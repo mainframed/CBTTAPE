@@ -2,7 +2,7 @@
 
 This github archive is an extraction of the XMIT files availble on CBT tape. It was produced using the xmit python library availble here: https://github.com/mainframed/xmilib
 
-Folders contain the extracted zip files, the origina XMIT file unloaded to a folder named after the PDS contained in the XMIT and any nexted XMITs contained in the CBT xmit file.
+Folders contain the extracted zip files, the original XMIT file unloaded to a folder named after the PDS contained in the XMIT and any nested XMITs contained in the CBT xmit file.
 
 Since the python library has mimetype detection all plaintext files were converted to text and binary files were given specific extentions.
 
