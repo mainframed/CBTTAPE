@@ -1,0 +1,394 @@
+REXX/NetView CLIST cross-reference utility
+
+My present site's NetView had been heavily customized by
+someone who had moved to another department before I arrived.
+There were several hundred locally-written CLISTs, some written
+in NetView CLIST Language (NCL) and some in REXX. Some
+of them were obviously redundant and I suspected that a lot more
+were too. I aimed to remove the rubbish and document what was
+left. For this task I really needed to know whether any given
+CLIST was called by other CLISTs, and, if so, which ones.
+
+I started by using the ISPF 'search for' dialog, but quickly found
+that this was not adequate for the job. So I wrote the following
+cross-reference utility in REXX. As input it takes the DSNAME
+of one or more PDS. As output it produces a list of those
+members which are referred to in other members: for each of
+these, it shows the type (R for REXX or C for NCL), and a list of
+the other members which refer to it. The cross-reference utility is
+designed to be run in batch using IKJEFT01. The SYSTSPRT
+output can be printed or, more usefully, directed to a dataset
+which can be searched from TSO.
+
+The basic method relies on the ability of REXX to generate
+variable names dynamically. The steps are:
+
+o      Use the TSO command 'LISTDS dsname MEMBERS' for
+each PDS, trapping the output to produce a list of members.
+
+o      For each member, create a REXX variable to contain the
+references. The variable initially contains the member name itself
+and a number indicating which library it resides in. In case of
+duplicate member names, the library named first in the parameter
+list takes precedence.
+
+o      Scan each member, extracting words. Each time a word is
+found for which a variable exists - that is, it is the name of a
+member in the concatenation of PDSs - we treat this as a
+'reference', and add the name of the member we are currently
+processing to the end of the variable for the member referenced.
+
+o      Finally, print out the contents of the variables which contain
+references. To reduce the amount of output, members which are
+not  referenced are not listed.
+
+My initial attempt produced a lot of false hits which turned out to
+be in comments. I therefore added logic to detect and ignore
+comments - and a few other things such as &WRITE statements.
+This in turn meant that I had to distinguish between REXX and
+NCL by checking whether the first record contained a REXX
+comment (beginning with '/*').
+
+To do all this parsing I decided to use a Finite State Machine
+method. This is a fairly simple technique which uses a 'machine'
+which processes one character at a time, and is always in one of a
+finite number of 'states'. The current state and the character
+processed determine the action to be taken and the next state. This
+is easily implemented using two tables, one containing the actions
+and the other the states. In this example, I chose to make the
+tables smaller by first classifying the input character as one of a
+small number of character types, and using the type to index the
+tables.
+
+Two different sets of tables are used, one for REXX and one for
+NCL. The correct set of tables is selected when the first record of
+each member is read. Clearly, the program could be extended to
+handle other languages. Be aware, however, that coding and
+debugging the state tables is a non-trivial task.
+
+The program is not perfect. The intention was to reduce the
+number of false hits to an acceptable level, but I was not prepared
+to write a complete parser for NCL and REXX.
+
+Be aware that the program is very CPU-intensive. It is suggested
+that you benchmark it on a small CLIST library before letting it
+loose on a large CLIST library during prime shift.
+
+The poor performance largely arises from the fact that several
+REXX procedure calls are required for each character of the input.
+In an attempt to improve matters, I added a set of 'skip tables',
+which cause the get-character routine to skip over characters
+which do not cause an action or change the state. This made a
+dramatic difference, roughly halving the CPU time used.
+
+/* REXX    NetView Clist/REXX PDS Cross Referencer */
+/*         Syntax:   SGXREF  dsname1  dsname2 ... */
+/* debug = 0 :  no debugging output */
+/* debug = 1 :  list member names as they are processed */
+/* debug = 2 :  list input, list each name as found */
+/* debug = 3 :  list each character, state and action */
+   debug = 0
+/* Build dataset list and member list */
+arg dsns
+memcount = 0
+do dsnno = 1 to words(dsns)
+  dsn.dsnno = subword(dsns,dsnno,1)
+  dsname = dsn.dsnno; call PDSMEMS
+end
+/* Scan each member */
+do memno = 1 to memcount
+  member = memlist.memno
+  dsnno = subword(xref.member,2,1)
+  dsname = dsn.dsnno; call MEMXREF
+end
+/* Output the results, omitting members with no references */
+do memno = 1 to memcount
+  member = memlist.memno; refs = xref.member
+  if length(refs) > 12 then say memno exectype.member':' refs
+end; exit
+/********************************************************************/
+/*  PDSMEMS: add members for this PDS to the list                   */
+/********************************************************************/
+PDSMEMS: retc = listdsi("'"dsname"'" 'DIRECTORY')
+if retc ^= 0 then do
+  select
+    when retc = 16 & sysreason = 5 then
+      say 'Dataset' dsname 'not catalogued'
+    otherwise say 'LISTDSI for' dsname 'completed' retc '-' sysreason
+  end; exit
+end
+if sysdsorg ^= 'PO' then do
+  say 'Dataset' dsname 'is not partitioned'; exit
+end
+/*  Set up a variable for each member to hold the references.       */
+/*  Variable name is XREF.membername                                */
+/*  Initial contents are:   "membername libnumber :"                */
+/*  As references are found they are appended to this string.       */
+retc = outtrap(line.,'*')
+"LISTDS '"dsname"' MEMBERS"
+retc = outtrap('OFF')
+do lineno = 7 to line.0
+  member = strip(line.lineno)
+  if xref.member = "XREF."||member then /* not a duplicate member */
+  do
+    memcount = memcount + 1; memlist.memcount = member
+    /* keep member list sorted in member name order */
+    memb = memcount
+    do mema = memcount-1 to 1 by -1 while memlist.mema > memlist.memb
+      memlist.memb = memlist.mema; memlist.mema = member; memb = mema
+    end
+    xref.member = left(member||copies(' ',8),8) dsnno ':'
+  end /* if */
+end /* do */
+return
+/********************************************************************/
+/* Routine to process a PDS member                                  */
+/********************************************************************/
+MEMXREF:if debug>=1 then say '*** processing member' member 'of' dsname
+"alloc file(indd) shr reuse da('"dsname"("member")'"
+alphanum = "ABCDEFGHIJKLMNOPQRSTUVWXYZ$#@0123456789"
+line = ""; name = ""; chpos = 1; nextpos = 0
+firstline = 1; eof = 0; state = 'A'; action = '.'
+newstack
+do until eof
+  chtype = GETCH()
+  action = substr(action.state, chtype, 1)
+  newstate = substr(state.state, chtype, 1)
+  if debug>=3 then
+  say 'state='state' chpos='chpos' ch='ch' type='chtype' action='action
+  select
+    when action = 'S' then name = ch
+    when action = 'A' then name = name || ch
+    when action = 'N' then call PROCNAME
+    otherwise nop
+  end /* select */
+  if debug>=3 then say 'newstate='newstate
+  state = newstate
+end /* do */
+"execio 1 diskr" indd "( finis" /* close file */
+delstack; return
+/**********************************************************************/
+/* Routine to process a name                                          */
+/**********************************************************************/
+PROCNAME: if debug>=2 then say 'process' name
+if length(name) <= 8,       /* valid as a member name */
+& name ^= member then do    /* not a self-reference   */
+  refs = xref.name
+  if refs ^= "XREF."||name, /* member exists with this name */
+  & wordpos(member, refs, 4) = 0    /* first ref from current member */
+  then xref.name = xref.name member /* add the new reference */
+end; return
+/**********************************************************************/
+/* Initialize Finite State Machine tables for REXX                    */
+/**********************************************************************/
+INITREXX: /* character types:
+   1 : other characters not listed below
+   2 : blank, comma (,) semi-colon (;), newline
+   3 : colon (:)
+   4 : ' single quote
+   5 : " double quote
+   6 : /
+   7 : *
+   8 : alpha (A-Z, $, #, @)
+   9 : 0-9 numeric
+  10 : . ? & _ (underscore)
+  11 : + - =
+  12 : ( ) | (vertical bar)
+  13 : end of file
+*/
+ch_newline = 2; ch_eof = 13
+/* translate tables - convert character to type code */
+tablei = " ,;:/*ABCDEFGHIJKLMNOPQRSTUVWXYZ$#@0123456789.?&_+-=()|'"""
+tableo = "222367888888888888888888888888888889999999999aaaabbbccc45"
+/* action table:  a row for each state, a column for each char type */
+   action codes:
+   . = no action
+   S = start new name
+   A = add character to current name
+   N = end of name, process name
+   P = stop
+*/
+action.A = '.......S....P' /* A: initial state */
+action.B = '.......S....P' /* B: inside single quotes */
+action.C = '.......S....P' /* C: inside double quotes */
+action.D = '.......S....P' /* D: slash */
+action.E = '............P' /* E: inside comment */
+action.F = '............P' /* F: '*' found inside comment */
+action.G = 'NN.NNN.AA..NP' /* G: in symbol possibly a member name */
+action.H = '............P' /* H: in symbol not a member name */
+action.I = '.N.NN..AA..NP' /* I: in name inside single quotes */
+action.J = '.N.NN..AA..NP' /* J: in name inside double quotes */
+action.K = '............P' /* K: in symbol in single quotes */
+action.L = '............P' /* L: in symbol in double quotes */
+action.Z = 'PPPPPPPPPPPPP' /* Z: end of input */
+/* state table: letter represents new state */
+state.A  = 'AAABCDAGHHAAZ' /* A: initial state */
+state.B  = 'BBBABBBIKKBBZ' /* B: inside single quotes */
+state.C  = 'CCCCACCJLLCCZ' /* C: inside double quotes */
+state.D  = 'AAABCAEGHHAAZ' /* D: slash */
+state.E  = 'EEEEEEFEEEEEZ' /* E: inside comment */
+state.F  = 'EEEEEAEEEEEEZ' /* F: '*' found inside comment */
+state.G  = 'AAABCDAGGHAAZ' /* G: in symbol possibly a member name */
+state.H  = 'AAABCDAHHHAAZ' /* H: in symbol not a member name */
+state.I  = 'BBBABBBIIKBBZ' /* I: in name inside single quotes */
+state.J  = 'CCCCACCJJLCCZ' /* J: in name inside double quotes */
+state.K  = 'BBBABBBKKKBBZ' /* K: in symbol in single quotes */
+state.L  = 'CCCCACCLLLCCZ' /* L: in symbol in double quotes */
+state.Z  = 'ZZZZZZZZZZZZZ' /* Z: end of input */
+/* Skip tables used to improve performance of GETCH routine.          */
+/* if match.state is 'N', skip.state contains characters which do not */
+/* cause either an action or a change of state.  (It does not         */
+/* necessarily contain ALL such characters).                          */
+/* if match.state is 'M', skip.state contains ALL the characters      */
+/* which cause either an action or a change of state.                 */
+/* These tables are used in a call to the VERIFY function of the form */
+/*       nextpos = verify(line, skip.state, match.state, nextpos)     */
+match.A  = "N"; skip.A = " ,;:*+-=()|"
+match.B  = "N"; skip.B = ' ,;:"/*+-=()|'
+match.C  = "N"; skip.C = " ,;:'/*+-=()|"
+match.D  = "N"; skip.D = ""
+match.E  = "M"; skip.E = "*"
+match.F  = "N"; skip.F = ""
+match.G  = "N"; skip.G = ""
+match.H  = "N"; skip.H = alphanum || ".?&_"
+match.I  = "N"; skip.I = ""
+match.J  = "N"; skip.J = ""
+match.K  = "N"; skip.K = alphanum || ".?&_"
+match.L  = "N"; skip.L = alphanum || ".?&_"
+match.Z  = "N"; skip.Z = tablei
+return
+/**********************************************************************/
+/* Initialize Finite State Machine tables for NetView Clist Language  */
+/**********************************************************************/
+INITNVCL:
+/* character types: same as for REXX except:
+   2 : blank, comma (,) semi-colon (;)
+   3 : newline
+*/
+ch_newline = 3; ch_eof = 13
+/* translate tables - convert character to type code */
+tablei = " ,;:/*ABCDEFGHIJKLMNOPQRSTUVWXYZ$#@0123456789.?&_+-=()|'"""
+tableo = "222167888888888888888888888888888889999999999aaaabbbccc45"
+/* action table */
+action.A = '.......S....P' /* A: initial state */
+action.B = '.......S....P' /* B: inside single quotes */
+action.G = 'NNNNNN.AA..NP' /* G: in symbol possibly a member name */
+action.H = '............P' /* H: in symbol not a member name */
+action.I = '.NNNN..AA..NP' /* I: in name inside single quotes */
+action.K = '............P' /* K: in symbol in single quotes */
+action.Z = 'PPPPPPPPPPPPP' /* Z: end of input */
+/* state table */
+state.A  = 'AAABAAAGHHHAZ' /* A: initial state */
+state.B  = 'BBAABBBIKKKBZ' /* B: inside single quotes */
+state.G  = 'AAABAAAGGHAAZ' /* G: in symbol possibly a member name */
+state.H  = 'AAABAAAHHHAAZ' /* H: in symbol not a member name */
+state.I  = 'BBAABBBIIKBBZ' /* I: in name inside single quotes */
+state.K  = 'BBAABBBKKKBBZ' /* K: in symbol in single quotes */
+state.Z  = 'ZZZZZZZZZZZZZ' /* Z: end of input */
+/* Skip tables */
+match.A  = "N"; skip.A = ' ,;:"/*()|'
+match.B  = "N"; skip.B = ' ,;:"/*()|'
+match.G  = "N"; skip.G = ""
+match.H  = "N"; skip.H = alphanum || ".?&_"
+match.I  = "N"; skip.I = ""
+match.K  = "N"; skip.K = alphanum || ".?&_"
+match.Z  = "N"; skip.Z = tablei
+return
+/**********************************************************************/
+/* Get-character function                                             */
+/* chpos: position in line, relative to 1, of character just read     */
+/* nextpos: position of next character to be read (0 if end of line)  */
+/* ch: character                                                      */
+/* Returned value (chtype) is type code for character                 */
+/* At end of line chpos=length(line)+1, chtype=ch_newline, nextpos=0  */
+/**********************************************************************/
+GETCH: ch = ' '
+if eof then return ch_eof
+if nextpos > length(line) then do /* signal end of line */
+  chpos = nextpos; nextpos = 0; return ch_newline
+end
+if nextpos < 1 then do /* end of line was signalled last time */
+  call GETSTMT; if eof then return ch_eof; nextpos = 1
+end
+if skip.state ^= "" then do /* skip insignificant characters */
+ nextpos = verify(line, skip.state, match.state, nextpos)
+ if nextpos=0 then do; chpos = length(line)+1; return ch_newline; end
+end
+chpos = nextpos; ch = substr(line, chpos, 1); nextpos = chpos + 1
+return pos(translate(ch, tableo, tablei), '23456789abcd') + 1
+/**********************************************************************/
+/* Get-statement routine                                              */
+/**********************************************************************/
+GETSTMT: line = GETLINE(); if eof then return
+/* Examine first record to determine language (NCL or REXX).
+   Deal with sequence numbering and CLIST statement. */
+if firstline then do
+  firstline = 0
+  if left(strip(line,'L'),2) = '/*' then do
+    exectype.member = 'R'; call INITREXX
+    /* set seqnum to 1 if sequence-numbered, 0 if not */
+    seqnum = datatype(substr(line,length(line)-7),'N')
+  end
+  else do
+    exectype.member = 'C'; call INITNVCL
+    seqnum = 1 /* NCL Clists are always sequence numbered */
+    if (subword(line,1,1) = "CLIST" & left(line,1) = ' '),
+    | subword(line,2,1) = "CLIST" then line = " "
+    else line = left(line, length(line)-8) /* remove sequence number */
+  end
+end
+else if seqnum then line = left(line,length(line)-8)
+if exectype.member = 'R' then do; line = strip(line); return; end
+/* The remainder of the routine deals with NCL. */
+/* First handle NCL continuation character '+' or '-': */
+stripline = strip(line, 'T') /* trailing blanks removed */
+contpos = length(stripline) /* position of last non-blank char */
+lastchar = right(stripline,1) /* last non-blank char */
+do while verify(lastchar, '+-') = 0
+  line2 = GETLINE(); if eof then return
+  line2 = left(line2, length(line2)-8)
+  /* concatenate lines: '+' removes blanks, '-' does not */
+  select
+    when lastchar = '+' then
+      line = left(line,contpos-1) || strip(line2,'L')
+    when lastchar = '-' then
+      line = overlay(' ', line, contpos) || line2
+  end
+  stripline = strip(line, 'T') /* trailing blanks removed */
+  contpos = length(stripline) /* position of last non-blank char */
+  lastchar = right(stripline,1) /* last non-blank char */
+end
+/* Remove comments and various control statements and commands. */
+line = strip(line); firstword = subword(line,1,1)
+if left(line,1) = '*',
+| wordpos(firstword, "&GOTO &WRITE &CONTROL &PAUSE &CGLOBAL &TGLOBAL",
+  "&EXIT GLOBALV WTO WTOR DOM SYSTEM PARSEL2R GETMLINE GETMPRES",
+  "GETMTFLG GETMTYPE NPDA RUNCMD LINKTEST LINKDATA LINKPD") > 0
+then line = " "
+/* Skip over &BEGWRITE statements and the data line(s) following.    */
+/* If the label for the &BEGWRITE is a variable, we only skip as far */
+/* as the next label.                                                */
+if firstword = "&BEGWRITE" then do
+  label = subword(line, words(line)) /* the last word */
+  if left(label,1) = '-' then /* it is a label */
+    if substr(label,2,1) = '&' then /* variable label */
+    do while left(strip(GETLINE(),'L'),1) ^= '-'; nop; end
+    else do while subword(GETLINE(),1,1) ^= label; nop; end
+  else line = GETLINE() /* no label, just skip one line */
+  line = " "
+end; return
+/**********************************************************************/
+/* Line input function                                                */
+/**********************************************************************/
+GETLINE: ln = ""; if eof then return ln
+"execio 1 diskr" indd "( lifo"
+if rc > 0 then eof = 1; else pull ln
+if debug>=2 then say '\' ln
+return ln
+/**********************************************************************
+
+
+Mike Field
+Systems Programmer
+CDS Ltd (UK)                                                        c Reserved 1994
+

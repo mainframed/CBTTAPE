@@ -1,0 +1,20 @@
+         MACRO
+         RCPSR2 &A
+         GBLB  &RCPSR2
+         GBLC  &DYNP
+         LCLC  &C
+.*   TO SAVE REG 2 IN REG 0 FOR ALLOC INNER MACROS FIRST TIME ONLY
+.*    IF OPERAND SUPPLIED AND SAVE DONE, RESTORES REG 2 AND
+.*    GENERATES MOVE INSTRUCTION FOR EXECUTE
+         AIF   ('&A' NE '').UNSAVE
+         AIF   (&RCPSR2).EXIT
+&RCPSR2  SETB  1
+         LR    R0,R2                   SAVE CONTENTS OF REGISTER 2
+         MEXIT
+.UNSAVE  AIF   (NOT &RCPSR2).EXIT
+         B     *+10                    SKIP NEXT INSTRUCTION
+&C       SETC  '&DYNP.MVC'
+&C       MVC   S99TUPAR(0),0(R14)      EXECUTED MOVE
+         LR    R2,R0                   RESTORE CONTENTS OF REGISTER 2
+&RCPSR2  SETB  0
+.EXIT    MEND

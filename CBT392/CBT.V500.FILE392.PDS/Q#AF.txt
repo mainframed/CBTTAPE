@@ -1,0 +1,444 @@
+         TITLE '--- QUEUE--AUTHFUNC -- CHANGE AUTHORIZED STATES ---'
+*---------------------------------------------------------------------*
+*                                                                     *
+*   AUTHFUNC - Test, set, reset APF authorization, switch PSW key     *
+*              or mode                                                *
+*                                                                     *
+*   Entry - R1 = 0 ==> invalid entry code                             *
+*              = 4 ==> get APF authorized if not                      *
+*              = 8 ==> reset APF if we set it                         *
+*              = 12 ==> switch to key zero                            *
+*              = 16 ==> switch to key non-zero                        *
+*              = 20 ==> switch to supervisor state                    *
+*              = 24 ==> switch to problem state                       *
+*         - If the entry code in R1 is negative, the function indi-   *
+*           cated by the complement of R1 is performed conditionally. *
+*                                                                     *
+*   Exit - R15 = 0 ==> success                                        *
+*              = 4 ==> unable to perform function                     *
+*                                                                     *
+*   Updates:                                                          *
+*      17Jun91  LDW  Check IKJEFTSR return code instead of QXAPFFL    *
+*                       silliness                                     *
+*      17Apr91  LDW  Don't use TSO/E service routine if TSO/E is not  *
+*                       installed (ref @GLOBALS).  (If you're running *
+*                       a release of JES2 such that QUEUE needs APF   *
+*                       authorization,  and you want to use the ISPF  *
+*                       interface, you're on your own.)               *
+*      14Apr91  LDW  Fix QXAPFFL logic so we don't S0C4 if QAUTH      *
+*                       doesn't exist (QAUTH also was changed)        *
+*      01Feb91  LDW  Change APF program name from ISRAUTH to QAUTH    *
+*      23Oct90  GLA  Don't invoke ikjeftsr if currently authorized    *
+*                    any way shape or form. Can get S378-14 otherwise.*
+*                    Things are getting crazier and crazier.          *
+*      11Oct90  GLA  Preserve current state in reset APF              *
+*      21Sep90  GLA  Merge into new base level of USC Queue.          *
+*      15May89  GLA  Previous scheme did not work. Since only 1 JSCB  *
+*                    exists for whole step (address space in this     *
+*                    case), when parallel structure was taken down    *
+*                    the JSCBAUTH bit was reset. So instead we will   *
+*                    reset the key in the PRB of the parallel         *
+*                    structure, thus returning in key 0.              *
+*                                                                     *
+*      13May89  GLA  Too much overhead in scheme below. Also did not  *
+*                    turn on APF authorization. Instead lets use the  *
+*                    IKJEFTSR invoked routine to set the JSCBAUTH     *
+*                    bit in the task running Q and then return. This  *
+*                    will allow ISPF services while authorized.       *
+*                    YES, this is an integrity exposure, but so was   *
+*                    the user SVC it replaces. Also there is no other *
+*                    way to invoke ISPF authorized.                   *
+*                                                                     *
+*  FISHHEADS FISHEADS,                                                *
+*       ROLLY POLLY FISHHEADS                                         *
+*  FISHHEADS FISHEADS,                                                *
+*       EAT THEM UP, YUMMMMMM                                         *
+*                                                                     *
+*      05May89  GLA  Try new tech for achieving APF authorization:    *
+*                    use the IKJEFTSR routine to invoke as authorized *
+*                    a small program that will return to the QUEUE    *
+*                    code using registers passed to it. This way      *
+*                    QUEUE will be authorized. Note however that no   *
+*                    ISPF services are available while authorized     *
+*                    because the ISPF tasks are "STATUS STOPPED".     *
+*                    When deauth req occurs, undo the IKJEFTSR task   *
+*                    structure and return to after the call of        *
+*                    IKJEFTSR. Then use regs saved on deauth request  *
+*                    to return to QUEUE as unauthorized.              *
+*      04Jun88  LDW  Add call types 12-24                             *
+*      24OCT86  EMS  FIX APF RESET CODE                               *
+*      03/30/86 LDW  USE &@@SCSVC INSTEAD OF &QAPFSVC                 *
+*      01/13/83 LDW  ROUTINE CREATED                                  *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SPACE 3
+AUTHFUNC QSTART WORKLEN=AF@WORKL                                21SEP90
+         USNGX WORK,R13                                         21SEP90
+         LR    R3,R1                    save entry code
+*                                                               26OCT90
+**       START DEBUGGING                                        26OCT90
+*                                                               26OCT90
+         MVC   WTPCMD(WTPCLEN-4),=CL80' '                       26OCT90
+         MVC   WTPL(4),=AL2(WTPCLEN,X'8000')                    26OCT90
+         MVC   WTPCMD,QDREPLY                                   26OCT90
+         MVC   WTPP1,QPARM1                                     26OCT90
+         MVC   WTPP2,QPARM2                                     26OCT90
+         MVC   WTPRTDSC(4),=AL2(0,X'0020')                      26OCT90
+         LPR   R1,R3          GET REAL CODE                     26OCT90
+         LA    R1,AF$TB(R1)   POINT AT STAT                     26OCT90
+         MVC   WTPSTAT,0(R1)  MOVE IN STATUS                    26OCT90
+         L     R1,4(,R13)                                       26OCT90
+         L     R1,12(,R1)     GET RETURN ADDRESS                26OCT90
+         SL    R1,=V(QUEUE)   GET OFFSET                        26OCT90
+         ST    R1,DUMCLST                                       26OCT90
+         UNPK  WTPOFFS(9),DUMCLST(5)                            26OCT90
+         MVI   WTPOFFS+8,C' '                                   26OCT90
+         TR    WTPOFFS(8),QHEXTAB                               26OCT90
+*        WTO   MF=(E,WTPL)                                      26OCT90
+         LR    R1,R3                                            26OCT90
+*                                                               26OCT90
+**       END DEBUGGING                                          26OCT90
+*                                                               26OCT90
+         LPR   R1,R1                    get a positive copy of code
+         CH    R1,=H'24'                TOO BIG?
+         BH    AF$ERR2                  YES - ABORT
+         B     *+4(R1)                  decode function request
+         B     AF$ERR1                  00 - obsolete entry code
+         B     AF$APF                   04 - set APF
+         B     AF$UNAPF                 08 - reset APF
+         B     AF$ZERO                  12 - switch to key zero
+         B     AF$NONZ                  16 - switch to key non-zero
+         B     AF$SUPR                  20 - switch to supervisor state
+         B     AF$PROB                  24 - switch to problem state
+AF$TB    DC    C'*BADAPF RAPFZEROKEY8SUPRPROB'                  26OCT90
+         SPACE 3
+AF$ZERO  TM    QXAUTH,QXSUPR            are we in supervisor state?
+         BZ    AF$Z$1                   no - try to get APF
+*
+         MODESET  EXTKEY=ZERO           do it the quick way
+*
+         B     QSTOP00
+         SPACE 1
+AF$Z$1   TM    QXAUTH,QXAPFSET          IS APF ALREADY SET      26OCT90
+         BZ    AF$Z$2                   NO SO SET IT            26OCT90
+         MODESET KEY=ZERO               USE MVS SINCE AUTH'ED   26OCT90
+         B     QSTOP00                  DONE                    26OCT90
+         SPACE 1                                                26OCT90
+AF$Z$2   LA    R1,4                     try to get APF authorized
+         LTR   R3,R3                    original request conditional?
+         BNM   *+6                      no - ok
+         LNR   R1,R1                    yes - make this conditional
+         QCALL AUTHFUNC                 recursive!
+         LTR   R15,R15                  ok?
+         BNZ   QSTOPRC                  no - return to caller
+*
+         MODESET  KEY=ZERO
+*
+         LA    R1,8                     unset it if necessary
+         QCALL AUTHFUNC                 recursive!
+         B     QSTOP00
+         SPACE 3
+AF$NONZ  TM    QXAUTH,QXSUPR            are we in supervisor state?
+         BZ    AF$N$1                   no - try to get APF
+*
+         MODESET  EXTKEY=&@@QXKEY       do it the quick way
+*
+         B     QSTOP00
+         SPACE 1
+AF$N$1   TM    QXAUTH,QXAPFSET          IS APF ALREADY SET      26OCT90
+         BZ    AF$N$2                   NO SO SET IT            26OCT90
+         MODESET KEY=NZERO              USE MVS SINCE AUTH'ED   26OCT90
+         B     QSTOP00                  DONE                    26OCT90
+         SPACE 1                                                26OCT90
+AF$N$2   LA    R1,4                     try to get APF authorized
+         LTR   R3,R3                    original request conditional?
+         BNM   *+6                      no - ok
+         LNR   R1,R1                    yes - make this conditional
+         QCALL AUTHFUNC                 recursive!
+         LTR   R15,R15                  ok?
+         BNZ   QSTOPRC                  no - return to caller
+*
+         MODESET  KEY=NZERO
+*
+         LA    R1,8                     unset it if necessary
+         QCALL AUTHFUNC                 recursive!
+         B     QSTOP00
+         SPACE 3
+AF$SUPR  TM    QXAUTH,QXSUPR            are we in supervisor state?
+         BNZ   QSTOP00                  yes - don't change anything
+         TM    QXAUTH,QXAPFSET          IS APF ALREADY SET      26OCT90
+         BZ    AF$S$2                   NO SO SET IT            26OCT90
+         MODESET MODE=SUP               USE MVS SINCE AUTH'ED   26OCT90
+         B     QSTOP00                  DONE                    26OCT90
+         SPACE 1                                                26OCT90
+AF$S$2   LA    R1,4                     try to get APF authorized
+         LTR   R3,R3                    original request conditional?
+         BNM   *+6                      no - ok
+         LNR   R1,R1                    yes - make this conditional
+         QCALL AUTHFUNC                 recursive!
+         LTR   R15,R15                  ok?
+         BNZ   QSTOPRC                  no - return to caller
+*
+         MODESET  MODE=SUP
+*
+         LA    R1,8                     unset it if necessary
+         QCALL AUTHFUNC                 recursive!
+         B     QSTOP00
+         SPACE 3
+AF$PROB  TM    QXAUTH,QXSUPR            did we start in supervisor st?
+         BNZ   QSTOP00                  yes - don't change back
+         TM    QXAUTH,QXAPFSET          IS APF ALREADY SET      26OCT90
+         BZ    AF$P$2                   NO SO SET IT            26OCT90
+         MODESET MODE=PROB              USE MVS SINCE AUTH'ED   26OCT90
+         B     QSTOP00                  DONE                    26OCT90
+         SPACE 1                                                26OCT90
+AF$P$2   LA    R1,4                     try to get APF authorized
+         LTR   R3,R3                    original request conditional?
+         BNM   *+6                      no - ok
+         LNR   R1,R1                    yes - make this conditional
+         QCALL AUTHFUNC                 recursive!
+         LTR   R15,R15                  ok?
+         BNZ   QSTOPRC                  no - return to caller
+*
+         MODESET  MODE=PROB
+*
+         LA    R1,8                     unset it if necessary
+         QCALL AUTHFUNC                 recursive!
+         B     QSTOP00
+         SPACE 3
+AF$APF   EQU   *
+**       TESTAUTH  FCTN=1               ASK MVS IF WE ARE APF AUTH
+         SPACE 1
+**       LTR   R15,R15                  ARE WE?
+**       BZ    QSTOPRC                  YES - RETURN WITH RC=0
+         TM    QXAUTH,QXAPFENT          are we running APF authorized?
+         BNZ   QSTOP00                  yes - return with RC=0
+*%%       AIF   (&@@SCSVC EQ 0).APF01    SKIP IF APF SVC NOT PROVIDED
+*%%      QAPF  SET                      ATTEMPT TO SET IT
+*%%      SPACE 1
+*%%      TESTAUTH  FCTN=1               SEE IF IT WORKED
+*%%      SPACE 1
+*%%      OI    QXAUTH,QXAPFSET          ASSUME IT WORKED
+*%%      LTR   R15,R15                  DID IT?
+*%%      BZ    QSTOPRC                  YES - RETURN WITH RC=0
+*%%      NI    QXAUTH,255-QXAPFSET      NO - RESET INDICATOR
+*%%F01    ANOP
+         B     APFTSR                   Use TSR to Authorize    21SEP90
+         LTR   R15,R3                   WHAT WAS REQUESTED FUNCTION?
+         BNZ   QSTOPRC                  RETURN WITH RC=4 FOR ENTRY=4
+         QTILT '*** QUEUE IS NOT RUNNING APF AUTHORIZED ***'
+         SPACE 2
+AF$UNAPF TESTAUTH  FCTN=1               CURRENTLY APF AUTHORIZED?
+         SPACE 1
+         LTR   R15,R15                  WELL?
+         BNZ   AF$ERR3                  NO - ERROR
+         TM    QXAUTH,QXAPFSET          DID WE SET IT ON?
+         BNO   QSTOPRC                  NO - LEAVE IT ON
+         B     APFTSRRS                 Use TSR to Authorize    21SEP90
+*%%       AIF   (&@@SCSVC EQ 0).APF02    SKIP IF APF SVC NOT PROVIDED
+*%%      QAPF  RESET                    TURN IT OFF
+*%%      SPACE 1
+*%%      TESTAUTH  FCTN=1               SEE IF IT WENT OFF
+*%%      SPACE 1
+*%%      LTR   R15,R15                  DID IT?
+*%%      BNZ   QSTOP                    YES - RETURN WITH RC=0
+*%%      L     R0,=C'AF4 '              SET LOGIC ERROR CODE
+*%%      L     R15,=V(LOGICERR)         -> ROUTINE
+*%%      BALR  R14,R15                  GO TO IT (NO RETURN)
+*%%      SPACE 2
+*%%       AGO   .APF03
+*%%F02    ANOP
+*%%      L     R0,=C'AF5 '              SET LOGIC ERROR CODE
+*%%      L     R15,=V(LOGICERR)         -> ROUTINE
+*%%      BALR  R14,R15                  GO TO IT (NO RETURN)
+*%%F03    ANOP
+         SPACE 2
+AF$ERR1  L     R0,=C'AF1 '              SET LOGIC ERROR CODE
+         L     R15,=V(LOGICERR)         -> ROUTINE
+         BALR  R14,R15                  GO TO IT (NO RETURN)
+         SPACE 2
+AF$ERR2  L     R0,=C'AF2 '              SET LOGIC ERROR CODE
+         L     R15,=V(LOGICERR)         -> ROUTINE
+         BALR  R14,R15                  GO TO IT (NO RETURN)
+         SPACE 2
+AF$ERR3  L     R0,=C'AF3 '              SET LOGIC ERROR CODE
+         L     R15,=V(LOGICERR)         -> ROUTINE
+         BALR  R14,R15                  GO TO IT (NO RETURN)
+         SPACE 2
+         LTORG ,
+***********************************************************************
+*                                                                     *
+*  INVOKE IKJEFTSR TO MAKE AUTHORIZED BY REENTERING AT APFTCB         *
+*                                                                     *
+***********************************************************************
+APFTSR   DS    0H
+         TESTAUTH FCTN=0,STATE=NO,KEY=YES,RBLEVEL=1,BRANCH=NO   23OCT90
+         LTR   R15,R15                  Are we currently key=0  23OCT90
+         BZ    AF$JSET                  A. if yes just set APF  23OCT90
+*                                                               23OCT90
+**       We are definitely not KEY=0 here, so if SUPR state     23OCT90
+**       then don't invoke IKJEFTSR                             23OCT90
+*                                                               23OCT90
+         TESTAUTH FCTN=0,STATE=YES,KEY=NO,RBLEVEL=1,BRANCH=NO   23OCT90
+         LTR   R15,R15                  Are we supr state       23OCT90
+         BZ    AF$FUDG                  A. if yes fudge it      23OCT90
+*                                                               23OCT90
+**       At this point we are KEY=8 and PROB state, so use      23OCT90
+**       IKJEFTSR to get KEY=0 to set APF authorization.        23OCT90
+*                                                               23OCT90
+          AIF   (&@@TSOE NE 0).AF010
+         B     APF$FL                   go to APF failure routine
+          AGO   .AF020
+.AF010    ANOP
+         USNGX PSA,R0
+         L     R1,PSATOLD               get current TCB address
+         L     R1,TCBRBP-TCB(,R1)       get RB pointer
+         ST    R1,QAPFR13               save RB address
+         MVC   QNAME,=CL8'QAUTH'
+         MVC   QDUMHDR+2(2),=H'4'       set length
+         MVC   QPRMHDR+2(2),=AL2(QPRMLEN) set length
+         MVC   QDUM1,=F'-1'             set parm to show not CPPL
+         LA    R1,QDUMHDR+2             point at second parms
+         LA    R2,QPRMHDR+2             point at first parms
+         STM   R1,R2,DUMCLST            create parm list
+         OI    DUMCLST+4,X'80'          set end indicator
+         ST    R11,QPRM1                save addr of QCOMMON
+         LA    R1,APFTCB                get addr of routine
+         ST    R1,QPRM2                 save addr of return regs
+         L     R15,CVTPTR
+         L     R15,CVTTVT-CVT(,R15)
+         L     R15,TSVTASF-TSVT(,R15)
+         CALL  (15),                                                   X
+               (FLAGS,QNAME,BUFLEN,RETCODE,RSNCODE,ABNDCODE,DUMCLST),  X
+               VL,MF=(E,QAPFSV)
+         LTR   R15,R15                  did TSR or QAUTH fail?
+         BNZ   APF$FL                   yes - so issue msg or rtn
+** if successful then we are in key zero
+         L     R1,PSATOLD               get current TCB address
+         L     R1,TCBJSCB-TCB(,R1)      get the JSCB address
+         USNGX IEZJSCB,R1     BASE IT
+         OI    JSCBOPTS,JSCBAUTH        set authorization on
+         DROPX R1             BASE IT
+         MODESET KEY=NZERO,MODE=PROB
+         OI    QXAUTH,QXAPFSET          show we set auth on
+         B     QSTOP00                  now exit with rc=0
+.AF020    ANOP
+         SPACE 3
+AF$JSET  L     R1,PSATOLD               get current TCB address 23OCT90
+         L     R1,TCBJSCB-TCB(,R1)      get the JSCB address    23OCT90
+         USNGX IEZJSCB,R1     BASE IT                           23OCT90
+         OI    JSCBOPTS,JSCBAUTH        set authorization on    23OCT90
+         DROPX R1             BASE IT                           23OCT90
+         OI    QXAUTH,QXAPFSET          show we set auth on     23OCT90
+         B     QSTOP00                  now exit with rc=0      23OCT90
+         SPACE 3                                                23OCT90
+AF$FUDG  DS    0H                                               23OCT90
+         MODESET KEY=ZERO               set the key             23OCT90
+         L     R1,PSATOLD               get current TCB address 23OCT90
+         L     R1,TCBJSCB-TCB(,R1)      get the JSCB address    23OCT90
+         USNGX IEZJSCB,R1     BASE IT                           23OCT90
+         OI    JSCBOPTS,JSCBAUTH        set authorization on    23OCT90
+         DROPX R1             BASE IT                           23OCT90
+         MODESET KEY=NZERO              reset the key           23OCT90
+         OI    QXAUTH,QXAPFSET          show we set auth on     23OCT90
+         B     QSTOP00                  now exit with rc=0      23OCT90
+         SPACE 3                                                23OCT90
+***********************************************************************
+*                                                                     *
+*  TO DEAUTHORIZE, JUST TURN OFF BIT IN JFCB                          *
+*                                                                     *
+***********************************************************************
+APFTSRRS DS    0H
+         TESTAUTH FCTN=0,STATE=YES,KEY=NO,RBLEVEL=1,BRANCH=NO   11OCT90
+         LR    R5,R15                                           11OCT90
+         TESTAUTH FCTN=0,STATE=NO,KEY=YES,RBLEVEL=1,BRANCH=NO   11OCT90
+         LR    R6,R15
+         MODESET KEY=ZERO,MODE=SUP
+         L     R1,PSATOLD               get current TCB address
+         L     R1,TCBJSCB-TCB(,R1)      get the JSCB address
+         USNGX IEZJSCB,R1     BASE IT
+         NI    JSCBOPTS,X'FF'-JSCBAUTH  set authorization off
+         DROPX R1             BASE IT
+         LTR   R5,R5                    need to reset mode ??   11OCT90
+         BZ    APFTSRR1                                         11OCT90
+         MODESET MODE=PROB              reset to problem mode   11OCT90
+APFTSRR1 LTR   R6,R6                    need to reset key ??    11OCT90
+         BZ    APFTSRR2                                         11OCT90
+         MODESET KEY=NZERO              reset to tcb key        11OCT90
+APFTSRR2 DS    0H                                               11OCT90
+*        MODESET KEY=NZERO,MODE=PROB
+         NI    QXAUTH,255-QXAPFSET      reset
+         B     QSTOP00                  now exit with rc=0
+         DROPX R0
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*  IKJEFTSR failed to cause authorization, so issue message           *
+*                                                                     *
+***********************************************************************
+APF$FL   DS    0H
+         NI    QXAUTH,255-QXAPFSET      reset flags
+         LTR   R15,R3                   check entry code
+         BNZ   QSTOPRC                  set rc if only checking
+         QTILT '*** QUEUE IS NOT RUNNING APF AUTHORIZED ***'
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*  This code is invoked by QAUTH and will set authorization on        *
+*                                                                     *
+***********************************************************************
+APFTCB   BALR  R12,0
+         DROPX R12
+         USNGX *,R12
+         MODESET KEY=ZERO,MODE=SUP
+         L     R1,QAPFR13               get address of rb
+         NI    17(R1),X'0F'             set key to zero
+         RETURN (14,12),RC=0
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*  MISCELLANY                                                         *
+*                                                                     *
+***********************************************************************
+FLAGS    DC    X'00000102'              Flags for IKJEFTSR
+BUFLEN   DC    F'8'                     Length of buffer
+         LTORG ,
+         DROPX R13                                              21SEP90
+         SPACE 3
+         QCOMMON
+***********************************************************************
+*                                                                     *
+*  GENERATE CONTROL BLOCK DSECTS                                      *
+*                                                                     *
+***********************************************************************
+WORK     DSECT
+         ORG   WORK+72
+QDUMHDR  DS    H,H     LENGTH      ***
+QDUM1    DS    F       F'-1'       *
+QPRMHDR  DS    H,H     LENGTH      *  keep together
+QPRM1    DS    A       QCOMMON     *
+QPRM2    DS    A       R13 APF CL  ***
+QPRMLEN  EQU   *-QPRM1             length of parms
+DUMCLST  DS    2F                  CALL PARM LIST
+RETCODE  DS    F                        Function return code
+RSNCODE  DS    F                        IKJEFTSR reason code
+ABNDCODE DS    F                        IKJEFTSR abend code
+QNAME    DS    CL8                 ADDRESS OF Q LOAD MODULE NAME
+*                                                               26OCT90
+**       DEBUGGING WTP                                          26OCT90
+*                                                               26OCT90
+WTPL     DS    F                                                26OCT90
+WTPLINE  DS    0C                                               26OCT90
+WTPSTAT  DS    CL4,C                                            26OCT90
+WTPOFFS  DS    CL8,C                                            26OCT90
+WTPCMD   DS    CL8,C                                            26OCT90
+WTPP1    DS    CL8,C                                            26OCT90
+WTPP2    DS    CL8,C                                            26OCT90
+WTPCLEN  EQU   *-WTPL                                           26OCT90
+WTPRTDSC DS    AL4                                              26OCT90
+AF@WORKL EQU   *-WORK
+         QZCVT
+         QZTSVT
+         QZPSA
+         QZTCB
+         QZJSCB

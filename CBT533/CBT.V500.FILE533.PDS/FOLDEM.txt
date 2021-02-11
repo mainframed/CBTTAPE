@@ -1,0 +1,481 @@
+   TITLE 'FOLDEM -- FOLD FB-80 DATA FROM A LONG BUFFER'
+FOLDEM   CSECT
+*  ---------------------------------------------------------------  *
+*
+*   AUTHOR:       Sam Golob
+*
+*   Copyright 2004 - 2005 by Sam Golob.  All rights reserved,
+*                 subject to express permissions from the author
+*                 to use this software.  This software is part
+*                 of VTTS (Virtual Tape Transportation System).
+*
+*                 Permission is granted by the author for all
+*                 parts of the VTTS package which are distributed
+*                 on the CBT Tape collection, to be used by
+*                 anyone for their own use, but not for resale
+*                 or for reincorporation within commercial code.
+*
+*                           -------------------------------------
+*                           It is probably not necessary to run
+*                           this program in 24-bit mode.  But
+*                           it works when it is run that way.
+*                           -------------------------------------
+*                           We do want old MVS systems to be able
+*                           to run this routine.
+*                           -------------------------------------
+*
+*  ---------------------------------------------------------------  *
+*                                                                   *
+*  SUBROUTINE:    FOLDEM                                            *
+*                                                                   *
+*  DESCRIPTION:                                                     *
+*                                                                   *
+*      This program is the heart of the process of creating an      *
+*      AWS-format disk file from a real tape file.  The disk        *
+*      file is data that has been folded over from a buffer,        *
+*      into an FB-80 dataset.                                       *
+*                                                                   *
+*      This program takes buffer data and folds it into FB-80       *
+*      data, starting from a given buffer address, for a given      *
+*      number of bytes.  The data is folded into an 80-byte         *
+*      workarea starting from a given OFFSET address (+0 to +79)    *
+*      into the workarea.  When the workarea has been completely    *
+*      filled and more data is to be written, a PUT is done to      *
+*      write out the data from the 80-byte workarea, and then       *
+*      the workarea is cleared with binary zeros before any         *
+*      additional data is written to it.  An incompletely filled    *
+*      workarea is not written out, and the same is true if the     *
+*      workarea is full but no more data is to be written out.      *
+*      So in that case, the location of the workarea is returned    *
+*      to the caller in field FLDSCARD, and it is the caller's      *
+*      responsibility to do the PUT for the last card.              *
+*                                                                   *
+*  INPUTS and OUTPUTS:                                              *
+*                                                                   *
+*      This program is driven by a control block called FLDAREA,    *
+*      which is updated by both this program and by the caller.     *
+*      See below for more details.                                  *
+*                                                                   *
+*  FILES NEEDED:                                                    *
+*                                                                   *
+*      This program assumes that the caller has opened DCBs for     *
+*      an FB-80 file called AWSOUT, which receives the output       *
+*      "virtual tape" data, and for SYSPRINT.  This program         *
+*      needs to do PUTs to AWSOUT, and if necessary, it needs       *
+*      to write messages to SYSPRINT.  Therefore the caller has     *
+*      to provide ENTRY AWSOUT and ENTRY SYSPRINT statements in     *
+*      front of its AWSOUT and SYSPRINT DCBs, respectively.         *
+*                                                                   *
+*  METHOD OF OPERATION:                                             *
+*                                                                   *
+*      This program operates using a control block, called the      *
+*      FLDAREA, which is passed from the caller and back to the     *
+*      caller.  Both the caller and this program update the         *
+*      FLDAREA.  Upon entry to this program, R1 is expected to      *
+*      point to the caller's copy of FLDAREA, and upon return,      *
+*      R1 is pointed to the updated copy of FLDAREA in this         *
+*      subroutine.  So the caller has to copy it back over its      *
+*      own instance of FLDAREA after the return.                    *
+*                                                                   *
+*      The caller does one tape read, or read of data into a        *
+*      buffer.  From the number of bytes read, and possibly from    *
+*      the given chunk size also, the caller will construct an      *
+*      AWS header which will determine how many bytes should be     *
+*      folded into the FB-80 disk dataset.  This AWS header is      *
+*      also folded in by a call to this program, and then the       *
+*      tape data is folded in afterward, for the number of bytes    *
+*      required either by the chunk size or by the block size.      *
+*                                                                   *
+*      This program does one or more PUTs into the FB-80 file,      *
+*      until the request for the number of bytes to be folded,      *
+*      is satisfied.  A PUT is done whenever the FB-80 work area    *
+*      has been filled.  At the end of the fold operation, the new  *
+*      OFFSET into the FB-80 workarea (that has not yet been        *
+*      written out to disk), the number of bytes that have been     *
+*      folded, and the projected start of the next data to be       *
+*      folded, are returned in the fields of the FLDAREA control    *
+*      block.                                                       *
+*                                                                   *
+*      The following is the layout of the FLDAREA.  Fields          *
+*      marked with an arrow must be supplied upon input to this     *
+*      program.                                                     *
+*                                                                   *
+*      FLDAREA  DS    0F         FOLDEM AREA CONTROL BLOCK          *
+*      *                         ------ ---- ------- -----          *
+*  --> FLDSCARD DC    F'0'       Start address of 80-byte card      *
+*  --> FLDECARD DC    F'0'       End address of 80-byte card        *
+*  --> FLDOFFST DC    F'0'       OFFSET of data in the card         *
+*  --> FLDBYTES DC    F'0'       Number of bytes to be folded now   *
+*  --> FLDBYTOT DC    F'0'       Batch total of bytes left to move  *
+*      FLDBYMVD DC    F'0'       Number of bytes folded now         *
+*  --> FLDBUFFR DC    F'0'       Current data start address         *
+*  --> FLDBSTRT DC    F'0'       Original start data address        *
+*      FLDOUTCT DC    PL7'0'     Number of PUTs for AWSOUT records  *
+*  --> FLDREADF DC    X'00'      This run is "READ ONLY"  ?         *
+*      *              X'01'      Yes, read only. (Copied from the   *
+*                                READFLAG byte in the caller.)      *
+*      FLDLENTH EQU   *-FLDAREA                                     *
+*                                                                   *
+*      The rest of the fields are calculated by this program        *
+*      and returned to the caller.                                  *
+*                                                                   *
+*      FLDBUFFR and FLDOFFST are updated by this program, and       *
+*      upon return to the caller, they point to the input data      *
+*      and output data positions, respectively, that are just       *
+*      after the moved data, to anticipate the next call, so as     *
+*      to be able to move more data.  FLDBSTRT preserves the        *
+*      very beginning address of the input buffer, whereas          *
+*      FLDBUFFR is a place somewhere within the buffer, which       *
+*      is the start from where the new data is expected to be       *
+*      moved.                                                       *
+*                                                                   *
+*      A new field, FLDBYTOT, makes it easier to create chunked     *
+*      AWS-format tape files, when the chunksize is less than       *
+*      the blocksize.  This field originally (after a block is      *
+*      read into the buffer from the tape) contains the number      *
+*      of bytes in the entire block.  After each chunk of data      *
+*      is written, this field gets decremented by the number of     *
+*      bytes in the chunk just written.                             *
+*                                                                   *
+*      Since both the caller and this program do PUT operations     *
+*      to the output FB-80 file, the count of the number of PUTs    *
+*      done, FLDOUTCT, is updated by BOTH the caller and by this    *
+*      program.                                                     *
+*                                                                   *
+*  ---------------------------------------------------------------  *
+         MACRO
+*  ---------------------------------------------------------------  *
+*    This macro is used to display hex values in a printed report.
+*  ---------------------------------------------------------------  *
+&NAME    HEX   &TO,&LEN,&FROM
+&NAME    DS    0H
+         ST    R4,SAVER04
+         STM   15,1,HEXSAVE
+         LA    1,&FROM
+         LA    0,&LEN
+         LA    15,&TO
+         BAL   4,HEX
+         L     R4,SAVER04
+         LM    15,1,HEXSAVE
+         MEND
+         SPACE
+         YREGS
+FOLDEM   AMODE 24
+FOLDEM   RMODE 24
+         USING *,R15
+         B     EYECATCH
+         DC    C'--- '            MAKE EYECATCHER VISIBLE
+         DC    C'FOLDEM'
+         DC    C' - '
+SYSDAT   DC    C'&SYSDATE'
+         DC    C'  ',C'&SYSTIME '
+SAVEAREA DC    18F'0'
+EYECATCH DS    0D                    ENSURE ALIGNMENT
+         STM   R14,R12,12(R13)
+         LR    R5,R1                 SAVE PARM POINTER
+         LA    R1,SAVEAREA           NEW SAVE-AREA ADDRESS
+         ST    R1,8(,R13)            FORWARD SAVE-AREA CHAIN PTR
+         ST    R13,4(,R1)            BACKWARD SAVE-AREA CHAIN PTR
+         LR    R13,R1                NEW SAVE AREA ADDRESS
+         DROP  R15
+* -----                              SET UP BASE REGISTERS
+         USING FOLDEM,R12,R11
+         LR    R12,R15
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+         LR    R1,R5                 RESTORE PARM POINTER
+         ST    R1,SAVEPARM           Save pointer to caller's FLDAREA
+         L     R0,SYSPRINV           SYSPRINT DCB address in caller
+         ST    R0,SYSPRDCB             store for the program's use
+         L     R0,AWSOUTV            AWSOUT   DCB address in caller
+         ST    R0,AWOUTDCB             store for the program's use
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*                                                                   *
+*   Routine to fold buffer data into an FB-80 file, starting at     *
+*   a given location in the buffer, for a certain number of bytes,  *
+*   and starting at a given OFFSET in the 80-byte workarea to       *
+*   which the buffer data will be written.  When the 80-byte        *
+*   workarea is filled up, a PUT is done to AWSOUT, and the         *
+*   workarea is cleared with binary zeros for more data to be       *
+*   written.                                                        *
+*                                                                   *
+*   Input:   FLDAREA fields are all supplied by the calling         *
+*            program, except for FLDBYMVD which is calculated       *
+*            by this program and returned to the caller.  The       *
+*            caller's copy of FLDAREA is pointed to by Register 1.  *
+*                                                                   *
+*            The buffer area containing the data to be folded       *
+*            is supplied by the calling program, as well as the     *
+*            number of bytes that is expected to be folded.         *
+*                                                                   *
+*   Output:  Data from the buffer will be moved into the 80-byte    *
+*            workarea until the workarea is filled.  When the       *
+*            workarea is filled, a PUT will be done to AWSOUT,      *
+*            and the workarea is cleared to X'00's to make room     *
+*            for more data, when more data is to be written.        *
+*                                                                   *
+*            Ending OFFSET into the 80-byte workarea, pointing to   *
+*            just after the data which has been moved, is returned  *
+*            in the FLDOFFST field.  Upon return to the caller,     *
+*            the FLDBUFFR field is updated to point to the place    *
+*            in the buffer just after the data which has been       *
+*            moved.  The FLDBSTRT field always should point to the  *
+*            beginning of the data buffer, but this is at the       *
+*            discretion of the calling program.                     *
+*                                                                   *
+*            A count of bytes actually moved from the buffer to     *
+*            the 80-byte workarea (and written out by PUTs to the   *
+*            AWSOUT DD name as is necessary) is calculated by this  *
+*            program and returned in the FLDBYMVD field.  Upon      *
+*            return, the number in the FLDBYMVD field should match  *
+*            the number in the FLDBYTES field.                      *
+*                                                                   *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+* <--------- SET UP LOOP TO START MOVING THE DATA ------->
+FOLDIT   DS    0H
+         L     R1,SAVEPARM          Load address of caller's FLDAREA
+         L     R2,=A(FLDBLOCK)      Load address of our copy of FLDAREA
+         USING FLDBLOCK,R2
+         MVC   FLDAREA(FLDLENTH),0(R1)  Move caller's FLDAREA to ours
+* - - - - - - - - - -      Load the buffer quantities
+         L     R7,FLDBUFFR          Initialize start of buffer data
+         L     R8,FLDBYTES          Bytes to be moved
+         AR    R8,R7                Add in start buffer address
+         ST    R8,HYPOENDB          Hypothetical end-of-buffer address
+*                                   which is probably the real
+*                                   end-of-data to be moved.
+* - - - - - - - - - -      Load the card quantities
+         MVC   SAVEBEGC,FLDSCARD    Save "start of card" address
+         MVC   SAVEENDC,FLDECARD    Save "end of card" address
+         MVC   FLDBYMVD,=F'0'       Initialize count of bytes moved
+         L     R7,FLDSCARD          Point to beginning of card
+         A     R7,FLDOFFST          Add OFFSET to start of output
+         ST    R7,SAVEBEGO          Save where output starts
+         L     R8,SAVEBEGO          Copy beg of output address
+         A     R8,FLDBYTES          Make hypothetical end address,
+*                                   by adding the bytes to be moved.
+         ST    R8,HYPOENDC          Store hypothetical card end address
+*                                   (This may be way past end of card.)
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*  Cases:  1.  Current move is to within the current card.        *
+*              Covered by LOOPSHRT routine.                       *
+*                                                                 *
+*          2.  Current move is past the current card.             *
+*              Covered by LOOPMORE routine.  So we have to do     *
+*              iterations.                                        *
+*                                                                 *
+*        R6 always contains the number of bytes to be moved       *
+*        for this segment.                                        *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+LOOPINIT DS    0H
+         L     R7,SAVEBEGO          Beginning of CARD data
+         L     R8,HYPOENDC          Hypothetical end of CARD data
+         L     R3,FLDBUFFR          Prime R3 with start of buffer data
+         C     R8,SAVEENDC          Is R8 past the end-of-card?
+         BH    LOOPMORE             Yes. Do multiple moves and PUTs.
+LOOPSHRT DS    0H                   No. Do the one move only.
+         LR    R6,R8                Get byte count to move NOW.
+         SR    R6,R7                Bytes to move from buffer to card
+         C     R6,=F'80'            More than 80?
+         BH    LOOPERR1             Yes. Has to be error, so flag it.
+         BCTR  R6,0                 No. One less for EXECUTE.
+         EX    R6,MOVEBUFF          Move the data from buffer to card.
+         LA    R6,1(,R6)            Restore count of bytes moved
+         L     R1,FLDBYMVD          Increment
+         AR    R1,R6                  total bytes moved.
+         ST    R1,FLDBYMVD          Store it away for later.
+         LA    R3,0(R6,R3)          Bop past beginning buffer address.
+*        MVC   LINE+1(8),=C'LSHRT1: '   **  Diagnostic  **
+*        BAL   R9,FLDIMAGE
+         C     R3,HYPOENDB          Not equal to predicted end?
+         BNE   LOOPERR2             Error, so flag it.
+         ST    R3,FLDBUFFR          Return modified new buffer address.
+         LR    R6,R8                Calculate new OFFSET -
+         S     R6,FLDSCARD          Subtract beginning of card address
+         ST    R6,FLDOFFST          Store the result as new OFFSET
+* -- >
+LOOPTS50 DS    0H
+*                                   If OFFSET > X'4F', card is complete
+         C     R6,=F'80'            Is the new offset exactly X'50'?
+         BNE   LOOPNT50             No. Then current card not complete.
+*                                   Yes. Then PUT out card and init it.
+         S     R8,=F'80'            -80 bytes because new card PUT out
+         ST    R10,SAVER10          Save register for safety
+         L     R10,AWOUTDCB         Point to AWSOUT DCB in caller
+         L     R1,FLDSCARD          Load address of card
+         MVC   WORKAREA(80),0(R1)   Move full card image to workarea
+         TM    FLDREADF,X'01'       Is this a READ only run?
+         BO    NOPUT001             Yes. Can't PUT to AWSOUT.
+         PUT   (10),WORKAREA        PUT the card image to output file
+NOPUT001 DS    0H
+         L     R10,SAVER10          Restore R10
+         AP    FLDOUTCT,=P'1'       Count of AWSOUT records written
+         L     R7,SAVEBEGC          Point to beginning address of card
+         MVC   0(80,R7),ZEROCARD    Initialize card image for next move
+         XR    R6,R6                Clear R6
+         ST    R6,FLDOFFST          New offset is 0, not X'50'
+LOOPNT50 DS    0H
+* -- >
+         L     R1,FLDBYTOT          Before return, lessen FLDBYTOT
+         S     R1,FLDBYMVD          And subtract bytes already moved
+         ST    R1,FLDBYTOT          To show new total buffer byte count
+*        MVC   LINE+1(8),=C'LSHRT2: '   **  Diagnostic  **
+*        BAL   R9,FLDIMAGE
+         B     RETURN
+*
+LOOPMORE DS    0H                   Data move if more than one card
+*
+         L     R6,SAVEENDC          We're going past end-of-card
+         SR    R6,R7                Subtract beg address of data
+         C     R6,=F'80'            Still bigger than 80?
+         BH    LOOPERR1             Yes. Has to be error.
+         BCTR  R6,0                 Subtract one for EXECUTE
+         EX    R6,MOVEBUFF          Move data into buffer
+         LA    R6,1(,R6)            Restore byte count
+         L     R1,FLDBYMVD          Increment
+         AR    R1,R6                  total
+         ST    R1,FLDBYMVD              bytes moved
+         LA    R3,0(R6,R3)          Bop past data moved in buffer
+*        MVC   LINE+1(8),=C'LMORE1: '  **  Diagnostic  **
+*        BAL   R9,FLDIMAGE
+         C     R3,HYPOENDB          Test if past end of buffer
+         BH    LOOPERR3             Yes. Has to be an error.
+         ST    R3,FLDBUFFR          Re-point current buffer address.
+         S     R8,=F'80'            -80 bytes because new card PUT out
+         ST    R10,SAVER10          Save register for safety
+         L     R10,AWOUTDCB         Point to AWSOUT DCB in caller
+         L     R1,FLDSCARD          Load address of card
+         MVC   WORKAREA(80),0(R1)   Move full card image to workarea
+         TM    FLDREADF,X'01'       Is this a READ only run?
+         BO    NOPUT002             Yes. Then don't produce AWSOUT.
+         PUT   (10),WORKAREA        PUT the card image to output file
+NOPUT002 DS    0H
+         L     R10,SAVER10          Restore R10
+         AP    FLDOUTCT,=P'1'       Count of AWSOUT records written
+         L     R7,SAVEBEGC          Point to beginning address of card
+         MVC   0(80,R7),ZEROCARD    Initialize card image for next move
+*        MVC   LINE+1(8),=C'LMORE2: '  **  Diagnostic  **
+*        BAL   R9,FLDIMAGE
+         C     R8,SAVEENDC          Is R8 within the card image end?
+         BH    LOOPMORE             No. Do the LOOPMORE routine.
+         B     LOOPSHRT             Yes. Do the LOOPSHRT routine.
+         SPACE 3
+* ----------------------------------------------------------------- *
+MOVEBUFF MVC   0(*-*,R7),0(R3)      << EXECUTED >>
+* --------------------------------------------------------- *
+LOOPERR1 DS    0H                   Error entry location
+         MVC   LINE,LINE-1             **  Diagnostic  **
+         MVC   LINE+1(9),=C'LOOPERR1 '
+         BAL   R9,FLDIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR2 DS    0H                   Error entry location
+         MVC   LINE,LINE-1             **  Diagnostic  **
+         MVC   LINE+1(9),=C'LOOPERR2 '
+         BAL   R9,FLDIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR3 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR3 ' **  Diagnostic  **
+         BAL   R9,FLDIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+* --------------------------------------------------------- *
+RETURN   DS    0H                   RETURN TO THE CALLER
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SAVEPARM         Address of FLDAREA in caller
+         MVC   0(FLDLENTH,R10),FLDAREA    Copy changed FLDAREA back
+         L     R10,SAVER10          Restore R10
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'0'      Load Maximum Return Code
+         MVC   24(4,R13),=A(FLDBLOCK)  Return address of FLDAREA in R1.
+         LM    R14,R12,12(R13)
+         BR    R14
+         EJECT
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+* ---      S U B R O U T I N E S                        --- *
+* --------------------------------------------------------- *
+FLDIMAGE DS    0H         Diagnostic Data - State of FLDAREA currently
+*
+         HEX   LINE+10,4,FLDSCARD
+         HEX   LINE+20,4,FLDECARD
+         HEX   LINE+30,4,FLDOFFST
+         HEX   LINE+40,4,FLDBYTES
+         HEX   LINE+50,4,FLDBYTOT
+         HEX   LINE+60,4,FLDBYMVD
+         HEX   LINE+70,4,FLDBUFFR
+         HEX   LINE+80,4,FLDBSTRT
+         HEX   LINE+90,7,FLDOUTCT
+         HEX   LINE+106,1,FLDREADF
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+         BR    R9
+* - - - - - - - -  D A T A   A R E A S  - - - - - - - - *
+FLDBLOCK CSECT
+FLDAREA  DS    0F           FOLDEM AREA CONTROL BLOCK
+*                           ------ ---- ------- -----
+FLDSCARD DC    F'0'         Start address of 80-byte card
+FLDECARD DC    F'0'         End address of 80-byte card
+FLDOFFST DC    F'0'         OFFSET of data in the card
+FLDBYTES DC    F'0'         Number of bytes to be folded now
+FLDBYTOT DC    F'0'         Batch total of bytes left to move
+FLDBYMVD DC    F'0'         Number of bytes folded now
+FLDBUFFR DC    F'0'         Current data start address
+FLDBSTRT DC    F'0'         Original start data address
+FLDOUTCT DC    PL7'0'       Number of PUTs for AWSOUT records
+FLDREADF DC    X'00'        This run is "READ ONLY"  ?
+*              X'01'        Yes, read only.
+FLDLENTH EQU   *-FLDAREA
+*
+FOLDEM   CSECT
+WORKAREA DS    CL80                 Card image work area
+         DC    CL4' '               Padding
+         DC    C' '
+LINE     DC    CL133' '             Output line
+         DC    C' '
+LINE2    DC    CL133' '             Second output line if needed
+*
+FF       EQU   X'FF'
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEX      DS    0H
+         MVC   1(1,R15),0(R1)        Move byte
+         UNPK  0(3,R15),1(2,R15)     Unpack
+         TR    0(2,R15),HEXTAB-240
+         LA    R15,2(,R15)           Increment output pointer
+         LA    R1,1(,R1)             Increment input pointer
+         BCT   R0,HEX                Decrement length, then loop
+         MVI   0(R15),C' '           Blank the trailing byte
+         BR    R4                    Return to caller
+HEXTAB   DC    C'0123456789ABCDEF'   Translate table
+         SPACE
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEXSAVE  DS    3F                    Register save for HEX macro
+SAVER04  DS    H                     Register save for HEX macro
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+ZEROCARD DC    80X'00'
+SAVEBEGO DC    F'0'                 Save beg address of card output
+SAVEBEGC DC    F'0'                 Save beg address of card
+SAVEENDC DC    F'0'                 Save end address of card
+SAVEPARM DC    F'0'                 Save CALLER'S FLDAREA address
+HYPOENDC DC    F'0'                 Hypothetical end address after card
+HYPOENDB DC    F'0'                 Calculated end of buffer address
+SYSPRINV DC    V(SYSPRINT)          Address of SYSPRINT DCB
+AWSOUTV  DC    V(AWSOUT)            Address of AWSOUT DCB
+SYSPRDCB DC    F'0'                 SYSPRINT DCB address stored here
+AWOUTDCB DC    F'0'                 AWSOUT DCB address stored here
+SAVER10  DC    F'0'
+         END

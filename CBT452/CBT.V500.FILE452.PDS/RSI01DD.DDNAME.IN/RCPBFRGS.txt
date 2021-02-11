@@ -1,0 +1,19 @@
+         MACRO
+         RCPBFRGS &BUFPTR,&WKREGS
+         GBLC  &RCPBFRP,&RCPBFR1,&RCPBFR2
+         AIF   ('&BUFPTR' EQ '').TGP
+&RCPBFRP SETC  '&BUFPTR'
+         AGO   .TWK1
+.TGP     AIF   ('&RCPBFRP' NE '').TWK1
+&RCPBFRP SETC  'R1'
+.TWK1    AIF   ('&WKREGS(1)' EQ '').TG1
+&RCPBFR1 SETC  '&WKREGS(1)'
+         AGO   .TWK2
+.TG1     AIF   ('&RCPBFR1' NE '').TWK2
+&RCPBFR1 SETC  'R14'
+.TWK2    AIF   ('&WKREGS(2)' EQ '').TG2
+&RCPBFR2 SETC  '&WKREGS(2)'
+         MEXIT
+.TG2     AIF   ('&RCPBFR2' NE '').EXIT
+&RCPBFR2 SETC  'R15'
+.EXIT    MEND

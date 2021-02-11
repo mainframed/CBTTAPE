@@ -1,0 +1,203 @@
+//IBMUSERI JOB (CCMVS),P390IPL,
+// NOTIFY=&SYSUID,REGION=5M,
+// CLASS=A,MSGCLASS=X,COND=(0,NE)
+//ASMH EXEC PGM=ASMA90,PARM=(NODECK,OBJECT,NOESD,NORLD,NOXREF)
+***********************************************************************
+*                                                                     *
+* MODULE NAME = P390IPL                                               *
+*                                                                     *
+* DESCRIPTIVE NAME = Automate MVS IPL and shutdown on the P390        *
+*                                                                     *
+* STATUS = R102                                                       *
+*                                                                     *
+* FUNCTION = This program is a multi-function MPF exit                *
+*            which does the following:                                *
+*                                                                     *
+*            1. Replies to the JES2 startup and TCAS IKT003D          *
+*               messages.                                             *
+*                                                                     *
+*            2. Invokes the SHUTDOWN program as a sub-task            *
+*               of the CONSOLE address-space when the operator        *
+*               enters the SHUTDOWN command.                          *
+*                                                                     *
+* AUTHOR = Gilbert Saint-flour                                        *
+*                                                                     *
+* ENVIRONMENT = See below                                             *
+*                                                                     *
+*    DEPENDENCIES: MVS/ESA V5 or OS/390                               *
+*                  SHUTDOWN utility                                   *
+*                                                                     *
+* MODULE TYPE = PROCEDURE, (CSECT TYPE)                               *
+*                                                                     *
+*    PROCESSOR = IBM HIGH LEVEL ASSEMBLER/MVS                         *
+*                                                                     *
+*    MODULE SIZE = 2K                                                 *
+*                                                                     *
+*    ATTRIBUTES = Reenterable, RMODE ANY, AMODE 31,                   *
+*                 Supervisor State, Key 0                             *
+*                                                                     *
+* OPERATION = See documentation for IEAVMXIT                          *
+*                                                                     *
+* INSTALLATION = See Below                                            *
+*                                                                     *
+*    1. Link-edit P390IPL into an APF-authorized link-list            *
+*       library and refresh LLA.                                      *
+*                                                                     *
+*    2. Add the following lines to the active MPFLSTnn                *
+*       member in SYS1.PARMLIB:                                       *
+*                                                                     *
+*         IEE305I,SUP(NO),RETAIN(NO),USEREXIT(P390IPL)                *
+*         IST020I,SUP(NO),RETAIN(NO),USEREXIT(P390IPL)                *
+*         $HASP426,SUP(NO),RETAIN(NO),USEREXIT(P390IPL)               *
+*         $HASP441,SUP(NO),RETAIN(NO),USEREXIT(P390IPL)               *
+*         $HASP454,SUP(NO),RETAIN(NO),USEREXIT(P390IPL)               *
+*                                                                     *
+*    3. Issue the SET MPF=nn command to activate P390IPL.             *
+*                                                                     *
+* PARAMETERS = See documentation for IEAVMXIT                         *
+*                                                                     *
+* RETURN-CODES = NONE                                                 *
+*                                                                     *
+* CHANGE ACTIVITY                                                     *
+*                                                                     *
+*  $101 $HASP441                                                      *
+*  $102 Fix loop in IST020I section                                   *
+*       Provide actual reply number for $HASP426
+*                                                                     *
+***********************************************************************
+P390IPL  CSECT
+P390IPL  RMODE ANY
+         BAKR  R14,0                   save registers
+         LR    R10,R15
+         USING P390IPL,R10
+         L     R11,0(,R1)              CTXT PARM LIST
+         USING CTXT,R11
+         L     R12,CTXTTXPJ            TEXT MAJOR POINTER
+         USING CTXTATTR,R12
+         USING SAVEAREA,R13
+*
+         CLC   =C'$HASP426 ',CTXTTMSG  "specify options"
+         BE    HASP426
+         CLC   =C'$HASP441 ',CTXTTMSG  "reply Y to continue init"
+         BE    REPLY_Y
+         CLC   =C'$HASP454 ',CTXTTMSG  "bypass MAS integrity lock"
+         BE    REPLY_Y
+         CLC   =C'IST020I ',CTXTTMSG   VTAM INITIALIZATION COMPLETE
+         BE    IST020I
+         CLC   =C'IEE305I SHUTDOWN COMMAND INVALID',CTXTTMSG
+         BE    SHUTDOWN
+         PR
+*---------------------------------------------------------------------*
+*        Reply NOREQ to $HASP426 message                              *
+*---------------------------------------------------------------------*
+HASP426  L     R0,CTXTRPYB             REPLY ID (BINARY)
+         CVD   R0,DWD                  REPLY ID (DECIMAL)
+         OI    DWD+7,X'0F'             no sign
+         UNPK  HASP426R+6(2),DWD       REPLY ID
+         LA    R1,HASP426R             addr of the command
+         BAL   R14,SENDCMD             issue the command
+         PR
+HASP426R WTO   'R 01,NOREQ',MF=L
+*---------------------------------------------------------------------*
+*        Reply Y to $HASP454 message                                  *
+*---------------------------------------------------------------------*
+REPLY_Y  L     R0,CTXTRPYB             REPLY ID (BINARY)
+         CVD   R0,DWD                  REPLY ID (DECIMAL)
+         OI    DWD+7,X'0F'             no sign
+         UNPK  HASP454R+6(2),DWD       REPLY ID
+         LA    R1,HASP454R             addr of the command
+         BAL   R14,SENDCMD             issue the command
+         PR
+HASP454R WTO   'R 02,Y',MF=L           JES2 CHKPT ERROR
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Start TCAS when VTAM is ready                                *
+*                                                                     *
+*        If there is an ORE for TCAS, it must be IKT003D TCAS         *
+*        UNABLE TO ACCEPT LOGON.  In this case, reply RETRY.          *
+*        Otherwise, issue the START TCAS command.                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+IST020I  L     R3,CVTPTR               POINT AT CVT
+         L     R4,CVTCUCB-CVTMAP(,R3)  UCM
+         ICM   R5,B'1111',UCMRPYQ-UCM(R4) FIRST ORE
+         BZ    IST020M                 NO OUTSTANDING REPLIES, EXIT
+         USING OREF,R5
+*LOOP
+IST020L  CLC   =C'ORE ',ORECBID        Am I lost?
+         BNE   IST020M                 Yes, exit loop
+         CLC   =C'TCAS ',OREWTORU      USERID=TCAS ?
+         BE    IST020R                 yes, reply RETRY
+         ICM   R5,B'1111',ORELKP       NEXT ORE
+         BNZ   IST020L                 LOOP
+*ENDLOOP
+IST020M  SR    R0,R0                   CN(0)
+         MGCR  IST020S                 SEND COMMAND
+         PR
+IST020S  WTO   'S TCAS',MF=L
+*
+IST020R  MVC   IST020RR+6(2),OREID     REPLY ID
+         SR    R0,R0                   CN(0)
+         MGCR  IST020RR                SEND COMMAND
+         PR
+IST020RR WTO   'R 00,RETRY',MF=L
+*---------------------------------------------------------------------*
+*        Issue a REPLY command                                        *
+*---------------------------------------------------------------------*
+SENDCMD  BAKR  R14,0
+         ST    R1,DWD                  addr of the command
+         STIMERM SET,                                                  X
+               EXIT=SENDCMDX,          exit rtne                       X
+               BINTVL=ONESEC,          INTERVAL                        X
+               PARM=DWD,               ECB/CIB POINTERS                X
+               ID=DWD+4,               token                           X
+               MF=(E,STIMER_L)
+         PR
+ONESEC   DC    AL4(100)                one second
+*---------------------------------------------------------------------*
+*        ATTACH the SHUTDOWN utility when the SHUTDOWN                *
+*        command is issued.                                           *
+*---------------------------------------------------------------------*
+SHUTDOWN L     R2,CTXTFCNP             GET ADDR OF CONSOLE ID
+         L     R1,0(,R2)               PASS CONSOLE ID TO SUB-TASK
+         ATTACH EP=SHUTDOWN,           ATTACH SHUTDOWN PGM             X
+               JSTCB=YES               PREVENT RC=X'18'
+         OI    CTXTRFB2,CTXTRDTM       SUPPRESS IEE305I MESSAGE
+         PR
+         DROP
+*---------------------------------------------------------------------*
+*        TIMER EXIT                                                   *
+*---------------------------------------------------------------------*
+SENDCMDX BAKR  R14,0
+         L     R2,4(,R1)               parm (addr of the command)
+         SR    R0,R0                   CN(0)
+         MGCR  (R2)                    SEND COMMAND
+         PR
+*
+*        work area for CVD routine
+*
+SAVEAREA DSECT
+         DS    2F
+DWD      DS    D
+STIMER_L STIMERM SET,MF=L
+         DS    CL(SAVEAREA+72-*)       length check
+*
+         PRINT NOGEN
+PRINT    OPSYN ANOP
+         YREGS
+         IEZVX100                      CTXT PARM LIST
+         IHAORE DSECT=YES              OPERATOR REPLY ELEMENT
+         IEECUCM DSECT=YES             UNIT CONTROL MODULE
+         CVT   DSECT=YES
+         END
+//SYSLIB   DD DISP=SHR,DSN=IBMUSER.TRIMMAC               (optional)
+//         DD DISP=SHR,DSN=SYS1.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MODGEN
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//*
+//LINKLLA EXEC PGM=LINKLLA,PARM=RENT
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//SYSLMOD  DD DISP=SHR,DSN=SYS1.P390.LINKLIB(P390IPL)
+//SYSPRINT DD SYSOUT=*

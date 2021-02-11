@@ -1,0 +1,198 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; "COMPILE-EVAL"
+;;;
+
+;;; This workhorse compiles any form.  It outputs chunks of pseudocode.
+;;; At the highest level, this is sandwiched between two layers of
+;;;  prologue and epilogue code (see COMPILE-BODY).
+;;; The first operand is the form to be evaluated - er, compiled.
+;;; The second operand is a variable (either argument or local)
+;;;  in which the result is to be placed (e.g. for a SETQ).
+;;; The third operand is a "target" to which the result of the
+;;;  evaluated code is to be assigned (typically an argument spec as
+;;;  input to another function).
+
+;;; If the form is a macro call, then it should not appear, since all
+;;; macros should have been expanded in the transformation stage.
+;;; Note - a "CMACRO" is a macro definition known only to the compiler.
+
+;;; If (CAR form) is a LAMBDA-expression, then...
+;;; Give the LAMBDA-function a name,
+;;; compile it and put it on the list of internal procedures.
+;;; Then evaluate the form using the newly created LAMBDA-function.
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/22/88 - Support for inline ASSQ and MEMQ.                        *
+;* 06/06/88 - Support for VALUES and new special forms.                *
+;* 06/23/88 - Support for PROG and RETURN removed.                     *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defmacro comma      () ''|,| )
+(defmacro comma-at   () ''|,@|)
+(defmacro comma-dot  () ''|,.|)
+
+(defmacro zccclos (b v s e)
+ `(zccfarg 'closure ,b ,v ,s ,e))
+
+(defmacro zccsubr (b v s e)
+ `(zccfarg 'subr ,b ,v ,s ,e))
+
+(defun zccevcom (b v s e &aux p carb)
+ (cond
+     ;
+     ; If form is NIL, compile a reference to NIL.
+     ;
+      ((null b)                   (modq body `(setnil nil ,v ,s)))
+     ;
+     ; If form is an atom, compile a reference to the value of the atom
+     ;
+      ((atom b)                   (zccatom b v s e))
+     ;
+     ; Otherwise, check if form is a special object inserted by the
+     ; compiler.  If it the unique object ZDEF, it's an internally
+     ; optimized non-lexical DEFUN.
+     ;
+      ((progn (setq carb (car b))
+              (eq carb zdef)
+       )                          (zccdef   (cdr b) v s e))
+
+     ;
+     ; Otherwise, assume form is a list.  Determine what kind of
+     ; function.  If function name is not an atom, assume it is a
+     ; LAMBDA-expression and compile accordingly
+     ; (ZCCFUNC'll flag it as an error if it's not a LAMBDA-expression).
+     ;
+      ((not (symbolp carb))       (zccevcom-maybe-lambda b v s e))
+     ;
+     ; If function is a macro, compile the macro expansion.
+     ;
+      ((and (or (get carb 'macro)
+                (get carb 'cmacro))
+            (not (get carb 'cexpr))
+       )                          (zccevcom (zilcomex b nil) v s e))
+      ;
+      ; If the function is not defined by the ZIL system, or if it
+      ; was defined but the definition was overridden, compile as
+      ; a function call.
+      ;
+      ((neq (get carb 'defined-by) 'system)
+                                  (zcceval carb (cdr b) v s e))
+     ;
+     ; Check for all special forms.
+     ;
+      ((eq carb 'quote)           (zccquote (cdr b) v s e))
+      ((eq carb 'cond)            (zcccond  (cdr b) v s e))
+      ((eq carb 'progn)           (zccprogn (cdr b) v s e))
+      ((eq carb 'block)           (zccblock (cdr b) v s e))
+      ((eq carb 'return-from)     (zccretf  (cdr b)     e))
+      ((eq carb 'tagbody)         (zcctbody (cdr b) v s e))
+      ((eq carb 'go)              (zccgo    (cdr b)     e))
+      ((eq carb 'setq)            (zccsetq  (cdr b) v s e))
+      ((eq carb 'and)             (zccand   (cdr b) v s e))
+      ((eq carb 'or)              (zccor    (cdr b) v s e))
+      ((eq carb 'not)             (zccnot   (cdr b) v s e))
+      ((eq carb 'null)            (zccnot   (cdr b) v s e))
+      ((eq carb 'catch)           (zcccatch (cdr b) v s e))
+      ((eq carb 'throw)           (zccthrow (cdr b) v s e))
+      ((eq carb 'unwind-protect)  (zccuwp   (cdr b) v s e))
+      ((eq carb 'function)        (zccclos  (cdr b) v s e))
+      ((eq carb 'subr)            (zccsubr  (cdr b) v s e))
+      ((eq carb 'declare)         (zccdcl   (cdr b) v s e))
+      ((eq carb 'multiple-value-list)
+                                  (zccmvlst (cdr b) v s e))
+      ((eq carb 'multiple-value-bind)
+                                  (zccmvbnd (cdr b) v s e))
+
+      ((eq carb 'funcall)         (zccfcall (cdr b) v s e))
+
+      ((eq carb 'values )         (zccvals  (cdr b) v s e))
+
+      ((or (eq carb 'arg)
+           (eq carb 'setarg)
+           (eq carb 'listify))    (zcclexfn carb (cdr b) v s e))
+
+      ((or (eq carb 'eq)
+           (eq carb 'eql)
+           (eq carb 'cons)
+           (eq carb 'rplaca)
+           (eq carb 'rplacd)
+           (eq carb 'assq)
+           (eq carb 'memq)
+           (eq carb 'vref)
+           (eq carb 'vset))       (zccfast  carb (cdr b) v s e))
+
+      ((or (eq carb (comma))
+           (eq carb (comma-at))
+           (eq carb (comma-dot)))
+       (zerror "Syntax error - comma not inside backquote"))
+
+      ((or (eq carb 'defun)
+           (eq carb 'defload)
+           (eq carb 'defvar)
+           (eq carb 'eval-when))
+       (modq body
+     `(error "Form cannot be compiled, valid only at top level" ,carb)))
+     ;
+     ; Otherwise, compile as a function call.
+     ;
+      (t                          (zcceval carb (cdr b) v s e))
+  ))
+
+;
+; This function compiles a form whose CAR is not a symbol.
+; The CAR of the form may be a LAMBDA- or LABEL-expression;
+; otherwise it is not compilable.
+;
+
+(defun zccevcom-maybe-lambda (b v s e)
+
+ ; This is what ZILCO used to do all the time with these things.
+ ; (zcceval (zcclamb (car b) e) (cdr b) v s e)
+ ; It would call ZCCLAMB to turn the CAR of the form into another
+ ; function and then generate code to call it (ZCCLAMB would flag
+ ; an error if the form were not a valid LAMBDA-expression).
+ ;
+ ; Now we try to compile the LAMBDA inline if possible.  Here's how:
+ ;
+ ; If the CAR of the form is a LABEL-expression, do as before - we
+ ; have to generate another function.
+ ;
+ ; If the CAR of the form is a LAMBDA-expression, see if it is a
+ ; compilable one.  If it is, generate the code inline.  If it is
+ ; not, generate an APPLY of an interpretive LAMBDA expression.
+ ;
+
+ (let (((formcar . formcdr) b))
+  (cond
+   ((atom formcar)
+    (modq body
+          `(error "Function name not a symbol or LAMBDA-expression"
+                  ,formcar)))
+   (t
+    (case (car formcar)
+     (lambda (zcceval formcar formcdr v s e)) ;ZCCEVAL knows what to do
+     (label  (zcceval (zcclamb formcar t e) formcdr v s e))
+     (t      (modq body
+              `(error "Bad expression in CAR of form, can't compile"
+                      ,formcar))))))))
+

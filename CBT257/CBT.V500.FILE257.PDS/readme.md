@@ -1,0 +1,41 @@
+
+## $$$DOC.txt
+```
+FIXING YOUR OLD LINKAGE EDITOR  (IN DFSMS/MVS TOO)
+
+
+    Even under DFSMS/MVS, with HEWL and IEWL being the new 'binder',
+you can still run the old linkage editor if you say EXEC PGM=HEWLKED.
+IBM has kept a version of the old linkage editor around.  However,
+with the binder, IBM has removed the old (now stupid) restriction
+that object decks can't be blocked greater than 3200 bytes, or 40
+records per block.  There were memory restrictions once, that are
+now long gone.
+
+    I've looked at my copies of the old linkage editor HEWLKED in
+DFSMS, and behold, the old restriction hasn't been lifted or cured.
+It is so easy to do!  We had a usermod once, which I am bringing
+to you now.  I have two versions of this mod, one for DFSMS 1.0,
+and another for DFSMS 1.3.  Both are the same as each other, really.
+Also, you shouldn't have any trouble fitting this mod to any version
+of the old linkage editor, young or old.  I have also included zaps
+for all versions of the linkage editor which I had lying around at
+our installation, as well as I could determine.
+
+    VERSION TABLE:
+
+       HDQ1102    -   MVS/370   DFP 1.1
+       HDP2230    -   MVS/XA    DFP 2.3
+       HDP2240    -   MVS/XA    DFP 2.4
+       JDZ1110    -   DFSMS/MVS  1.1.0
+       HDZ11C0    -   DFSMS/MVS  1.3.0
+       MVS38      -   MVS 3.8j
+       MVT        -   OS/360 Release 21.8
+
+    If you have any questions, I'm (hopefully) at:
+
+ Sam Golob                    sbgolob@attglobal.net
+ PO Box 906                   sbgolob@cbttape.org
+ Tallman, NY 10982-0906
+```
+

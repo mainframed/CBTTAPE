@@ -1,0 +1,591 @@
+/* --------------------  rexx procedure  -------------------- */
+ ver = '1.3'
+/* Name:      IEBPDSE                                         *
+ *                                                            *
+ * Function:  Invoke the IBM IEBPDSE utility to try to        *
+ *            repair a PDSE (or at least report on it)        *
+ *                                                            *
+ * Syntax:    %iebpdse pdse-dsname iebpdse-parms              *
+ *                                                            *
+ *            pdse-dsname is the pdse data set name           *
+ *            iebpdse-parms are processing parms:             *
+ *                                                            *
+ *            ANAL      - PDSE analysis                       *
+ *            A           Default enabled                     *
+ *            BYPASS    - Bypass the IEBPDSE prompt panel     *
+ *            B           Default disabled                    *
+ *            DUMP      - System Dump if PDSE is corrupt      *
+ *            D           Default disabled                    *
+ *            FLUSH     - Flush PDSE pages before analysis    *
+ *            F           Default enabled                     *
+ *            NOANAL    - Do NOT do an analysis               *
+ *            NOA         Default disabled                    *
+ *            NODUMP    - Do NOT take a System Dump           *
+ *            NOD         Default enabled                     *
+ *            NOFLUSH   - Do NOT flush any PDSE pages         *
+ *            NOF         Default enabled                     *
+ *            PERF      - Do a Pending Delete process         *
+ *            P           Default enabled                     *
+ *                                                            *
+ * Author:    Lionel B. Dyck                                  *
+ *                                                            *
+ * History:                                                   *
+ *       1.3  11/01/17 - Add version level                    *
+ *       1.2  10/27/17 - Add return code checking and msgs    *
+ *                     - Set Flush and Perf as default action *
+ *       1.1  10/26/17 - Add runtime parms for IEBPDSE        *
+ *       1.0  09/02/16 - Don't force performpendingdeletes    *
+ *       0.4  08/31/16 - Enable Point/Shoot                   *
+ *       0.3  08/23/16 - Add Alloc for SYSIN DD Dummy         *
+ *       0.2  08/19/16 - ISPF Interface added                 *
+ *       0.1  03/10/16 - creation                             *
+ *                                                            *
+ * ---------------------------------------------------------- */
+ arg pdse pdseopt
+
+/* --------------- *
+ * Define defaults *
+ * --------------- */
+ parse value '' with null zdump zflush zanal zperf zcmd parm bypass
+
+/* ---------------------- *
+ | Define Default Actions |
+ * ---------------------- */
+ zflush = 'F'
+ zperf  = 'P'
+ zdump  = 'N'
+
+/* ------------------------------------------- *
+ | Check for any passed parameters for IEBPDSE |
+ * ------------------------------------------- */
+  do i = 1 to words(pdseopt)
+    zopt = word(pdseopt,i)
+    Select
+      When Abbrev('BYPASS',zopt,1)  = 1 then bypass = 'Y'
+      When Abbrev('DUMP',zopt,1)    = 1 then zdump  = 'D'
+      When Abbrev('NODUMP',zopt,3)  = 1 then zdump  = 'N'
+      When Abbrev('FLUSH',zopt,1)   = 1 then zflush = 'F'
+      When Abbrev('NOFLUSH',zopt,3) = 1 then zflush = 'N'
+      When Abbrev('ANAL',zopt,1)    = 1 then zanal  = null
+      When Abbrev('NOANAL',zopt,3)  = 1 then zanal  = 'N'
+      When Abbrev('PERF',zopt,1)    = 1 then do
+        if zperf = 'P' then zperf = null
+        else zperf = 'P'
+      end
+      Otherwise nop
+    end
+  end
+
+/* ------------ *
+ * Address ISPF *
+ * ------------ */
+ Address ISPExec
+
+/* ------------------------------- *
+ * Load the ISPF Panel dynamically *
+ * ------------------------------- */
+ load_info = loadispf()
+
+/* ------------------------------------- *
+ * Display the prompting panel until PF3 *
+ * ------------------------------------- */
+ if bypass = 'Y'
+    then do
+         call doit
+         exit
+         end
+ do forever
+    zcmd = null
+    'display panel(iebpdse)'
+    if rc > 0 then do
+       Address ISPEXEC
+       do until length(load_info) = 0
+          parse value load_info with dd libd load_info
+          if left(libd,6) = "ALTLIB" then do
+             if libd = "ALTLIBC" then lib = "CLIST"
+                                 else lib = "EXEC"
+             Address TSO,
+               "Altlib Deact Application("lib")"
+             end
+          else "libdef" libd
+          address tso "free f("dd")"
+          end
+        exit
+        end
+    if word(zcmd,1) = 'SET' then do
+       zopt = word(zcmd,2)
+       Select
+         When zopt = 'DUMP'     then zdump  = 'D'
+         When zopt = 'NODUMP'   then zdump  = 'N'
+         When zopt = 'FLUSH'    then zflush = 'F'
+         When zopt = 'NOFLUSH'  then zflush = 'N'
+         When zopt = 'ANAL'     then zanal = 'N'
+         When zopt = 'PERF'     then do
+              if zperf = 'P' then zperf = null
+                             else zperf = 'P'
+              end
+         end
+       zcmd = null
+       iterate
+       end
+    if pdse /= null then call doit
+    end
+
+/* ----------------------------- *
+ * Do the actual call to IEBPDSE *
+ * ----------------------------- */
+ DoIt:
+
+ if sysdsn(pdse) /= 'OK' then do
+    zedsmsg = 'Error'
+    zedlmsg = pdse sysdsn(pdse)
+    'Setmsg msg(isrz001)'
+    return
+    end
+
+/* -------------- *
+ * Setup the parm *
+ * -------------- */
+ if zdump = 'D' then parm = 'DUMP'
+                else parm = 'NODUMP'
+ if zflush = 'F' then
+    if parm /= null then parm = parm',FLUSH'
+                    else parm = 'FLUSH'
+ if zanal = 'N' then
+    if parm /= null then parm = parm',NOANALYSIS'
+                    else parm = 'NOANALYSIS'
+ if zperf = 'P' then
+    if parm /= null then parm = parm',PERFORMPENDINGDELETE '
+                    else parm = 'PERFORMPENDINGDELETE '
+
+/* ------------------------------ *
+ * Define the temp report dataset *
+ * ------------------------------ */
+ if sysvar('syspref') = null
+    then rdsn = "'"sysvar('sysuid')'.iebpdse.r'random(99999)"'"
+    else rdsn = "'"sysvar('syspref')'.iebpdse.r'random(99999)"'"
+
+/* -------------------- *
+ * Call IEBPDSE finally *
+ * -------------------- */
+  Address TSO
+  "alloc f(sysprint) reuse spa(1,1) tr ds("rdsn")"
+  "alloc f(syslib) ds("pdse") shr"
+  "alloc f(sysin) dummy reuse"
+  "call *(iebpdse) '"parm"'"
+  iebpdse_rc = rc
+  "free f(syslib sysprint)"
+  "alloc f(sysprint) ds(*) reuse"
+  "alloc f(sysin) ds(*) reuse"
+
+/* ------------------------------------------------------------------- *
+ | Interpret the Return Code                                           |
+ |                                                                     |
+ | 00 (X'00') Successful completion.                                   |
+ | 04 (X'04') The input PDSE is slightly damaged. Processing continues |
+ | 08 (X'08') The input PDSE is corrupted. The utility ends.           |
+ | 12 (X'0C') The input PDSE could not be opened. The utility ends.    |
+ | 16 (X'10') The input data set is not a PDSE. The utility ends.      |
+ * ------------------------------------------------------------------- */
+ Select
+   When iebpdse_rc = 0 then do
+        zedsmsg = 'Success'
+        zedlmsg = 'Successful completion.'
+        end
+   When iebpdse_rc = 4 then do
+        zedsmsg = 'Warning'
+        zedlmsg = 'The input PDSE is slightly damaged. Processing continues.'
+        end
+   When iebpdse_rc = 8 then do
+        zedsmsg = 'Error'
+        zedlmsg = 'The input PDSE is corrupted. The utility ends.'
+        end
+   When iebpdse_rc = 12 then do
+        zedsmsg = 'Error'
+        zedlmsg = 'The input PDSE could not be opened. The utility ends.'
+        end
+   When iebpdse_rc = 16 then do
+        zedsmsg = 'Error'
+        zedlmsg = 'The input data set is not a PDSE. The utility ends.'
+        end
+   Otherwise do
+        zedsmsg = 'Unknown'
+        zedlmsg = 'Return code' iebpdse_rc 'is an unknown return code.'
+        end
+   end
+   Address ISPExec 'Setmsg msg(isrz001)'
+
+/* ----------------- *
+ * Browse the report *
+ * ----------------- */
+ Address ISPExec ,
+   "Browse dataset("rdsn")"
+
+/* --------------------------------------------- *
+ * Delete the report file and return for another *
+ * --------------------------------------------- */
+ call outtrap 'x.'
+ 'Delete' rdsn
+ call outtrap 'off'
+ return
+
+/* --------------------  rexx procedure  -------------------- *
+ * Name:      LoadISPF                                        *
+ *                                                            *
+ * Function:  Load ISPF elements that are inline in the       *
+ *            REXX source code.                               *
+ *                                                            *
+ * Syntax:    rc = loadispf()                                 *
+ *                                                            *
+ *            The inline ISPF resources are limited to        *
+ *            ISPF Messages, Panels, and Skeletons,           *
+ *                 CLISTs and EXECs are also supported.       *
+ *                                                            *
+ *            The inline resources must start in column 1     *
+ *            and use the following syntax:                   *
+ *                                                            *
+ *            >START    used to indicate the start of the     *
+ *                      inline data                           *
+ *                                                            *
+ *            >END    - used to indicate the end of the       *
+ *                      inline data                           *
+ *                                                            *
+ *            Each resource begins with a type record:        *
+ *            >type name                                      *
+ *               where type is CLIST, EXEC, MSG, PANEL, SKEL  *
+ *                     name is the name of the element        *
+ *                                                            *
+ * Sample usage:                                              *
+ *          -* rexx *-                                        *
+ *          load_info = loadispf()                            *
+ *          ... magic code happens here (your code) ...       *
+ *          Address ISPEXEC                                   *
+ *          do until length(load_info) = 0                    *
+ *             parse value load_info with dd libd load_info   *
+ *             if left(libd,6) = "ALTLIB" then do             *
+ *                if libd = "ALTLIBC" then lib = "CLIST"      *
+ *                                    else lib = "EXEC"       *
+ *                Address TSO,                                *
+ *                  "Altlib Deact Application("lib")"         *
+ *                end                                         *
+ *             else "libdef" libd                             *
+ *             address tso "free f("dd")"                     *
+ *             end                                            *
+ *          exit                                              *
+ *          >Start inline elements                            *
+ *          >Panel panel1                                     *
+ *          ...                                               *
+ *          >Msg msg1                                         *
+ *          ...                                               *
+ *          >End of inline elements                           *
+ *                                                            *
+ * Returns:   the list of ddnames allocated for use along     *
+ *            with the libdef's performed or altlib           *
+ *                                                            *
+ *            format is ddname libdef ddname libdef ...       *
+ *                   libdef may be altlibc or altlibe         *
+ *                   for altlib clist or altlib exec          *
+ *                                                            *
+ * Notes:     Entire routine must be included with REXX       *
+ *            exec - inline with the code.                    *
+ *                                                            *
+ * Comments:  The entire rexx program is processed from the   *
+ *            last record to the first to find the >START     *
+ *            record at which point all records from that     *
+ *            point on are processed until the >END           *
+ *            statement or the end of the program is found.   *
+ *                                                            *
+ *            It is *strongly* suggested that the inline      *
+ *            elements be at the very end of your code so     *
+ *            that the search for them is faster.             *
+ *                                                            *
+ *            Inline ISPTLIB or ISPLLIB were not supported    *
+ *            because the values for these would have to be   *
+ *            in hex.                                         *
+ *                                                            *
+ * Author:    Lionel B. Dyck                                  *
+ *                                                            *
+ * History:                                                   *
+ *            05/10/16 - correction for clist and exec        *
+ *            04/19/16 - bug correction                       *
+ *            06/04/04 - Enhancements for speed               *
+ *            08/05/02 - Creation                             *
+ *                                                            *
+ * ---------------------------------------------------------- *
+ * Disclaimer: There is no warranty, either explicit or       *
+ * implied with this code. Use it at your own risk as there   *
+ * is no recourse from either the author or his employeer.    *
+ * ---------------------------------------------------------- */
+ LoadISPF: Procedure
+
+ parse value "" with null kmsg kpanel kskel first returns ,
+                     kclist kexec
+/* ------------------------------------------------------- *
+ * Find the InLine ISPF Elements and load them into a stem *
+ * variable.                                               *
+ *                                                         *
+ * Elements keyword syntax:                                *
+ * >START - start of inline data                           *
+ * >CLIST name                                             *
+ * >EXEC name                                              *
+ * >MSG name                                               *
+ * >PANEL name                                             *
+ * >SKEL name                                              *
+ * >END   - end of all inline data (optional if last)      *
+ * ------------------------------------------------------- */
+ last_line = sourceline()
+ do i = last_line to 1 by -1
+    line = sourceline(i)
+    if translate(left(line,6)) = ">START " then leave
+    end
+ rec = 0
+/* --------------------------------------------------- *
+ * Flag types of ISPF resources by testing each record *
+ * then add each record to the data. stem variable.    *
+ * --------------------------------------------------- */
+ do j = i+1 to last_line
+    line = sourceline(j)
+    if translate(left(line,5)) = ">END "   then leave
+    if translate(left(line,7)) = ">CLIST " then kclist = 1
+    if translate(left(line,6)) = ">EXEC "  then kexec  = 1
+    if translate(left(line,5)) = ">MSG "   then kmsg   = 1
+    if translate(left(line,7)) = ">PANEL " then kpanel = 1
+    if translate(left(line,6)) = ">SKEL "  then kskel  = 1
+    rec  = rec + 1
+    data.rec = line
+    end
+
+/* ----------------------------------------------------- *
+ * Now create the Library and Load the Member(s)         *
+ * ----------------------------------------------------- */
+ Address ISPExec
+/* ----------------------------- *
+ * Assign dynamic random ddnames *
+ * ----------------------------- */
+ clistdd = "lc"random(999)
+ execdd  = "le"random(999)
+ msgdd   = "lm"random(999)
+ paneldd = "lp"random(999)
+ skeldd  = "ls"random(999)
+
+/* ---------------------------------------- *
+ *  LmInit and LmOpen each resource library *
+ * ---------------------------------------- */
+ if kclist <> null then do
+    call alloc_dd clistdd
+    "Lminit dataid(clist) ddname("clistdd")"
+    "LmOpen dataid("clist") Option(Output)"
+    returns = strip(returns clistdd 'ALTLIBC')
+    end
+ if kexec <> null then do
+    call alloc_dd execdd
+    "Lminit dataid(exec) ddname("execdd")"
+    "LmOpen dataid("exec") Option(Output)"
+    returns = strip(returns execdd 'ALTLIBE')
+    end
+ if kmsg <> null then do
+    call alloc_dd msgdd
+    "Lminit dataid(msg) ddname("msgdd")"
+    "LmOpen dataid("msg") Option(Output)"
+    returns = strip(returns msgdd 'ISPMLIB')
+    end
+ if kpanel <> null then do
+    call alloc_dd paneldd
+    "Lminit dataid(panel) ddname("paneldd")"
+    "LmOpen dataid("panel") Option(Output)"
+    returns = strip(returns paneldd 'ISPPLIB')
+    end
+ if kskel <> null then do
+    call alloc_dd skeldd
+    "Lminit dataid(skel) ddname("skeldd")"
+    "LmOpen dataid("skel") Option(Output)"
+    returns = strip(returns skeldd 'ISPSLIB')
+    end
+
+/* ----------------------------------------------- *
+ * Process all records in the data. stem variable. *
+ * ----------------------------------------------- */
+ do i = 1 to rec
+    record = data.i
+    recordu = translate(record)
+    if left(recordu,5) = ">END " then leave
+    if left(recordu,7) = ">CLIST " then do
+       if first = 1 then call add_it
+       type = "Clist"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">EXEC " then do
+       if first = 1 then call add_it
+       type = "Exec"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,5) = ">MSG " then do
+       if first = 1 then call add_it
+       type = "Msg"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,7) = ">PANEL " then do
+       if first = 1 then call add_it
+       type = "Panel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">SKEL " then do
+       if first = 1 then call add_it
+       type = "Skel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+   /* --------------------------------------------*
+    * Put the record into the appropriate library *
+    * based on the record type.                   *
+    * ------------------------------------------- */
+    Select
+      When type = "Clist" then
+           "LmPut dataid("clist") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Exec" then
+           "LmPut dataid("exec") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Msg" then
+           "LmPut dataid("msg") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Panel" then
+           "LmPut dataid("panel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Skel" then
+           "LmPut dataid("skel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      end
+    end
+ if type <> null then call add_it
+/* ---------------------------------------------------- *
+ * Processing completed - now lmfree the allocation and *
+ * Libdef the library.                                  *
+ * ---------------------------------------------------- */
+ if kclist <> null then do
+    Address TSO,
+    "Altlib Act Application(Clist) File("clistdd")"
+    "LmFree dataid("clist")"
+    end
+ if kexec <> null then do
+    Address TSO,
+    "Altlib Act Application(Exec) File("execdd")"
+    "LmFree dataid("exec")"
+    end
+ if kmsg <> null then do
+    "LmFree dataid("msg")"
+    "Libdef ISPMlib Library ID("msgdd") Stack"
+    end
+ if kpanel <> null then do
+    "Libdef ISPPlib Library ID("paneldd") Stack"
+    "LmFree dataid("panel")"
+    end
+ if kskel <> null then do
+    "Libdef ISPSlib Library ID("skeldd") Stack"
+    "LmFree dataid("skel")"
+    end
+ return returns
+
+/* --------------------------- *
+ * Add the Member using LmmAdd *
+ * based upon type of resource *
+ * --------------------------- */
+ Add_It:
+ Select
+    When type = "Clist" then
+         "LmmAdd dataid("clist") Member("name")"
+    When type = "Exec" then
+         "LmmAdd dataid("exec") Member("name")"
+    When type = "Msg" then
+         "LmmAdd dataid("msg") Member("name")"
+    When type = "Panel" then
+         "LmmAdd dataid("panel") Member("name")"
+    When type = "Skel" then
+         "LmmAdd dataid("skel") Member("name")"
+    Otherwise nop
+    end
+ type = null
+ return
+
+/* ------------------------------ *
+ * ALlocate the temp ispf library *
+ * ------------------------------ */
+ Alloc_DD:
+ arg dd
+ Address TSO
+ if pos(left(dd,2),"lc le") > 0 then
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(1)",
+    "recfm(v b) lrecl(255) blksize(32760)"
+ else
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(1)",
+    "recfm(f b) lrecl(80) blksize(23440)"
+ return
+
+>Start
+>Panel iebpdse
+)Attr Default(%+_)
+   # type(input ) intens(high) caps(on) just(left) hilite(uscore) skip(off)
+   $ type(output) intens(high) caps(on) just(asis) pas(on) hilite(uscore)
+   | type(text) intens(high) color(blue) hilite(reverse)
+   @ type(output) intens(high) color(blue) hilite(reverse)
+)Body  Expand(\\)
+%-\-\-|IEBPDSE PDSE Validation Utility@ver%-\-\-
+%Command ===>_zcmd
+%
+%PDSE Data Set Name:#pdse                                         +
+
+%IEBPDSE Options:
+
+ #z+ $Dump+or$NoDump+        D or N
+      Dump   - the SMSPDSE(1) Address Space if the PDSE is Broken
+      NoDump - do not dump the address space (default)
+
+ #z+ $Flush+or$NoFlush+      F or N
+      Flush   - Previously read pages should not be used for validation
+      NoFlush - Use previously read pages for validation
+
+ #z+ $anal      +            N or blank
+      Used with PERFORMPENDINGDELETE to bypass PDSE validation
+
+ #z+ $perf                +  P or blank
+      Causes all Pending Deletes to be processed.
+
+)Init
+ .cursor = pdse
+ .zvars = '(zdump zflush zanal zperf)'
+ &dump    = 'Dump'
+ &nodump  = 'NoDump'
+ &flush   = 'Flush'
+ &noflush = 'NoFlush'
+ &anal    = 'NoAnalysis'
+ &perf    = 'PerformPendingDelete'
+ if (&zdump = &z)
+     &zdump   = 'N'
+ if (&zflush = &z)
+     &zflush  = 'N'
+ if (&zanal NE &z)
+     &zanal  = 'N'
+)Proc
+ ver (&pdse,dsnameq)
+ ver (&zdump,nb,list,D,N)
+ ver (&zflush,nb,list,F,N)
+ ver (&zanal,list,N)
+ ver (&zperf,list,P)
+)Pnts
+FIELD(dump    ) VAR(ZCMD) VAL('SET DUMP')
+FIELD(nodump  ) VAR(ZCMD) VAL('SET NODUMP')
+FIELD(flush   ) VAR(ZCMD) VAL('SET FLUSH')
+FIELD(noflush ) VAR(ZCMD) VAL('SET NOFLUSH')
+FIELD(anal    ) VAR(ZCMD) VAL('SET ANAL')
+FIELD(perf    ) VAR(ZCMD) VAL('SET PERF')
+)End
+>End

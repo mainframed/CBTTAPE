@@ -1,0 +1,1354 @@
+*PROCESS RENT,FLAG(PAGE0)                                          V121
+SRSDRVR TITLE '- SYSOUT Retrieval Services (SRS) Driver Module'
+SRSDRVR CSECT , ATTR=RENT,REUS,REFR
+SRSDRVR AMODE 31
+SRSDRVR RMODE ANY                                                  V121
+*=====================================================================*
+*                                                                     *
+*  MODULE NAME:  SRSDRVR                                              *
+*                                                                     *
+*  DESCRIPTIVE-NAME: SYSOUT Retrieval Services (SRS) Driver Module    *
+*                                                                     *
+*  STATUS: z/OS Release 1.9 and higher *ONLY*                      V130
+*                                                                     *
+*  OPERATION:                                                         *
+*                                                                     *
+*    This module is part of SYSOUT Retrieval Services, generalized    *
+*    external interface to data residing on the JES spool.  SRS uses  *
+*    the SYSOUT Application Program Interface (SAPI) to request       *
+*    spool data from JES2.                                            *
+*                                                                     *
+*    SRSDRVR attaches the SRSTASK subprogram to setup and manage      *
+*    the SRS request to JES, and to handle the actual de-spooling     *
+*    selected SYSOUT.                                                 *
+*                                                                     *
+*    The following dataset selection criteria is supported:           *
+*                                                                     *
+*       1) SYSOUT class                                               *
+*       2) Jobname                                                    *
+*       3) Destination                                                *
+*       4) Forms ID                                                   *
+*       5) JES jobid                                                  *
+*       6) Writer name                                                *
+*       7) DDNAME                                                  V120
+*                                                                     *
+*    Selection criteria can be specified as a PARM to the SRSDRVR  V121
+*    program.  Note that reading parms from SYSPARM DD dataset     V121
+*    is no longer supported.                                       V121
+*                                                                     *
+*    The PARM is specified as follows:                                *
+*                                                                     *
+*    P=pgnmane        The program that will be called to despool      *
+*                     the data (default: SRSGENER)                 V111
+*PPARM=parms          Parameter list passed to the despooling pgm  V120
+*    Q=class          The output class to be selected                 *
+*    J=jobname        The jobname to be selected                      *
+*    D=destination    The destination to be selected                  *
+*    F=forms          The forms queue to be selected                  *
+*   JI=jobid          The 8-character JES jobid to be selected        *
+*                     NOTE: In SRS 1.1.2 and higher, STC and TSU   V112
+*                           ARE honored in addition to JOB         V112
+*    W=writername     The writer name to be selected                  *
+*DDNAME=ddname        The DDNAME of the spool data set to be sel'd V120
+*  LIM=select-limit   The maximum number of datasets to despool       *
+* WAIT=YES or NO      Whether the task is to wait for datasets        *
+*                     or end when no more datasets remain             *
+* DISP=KEEP or DELETE The disposition of despooled datasets        V111
+*                     (default: DELETE)                            V111
+* STATUS=HELD         The status of datasets to be selected     @A11102
+*        NONHELD      (default: NONHELD)                        @A11102
+*        ALL                                                    @A11102
+*                                                                     *
+*    Selection parameters are passed un-edited to SAPI.  Wildcard     *
+*    and masking parameters can be specified wherever supported by    *
+*    SAPI.                                                            *
+*                                                                     *
+*    In addition, SRSDRVR handles STOP/MODIFY commands issued by      *
+*    the operator.                                                    *
+*                                                                     *
+*    NOTES:                                                           *
+*                                                                     *
+*      Currently, only one SYSOUT selection criteria combination can  *
+*      be specified, and only one SRSTASK can be attached per SRSDRVR.*
+*                                                                     *
+*    ATTRIBUTES:                                                      *
+*                                                                     *
+*      Location:  resident in own address space                       *
+*      State:  problem; does not need to be APF authorized         V130
+*      Amode:  31-bit                                                 *
+*      Rmode:  ANY                                                 V121
+*      Key:  8                                                     V130
+*      Mode:  task                                                    *
+*      Serialization: none                                            *
+*      Type:  Reentrant                                               *
+*                                                                     *
+*  Written By: Dave Danner                                      @A11202
+*              Summit Technical Services, Inc.                  @A11202
+*                                                                     *
+*          January, 1998                                              *
+*                                                                     *
+*  Change log:                                                        *
+*    DWD 04/98: Add DISP=KEEP/DELETE support                       V111
+*               Remove JES2 macros                                 V111
+*    DWD 03/99: STATUS= support                                 @A11102
+*    DWD 07/99: STC/TSU support for JOBID (JI=) parameter          V112
+*    DWD 03/02: 7-digit job numbers in JOIID                    @A11206
+*    DWD 09/03: Select by DDNAME                                   V120
+*               Support for parameter list passed to despool pgm   V120
+*    DWD 12/04: Separator record support                           V121
+*               Expand parm keywords; support abbreviated kwds     V121
+*               Support installation defaults                      V121
+*    DWD 10/06: Expand DEST to 18 characters                    @A12101
+*    DWD 03/08: Check for minimum z/OS level                       V130
+*=====================================================================*
+SRSDRVR  SRSBEGIN LEVEL=BASE                                       V130
+         BAKR  R14,0                Save environment
+         LR    R12,R15              Set base register
+         LR    R6,R1                Save pointer to parms
+         USING SRSDRVR,R12
+         LA    R11,4095(R12)        Set second                     V120
+         LA    R11,1(R11)           ...base register               V120
+         USING SRSDRVR+4096,R11                                    V120
+*
+         STORAGE OBTAIN,LENGTH=SRSDLEN,LOC=ANY Get a work area     V121
+         LR    R4,R1                Copy work area address
+         LA    R5,SRSDLEN           Get length of work area
+         SLR   R15,R15              Zero source length for MVCL
+         LR    R14,R15              Zero source address for MVCL
+         MVCL  R4,R14               Clear entire work area
+         LR    R13,R1               Point to my save area
+         MVC   4(4,R13),=C'F1SA'    Indicate linkage stack in use
+         USING SRSDWORK,R13         Address work area
+*
+         MVC   WTOBUFF+2(L'SRS500I),SRS500I
+         LA    R15,L'SRS500I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         BRAS  R9,SRSDWTO          Issue the message               V130
+*
+         BRAS  R10,SETUP           Perform general setup functions V130
+         LTR   R4,R15              Was setup successfull ?
+         BNZ   RETURN              No, quit now
+         BRAS  R10,PARSPARM        Parse input parms               V130
+         LTR   R4,R15              Was parse successfull ?
+         BNZ   RETURN              No, quit now
+*=====================================================================*
+* Attach a writer subtask to process the request.                     *
+*=====================================================================*
+         BRAS  R10,ATTWTR                                          V130
+         LTR   R4,R15                  Attach successful?          V121
+         BNZ   RETURN                  No, quit now                V121
+         SPACE 2
+*=====================================================================*
+* Show the status of the writer.                                      *
+*=====================================================================*
+         BRAS  R10,WTRSTAT                                         V130
+         SPACE 2
+*=====================================================================*
+* Wait for STOP/MODIFY command.                                       *
+*=====================================================================*
+WAITCHEK DS    0H
+         TM    STATUS,NOWAIT           Are we waiting for datasets
+         BO    TESTSUB                 No, skip CIB setup
+* Initialize stc/operator communication.
+WAITSM   DS    0H
+         MVC   WTOBUFF(EXTPARML),EXTPARM
+         EXTRACT RESPAREA,MF=(E,WTOBUFF)
+         L     R8,RESPAREA             Load comm area address
+         USING COMLIST,R8
+         ICM   R3,15,COMCIBPT          Obtain address of CIB
+         BZ    NOSTCIB                 If none, continue
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(3)  Free start CIB
+NOSTCIB  DS    0H
+         QEDIT ORIGIN=COMCIBPT,CIBCTR=2   Set CIB limit
+         L     R15,COMECBPT            Get address of comm ecb
+         ST    R15,ECBCOMM             Save in ecb list
+WAITREP  DS    0H
+         L     R1,ECBCOMM          Get address of comm ecb
+         WAIT  1,ECBLIST=ECBLIST   Wait for STOP/MOD or task end
+         L     R15,ECBCOMM         Get address of comm ECB
+         TM    0(R15),ECBPOST      Was it posted ?
+         BNO   TESTSUB             No, SRSTASK ended
+*=====================================================================*
+* Process the STOP or MODIFY command.                                 *
+*=====================================================================*
+PROCCIB  DS    0H
+         OI    STATUS,STOPMOD      Flag STOP/MODIFY processing
+*V130    NI    0(R15),X'FF'-(ECBWAIT+ECBPOST)  Clear wait & post   V130
+         L     R7,COMCIBPT         Get address of CIB
+         USING CIB,R7
+         CLI   CIBVERB,CIBSTOP     STOP command issued ?
+         BE    SHUTDOWN            Yes, shut it down
+*=====================================================================*
+* Process MODIFY command.                                             *
+*=====================================================================*
+         CLC   =C'STOP',CIBDATA    MODIFY STOP ISSUED ?
+         BE    SHUTDOWN            Yes, shut it down
+         CLC   =C'SHUTDOWN',CIBDATA  MODIFY SHUTDOWN ISSUED ?
+         BE    SHUTDOWN            Yes, shut it down
+         CLC   =C'STATUS',CIBDATA  Modify STATUS issued ?
+         BE    SHOWSTAT            Yes, issue status message
+         MVC   WTOBUFF+2(L'SRS530E),SRS530E
+         LA    R15,L'SRS530E       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         B     FREECIB             Free the CIB and shutdown
+         SPACE 2
+SHUTDOWN DS    0H
+         OI    STATUS,STOP         Set stop bit
+         MVC   WTOBUFF+2(L'SRS502I),SRS502I
+         LA    R15,L'SRS502I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         B     FREECIB             Free the CIB
+         SPACE 2
+SHOWSTAT DS    0H
+         L     R1,TBLKFRST         Get address of SRSTBLK
+         BRAS  R10,WTRSTAT         And show its status             V130
+         SPACE 2
+FREECIB  DS    0H
+         NI    STATUS,X'FF'-STOPMOD  STOP/MODIFY processing done
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(3)  Free the CIB
+         DROP  R7
+         TM    STATUS,STOP         Stop requested ?
+         BNO   WAITSM              No, go wait again
+*=====================================================================*
+* Post SRSTASK, requesting shutdown.
+*=====================================================================*
+TESTSUB  DS    0H
+         SLR   R4,R4               Set RC=0
+         ICM   R6,15,TBLKFRST      Get address of first SRSTBLK    V121
+         BZ    RETURN              Skip if no subtasks attached    V121
+SHUTTASK DS    0H
+         USING SRSTBLK,R6          Addressability to block
+         TM    SRSTECB,ECBPOST     Did task already end ?
+         BO    DODETACH            Yes, detach it
+         TM    SRSTFLAG,SRSTNOWT   Is task waiting for datasets ?
+         BO    SKIPPOST            No, just wait for task to end
+         OI    SRSTFLAG,SRSTSHUT   Indicate SHUTDOWN requested
+         POST  SRSTECBX            POST subtask
+SKIPPOST DS    0H
+         WAIT  1,ECB=SRSTECB       Wait for subtask to complete
+DODETACH DS    0H
+         ICM   R15,7,SRSTECB+(ECBCCCNT-ECB) SRSTASK RC=0, noabend?
+         BZ    TASKOK              Yes, leave RC
+         LA    R4,24               No, set RC=24
+TASKOK   DS    0H
+         DETACH SRSTTCB            Detach subtask
+         C     R4,SRSTRC           Higher RC ?
+         BNL   FREETBLK            Branch if not
+         L     R4,SRSTRC           Set new RC
+FREETBLK DS    0H
+         L     R5,SRSTNEXT         Point at next block
+         STORAGE RELEASE,LENGTH=SRSTBLKL,ADDR=(6) Free work TBLK   V121
+         LTR   R6,R5               Get next block
+         BNZ   SHUTTASK            Branch back if more
+         DROP  R6
+         SPACE 5
+RETURN   DS    0H
+         TM    STATUS,OPSTABL      SRSOPTS module loaded?          V121
+         BZ    NOOPTDEL            No, don't DELETE                V121
+         DELETE EPLOC=OPTSTAB      Delete options table            V121
+NOOPTDEL DS    0H                                                  V121
+         LR    R1,R13              Save getmained storage address
+         STORAGE RELEASE,LENGTH=SRSDLEN,ADDR=(1) Free work area    V121
+         LR    R15,R4              Set RC
+         PR                        Return to caller
+         EJECT
+*=====================================================================*
+* GENERAL SETUP ROUTINE.                                              *
+*  1) Check for minimum z/OS level                                 V130
+*  2) Initialize stc/operator communication.                       V130
+*=====================================================================*
+SETUP    DS    0H
+         ACONTROL FLAG(NOPAGE0)        CVTPTR is valid PAGE 0 ref  V130
+         L     R15,CVTPTR              Get CVT address             V130
+         ACONTROL FLAG(PAGE0)          Restore low core check      V130
+         TM    CVTOSLV5-CVT(R15),CVTH7740 z/OS 1.9 or higher?      V130
+         BO    ZOSOK                   Yes, continue               V130
+         MVC   WTOBUFF+2(L'SRS540E),SRS540E                        V130
+         LA    R15,L'SRS540E           Get length of message       V130
+         STH   R15,WTOBUFF             Save length in WTO          V130
+         BRAS  R9,SRSDWTO              Issue the message           V130
+         LA    R15,8                   Set bad RC                  V130
+         B     SETUPX                  Return & terminate          V130
+ZOSOK    DS    0H                                                  V130
+* Initialize variables.
+         LA    R15,TBLKFRST            Get last block pointer
+         ST    R15,TBLKPLST            And save it
+         LA    R15,1                   Set the writer ID
+         STH   R15,XWTRID              And save it
+         L     R15,PSAAOLD-PSA(,0)     Point to ASCB
+         ICM   R15,15,ASCBJBNI-ASCB(R15) Get batch name address
+         BZ    NOBATJ                  If not batch, skip flag set
+         OI    STATUS,BATCHJ           Flag running as batch job   V112
+NOBATJ   DS    0H
+         SLR   R15,R15             Set RC=0
+SETUPX   DS    0H
+         BR    R10                 Return to main routine
+         EJECT
+*==================================================================
+* Process the PARM= keywords from the EXEC statement.
+*==================================================================
+PARSPARM DS    0H                                                  V121
+* Build the keyword table                                          V121
+         LA    R1,SRSKEYTB         Point at start of table         V121
+         USING SRSKW,R1                                            V121
+*==================================================================V121
+* Define all supported keywords via the SRSKEY macro.              V121
+* The format is as follows:                                        V121
+* SRSKEY                                                           V121
+*    KEYWORD=keyword                                               V121
+*       Specifies the full name of the keyword                     V121
+*    LOC=temp-storage-loc                                          V121
+*       Specifies the temporary storage location to parse the      V121
+*       keyword value into                                         V121
+*    ABBREV=n                                                      V121
+*       Specifies that the keyword can be abbreviated by           V121
+*       specifying only the first n characters                     V121
+*    DEFAULT=default-value-loc                                     V121
+*       Specifies the location of the default value for this       V121
+*       keyword which is used if the keyword is not specified      V121
+*       by the user                                                V121
+*    TBLK=TBLK-loc                                                 V121
+*       Specifies the location in the TBLK to move either the      V121
+*       keyword value specified by the user or the default value   V121
+*       if none is specified.  If TBLK= is specified, the          V121
+*       appropriate value is simply moved into the TBLK without    V121
+*       any editing or validation.  TBLK= and ROUTINE= are         V121
+*       mutually exclusive.                                        V121
+*    ROUTINE=routine-address                                       V121
+*       Specifies the address of a routine to process the keyword. V121
+*       The routine is responsible for building the entry in the   V121
+*       TBLK that corresponds to the keyword.  TBLK= and ROUTINE=  V121
+*       are mutually exclusive.                                    V121
+*==================================================================V121
+         SRSKEY KEYWORD=PROGRAM,LOC=SRSUPGMN,ABBREV=1,             V121+
+               TBLK=SRSTPGMN,DEFAULT=SRSOPGMN                      V121
+         SRSKEY KEYWORD=CLASS,LOC=SRSUCLAS,                        V121+
+               TBLK=SRSTCLAS,DEFAULT=SRSOCLAS                      V121
+         SRSKEY KEYWORD=Q,LOC=SRSUCLAS,                            V121+
+               TBLK=SRSTCLAS,DEFAULT=SRSOCLAS                      V121
+         SRSKEY KEYWORD=JOBNAME,LOC=SRSUJOBN,ABBREV=1,             V121+
+               TBLK=SRSTJOBN,DEFAULT=SRSOJOBN                      V121
+         SRSKEY KEYWORD=DEST,LOC=SRSUDEST,ABBREV=1,                V121+
+               TBLK=SRSTDEST,DEFAULT=SRSODEST                      V121
+         SRSKEY KEYWORD=FORMS,LOC=SRSUFORM,ABBREV=1,               V121+
+               TBLK=SRSTFORM,DEFAULT=SRSOFORM                      V121
+         SRSKEY KEYWORD=JOBID,LOC=SRSUJBID,ABBREV=4,               V121+
+               ROUTINE=PROCJBID                                    V121
+         SRSKEY KEYWORD=JI,LOC=SRSUJBID,                           V121+
+               ROUTINE=PROCJBID                                    V121
+         SRSKEY KEYWORD=WRITER,LOC=SRSUWTRN,ABBREV=1,              V121+
+               TBLK=SRSTWTRN,DEFAULT=SRSOWTRN                      V121
+         SRSKEY KEYWORD=LIMIT,LOC=SRSULIMT,ABBREV=3,               V121+
+               ROUTINE=PROCLIMT,DEFAULT=SRSOLIMT                   V121
+         SRSKEY KEYWORD=WAIT,LOC=SRSUWAIT,                         V121+
+               ROUTINE=PROCWAIT,DEFAULT=SRSOWAIT                   V121
+         SRSKEY KEYWORD=DISP,LOC=SRSUDISP,                         V121+
+               ROUTINE=PROCDISP,DEFAULT=SRSODISP                   V121
+         SRSKEY KEYWORD=STATUS,LOC=SRSUSTAT,ABBREV=4,              V121+
+               ROUTINE=PROCSTAT,DEFAULT=SRSOSTAT                   V121
+         SRSKEY KEYWORD=SEP,LOC=SRSUSEPO,                          V121+
+               ROUTINE=PROCSEPO,DEFAULT=SRSOSEPO                   V121
+         SRSKEY KEYWORD=SEPID,LOC=SRSUSEPI,ABBREV=4,               V121+
+               TBLK=SRSTSEPI,DEFAULT=SRSOSEPI                      V121
+         SRSKEY KEYWORD=DDNAME,LOC=SRSUDDNM,ABBREV=2,              V121+
+               TBLK=SRSTDDNM                                       V121
+         SRSKEY KEYWORD=PPARM,LOC=SRSUPPRM,                        V121+
+               TBLK=SRSTPPRM,DEFAULT=SRSOPPRM                      V121
+         SRSKEY KEYWORD=OPTS,LOC=SRSUOPTS,ABBREV=3                 V121
+         MVC    SRSKW(4),=X'FFFFFFFF'  Set end of table marker     V121
+         DROP  R1                                                  V121
+*                                                                  V121
+*==================================================================V121
+* In this phase of processing, we scan the input parm provided     V121
+* by the user and move the keyword values supplied to a temporary  V121
+* location.                                                        V121
+*==================================================================V121
+         L     R6,0(,R6)           Point at length of parms        V121
+         LH    R15,0(,R6)          Get length of parms             V121
+         LTR   R15,R15             Any parms ?                     V121
+         BZ    PARSDONE            No, skip parse                  V121
+         LA    R2,2(R6)            Point at first char in parm     V121
+         LA    R7,1(R15,R6)        Point at last char in parm      V121
+CHECKOP  DS    0H
+         CR    R2,R7               Any more operands ?
+         BH    PARSDONE            No, done with parse
+* Find the last character in the operand and the '='               V121
+         LA    R3,1(R2)            Point at next character
+         SLR   R5,R5               Init equals pointer             V121
+FINDEND  DS    0H
+         CR    R3,R7               End of operand ?
+         BH    GOTEND              Yes, good
+         TM    PARSSTAT,PARSPARN   Looking for right parenthesis ? V120
+         BZ    NOPCHECK            No, check for comma             V120
+         CLI   0(R3),C')'          End of operand ?                V120
+         BNE   NEXTCHAR            No, keep looking                V120
+         NI    PARSSTAT,X'FF'-PARSPARN  Reset parenthesis flag     V120
+         B     NEXTCHAR            Check for comma next            V120
+NOPCHECK DS    0H                                                  V120
+         CLI   0(R3),C'='          Equals found?                   V121
+         BNE   CKCOMM              No, keep checking               V121
+         LR    R5,R3               Save equals location            V121
+         B     NEXTCHAR            Check next char                 V121
+CKCOMM   DS    0H                                                  V121
+         CLI   0(R3),C','          End of operand ?
+         BE    GOTEND              Yes, good
+         CLI   0(R3),C'('          Operand with parenthesis ?      V120
+         BNE   NEXTCHAR            No, keep looking for comma      V120
+         OI    PARSSTAT,PARSPARN   Flag right parenthesis needed   V120
+NEXTCHAR DS    0H                                                  V120
+         LA    R3,1(R3)            Point at next char
+         B     FINDEND             And check it
+GOTEND   DS    0H
+         BCTR  R3,0                Point at last character in op
+         LR    R4,R3               Copy to work reg
+* At this point...                                                 V121
+* R2 points at the beginning of the keyword=value string           V121
+* R3/R4 points at the end of the keyword=value string              V121
+* R5 points at the equals sign in the keyword=value string         V121
+         ST    R2,PARSOPST         Save start of operand           V112
+         ST    R3,PARSOPEN         Save end of operand             V112
+         LTR   R5,R5               Equals sign found?              V121
+         BZ    PARSERR             No, error                       V121
+         TM    PARSSTAT,PARSPARN   Were we looking for a rt paren? V120
+         BZ    NOPCHEC2            No, skip check                  V120
+         CLI   0(R3),C')'          Did we find one ?               V120
+         BNE   PARSERR             No, error                       V120
+NOPCHEC2 DS    0H                                                  V120
+* Locate keyword in keyword table                                  V121
+         SR    R5,R2               Calculate length of keyword     V121
+         LA    R8,SRSKEYTB         Point at start of table         V121
+         USING SRSKW,R8                                            V121
+         SLR   R15,R15             Clear work reg                  V121
+KWDLOOP  DS    0H                                                  V121
+         CLC   SRSKW(4),=X'FFFFFFFF'  At end of table?             V121
+         BE    PARSERR             Yes, invalid keyword            V121
+         IC    R15,SRSKWNAL        Get length of keyword           V121
+         CR    R5,R15              User kwd len > table kwd len?   V121
+         BH    NEXTKWD             Yes, can't match                V121
+         IC    R15,SRSKWSIG        Get min (abbrev) length         V121
+         CR    R15,R5              Min kwd len > user kwd len      V121
+         BH    NEXTKWD             Yes, can't match                V121
+         L     R6,SRSKWNAM         Get addr of kwd name            V121
+         LR    R14,R5              Copy kwd length                 V121
+         BCTR  R14,0               Prep for execute                V121
+         EX    R14,CLCKWD          Keyword match?                  V121
+         BNE   NEXTKWD             No, check next keyword          V121
+         LA    R2,1(R5,R2)         Point at keyword value          V121
+         SR    R4,R2               Get length of value (minus 1)   V121
+         LA    R4,1(R4)            Get true length                 V121
+         LTR   R4,R4               Null operand?                   V121
+         BNP   NOVPAR              Yes, skip paren check           V121
+         CLI   0(R2),C'('          Is kwd value inside parens?     V121
+         BNE   NOVPAR              No, skip adjustment             V121
+         LA    R2,1(R2)            Point at 1st char inside paren  V121
+         SH    R4,=H'2'            And fix up length               V121
+NOVPAR   DS    0H                                                  V121
+         IC    R15,SRSKWLOL        Get max length of value         V121
+         CR    R4,R15              User value greater than max?    V121
+         BH    PARSERR             *temp*                          V121
+         L     R6,SRSKWLOC         Get location address            V121
+         CLI   0(R6),C' '          Keyword already specified?      V121
+         BH    PARSDUP             Yes, error                      V121
+         MVI   0(R6),C' '          Init first char to blank        V121
+         SH    R15,=H'2'           One for first char & one for EX V121
+         BM    ONEBYTEF            Done if 1-byte field            V121
+         EX    R15,MVCBLNK         Init rest of value to blanks    V121
+ONEBYTEF DS    0H                                                  V121
+         LTR   R4,R4               Null operand?                   V121
+         BNP   NEXTOP              Yes, leave blanks               V121
+         BCTR  R4,0                Prep for execute                V121
+         EX    R4,MVCVAL           Move value                      V121
+         B     NEXTOP              Process next parm opt           V121
+NEXTKWD  DS    0H                                                  V121
+         LA    R8,SRSKWL(R8)       Next kwd table entry            V121
+         B     KWDLOOP             Go check it                     V121
+CLCKWD   CLC   0(*-*,R6),0(R2)                                     V121
+MVCBLNK  MVC   1(*-*,R6),0(R6)                                     V121
+MVCVAL   MVC   0(*-*,R6),0(R2)                                     V121
+         DROP  R8                                                  V121
+NEXTOP   DS    0H
+         LA    R2,2(R3)            Point at next operand
+         B     CHECKOP             Check next operand
+         SPACE 3
+PARSDONE DS    0H
+         SLR   R15,R15             Set parse RC=0
+         BR    R10                 Return to main routine
+         SPACE 3
+* Syntax error in paramater list
+PARSERR  DS    0H
+         MVC   WTOBUFF+2(L'SRS520E),SRS520E
+         LA    R1,WTOBUFF+L'SRS520E+2 Point at end of base message V121
+         L     R2,PARSOPST         Restore pointer to operand      V112
+         L     R4,PARSOPEN         Restore pointer to end of op    V112
+         SR    R4,R2               Get length                      V112
+         EX    R4,MVCPARM          Move bad op into message
+         LA    R1,1(R1,R4)         Point after bad op              V121
+         LA    R15,WTOBUFF+2       Get start of WTO text           V121
+         SR    R1,R15              Calculate length of message     V121
+         STH   R1,WTOBUFF          Save length in WTO parm         V121
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         LA    R15,8               Set parse RC=8
+         BR    R10                 Return to main routine
+         SPACE 3                                                   V121
+* Parameter previously specified                                   V121
+PARSDUP  DS    0H                                                  V121
+         MVC   WTOBUFF+2(L'SRS520E),SRS520E  Move basic msg        V121
+         LA    R1,WTOBUFF+L'SRS520E+2 Point at end of base message V121
+         L     R2,PARSOPST         Restore pointer to operand      V121
+         BCTR  R5,0                Prep keyword length for EX      V121
+         EX    R5,MVCPARM          Move bad op into message        V121
+         LA    R1,1(R1,R5)         Point after keyword             V121
+         MVC   0(23,R1),=C'= was already specified'                V121
+         LA    R1,23(R1)           Point after added text          V121
+         LA    R15,WTOBUFF+2       Get start of WTO text           V121
+         SR    R1,R15              Calculate length of message     V121
+         STH   R1,WTOBUFF          Save length in WTO parm         V121
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         LA    R15,8               Set parse RC=8                  V121
+         BR    R10                 Return to main routine          V121
+MVCPARM  MVC   0(*-*,R1),0(R2)                                     V121
+         EJECT
+ATTWTR   DS    0H
+*=====================================================================*
+* ATTACH SRS SSI interface subtask.                                   *
+*  1) Load the default options module.                             V121
+*  2) Obtain storage for and build the SRSTBLK.                    V121
+*  3) Validate the option specified (either from the user-supplied V121
+*     PARMS or from the default options.                           V121
+*  4) Attach SRSTASK.                                              V121
+*=====================================================================*
+         SPACE 2
+         MVC   OPTSTAB,=CL8'SRSOPTS'  Set default SRSOPT name      V121
+         CLI   SRSUOPTS,C' '          Specified by user?           V121
+         BNH   NOUOPTS                No, keep default             V121
+         MVC   OPTSTAB+6(2),SRSUOPTS  Use SRSOPTxx from user       V121
+NOUOPTS  DS    0H                                                  V121
+         LA    R2,1                   Set possible error code      V121
+         LOAD  EPLOC=OPTSTAB,ERRET=OPTSERR   Load the module       V121
+         OI    STATUS,OPSTABL         Flag table loaded            V121
+         LR    R7,R0                  Copy default options addr    V121
+         USING SRSOPT,R7                                           V121
+         LA    R2,2                   Set possible error code      V121
+         SLL   R1,3                   Convert length to bytes      V121
+         CLM   R1,B'0011',=AL2(SRSOPTL)  Expected length ?         V121
+         BNE   OPTSERR                No, quit now                 V121
+         LA    R2,3                   Set possible error code      V121
+         CLC   =C'SRSOPT',SRSOEYE     Valid eye-catcher?           V121
+         BNE   OPTSERR                No, quit now                 V121
+         LA    R2,4                   Set possible error code      V121
+         CLI   SRSOLVL,SRSOMAC        Same level as SRSDRVR?       V121
+         BNE   OPTSERR                No, quit now                 V121
+*=====================================================================*
+* Build the SRSTBLK for the SRSTASK to be attached.                   *
+*=====================================================================*
+         STORAGE OBTAIN,LENGTH=SRSTBLKL,LOC=ANY Get stor for TBLK  V121
+         LR    R6,R1               Save block address
+         USING SRSTBLK,R6          Addressability to block
+         XC    SRSTBLK(SRSTBLKL),SRSTBLK   Clear block
+         MVC   SRSTBLKE,=CL8'SRSTBLK'  Set eye-catcher             V120
+         L     R15,TBLKPLST        Get old foward chain pointer
+         ST    R6,0(,R15)          Update new foward chain
+         LA    R15,SRSTNEXT        Get address of new last ptr
+         ST    R15,TBLKPLST        Save new foward chain pointer
+         LH    R15,XWTRID          Get the hex writer ID
+         CVD   R15,DOUBWORK        Make it decimal
+         LA    R15,1(R15)          Incrament task counter
+         STH   R15,XWTRID          Save new hex writer ID
+         OI    DOUBWORK+7,X'0F'    Fix up sign
+         UNPK  SRSTWRID,DOUBWORK+6(2)  Make it EBCDIC & put in SRSTBLK
+*==================================================================V121
+* Here we go back to the keyword table.  For keywords with TBLK=   V121
+* specified, we move the keyword setting to that location.  For    V121
+* keywords with ROUTINE= we call that routine to process the       V121
+* keyword.  If the keyword was specified by the user, we use the   V121
+* value copied to the temporary location.  Otherwise, we use the   V121
+* default value from the options table.                            V121
+*==================================================================V121
+*                                                                  V121
+         LA    R5,SRSKEYTB         Point at start of table         V121
+         USING  SRSKW,R5                                           V121
+TBLKLOOP DS    0H                                                  V121
+         CLC   SRSKW(4),=X'FFFFFFFF' End of table?                 V121
+         BE    TBLKDONE              Yes, all done                 V121
+         LH    R15,SRSKWTBK          Get TBLK offset               V121
+         LTR   R15,R15               Any specified?                V121
+         BNZ   TBLKFILL              Yes, copy value into TBLK     V121
+         ICM   R15,15,SRSKWRTN       Get routine address           V121
+         BZ    TBLKNEXT              If no routine, skip keyword   V121
+         BALR  R8,R15                Call routine to process kwd   V121
+         TM    STATUS,KEYERR         Error encountered ?           V121
+         BZ    TBLKNEXT              No, process next keyword      V121
+         LA    R15,8                 Set bad RC                    V121
+         B     ATTWTRX               And exit routine              V121
+TBLKFILL DS    0H                                                  V121
+         LA    R15,SRSTBLK(R15)      Get address in TBLK           V121
+         CLI   0(R15),C' '           Already filled in?            V121
+         BH    TBLKNEXT              Yes, nothing to do            V121
+         L     R14,SRSKWLOC          Get address of parsed value   V121
+         CLI   0(R14),X'00'          Was it specified?             V121
+         BNE   TBLKUSER              Yes, use it                   V121
+         LH    R14,SRSKWDEF          Get default offset            V121
+         LTR   R14,R14               Is there a default?           V121
+         BZ    TBLKNEXT              Not spec and no default       V121
+         LA    R14,SRSOPT(R14)       Get address in default table  V121
+TBLKUSER DS    0H                                                  V121
+         SLR   R1,R1                 Clear work reg                V121
+         IC    R1,SRSKWLOL           Get length of field in TBLK   V121
+         BCTR  R1,0                  Fix for execute               V121
+         EX    R1,MVCTBLK            Move value into TBLK          V121
+TBLKNEXT DS    0H                                                  V121
+         LA    R5,SRSKWL(R5)         Point to next entry           V121
+         B     TBLKLOOP              Process next keyword          V121
+TBLKDONE DS    0H                                                  V121
+         TM    STATUS,MSGLIM         Limit WTOs displayed ?
+         BZ    SPWTOALL              No, display all WTOs
+         OI    SRSTFLAG,SRSTWLIM     Set WTO limit option
+SPWTOALL DS    0H
+         CLI   SRSTPGMN,C' '         Despool pgm specified?        V121
+         BH    DSPGMOK               Yes, use it                   V121
+         MVC   SRSTPGMN,=CL8'SRSGENER' Set default                 V121
+DSPGMOK  DS    0H                                                  V121
+*==================================================================V121
+* If DISP=DELETE, check for at least some selection criteria.      V121
+* This is to prevent a user from inadvertently draining the spool! V121
+*==================================================================V121
+         TM    SRSTFLAG,SRSTKEEP   DISP=KEEP ?                     V121
+         BO    POK                 Yes, skip checks                V121
+         CLC   OPTSTAB,=CL8'SRSOPTS'  Special options in use?      V121
+         BNE   POK                 Yes, skip checks                V121
+         CLC   SRSTCLAS,SRSOCLAS   Was class specified ?           V121
+         BNE   POK                 Yes, process the request        V121
+         CLC   SRSTJOBN,SRSOJOBN   Was jobname specified ?         V121
+         BNE   POK                 Yes, process the request        V121
+         CLI   SRSTJBID,C' '       Was jobid specified ?           V121
+         BH    POK                 Yes, process the request        V121
+         CLC   =CL4'ALL',SRSTDEST  DEST=ALL specified ?         @A12101
+         BE    PDALL               Yes, skip DEST check            V121
+         CLC   SRSTDEST,SRSODEST   Was dest specified ?            V121
+         BNE   POK                 Yes, process the request        V121
+PDALL    DS    0H                                                  V121
+         CLC   SRSTFORM,=CL8'ALL'  FORMS=ALL specified ?           V121
+         BE    PFALL               Yes, skip FORMS check           V121
+         CLC   SRSTFORM,SRSOFORM   Was forms queue specified ?     V121
+         BNE   POK                 Yes, process the request        V121
+PFALL    DS    0H                                                  V121
+         CLC   SRSTWTRN,=CL8'ALL'  WRITER=ALL specified ?          V121
+         BE    PWALL               Yes, skip WRITER check          V121
+         CLC   SRSTWTRN,SRSOWTRN   Was writer name specified ?     V121
+         BNE   POK                 Yes, process the request        V121
+PWALL    DS    0H                                                  V121
+         MVC   WTOBUFF+2(L'SRS510E),SRS510E                        V121
+         LA    R15,L'SRS510E       Get length of message           V121
+         STH   R15,WTOBUFF         Save length in WTO              V121
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         LA    R15,8               Set RC=8                        V121
+         B     ATTWTRX             Termination                     V121
+POK      DS    0H                                                  V121
+*=====================================================================*
+* Attach SRSTASK to establish the SAPI interface.                     *
+*=====================================================================*
+         MVC   WTOBUFF(ATTPARML),ATTPARM
+         LA    R1,SRSTBLK          Get address of SRSTASK block
+         ATTACH EP=SRSTASK,ECB=SRSTECB,SF=(E,WTOBUFF)
+         ST    R1,SRSTTCB          Save TCB address
+         LA    R15,SRSTECB         Get address of subtask ECB
+         ST    R15,ECBPTASK        Save in ECB list
+         OI    ECBPTASK,X'80'      Flag as last entry
+* Document writer attached
+         TM    STATUS,MSGLIM       Limit number of WTOs ?
+         BO    NO502I              Yes, skip SRS502I
+         MVC   WTOBUFF+2(L'SRS501I),SRS501I
+         LA    R15,L'SRS501I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         BRAS  R9,SRSDWTO          Issue the message               V130
+NO502I   DS    0H
+         LR    R1,R6               Return SRSTBLK in R1
+         SLR   R15,R15             Set RC=0                        V121
+ATTWTRX  DS    0H                                                  V121
+         BR    R10
+MVCTBLK  MVC   0(*-*,R15),0(R14)                                   V121
+         EJECT
+OPTSERR  DS    0H                                                  V121
+*==================================================================V121
+* Handle problems with the options table.  R2 identifies the error V121
+* 1 - LOAD failed                                                  V121
+* 2 - Invaid length                                                V121
+* 3 - Invalid module idetifier                                     V121
+* 4 - Assembled at different SRS level                             V121
+*==================================================================V121
+         MVC   WTOBUFF+2(L'SRS525E),SRS525E     Set basic msg      V121
+         MVC   WTOBUFF+2+SRS525EM(8),OPTSTAB    Add Module name    V121
+         BCTR  R2,0                 Get index                      V121
+         MH    R2,=AL2(OPTSERE-OPTSERS)                            V121
+         LA    R15,OPTSERS(R2)      Get branch address             V121
+         BR    R15                  Add specific error text        V121
+* R2 = 1 branches here                                             V121
+OPTSERS  DS    0H                                                  V121
+         MVC   WTOBUFF+L'SRS525E+2(L'SRS525E1),SRS525E1            V121
+         LA    R15,L'SRS525E+L'SRS525E1         Length of msg      V121
+         B     OPTSERRM                         Issue msg          V121
+OPTSERE  DS    0H                                                  V121
+* R2 = 2 branches here                                             V121
+         MVC   WTOBUFF+L'SRS525E+2(L'SRS525E2),SRS525E2            V121
+         LA    R15,L'SRS525E+L'SRS525E2         Length of msg      V121
+         B     OPTSERRM                         Issue msg          V121
+* R2 = 3 branches here                                             V121
+         MVC   WTOBUFF+L'SRS525E+2(L'SRS525E3),SRS525E3            V121
+         LA    R15,L'SRS525E+L'SRS525E3         Length of msg      V121
+         B     OPTSERRM                         Issue msg          V121
+* R2 = 4 branches here                                             V121
+         MVC   WTOBUFF+L'SRS525E+2(L'SRS525E4),SRS525E4            V121
+         LA    R15,L'SRS525E+L'SRS525E4         Length of msg      V121
+OPTSERRM DS    0H                                                  V121
+         STH   R15,WTOBUFF         Save length in WTO parm         V121
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         LA    R15,8               Set bad RC                      V121
+         B     ATTWTRX             And exit                        V121
+*==================================================================V121
+* Special routines to process unique keywords follow               V121
+*==================================================================V121
+*                                                                  V121
+PROCSEPO DS    0H                                                  V121
+*==================================================================V121
+* Process the SEP option                                           V121
+*==================================================================V121
+         LA    R2,SRSOSEPO         Point at default SEP option     V121
+         CLI   SRSUSEPO,C' '       User specify SEP= ?             V121
+         BNH   NOSPUSEP            No, leave default               V121
+         LA    R2,SRSUSEPO         Use user specification          V121
+NOSPUSEP DS    0H                                                  V121
+         CLI   0(R2),C' '          SEP= specified ?                V121
+         BNH   PROCSEPX            No, skip it                     V121
+         CLC   =CL7'NO',0(R2)      SEP=NO ?                        V121
+         BE    PROCSEPX            Yes, no flags to set            V121
+         MVI   SRSTSEPO,SRSTSEPG   Assume SEP=OUTGRP               V121
+         CLC   =CL7'OUTGRP',0(R2)  SEP=OUTGRP ?                    V121
+         BE    PROCSEPX            Yes, cool - finished            V121
+         CLC   =CL7'YES',0(R2)     SEP=YES ?                       V121
+         BE    PROCSEPX            Yes, cool - finished            V121
+         MVI   SRSTSEPO,SRSTSEPJ   Assume SEP=JOB                  V121
+         CLC   =CL7'JOB',0(R2)     SEP=JOB ?                       V121
+         BE    PROCSEPX            Yes, cool - finished            V121
+         MVI   SRSTSEPO,SRSTSEPD   Assume SEP=DATASET              V121
+         CLC   =CL7'DATASET',0(R2) SEP=DATASET ?                   V121
+         BE    PROCSEPX            Yes, cool - finished            V121
+         CLC   =CL7'DS',0(R2)      SEP=DATASET (abbrev form) ?     V121
+         BNE   PARMERR             No, parm error                  V121
+PROCSEPX DS    0H                                                  V121
+         BR    R8                  Return to mainline              V121
+*                                                                  V121
+PROCLIMT DS    0H                                                  V121
+*==================================================================V121
+* Process the LIMIT option                                         V121
+*==================================================================V121
+         LA    R2,SRSOLIMT         Point at default LIMIT          V121
+         CLI   SRSULIMT,C' '       User specify LIM= ?             V121
+         BNH   NOSPULIM            No, keep default                V121
+         LA    R2,SRSULIMT         Use user specification          V121
+NOSPULIM DS    0H                                                  V121
+         CLI   0(R2),C' '          Limit specified ?               V121
+         BNH   PROCLIMX            No, skip it                     V121
+         LA    R3,L'SRSULIMT-1(R2) Last char in LIMIT area         V121
+         CLI   0(R3),C' '          Last char a blank?              V121
+         BNE   LIMEND              No, already pointing at end     V121
+         LR    R1,R2               Copy first char addr            V121
+         SLR   R0,R0               Set function code for findblnk  V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         BCTR  R1,0                Point at last char in limit     V121
+         LR    R3,R1               Save last char address          V121
+LIMEND   DS    0H                                                  V121
+         SR    R3,R2               Get length of limit (minus 1)   V121
+         EX    R3,MVCLIM1          Move to work area               V121
+         OC    FULLWORK(4),=X'F0F0F0F0' Force numeric              V121
+         EX    R3,CLCLIM           Validate numeric value          V121
+         BNE   PARMERR             If not numeric - error          V121
+         MVC   FULLWORK(4),=X'F0F0F0F0' Init work field            V121
+         LA    R1,FULLWORK+3       Last possible char              V121
+         SR    R1,R3               Backup length                   V121
+         EX    R3,MVCLIM2          Move to work area               V121
+         XC    DOUBWORK,DOUBWORK   Clear work area                 V121
+         PACK  DOUBWORK+5(3),FULLWORK(4)  Pack select limit        V121
+         CVB   R15,DOUBWORK        Make limit binary               V121
+         STH   R15,SRSTLIMT        And save in paramater block     V121
+PROCLIMX DS    0H                                                  V121
+         BR    R8                    Return to mainline            V121
+MVCLIM1  MVC   FULLWORK(*-*),0(R2)                                 V121
+CLCLIM   CLC   FULLWORK(*-*),0(R2)                                 V121
+MVCLIM2  MVC   0(*-*,R1),0(R2)                                     V121
+*                                                                  V121
+PROCWAIT DS    0H                                                  V121
+*==================================================================V121
+* Process the WAIT option                                          V121
+*==================================================================V121
+         LA    R2,SRSOWAIT           Point at default WAIT option  V121
+         CLI   SRSUWAIT,C' '         User specify WAIT= ?          V121
+         BNH   NOSPUWA               No, leave default             V121
+         LA    R2,SRSUWAIT           Use user specification        V121
+NOSPUWA  DS    0H                                                  V121
+         CLC   =CL3'YES',0(R2)       WAIT=YES ?                    V121
+         BE    PROCWAIX              Yes, allow wait               V121
+         CLC   =CL3'NO',0(R2)        WAIT=NO ?                     V121
+         BE    NOSPWAIT              No, disallow wait             V121
+         CLI   0(R2),C' '            Any option specified ?        V121
+         BH    PARMERR               Yes, it's invalid             V121
+         TM    STATUS,BATCHJ         Running as batch job ?        V121
+         BZ    PROCWAIX              If not batch, default to WAIT V121
+NOSPWAIT DS    0H                                                  V121
+         OI    SRSTFLAG,SRSTNOWT     Set no wait option            V121
+         OI    STATUS,NOWAIT         Set no wait option            V121
+         OI    STATUS,MSGLIM         Limit extraneous messages     V121
+PROCWAIX DS    0H                                                  V121
+         BR    R8                    Return to mainline            V121
+*                                                                  V121
+PROCDISP DS    0H                                                  V121
+*==================================================================V121
+* Process the DISP option                                          V121
+*==================================================================V121
+         LA    R2,SRSODISP           Point at default DISP option  V121
+         CLI   SRSUDISP,C' '         User specify DISP= ?          V121
+         BNH   NOSPUDS               No, leave default             V121
+         LA    R2,SRSUDISP           Use user specification        V121
+NOSPUDS  DS    0H                                                  V121
+         CLC   =CL6'DELETE',0(R2)    DISP=DELETE ?                 V121
+         BE    PROCDISX              Yes, cool                     V121
+         CLC   BLANKS(6),0(R2)       DISP= not specified ?         V121
+         BE    PROCDISX              Yes, treat as DELETE          V121
+         CLC   =CL6'KEEP',0(R2)      DISP=KEEP ?                   V121
+         BNE   PARMERR               No, it's invalid              V121
+         OI    SRSTFLAG,SRSTKEEP     Set KEEP option               V111
+PROCDISX DS    0H                                                  V121
+         BR    R8                    Return to mainline            V121
+*                                                                  V121
+*==================================================================V121
+* Process the STATUS option                                        V121
+*==================================================================V121
+PROCSTAT DS    0H                                                  V121
+         LA    R2,SRSOSTAT         Point at default STAT option    V121
+         CLI   SRSUSTAT,C' '       User specify STAT= ?            V121
+         BNH   NOSPUST             No, leave default               V121
+         LA    R2,SRSUSTAT         Use user specification          V121
+NOSPUST  DS    0H                                                  V121
+         CLC   =CL7'HELD',0(R2)    STATUS=HELD ?                   V121
+         BNE   SELNHLD             No, keep checkin                V121
+         OI    SRSTFLAG,SRSTSHLD   Flag HELD in TBLK               V121
+         B     PROCSTAX                                            V121
+SELNHLD  DS    0H                                                  V121
+         CLC   =CL7'ALL',0(R2)     STATUS=ALL ?                    V121
+         BNE   SELNALL             No, check NONHELD               V121
+         OI    SRSTFLAG,SRSTSHLD+SRSTSNHL Select HELD & NONHELD    V121
+         B     PROCSTAX                                            V121
+SELNALL  DS    0H                                                  V121
+         OI    SRSTFLAG,SRSTSNHL   Select NONHELD (default)        V121
+         CLC   =CL7'NONHELD',0(R2) STATUS=NONHELD ?                V121
+         BE    PROCSTAX            Yes, continue                   V121
+         CLC   BLANKS(6),0(R1)     Any other STATUS= ?             V121
+         BNE   PARMERR             Yes, it's invalid               V121
+PROCSTAX DS    0H                                                  V121
+         BR    R8                  Return to mainline              V121
+*                                                                  V121
+*==================================================================V121
+* Process the JOBID option                                         V121
+*==================================================================V121
+PROCJBID DS    0H                                                  V121
+         CLI   SRSTJBID,C' '         JOBID= already processed?     V121
+         BH    PROCJBIX              Yes, skip it                  V121
+         CLI   SRSUJBID,C' '         JOBID= specified ?            V121
+         BNH   PROCJBIX              No, skip it (no default)      V121
+*=================================================================*V121
+* Verify that the JOBID parameter is one of the following:         V121
+*                                                                  V121
+* Jn-Jnnnnnnn, JOn-JOnnnnnn, JOBn-JOBnnnnn                         V121
+* Sn-Snnnnnnn, STn-STnnnnnn, STCn-STCnnnnn                         V121
+* Tn-Tnnnnnnn, TSn-TSnnnnnn, TSUn-TSUnnnnn                         V121
+*                                                                  V121
+* Also, build the JOBID passed to the subtask using the            V121
+* 1-character prefix (i.e. pass 'J1234' instead of 'JOB1234').     V121
+*=================================================================*V121
+         LA    R2,SRSUJBID         Addr of JOBID= specified        V121
+         LA    R3,SRSUJBID+L'SRSUJBID-1 Last char in JOBID area    V121
+         CLI   0(R3),C' '          Last char a blank?              V121
+         BNE   JIEND               No, already pointing at end     V121
+         LR    R1,R2               Copy first char addr            V121
+         SLR   R0,R0               Set function code for findblnk  V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         BCTR  R1,0                Point at last char in jobid     V121
+         LR    R3,R1               Save last char address          V121
+JIEND    DS    0H                                                  V121
+         LA    R14,=C'JOBSTCTSU'   Point at valid jobid prefix     V121
+         LA    R15,3               Set max trips thru loop         V121
+GETFRST  DS    0H                                                  V121
+         CLC   0(1,R14),0(R2)      Check 1st char for JOB/STC/TSU  V121
+         BE    GOTFRST             If match, check rest            V121
+         LA    R14,3(R14)          Point to next prefix            V121
+         BCT   R15,GETFRST         Go check it                     V121
+         B     PARMERR             1st char not J S or T, error    V121
+GOTFRST  DS    0H                                                  V121
+         MVC   SRSTJBID,BLANKS     Init JOBID field                V121
+         MVC   SRSTJBID(1),0(R14)  Set J/S/T prefix                V121
+         LA    R15,2               Set max trips thru loop         V121
+         LR    R4,R2               Copy start of jobid             V121
+GETNUM   DS    0H                                                  V121
+         LA    R4,1(R4)            Point at next character         V121
+         CLI   0(R4),C'Z'          Start of job number ?           V121
+         BH    GOTNUM              Yes, go process the job number  V121
+         LA    R14,1(R14)          Next char in prefix             V121
+         CLC   0(1,R4),0(R14)      Prefix match ?                  V121
+         BNE   PARMERR             No, parameter error             V121
+         BCT   R15,GETNUM                                          V121
+         LA    R4,1(R4)            Point at 1st char in job number V121
+GOTNUM   DS    0H                                                  V121
+* R4 now points at the first character in the job number           V121
+         SR    R3,R4               Get length of job number        V121
+         BM    PARMERR             Error if no job number          V121
+         LA    R1,SRSTJBID+1       Get field for job number        V121
+         EX    R3,MVCJNUM          Save job number                 V121
+         EX    R3,NMCJNUM          Force job number to be numeric  V121
+         EX    R3,CLCJNUM          Passed jobnum numeric ?         V121
+         BNE   PARMERR             No, error                       V121
+         B     NOSPUJI                                             V121
+NMCJNUM  OC    SRSTJBID+1(*-*),=C'0000000'                         V121
+CLCJNUM  CLC   SRSTJBID+1(*-*),0(R4)                               V121
+MVCJNUM  MVC   0(*-*,R1),0(R4)                                     V121
+NOSPUJI  DS    0H                                                  V121
+PROCJBIX DS    0H                                                  V121
+         BR    R8                    Return to mainline            V121
+*                                                                  V121
+PARMERR  DS    0H                                                  V121
+*==================================================================V121
+* Routine to handle invalid value specified for keyword            V121
+*  R2 contains the address of the value specified                  V121
+*  R5 contains the address of keyword table entry for the keyword  V121
+*==================================================================V121
+         MVI   WTOBUFF,C' '                     Init WTO buffer    V121
+         MVC   WTOBUFF+1(L'WTOBUFF-1),WTOBUFF     to blanks        V121
+         MVC   WTOBUFF+2(L'SRS521E),SRS521E     Set basic msg      V121
+         LA    R1,WTOBUFF+L'SRS521E+2 Point at end of base message V121
+         LR    R15,R2              Get bad value addr              V121
+         IC    R14,SRSKWLOL        Get length of value             V121
+         BCTR  R14,0               Prep for execute                V121
+         EX    R14,MVCERR          Move into error msg             V121
+         SLR   R0,R0               Set function code for findblnk  V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVC   0(14,R1),=C''' for keyword '  add next part         V121
+         LA    R1,14(R1)           Bump msg pointer                V121
+         L     R15,SRSKWNAM        Get bad keyword name            V121
+         SLR   R14,R14             Clear reg for length            V121
+         IC    R14,SRSKWNAL        Get length of keyword           V121
+         BCTR  R14,0               Prep for execute                V121
+         EX    R14,MVCERR          Move into error msg             V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R15,WTOBUFF+2       Get start of WTO text           V121
+         SR    R1,R15              Calculate length of message     V121
+         STH   R1,WTOBUFF          Save length in WTO parm         V121
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         OI    STATUS,KEYERR       Flag error encountered          V121
+         BR    R8                  Return to ATTWTR routine        V121
+         DROP  R5,R6,R7                                            V121
+MVCERR   MVC   0(*-*,R1),0(R15)                                    V121
+*                                                                  V121
+WTRSTAT  DS    0H
+*=====================================================================*
+* Show status of writer                                               *
+*  R1 contains the address of SRSTBLK                                 *
+*=====================================================================*
+         LR    R6,R1               Save block address
+         USING SRSTBLK,R6          Addressability to block
+         MVI   WTOBUFF,C' '                    Initialize ...
+         MVC   WTOBUFF+1(L'WTOBUFF-1),WTOBUFF  ... wto buffer
+         LA    R1,WTOBUFF+2        Point at first character of text
+         MVC   0(L'SRS505I,R1),SRS505I Move in message ID
+         LA    R1,L'SRS505I(R1)    Point character after msgid     V120
+         MVC   0(2,R1),SRSTWRID    Add writer id
+         LA    R1,3(R1)            Update message pointer
+         MVC   0(5,R1),=C'STAT='   Add next part
+         LA    R1,5(R1)            Update message pointer
+         TM    SRSTECB,ECBPOST     Did task end ?
+         BO    TASKEND             Yes, handle it
+         MVC   0(6,R1),=C'ACTIVE'  Assume active
+         TM    SRSTFLAG,SRSTACT    Is task active ?
+         BO    TASKACT             Yes, leave alone
+         MVC   0(8,R1),=C'STARTING'  Fix up status
+         B     TASKACT             Do rest of msg
+TASKEND  DS    0H
+         MVC   0(11,R1),=C'ENDED CODE-'  Fix up status
+         LA    R1,11(R1)            Update message pointer
+         LR    R5,R1
+         L     R1,SRSTECB          Get return code
+         CALL  SRSPRHEX                                            V111
+         STCM  R0,3,0(R5)          Save first part of RC
+         STCM  R1,15,2(R5)         Save last part of RC
+         LR    R1,R5
+TASKACT  DS    0H
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         CLC   =C'SRSGENER',SRSTPGMN  Using default despool pgm?   V120
+         BE    NOSPGMN             Yes, leave off msg              V120
+         LA    R1,1(R1)            Add a blank
+         MVC   0(2,R1),=C'P='      Add next part
+         MVC   2(8,R1),SRSTPGMN    Add program name
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSPGMN  DS    0H                                                  V120
+         CLI   SRSTCLAS,X'00'      Select by class ?
+         BE    NOSCLAS             No, skip in message
+         MVC   1(2,R1),=C'Q='      Add next part
+         MVC   3(1,R1),SRSTCLAS    Add class
+         LA    R1,4(R1)            Point at next slot
+NOSCLAS  DS    0H
+         CLI   SRSTJOBN,X'00'      Select by jobname ?
+         BE    NOSJOBN             No, skip in message
+         MVC   1(2,R1),=C'J='      Add next part
+         LA    R1,3(R1)            Point at next slot
+         MVC   0(8,R1),SRSTJOBN    Add jobname
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSJOBN  DS    0H
+         CLI   SRSTJBID,X'00'      Select by jobid ?               V120
+         BE    NOSJBID             No, skip in message             V120
+         MVC   1(3,R1),=C'JI='     Add next part                   V120
+         LA    R1,4(R1)            Point at next slot              V120
+         MVC   0(8,R1),SRSTJBID    Add jobid name                  V120
+         SLR   R0,R0               Set function code for findblnk  V120
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSJBID  DS    0H
+         CLI   SRSTDEST,X'00'      Select by destination ?
+         BE    NOSDEST             No, skip in message
+         MVC   1(2,R1),=C'D='      Add next part
+         LA    R1,3(R1)            Point at next slot
+         MVC   0(L'SRSTDEST,R1),SRSTDEST  Add destination       @A12101
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSDEST  DS    0H
+         CLI   SRSTFORM,X'00'      Select by forms ?
+         BE    NOSFORM             No, skip in message
+         MVC   1(2,R1),=C'F='      Add next part
+         LA    R1,3(R1)            Point at next slot
+         MVC   0(L'SRSTFORM,R1),SRSTFORM    Add forms name
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSFORM  DS    0H
+         CLI   SRSTWTRN,X'00'      Select by writer name ?
+         BE    NOSWTRN             No, skip in message
+         MVC   1(2,R1),=C'W='      Add next part
+         LA    R1,3(R1)            Point at next slot
+         MVC   0(8,R1),SRSTWTRN    Add writer name
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSWTRN  DS    0H
+         CLI   SRSTDDNM,X'00'      Select by ddname ?              V120
+         BE    NOSDDNM             No, skip in message             V120
+         MVC   1(7,R1),=C'DDNAME=' Add next part                   V120
+         LA    R1,8(R1)            Point at next slot              V120
+         MVC   0(8,R1),SRSTDDNM    Add ddname                      V120
+         SLR   R0,R0               Set function code for findblnk  V120
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+NOSDDNM  DS    0H                                                  V120
+         MVC   1(2,R1),=C'S='      Set SELECT= kwd              @A11102
+         LA    R1,3(R1)            Update msg ptr               @A11102
+         TM    SRSTFLAG,SRSTSNHL+SRSTSHLD  SELECT=ALL ?         @A11102
+         BNO   SELO2               No, keep checkin             @A11102
+         MVC   0(3,R1),=C'ALL'     Set opt in msg text          @A11102
+         LA    R1,3(R1)            Update msg ptr               @A11102
+         B     SELODONE            Continue building message    @A11102
+SELO2    DS    0H                                               @A11102
+         TM    SRSTFLAG,SRSTSNHL   SELECT=NONHELD?              @A11102
+         BNO   SELO3               No, must be HELD             @A11102
+         MVC   0(7,R1),=C'NONHELD' Set opt in msg text          @A11102
+         LA    R1,7(R1)            Update msg ptr               @A11102
+         B     SELODONE            Continue building message    @A11102
+SELO3    DS    0H                                               @A11102
+         MVC   0(4,R1),=C'HELD'    Set opt in msg text          @A11102
+         LA    R1,4(R1)            Update msg ptr               @A11102
+SELODONE DS    0H                                               @A11102
+         TM    SRSTFLAG,SRSTKEEP   DISP=KEEP ?                     V111
+         BZ    NOSDKEEP            No, skip in message             V111
+         MVC   1(9,R1),=C'DISP=KEEP'  Set in msg                   V111
+         LA    R1,10(R1)           Point at next slot              V111
+NOSDKEEP DS    0H                                                  V111
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         BRAS  R9,SRSDWTO          Issue the message               V130
+* Display the number of datasets and the last job selected
+         TM    SRSTFLAG,SRSTACT    Is task active ?
+         BZ    WTRSTATX            No, no totals displayed
+         LA    R1,WTOBUFF+2        Restore pointer to msg text
+         LA    R1,8(R1)            Point at text after msgid
+         MVC   0(25,R1),=C'Output Groups Processed='               V120
+         LA    R1,24(R1)           Point at next area              V120
+         MVC   EDBUF,EDPAT         Move edit pattern to buffer
+         L     R15,SRSTCNT         Get dataset count
+         CVD   R15,DOUBWORK        Make it decimal
+         ED    EDBUF,DOUBWORK+3    Edit dataset count
+         LR    R3,R1               Save message pointer
+         LA    R1,EDBUF+L'EDBUF-1  Point at last char in data
+         LR    R2,R1               Save pointer
+         LA    R0,4                Set backward scan direction
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at first digit
+         SR    R2,R1               Get length of cnt (minus one)
+         EX    R2,MOVECNT          Move record count to message
+         LA    R1,1(R2,R3)         Point at end of text
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         BRAS  R9,SRSDWTO          Issue the message               V130
+         ICM   R15,15,SRSTCNT      Is count = 0 ?
+         BZ    WTRSTATX            Yes, skip rest of display
+         LA    R1,WTOBUFF+2        Restore pointer to msg text
+         LA    R1,8(R1)            Point at text after msgid
+         MVC   0(5,R1),=C'Last='   Move in next part of text
+         LA    R1,5(R1)            Point at next field
+         MVC   0(8,R1),SRSTLJBN    Move in last job selected
+         MVI   8(R1),C' '          Insure next char is a blank
+         SLR   R0,R0               Set foward scan direction
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVI   0(R1),C'('          Set starter for jobid
+         MVC   1(8,R1),SRSTLJBI    Move in last jobid selected
+         MVC   9(2,R1),=C') '      Set ending for jobid
+         LA    R1,11(R1)           Point at next field
+         MVC   DOUBWORK,SRSTTIME   Copy time to work area
+         L     R15,DOUBWORK        Get first part of GMT time
+         ACONTROL FLAG(NOPAGE0)    Valid use of low core below     V121
+         L     R14,CVTPTR          Get CVT addressability
+         ACONTROL FLAG(PAGE0)      Restore PAGE0 checking          V121
+         A     R15,CVTTZ-CVT(,R14) Add the time zone offset
+         ST    R15,DOUBWORK        Save local time
+         LR    R2,R1               Save message buffer pointer
+         MVC   CKCNPRMB(SCNVPRML),SCNVPARM  Move parm to buffer
+         STCKCONV STCKVAL=DOUBWORK,CONVVAL=TODCNV,                     +
+               DATETYPE=YYYYMMDD,MF=(E,CKCNPRMB) Convert time
+         LR    R1,R2               Restore message buffer pointer
+         LTR   R15,R15             RC=0 ?
+         BNZ   STCKFAIL            No, skip time display
+         MVC   0(17,R1),=C'hh:mm:ss mm/dd/yy'
+         UNPK  TODWORK(9),TODCNV(5)      Get 1st 8 digits of time
+         UNPK  TODWORK+8(5),TODCNV+4(3)  Get last 4 digits of time
+         MVC   0(2,R1),TODWORK           Move in hh
+         MVC   3(2,R1),TODWORK+2         Move in mm
+         MVC   6(2,R1),TODWORK+4         Move in ss
+         UNPK  TODWORK(9),TODCNV+8(5)    Get date
+         MVC   9(2,R1),TODWORK+4         Move in mm
+         MVC   12(2,R1),TODWORK+6        Move in dd
+         MVC   15(2,R1),TODWORK+2        Move in yy
+         LA    R1,17(R1)                 Point at end of text
+STCKFAIL DS    0H
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         BRAS  R9,SRSDWTO          Issue the message               V130
+WTRSTATX DS    0H
+         BR    R10
+         DROP  R6
+MOVECNT  MVC   0(*-*,R3),0(R1)
+         SPACE 2
+*==================================================================
+* SRSDRVR general-purpose WTO routine.
+*
+* This routine issues all WTOs for the SRS driver.  It supports
+* two forms of messages: normal and command-response.
+*
+*  At input:
+*    1) The message must reside in WTOBUFF.  The first two bytes
+*       contain the length of the text followed by the actual
+*       text.
+*    2) If the STOPMOD flag in STATUS is on, then the WTO is a
+*       command response.  R7 must point to the CIB that was
+*       generated for the STOP/MODIFY.
+*    3) R9 contains the return address.
+*  At input:
+*    1) The contents of R2 may be changed.
+*==================================================================
+SRSDWTO  DS    0H
+         TM    STATUS,STOPMOD      Command response ?
+         BO    WTORESP             Yes, issue w/CONSNAME           V120
+         USING CIB,R7
+WTONRESP DS    0H
+         MVC   WTOPARMB,WTOP1      Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB)
+         B     SRSDWTOX            All done
+         SPACE 3
+WTORESP  DS    0H
+         LR    R2,R7               Copy CIB address
+         AH    R2,CIBXOFF          Get addr of extention
+         USING CIBX,R2
+         MVC   WTOPARMB,WTOP2      Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,CART=CIBXCART,CONSNAME=CIBXCNNM,           +
+               MF=(E,WTOPARMB)
+         DROP  R2,R7
+         SPACE 3
+SRSDWTOX DS    0H
+         BR    R9
+*
+*=====================================================================*
+* Find the next blank character                                       *
+*  At input:                                                          *
+*    R0 - contains a code indicating the scanning direction           *
+*         0 - foward                                                  *
+*         4 - backward                                                *
+*    R1 - points to the character to start searching                  *
+*    R9 - contains the return address                                 *
+*  At output:                                                         *
+*    R1 - points to the next blank character                          *
+*=====================================================================*
+FINDBLNK DS    0H
+         LTR   R0,R0               Foward search ?
+         BZ    GETFWD              Yes, continue
+GETBACK  DS    0H
+         CLI   0(R1),C' '          Blank found
+         BER   R9                  Yes, return
+         BCTR  R1,0                Point at previous character
+         B     GETBACK             Check next char
+*
+GETFWD   DS    0H
+         CLI   0(R1),C' '          Blank found
+         BER   R9                  Yes, return
+         LA    R1,1(R1)            Point at next character
+         B     GETFWD              Check next char
+         EJECT
+* Static constants and areas
+* Message text
+BLANKS   DC    CL20' '
+SRS500I  DC    C'SRS500I SYSOUT Retrieval Services - Release 1.3.0   ' +
+                                                                   V130
+SRS501I  DC    C'SRS501I WTRxx attached'
+SRS502I  DC    C'SRS502I STOP command accepted'
+SRS505I  DC    C'SRS505I WTR'
+SRS510E  DC    C'SRS510E Error: No SYSOUT selection criteria specified'
+SRS520E  DC    C'SRS520E Input parameter invalid: '                V121
+SRS521E  DC    C'SRS521E Invalid value '''                         V121
+SRS525E  DC    C'SRS525E Error in options module xxxxxxxx - '      V121
+SRS525EM EQU   32      Offset to module name                       V121
+SRS525E1 DC    C'LOAD for module failed'                           V121
+SRS525E2 DC    C'Invaid length'                                    V121
+SRS525E3 DC    C'Invalid module identifier'                        V121
+SRS525E4 DC    C'Assembled at different SRS level'                 V121
+SRS530E  DC    C'SRS530E Invalid MODIFY option specified'
+SRS540E  DC    C'SRS540E This release of SRS requires z/OS 1.9 or highe+
+               r'                                                  V130
+*
+*
+ATTPARM  ATTACH SF=L
+ATTPARML EQU   *-ATTPARM
+*
+EXTPARM  EXTRACT 0,FIELDS=COMM,MF=L
+EXTPARML EQU   *-EXTPARM
+*
+OPNPARM  OPEN  0,MF=L
+OPNPARML EQU   *-OPNPARM
+*
+CLSPARM  CLOSE 0,MF=L
+CLSPARML EQU   *-CLSPARM
+*
+WTOP1    WTO   TEXT=(0),MF=L           Standard WTO parm list
+WTOP1L   EQU   *-WTOP1
+WTOP2    WTO   TEXT=(0),CART=,CONSNAME=,MCSFLAG=(RESP),                +
+               MF=L                    WTO parm list for cmdresp
+WTOP2L   EQU   *-WTOP2
+*
+SCNVPARM STCKCONV MF=L
+SCNVPRML EQU   *-SCNVPARM
+EDPAT    DC    X'402020206B2020206B202120'  999,999,999
+         LTORG
+         EJECT
+*
+SRSDWORK DSECT
+SAVE     DS    18F                     Save area
+DOUBWORK DS    D                       Doubleword work area
+FULLWORK DS    D                       Fullword work area          V121
+TBLKFRST DS    F                       Pointer to the first SRSTBLK
+TBLKPLST DS    F                       Pointer to the pointer field in +
+                                       the last SRSTBLK
+XWTRID   DS    H                       NUmber of the next SRSTASK to   +
+                                       attach
+OPTSTAB  DS    CL8                     Name of SRSOPTxx module     V121
+*                                                                  V120
+* Parameters below extracted from user-specified PARM=             V121
+SRSUPGMN DS    CL8             Name of despooling program          V121
+SRSUJOBN DS    CL8             Jobname to select                   V121
+SRSUDEST DS    CL18            Destination to select            @A12101
+SRSUFORM DS    CL8             Forms queue to select               V121
+SRSUJBID DS    CL8             JES2 jobid to select                V121
+SRSUWTRN DS    CL8             Writer name to select               V121
+SRSUSEPI DS    CL8             SEPID selected                      V121
+SRSUDDNM DS    CL8             DDNAME selected                     V121
+SRSUCLAS DS    C               SYSOUT class to select              V121
+SRSUOPTS DS    CL2             Options table suffix                V121
+SRSULIMT DS    CL4             Number of datasets to select        V121
+SRSUWAIT DS    CL3             WAIT option                         V121
+SRSUDISP DS    CL6             Dataset disposition                 V121
+SRSUSTAT DS    CL7             Dataset status                      V121
+SRSUSEPO DS    CL7             Separator Option                    V121
+SRSUPPRM DS    CL80            Parameters passed to despool pgm    V121
+*                                                                  V121
+ECBLIST  DS    0F
+ECBCOMM  DS    F
+ECBPTASK DS    F         SRSTASK ECB
+*
+RESPAREA DS    F
+PARSOPST DS    F         Starting address of operand being parsed  V112
+PARSOPEN DS    F         Ending address of operand being parsed    V112
+*
+         DS    0F                                                  V121
+SRSKEYTB DS    CL(100*SRSKWL)  Keyword table (up to 99 keywords)   V121
+         DS    0F
+WTOBUFF  DS    CL100
+         DS    0F
+WTOPARMB DS    CL(WTOP2L)
+         DS    0S(L'WTOPARMB-WTOP1L)   Insure buffer big enough
+CKCNPRMB DS    CL(SCNVPRML)
+*
+STATUS   DC    BL1'0'    Status bits
+BATCHJ   EQU   X'80'     Driver is running as a batch job
+MSGLIM   EQU   X'40'     Display only important WTO messages
+STOPMOD  EQU   X'20'     Processing STOP/MODIFY command
+STOP     EQU   X'08'     STOP COMMAND HAS BEEN ISSUED
+NOWAIT   EQU   X'04'     Writer is not waiting for datasets
+KEYERR   EQU   X'02'     Invalid value for keyword encountered     V121
+OPSTABL  EQU   X'01'     SRSOPTS module has been loaded            V121
+*
+PARSSTAT DC    BL1'0'       Parse Routine Status bits              V120
+PARSPARN EQU   B'10000000'  Looking for right parenthesis          V120
+*                                                                  V120
+TODCNV   DS    CL16                Converted TOD time
+TODWORK  DS    CL17                EBCDIC STCK time work area
+EDBUF    DS    CL(L'EDPAT)
+SRSDLEN  EQU   *-SRSDWORK
+         EJECT
+*                                                                  V121
+SRSKW    DSECT                                                     V121
+SRSKWLOC DS   F             Location of keyword value              V121
+SRSKWNAM DS   F             Name of keyword                        V121
+SRSKWRTN DS   F             Routine to process kwd (if any)        V121
+SRSKWTBK DS   H             Offset of keyword value in TBLK        V121
+SRSKWDEF DS   H             Offset of defalt val in OPTS table     V121
+SRSKWLOL DS   XL1           Length of the SRSKWLOC area            V121
+SRSKWNAL DS   XL1           Length of the SRSKWNAM area            V121
+SRSKWSIG DS   XL1           Num chars kwd name can be abbrev to    V121
+SRSKWFIL DS   XL1                                                  V121
+SRSKWL   EQU  *-SRSKW       Length of each SRSKW entry             V121
+*
+* MAPPING MACROS
+         SRSTBLK                   MAP SRS Task Data Block
+         SRSOPT  DSECT=YES         MAP SRS Options table           V121
+*        PRINT NOGEN
+         IHAPSA                    MAP PSA
+         IHAASCB                   MAP ASCB
+         CVT   DSECT=YES           MAP CVT
+         IKJTCB
+         IEFJESCT
+         IEFJSSIB
+         IEZJSCB
+CSCB     DSECT
+         IEECHAIN                  MAP CSCB
+         IHAECB
+         IEFZB4D0
+         IEFZB4D2
+         IEZCOM
+CIB      DSECT
+         IEZCIB
+         YREGS
+         END

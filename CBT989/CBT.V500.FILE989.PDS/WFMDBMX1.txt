@@ -1,0 +1,239 @@
+/*                                                                    rexx
+   WFM DB Maintenance
+    - drop duplicate dataset records
+    - drop orphaned member records
+
+   Parm
+     TEST(test options)   DUPDS and/or MBR, or ALL
+     MSGLVL(n)            1 shows more messages
+     TYPRUN(t)            DRY ot UPDATE
+*/
+
+ vtoc.=''
+ vtocn=0
+ pdsn.=''
+ arg p
+ parse var p . 'MSGLVL('$msglvl')' . 0 . 'TYPRUN('$typrun')' .,
+           0 . 'TEST('$test')' .
+ $msglvl  = word($msglvl 0,1)
+ $typrun  = word($typrun 'UPDATE',1)
+ if $test = 'ALL' then $test='DUPDS MBR'   /* ORPH */
+
+ if p<>'' then p='parm' p
+ call xmsg 'Dsn db maintenance started' p
+ say '  Testing ' $test
+ say '  Type run' $typrun
+ say '  Msglvl  ' $msglvl
+ if wordpos($typrun,'UPDATE DRY')=0 then exit xmsg('Invalid typrun',8)
+ if $test='' then exit xmsg('Missing test def',8)
+ do n=1 to words($test)
+   if wordpos(word($test,n),'DUPDS MBR')=0    /* ORPH */
+     then exit xmsg('Invalid test' word($test,n),8)
+ end
+
+ if wordpos('DUPDS',$test)>0 then cc=TestDupDs()
+ drop dbl. dup.
+
+ if wordpos('ORPH',$test)>0 then cc=TestOrphDsn()
+ drop dbl. del.
+
+ if wordpos('MBR',$test)>0 then cc=TestOrphMbr()
+ drop dbl. del.
+
+ say ''
+ exit xmsg('Maintenance done')
+
+XMsg: if arg(1)<>'' then say time() arg(1);return word(arg(2) 0,1)
+XTso: trace off; zz=outtrap(word(arg(2) '$.',1))
+        address tso arg(1);zz=outtrap('off');xtsorc=rc;return rc
+
+/*
+      test for duplicate dsn entries
+*/
+TestDupDs:
+ say ''
+ call xmsg 'Testing for duplicate dataset entries'
+
+ /* db record sample:
+  1       10        20        30        40        50
+  K---+----+-K--+----+----+----+----+----+----+----+
+  701018190145 ZDDIS1 CDS.ACDSHFS PO VB 255 27998 Y
+ */
+ /* reformat as vol dsn key */
+ call LoadDsnDb
+ do n=1 to dbl.0
+   dbl.n = subword(dbl.n,2,2) word(dbl.n,1)
+ end
+ call bpxwunix 'sort', 'dbl.', 'dbl.', 'STDERR.'
+
+ /* check for duplicates */
+ call xmsg 'Check for duplicates..'
+ dupn=0
+ do n=2 to dbl.0
+   m=n-1
+   if subword(dbl.n,1,2)<>subword(dbl.m,1,2) then iterate
+   dupn=dupn+1
+   say '       ' word(dbl.m,3) subword(dbl.m,1,2)
+   say ' dup of' word(dbl.n,3) subword(dbl.n,1,2)
+   dup.dupn=word(dbl.m,3)      /* drop the older dup by key */
+ end
+ call xmsg 'Duplicates found: 'dupn
+ if dupn=0 then return 0
+ dup.0=dupn
+
+ /* dry run */
+ if $typrun='DRY' | $msglvl>0 then do
+   call xmsg 'Update records generated..'
+   do n=1 to dup.0
+     say '  'dup.n
+   end
+   if $typrun='DRY' then return 0
+ end
+
+ /* Delete from dsndb */
+ ddel.0=0
+ call xmsg 'Delete from dsndb'
+ cc=RxVsamBa('del dd(dsndb) keystem(dup.) list(dell.)')
+ if cc<>0 then exit xmsg('Delete failed rc' cc rxvberrm,8)
+ call xmsg 'Records deleted:' rxvbdele+0,
+       ||  ', records remaining in db:' rxvbread-rxvbdele
+ if $msglvl>1 then do n=1 to ddel.0
+   say '   'ddel.n
+ end
+
+ /* Delete from mbrdb */
+ ddel.0=0
+ call xmsg 'Delete from mbrdb'
+ cc=RxVsamBa('del dd(mbrdb) textstem(dup.) POS(9) ENDPOS(20) list(ddel.)')
+ if cc<>0 then exit xmsg('Delete failed rc' cc rxvberrm,8)
+ call xmsg 'Records deleted:' rxvbdele+0,
+       ||  ', records remaining in db:' rxvbread-rxvbdele
+ if $msglvl>1 then do n=1 to ddel.0
+   say '   'ddel.n
+ end
+ return 0
+
+/*
+      test for missing physical datasets
+*/
+TestOrphDsn:
+ say ''
+ call xmsg 'Testing for orphaned dataset entries'
+
+ /* db record sample:
+  1       10        20        30        40        50
+  K---+----+-K--+----+----+----+----+----+----+----+
+  701018190145 ZDDIS1 CDS.ACDSHFS PO VB 255 27998 Y
+ */
+ call LoadDsnDb
+
+ /* do over list  */
+ deln=0
+ do dbn=1 to dbl.0
+   parse var dbl.dbn key vol dsn .
+   if vtoc.vol='' then Call VTOClist
+   if pdsn.vol.dsn='X' then iterate
+   deln=deln+1
+   del.deln=vol''dsn
+   say '  orphan:' dsn 'on' vol
+ end
+ call xmsg dbn-1 'datasets tested on' vtocn' disks, orphans:' deln
+
+ /* dry run */
+ if $typrun='DRY' then do
+   call xmsg 'Delete records generated..'
+   do n=1 to deln
+     say '  'del.n
+   end
+   return 0
+ end
+
+ /* Do delete  */
+ "execio" deln "diskw updlist (stem del. finis)"
+ cc=WfmDbdX1()
+ if cc<>0 then exit xmsg('Delete failed rc' cc,8)
+ return 0
+
+/*
+      test for orphaned member records
+*/
+TestOrphMbr:
+ say ''
+ call xmsg 'Testing for orphaned member entries'
+ call xmsg 'Offloading data'
+ cc=XTSO('repro infile(mbrdb) outfile(unload)')
+ if cc<>0 then exit xmsg('Offload mbrdb rc' cc $.1,8)
+ call xmsg 'records offloaded:' word($.1,7)
+
+ /* make dsndb key list */
+ call LoadDsnDb
+ keyl.=0
+ do n=1 to dbl.0
+   parse var dbl.n k .
+   keyl.k=1
+ end
+
+ /* read mbr offload, check keys */
+ call xmsg 'Processing offloaded member records'
+ deln=0
+ inpn=0
+ do forever
+   "Execio 10000 diskr unload (stem ul.)"
+   if ul.0=0 then leave
+   inpn=inpn+ul.0
+   if $msglvl>1 then,
+     call xmsg 'read' inpn 'records so far, orphans so far:' deln
+   do uln=1 to ul.0
+     k=substr(ul.uln,9,12)
+     if keyl.k then iterate /* already used */
+     deln=deln+1
+     say '  orphaned mbr:' ul.uln
+     del.deln=left(ul.uln,20)
+   end
+ end
+ "Execio 0 diskr unload (finis)"
+ del.0=deln
+ call xmsg  'Orphaned member records found:' del.0
+ if del.0=0 then return 0
+
+ /* dry run */
+ if $typrun='DRY' | $msglvl>0 then do
+   call xmsg 'Update records generated..'
+   do n=1 to del.0
+     say '  'del.n
+   end
+   if $typrun='DRY' then return 0
+ end
+
+ /* Do delete  */
+ rxvberrm=''
+ cc=RxVsamBa('del dd(mbrdb) keystem(del.)')
+ if cc<>0 then exit xmsg('Delete failed rc' cc rxvberrm,8)
+ call xmsg 'Records deleted:' rxvbdele+0
+ return 0
+
+ /* subroutine - build vtoc list */
+VTOClist:
+trace off
+ if $msglvl>0 then,
+   call xmsg 'Build disk info for' vol
+ cc=XTSO("VTOC" vol "LIMIT(DSO EQ PO) OR1(DSO EQ PE)",
+         "NOHEADING PRINT(NEW (DSNAME VOLUME))")
+ if rc<>0 then exit xmsg('VTOC' vol 'rc' rc,8)
+ if $msglvl>0 then,
+   say '         Libraries found' $.0 -1
+ vtoc.vol='X'         /* remember done */
+ vtocn=vtocn+1
+ do n=1 to $.0 -1
+   parse var $.n vdsn vvol .
+   pdsn.vvol.vdsn='X'  /* exists */
+ end
+ return 0
+
+LoadDsnDb:
+ cc=RxVsamBa('get dd(dsndb) stem(dbl.)')
+ if cc<>0 then exit xmsg('Read dsn db rc' cc,8)
+ call xmsg 'Records read from dsndb:' 0+dbl.0
+ return 0
+
+LowCase: return translate(arg(1),xrange('a','z'),xrange('A','Z'))

@@ -1,0 +1,1225 @@
+/* REXX */
+/*
+
+Description:
+       Resize (reallocate) an existing PS, PO, POE, VSAM
+       cluster or VSAM alternate index.
+
+Function:
+       Reallocate space for existing data set. Also can
+       convert PDS to PDSE and vice versa, update record
+       format, record length, block size, expiration date.
+       For VSAM cluster as well as VSAM alternate index
+       max lrecl, average lrecl, %free CI, %free CA and
+       expiration date may be changed.
+
+Syntax:
+       RESIZE dsname
+
+Returns:
+       0 - resize done
+       4 - resize done, warning issued
+       other - resize failed
+
+Note:
+       This code contains inline ISPF elements (panels, skels)
+
+(C) 2006-2018 Gregori Bliznets gbliznets@iba.by
+
+*/
+trace off
+parse arg parms
+address ISPEXEC
+dataid = ''
+rc = LoadISPF()
+parse upper var parms fromdsn .
+zerralrm = 'YES'
+zerrhm = '*'
+zerrsm = ''
+zerrlm = ''
+'VPUT (ZERRSM,ZERRLM,ZERRALRM,ZERRHM) SHARED'
+if fromdsn = ""
+then do
+  zerrsm = 'Dataset name is missed'
+  zerrlm = 'Dataset name is missed'
+  'SETMSG MSG(ISRZ002)'
+  exit 8
+  end
+if left(fromdsn,1) = "'" & right(fromdsn,1) = "'"
+then parse var fromdsn "'" fromdsn "'"
+rc = LISTDSI("'"fromdsn"' DIRECTORY SMSINFO")
+todsn = ''
+dsn = fromdsn
+do while dsn <> ''
+  parse var dsn q '.' dsn
+  if length(todsn) + length(q) + 16 > 44
+  then leave
+  todsn = todsn''q'.'
+end
+cc = 0
+yyyy = left(date('S'), 4)
+ddd = right(date('D'), 3, '0')
+ssssss = right(time('S'), 6, '0')
+todsn = todsn'D'yyyy''ddd'.T'ssssss
+alloc = sysalloc
+used = sysused
+units = sysunits
+dsorg = sysdsorg
+recfm = sysrecfm
+lrecl = syslrecl
+expdt = sysexdate
+blksize = sysblksize
+primary = sysprimary
+seconds = sysseconds
+extents = sysextents
+adirblk = sysadirblk
+udirblk = sysudirblk
+credt = syscreate
+dssms = sysdssms
+aextents = sysextents
+uextents = sysusedextents
+mgmtclas = sysmgmtclass
+dataclas = sysdataclass
+storclas = sysstorclass
+volume = sysvolume
+device = sysunit
+recorg = ''
+select
+when sysreason = 0
+then object = 'NVSAM'
+when sysreason = 30
+then do
+  zerrsm = 'Non-SMS data set'
+  zerrlm = 'Data set 'fromdsn' not SMS-managed,',
+           'LISTDSI reason code 'sysreason
+  'SETMSG MSG(ISRZ002)'
+  exit 8
+  end
+when sysreason = 12
+then do
+  call outtrap 'AMS.'
+  address TSO "LISTCAT ENTRIES('"fromdsn"') ALL"
+  call outtrap 'OFF'
+  parse var ams.1 w1 w2 .
+  if rc <> 0
+  then do
+    zerrsm = 'Unsupported'
+    zerrlm = 'Resize of the data set 'fromdsn' not supported,',
+             'LISTCAT return code 'rc
+    'SETMSG MSG(ISRZ002)'
+    exit 8
+    end
+  if w1 = 'PATH'
+  then do
+    zerrsm = 'Wrong target'
+    zerrlm = 'Path 'fromdsn' cannot be resized: it has no space behind'
+    'SETMSG MSG(ISRZ002)'
+    exit 8
+    end
+
+  /* Device constants: z/OS supports 3380, 3390, 9345 only */
+  devtypes.1  = '3390 0F 15 56664'
+  devtypes.2  = '3380 0E 15 47476'
+  devtypes.3  = '3330 0D 19 13030' /* 3330-11, 3333-11 */
+  devtypes.4  = '3375 0C 12 35616'
+  devtypes.5  = '3350 0B 30 19069'
+  devtypes.6  = '3340 0A 12  8368'
+  devtypes.7  = '3330 09 19 13030' /* 3390-1, 3390-2, 3333 */
+  devtypes.8  = '2314 08 20  7294'
+  devtypes.9  = '2305 07  8 14136' /* 2305-2 */
+  devtypes.10 = '2305 06  8 14136' /* 2305-1 */
+  devtypes.11 = '2301 05  8 14136'
+  devtypes.12 = '9345 04 15 46456'
+  devtypes.13 = '2311 01 10  3625'
+  devtypes.0 = 13
+
+  object = w1
+  dname = ''
+  iname = ''
+  dtracks = 0
+  itracks = 0
+  dunits = ''
+  iunits = ''
+  quote = "'"
+  storclas = ''
+  mgmtclas = ''
+  dataclas = ''
+  iprimary = ''
+  dprimary = ''
+  iseconds = ''
+  dseconds = ''
+  ivolume = ''
+  dvolume = ''
+  ifreeci = ''
+  dfreeci = ''
+  ifreeca = ''
+  dfreeca = ''
+  do i = 1 to ams.0
+    parse var ams.i w1 w2 w3 w4 w5 w6 w7 w8 .
+    select
+    when w1 = 'DATA' & w2 = '-------'
+    then dname = w3
+    when w1 = 'INDEX' & w2 = '------'
+    then iname = w3
+    when left(w1,8) = 'KEYLEN--' & iname = ''
+    then do
+      keylen = word(translate(w1,' ','-'),2)
+      avglrecl = word(translate(w2,' ','-'),2)
+      end
+    when left(w1,5) = 'RKP--' & iname = ''
+    then do
+      rkp = word(translate(w1,' ','-'),2)
+      maxlrecl = word(translate(w2,' ','-'),2)
+      end
+    when left(w1,8) = 'SHROPTNS' & iname = ''
+    then do
+      parse var w1 . '(' shropt ')' .
+      amorg = w5
+      k = wordpos(amorg, 'INDEXED NONINDEXED NUMBERED LINEAR')
+      recorg = word('KS ES RR LS', k)
+      k = i+1
+      parse var ams.k w10 w11 .
+      if object = 'CLUSTER'
+      then amattr = attr(w4) attr(w6) attr(w8) attr(w10)
+      /* ¢NO!ERASE ¢NO!WRITECHK ¢NO!REUSE */
+      if object = 'AIX'
+      then amattr = attr(w4) attr(w6) attr(w8) attr(w11)
+      /* ¢NO!ERASE ¢NO!WRITECHK ¢NON!UNIQKEY */
+      if object = 'PAGESPACE'
+      then amattr = ''
+      end
+    when left(w2,8) = 'CREATION'
+    then do
+      yyyyddd = translate(right(w2,8),'/','.')
+      select
+      when iname = '' & dname = ''
+      then credt = yyyyddd
+      when dname <> '' & iname = ''
+      then dcredt = yyyyddd
+      when iname <> '' & dname <> ''
+      then icredt = yyyyddd
+      end
+      end
+    when left(w2,10) = 'EXPIRATION'
+    then do
+      yyyyddd = translate(right(w2,8),'/','.')
+      if yyyyddd = '0000/000'
+      then yyyyddd = ''
+      select
+      when iname = '' & dname = ''
+      then expdt = yyyyddd
+      when dname <> '' & iname = ''
+      then dexpdt = yyyyddd
+      when dname <> '' & iname <> ''
+      then iexpdt = yyyyddd
+      end
+      end
+    when w1 = 'STORAGECLASS '
+    then do
+      storclas = strip(translate(w2,' ','-'))
+      mgmtclas = word(translate(w3,' ','-'),2)
+      if storclas = '(NULL)'
+      then storclas = ''
+      if mgmtclas = '(NULL)'
+      then mgmtclas = ''
+      end
+    when w1 = 'DATACLASS '
+    then do
+      dataclas = strip(translate(w2,' ','-'))
+      if dataclas = '(NULL)'
+      then dataclas = ''
+      end
+    when left(w1,12) = 'SPACE-TYPE--'
+    then do
+      if iname <> ''
+      then iunits = word(translate(w1,' ','-'),3)
+      else dunits = word(translate(w1,' ','-'),3)
+      end
+    when left(w1,11) = 'SPACE-PRI--'
+    then do
+      if iname <> ''
+      then iprimary = word(translate(w1,' ','-'),3)
+      else dprimary = word(translate(w1,' ','-'),3)
+      end
+    when left(w1,11) = 'SPACE-SEC--'
+    then do
+      if iname <> ''
+      then iseconds = word(translate(w1,' ','-'),3)
+      else dseconds = word(translate(w1,' ','-'),3)
+      end
+    when left(w1,13) = 'LOW-CCHH-----'
+    then do
+      parse var ams.i . (quote) +1 lowcc +4 lowhh (quote) .
+      k = i+1
+      parse var ams.k . (quote) +1 highcc +4 highhh (quote) .
+      tracks = (x2d(highcc)-x2d(lowcc))*trkpercyl+(x2d(highhh)-x2d(lowhh))+1
+      if iname <> ''
+      then itracks = itracks+tracks
+      else dtracks = dtracks+tracks
+      end
+    when left(w1,18) = 'VOLSER------------'
+    then do
+      if iname <> ''
+      then ivolume = word(translate(w1,' ','-'),2)
+      else dvolume = word(translate(w1,' ','-'),2)
+      end
+    when left(w1,13) = 'DEVTYPE------'
+    then do
+      parse var ams.i . (quote) +1 ucbtyp (quote) .
+      parse var ucbtyp ucbtbyt1 +1 ucbtbyt2 +1 ucbtbyt3 +1 ucbtbyt4 +1
+      found = 0
+      do k = 1 to devtypes.0
+        parse var devtypes.k name type trkpercyl bytepertrk
+        if '20'type == ucbtbyt3''ucbtbyt4
+        then do
+          found = 1
+          leave k
+          end
+      end k
+      if found = 0 /* assume 3390 when not found */
+      then parse var devtypes.1 name type trkpercyl bytepertrk
+      if iname <> ''
+      then idevice = name
+      else ddevice = name
+      end
+    when left(w1,13) = 'REC-INSERTED-'
+    then do
+      freeci = word(translate(w2,' ','-'),3)
+      if iname <> ''
+      then ifreeci = freeci
+      else dfreeci = freeci
+      end
+    when left(w1,13) = 'REC-UPDATED--'
+    then do
+      freeca = word(translate(w2,' ','-'),3)
+      if iname <> ''
+      then ifreeca = freeca
+      else dfreeca = freeca
+      end
+    when object = 'AIX' & left(w1,9) = 'CLUSTER--'
+    then relate = word(translate(w1,' ','-'),2)
+    when object = 'AIX' & left(w1,7) = 'UPGRADE'
+    then upgrade = w1
+    when object = 'AIX' & left(w1,7) = 'NOUPGRADE'
+    then upgrade = w1
+    when object = 'AIX' & left(w1,7) = 'AXRKP--'
+    then axrkp = word(translate(w1,' ','-'),2)
+    otherwise nop
+    end
+  end i
+  end
+otherwise
+  zerrsm = 'Unsupported'
+  zerrlm = 'Resize of the data set 'fromdsn' not supported,',
+           'LISTDSI reason code 'sysreason
+  'SETMSG MSG(ISRZ002)'
+  exit 8
+end
+if credt <> ''
+then credt = yyyymmdd(credt)
+select
+when wordpos(sysdssms, 'PDSE LIBRARY PROGRAM_LIBRARY DATA_LIBRARY') > 0
+then sysdsntype = 'LIBRARY'
+when dsorg = 'PO'
+then sysdsntype = 'PDS'
+when dsorg = 'PS' & sysseqdsntype <> ''
+then sysdsntype = sysseqdsntype
+otherwise
+  sysdsntype = ''
+end
+aunits = 'tracks'
+uunits = 'tracks'
+select
+when sysdsntype = 'LIBRARY'
+then do /* PDSE */
+  adirblk = ''
+  udirblk = ''
+  aunits = 'pages'
+  uunits = 'pages'
+  atracks = sysallocpages
+  utracks = sysusedpages
+  end
+when sysunits = 'CYLINDER'
+then do
+  atracks = systrkscyl * sysalloc
+  utracks = systrkscyl * sysused
+  end
+when sysunits = 'TRACK'
+then do
+  atracks = sysalloc
+  utracks = sysused
+  end
+when sysunits = 'BLOCK'
+then do
+  atracks = sysalloc * sysblksize / sysblkstrk
+  utracks = sysused * sysblksize / sysblkstrk
+  end
+otherwise
+  atracks = ''
+  utracks = ''
+end
+if (expdt <> '') & (expdt <> 0)
+then expdt = yyyymmdd(expdt)
+else expdt = ''
+sysexpdt = expdt
+dirblk = adirblk
+dsntype = sysdsntype
+/* the following code would automatically resize PO to POE
+if sysdsorg = 'PO' & sysdsntype = 'PDS'
+then dsntype = 'LIBRARY'
+*/
+zwinttl = 'Resize Facility'
+do forever
+  'ADDPOP ROW(6) COLUMN(6)'
+  /* create list of changeable screen variables */
+  select
+  when dsorg = 'VS' & recorg = 'KS'
+  then vars = 'avglrecl maxlrecl dataclas mgmtclas storclas dunits dprimary' ,
+              'dseconds dvolume ddevice iunits iprimary iseconds ivolume' ,
+              'idevice dfreeci dfreeca ifreeci ifreeca'
+  when dsorg = 'VS'
+  then vars = 'avglrecl maxlrecl dataclas mgmtclas storclas dunits dprimary' ,
+              'dseconds dvolume ddevice dfreeci dfreeca'
+  otherwise
+    vars = 'units recfm lrecl blksize primary seconds dataclas mgmtclas' ,
+           'storclas expdt dsntype volume device dirblk'
+  end
+  /* store values of the changeable screen variables */
+  drop var.
+  do i = 1 to words(vars)
+    var.i = value(translate(word(vars, i)))
+  end i
+  panel = 'PANEL'dsorg
+  if recorg = 'KS'
+  then panel = 'PANEL'recorg
+  'DISPLAY PANEL('panel')'
+  cc = rc
+  'REMPOP ALL'
+  if cc > 0
+  then leave
+  drop new.
+  found = 0
+  do i = 1 to words(vars)
+    if value(word(vars, i)) <> var.i
+    then found = 1
+  end i
+  if found = 0
+  then do
+    zerrsm = 'Nothing to do'
+    zerrlm = 'Nothing was changed, data set remains unchanged'
+    'SETMSG MSG(ISRZ002)'
+    iterate
+    end
+  if dsorg <> 'VS'
+  then minlrecl = min(syslrecl,lrecl)
+  if (expdt <> getvar('expdt')) & (expdt <> '')
+  then expdt = yyyyddd(expdt)
+  if keep = 'N'
+  then do
+    'ADDPOP ROW(6) COLUMN(6)'
+    'DISPLAY PANEL(CONFIRM)'
+    cc = rc
+    'REMPOP ALL'
+    if cc <> 0
+    then iterate
+    end
+  if submit = 'Y' | submit = 'E'
+  then do
+    'VPUT (MINLRECL)'
+    'VGET (ZTEMPF ZTEMPN BJC1 BJC2 BJC3 BJC4)'
+    'FTOPEN TEMP'
+    'FTINCL SKEL'dsorg
+    'FTCLOSE'
+    if submit = 'S'
+    then do
+      rc = TSO("SUBMIT '"ztempf"'")
+      zerrsm = 'Submitted'
+      zerrlm = 'Job to resize data set 'fromdsn' successfully submited'
+      'SETMSG MSG(ISRZ002)'
+      end
+    else "EDIT DATASET('"ztempf"')"
+    iterate
+    end
+
+  select
+  when object = 'NVSAM'
+  then do
+    /* construct TSO ALLOCATE statement */
+    stmt = "ALLOCATE FI(UT2) DA('"todsn"') NEW CATALOG REUSE"
+    stmt = stmt' UNIT('device') 'units' SPACE('primary' 'seconds')'
+    if volume <> getvar('volume')
+    then stmt = stmt' VOLUME('volume')'
+    if mgmtclas <> getvar('mgmtclas')
+    then stmt = stmt' MGMTCLAS('mgmtclas')'
+    if dataclas <> getvar('dataclas')
+    then stmt = stmt' DATACLAS('dataclas')'
+    if storclas <> getvar('storclas')
+    then stmt = stmt' STORCLAS('storclas')'
+    select
+    when dsntype = 'PDS'
+    then stmt = stmt' DSORG(PO) DIR('dirblk')'
+    when dsntype = 'LIBRARY'
+    then stmt = stmt' DSORG(PO) DSNTYPE(LIBRARY)'
+    when dsorg = 'PS' & dsntype <> getvar('dsntype')
+    then stmt = stmt' DSORG(PS) DSNTYPE('dsntype')'
+    otherwise
+      stmt = stmt' DSORG('dsorg')'
+    end
+    stmt = stmt' LRECL('lrecl') BLKSIZE('blksize') RECFM('
+    do i = 1 to length(recfm)
+      stmt = stmt''substr(recfm,i,1)' '
+    end i
+    stmt = stmt')'
+    if units = 'BLOCK'
+    then stmt = stmt' BLOCK('blksize')'
+    else stmt = stmt' 'units
+    if expdt <> ''
+    then stmt = stmt' EXPDT('expdt')'
+    end
+  when object = 'CLUSTER'
+  then do
+    /* construct AMS DEFINE CLUSTER statement */
+    stmt = " DEFINE CLUSTER( NAME('"todsn"') "amorg
+    stmt = stmt' 'amattr
+    if expdt <> ''
+    then stmt = stmt' TO('expdt')'
+    if amorg = 'INDEXED'
+    then stmt = stmt' KEYS('keylen' 'rkp')'
+    if amorg <> 'LINEAR'
+    then stmt = stmt' RECORDSIZE('avglrecl' 'maxlrecl')'
+    if sms <> 'NO'
+    then do
+      if storclas <> ''
+      then stmt = stmt' STORAGECLASS('storclas')'
+      if mgmtclas <> ''
+      then stmt = stmt' MANAGEMENTCLASS('mgmtclas')'
+      if dataclas <> ''
+      then stmt = stmt' DATACLASS('dataclas')'
+      end
+    stmt = stmt' SHAREOPTIONS('shropt')'
+    stmt = stmt' )'
+    stmt = stmt" DATA (NAME('"todsn".D') "dunits"S("dprimary" "dseconds")"
+    if dfreeci+dfreeca <> 0
+    then stmt = stmt'  FREESPACE('dfreeci' 'dfreeca')'
+    if sms <> 'ONLY'
+    then stmt = stmt' VOLUMES('strip(dvolume)')'
+    stmt = stmt' )'
+    if amorg = 'INDEXED'
+    then do
+      stmt = stmt" INDEX (NAME('"todsn".I') "iunits"S("iprimary" "iseconds")"
+      if ifreeci+ifreeca <> 0
+      then stmt = stmt'  FREESPACE('ifreeci' 'ifreeca')'
+      if sms <> 'ONLY'
+      then stmt = stmt' VOLUMES('strip(ivolume)')'
+      stmt = stmt' )'
+      end
+    end
+  when object = 'AIX'
+  then do
+    /* construct DEFINE AIX statement */
+    stmt = " DEFINE AIX( NAME('"todsn"')"
+    stmt = stmt' RELATE('relate') 'upgrade
+    stmt = stmt' 'amattr
+    stmt = stmt' KEYS('keylen' 'axrkp')'
+    stmt = stmt' RECORDSIZE('avglrecl' 'maxlrecl')'
+    if freeci+freeca <> 0
+    then stmt = stmt' FREESPACE('freeci' 'freeca')'
+    stmt = stmt' SHAREOPTIONS('shropt') )'
+    stmt = stmt" DATA (NAME('"dname"') "dunits"S("dprimary" "dseconds")"
+    if sms <> 'ONLY'
+    then stmt = stmt' VOLUMES('strip(ivolume)')'
+    stmt = stmt' )'
+    stmt = stmt" INDEX (NAME('"iname"') "iunits"S("iprimary" "iseconds")"
+    if sms <> 'ONLY'
+    then stmt = stmt' VOLUMES('strip(ivolume)')'
+    stmt = stmt' )'
+    end
+  otherwise nop
+  end
+  /* create new object */
+  rc = TSO(stmt)
+  if rc <> 0
+  then do
+    zerrsm = word(stmt, 1)' failed 'rc
+    zerrlm = tso.1
+    'SETMSG MSG(ISRZ002)'
+    iterate
+    end
+
+  if keep = 'Y'
+  then do /* Data must be kept, copy data with proper utility */
+    Z = copies('00'x,8)
+    DDLIST = Z''Z''Z''Z'UTI     UTO     'Z'UT1     UT2     '
+    PARM = ''
+    if object = 'CLUSTER'
+    then rc = TSO("ALLOCATE FI(UT2) DA('"todsn"') SHR")
+    rc = TSO("ALLOC FI(UT1) DA('"fromdsn"') SHR")
+    rc = TSO("ALLOC FI(UTO) REU RECFM(F) LRECL(121) SPACE(1,1) TRACK")
+    rc = TSO("ALLOC FI(UTI) NEW TRACKS SPACE(1) UNIT(SYSDA) LRECL(80)",
+             "BLKSIZE(0) RECFM(F B) REU")
+    select
+    when dsorg = 'PO'
+    then do
+      uti.1 = ' COPY INDD=UT1,OUTDD=UT2'
+      uti.0 = 1
+      utp = 'IEBCOPY'
+      cc = rc
+      end
+    when dsorg = 'PS'
+    then do
+      u = 0
+      u = u+1; uti.u = ' GENERATE MAXFLDS=1 '
+      if lrecl <> minlrecl
+      then do
+        u = u+1; uti.u = ' RECORD FIELD=('minlrecl') '
+        end
+      uti.0 = u
+      utp = 'IEBGENER'
+      end
+    when object = 'AIX'
+    then do /* Just rebuild it rather than copy */
+      uti.1 = " BLDINDEX INDATASET('"relate"') - "
+      uti.2 = " OUTDATASET('"fromdsn"') "
+      uti.0 = 2
+      utp = 'IDCAMS'
+      end
+    when dsorg = 'VS'
+    then do
+      uti.1 = ' REPRO INFILE(UT1) OUTFILE(UT2) '
+      uti.0 = 1
+      utp = 'IDCAMS'
+      end
+    otherwise nop
+    end
+    rc = TSO('EXECIO 'uti.0' DISKW UTI (STEM UTI. FINIS')
+    address LINKMVS utp' PARM DDLIST'
+    cc = rc
+    if cc <> 0
+    then do
+      rc = TSO("EXECIO * DISKR UTO (STEM UTO. FINIS")
+      zerrsm = utp" rc "cc
+      zerrlm = ''
+      do i = 1 to uto.0
+        if left(word(uto.i,1),3) = 'IEB' | left(word(uto.i,1),3) = 'IDC'
+        then zerrlm = zerrlm" "uto.i
+      end i
+      'SETMSG MSG(ISRZ002)'
+      rc = TSO('FREE FI(UTI UTO UT1 UT2)')
+      rc = TSO("DELETE '"todsn"' PURGE")
+      iterate
+      end
+    rc = TSO('FREE FI(UTI UTO UT1 UT2)')
+    end
+
+  if object = 'AIX'
+  then do /* We've resized original object */
+    zerrsm = 'Resized'
+    zerrlm = 'Alternate index 'fromdsn' successfully rebuilt'
+    'SETMSG MSG(ISRZ002)'
+    iterate
+    end
+
+  /* Delete original data set */
+  rc = TSO("DELETE '"fromdsn"' PURGE")
+  if rc <> 0
+  then do
+    zerrsm = 'Delete failed 'rc
+    zerrlm = tso.1
+    'SETMSG MSG(ISRZ002)'
+    iterate
+    end
+  /* Rename target data set to original name */
+  if dsorg = 'VS'
+  then do
+    rc = TSO(" ALTER '"todsn"' NEWNAME('"fromdsn"')")
+    if rc = 0
+    then rc = TSO(" ALTER '"todsn".D' NEWNAME('"dname"')")
+    if rc = 0 & amorg = 'INDEXED'
+    then rc = TSO(" ALTER '"todsn".I' NEWNAME('"iname"')")
+    end
+  else rc = TSO("RENAME '"todsn"' '"fromdsn"'")
+  if rc <> 0
+  then do
+    zerrsm = 'Rename failed 'cc
+    zerrlm = tso.1
+    'SETMSG MSG(ISRZ002)'
+    iterate
+    end
+  zerrsm = 'Resized'
+  zerrlm = 'Data set 'fromdsn' successfully resized'
+  'SETMSG MSG(ISRZ002)'
+end
+
+quit:
+  rc = QuitISPF()
+  exit
+
+getvar:
+  parse arg var
+  p = wordpos(var, vars)
+  return var.p
+
+yyyymmdd: procedure /* convert date from yyyy/ddd to yyyy/mm/dd */
+  parse arg yyyy '/' ddd
+  dm = dpm(yyyy)
+  d = 0
+  do i = 1 by 1 until d > ddd
+    d = d + word(dm,i)
+  end i
+  return yyyy'/'right(i,2,0)'/'right(ddd-d+word(dm,i),2,0)
+
+yyyyddd: procedure /* convert date from yyyy/mm/dd to yyyy/ddd */
+  parse arg yyyy '/' mm '/' dd
+  dm = dpm(yyyy)
+  d = 0
+  do i = 1 to mm-1
+    d = d + word(dm,i)
+  end i
+  return yyyy'/'right(d+dd,3,'0')
+
+dpm: /* returns days-per-month for given year yyyy */
+  parse arg yyyy
+  if ((yyyy//4=0 & yyyy//100<>0) | yyyy//400=0)
+  then return '31 29 31 30 31 30 31 31 30 31 30 31'
+  else return '31 28 31 30 31 30 31 31 30 31 30 31'
+
+attr:
+  w = arg(1)
+  p = wordpos(w, 'NOWRITECHK WRITECHK NONUNIQKEY UNIQKEY')
+  if p > 0
+  then w = word('NOWRITECHECK WRITECHECK NONUNIQUEKEY UNIQUEKEY', p)
+  return w
+
+tso: /* run TSO command */
+  parse arg cmd
+  call outtrap 'tso.'
+  address TSO cmd
+  call outtrap 'OFF'
+  return rc
+
+LoadISPF: /* load ISPF elements that are inline in the REXX source code */
+  'CONTROL ERRORS RETURN'
+  rc = TSO('FREE FI($$ISPF$$)')
+  rc = TSO('ALLOC FI($$ISPF$$) UNIT(VIO) SPACE(5,5) DIR(5)',
+               'LRECL(80) RECFM(F B) BLKSIZE(32000)')
+  'LMINIT DATAID(DATAID) DDNAME($$ISPF$$)'
+  'LMOPEN DATAID('dataid') OPTION(OUTPUT)'
+  keys = 'START PANEL MSG SKEL END'
+  drop data.
+  data.0 = 0
+  found = 0
+  do i = sourceline() to 1 by -1
+    s = sourceline(i)
+    parse upper var s 1 ?? +2 keyword name .
+    select
+    when ?? = './'
+    then do
+      n = wordpos(keyword, keys)
+      select
+      when n = 0
+      then signal quit /* unknown marker */
+      when n = 1
+      then leave i /* top marker */
+      when n = words(keys)
+      then found = 1 /* bottom marker */
+      otherwise /* marker found */
+        if name = ''
+        then signal quit /* Name is missed */
+        if data.0 = 0
+        then iterate i /* empty element */
+        do n = data.0 to 1 by -1
+          s = data.n
+          'LMPUT DATAID('dataid') MODE(INVAR) DATALOC(S) DATALEN(80)'
+        end n
+        'LMMADD DATAID('dataid') MEMBER('name')'
+        drop data.
+        data.0 = 0
+      end
+      end
+    when found = 0
+    then iterate i
+    otherwise /* data element */
+      n = data.0+1
+      data.n = s
+      data.0 = n
+    end
+  end i
+  'LMCLOSE DATAID('dataid')'
+  'LMFREE DATAID('dataid')'
+  dataid = ''
+  'LIBDEF ISPPLIB LIBRARY ID($$ISPF$$) STACK'
+  'LIBDEF ISPMLIB LIBRARY ID($$ISPF$$) STACK'
+  'LIBDEF ISPSLIB LIBRARY ID($$ISPF$$) STACK'
+  return 0
+
+QuitISPF:
+  'CONTROL ERRORS RETURN'
+  if dataid <> ''
+  then do
+    'LMCLOSE DATAID('dataid')'
+    'LMFREE DATAID('dataid')'
+     end
+  'LIBDEF ISPPLIB'
+  'LIBDEF ISPMLIB'
+  'LIBDEF ISPSLIB'
+  rc = TSO('FREE FI($$ISPF$$)')
+  return 0
+
+/* inline ISPF elements follows
+./START
+./PANEL PANELPS
+)ATTR DEFAULT(%+_)
+% TYPE(TEXT) INTENS(HIGH) SKIP(ON)
++ TYPE(TEXT) INTENS(LOW) SKIP(ON)
+$ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) COLOR(YELLOW)
+# TYPE(OUTPUT) INTENS(LOW) CAPS(OFF) JUST(LEFT)
+@ TYPE(OUTPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT)
+_ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) PAD('_')
+¦ AREA(SCRL  ) EXTEND(OFF )
+)BODY WINDOW(64,16) EXPAND(<<) ASIS
+%COMMAND ===> $ZCMD                                         +
+@FROMDSN                                       +
+¦PARMS                                                         ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+)AREA PARMS
++Keep data  . . . . .$Z+       Submit job . . . . .$Z+
++
++Organization . . . .#DSORG +  Creation date  . . .#CREDT      +
++Record format  . . .$RECFM +  Space units  . . . .$Z          +
++Record length  . . .$LRECL+   Primary quantity . .$Z     +
++Block size . . . . .$Z    +   Secondary quantity .$Z     +
++Data set name type .$Z       +
++Management class . .$Z       +Volume serial  . . .$Z     +
++Storage class  . . .$Z       +Device type  . . . .$Z     +
++Data class . . . . .$Z       +Expiration date  . .$EXPDT      +
++
++Current Allocation            Current Utilization
++Allocated#Z    + . .#Z    +   Used#Z     + . . . .#Z   +
++Allocated extents  .#Z    +   Used extents . . . .#Z   +
+)INIT
+ .ZVARS  = '(KEEP SUBMIT UNITS PRIMARY BLKSIZE SECONDS DSNTYPE +
+             MGMTCLAS VOLUME STORCLAS DEVICE DATACLAS AUNITS ATRACKS +
+             UUNITS UTRACKS AEXTENTS UEXTENTS)'
+ .CURSOR = ZCMD
+ &KEEP = 'Y'
+ &SUBMIT = 'N'
+)REINIT
+)PROC
+ VER (&KEEP,NB,LIST,Y,N)
+ VER (&SUBMIT,NB,LIST,Y,N,E)
+ VER (&FROMDSN,NB,DSNAME)
+ VER (&DSNTYPE,NB,LIST,BASIC,LARGE,EXTENDED)
+ VER (&PRIMARY,NB,NUM)
+ VER (&SECONDS,NB,NUM)
+ VER (&LRECL,NB,NUM)
+ VER (&UNITS,NB,LIST,TRACK,TRACKS,CYLINDER,BLOCK,BLOCKS)
+ VER (&BLKSIZE,NB,NUM)
+ VER (&RECFM,NB)
+ VER (&EXPDT,STDDATE)
+)END
+./PANEL PANELPO
+)ATTR DEFAULT(%+_)
+% TYPE(TEXT) INTENS(HIGH) SKIP(ON)
++ TYPE(TEXT) INTENS(LOW) SKIP(ON)
+$ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) COLOR(YELLOW)
+# TYPE(OUTPUT) INTENS(LOW) CAPS(OFF) JUST(LEFT)
+@ TYPE(OUTPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT)
+_ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) PAD('_')
+¦ AREA(SCRL  ) EXTEND(OFF )
+)BODY WINDOW(64,16) EXPAND(<<) ASIS
+%COMMAND ===> $ZCMD                                         +
+@FROMDSN                                       +
+¦PARMS                                                         ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+)AREA PARMS
++Keep data  . . . . .$Z+       Submit job . . . . .$Z+
++
++Organization . . . .#DSORG +  Creation date  . . .#CREDT      +
++Record format  . . .$RECFM +  Space units  . . . .$Z          +
++Record length  . . .$LRECL+   Primary quantity . .$Z     +
++Block size . . . . .$Z    +   Secondary quantity .$Z     +
++Data set name type .$Z       +Directory blocks . .$Z     +
++Management class . .$Z       +Volume serial  . . .$Z     +
++Storage class  . . .$Z       +Device type  . . . .$Z     +
++Data class . . . . .$Z       +Expiration date  . .$EXPDT      +
++
++Current Allocation            Current Utilization
++Allocated#Z    + . .#Z    +   Used#Z     + . . . .#Z   +
++Allocated extents  .#Z    +   Used extents . . . .#Z   +
++Maximum dir. blocks #Z    +   Used dir. blocks . .#Z   +
+)INIT
+ .ZVARS  = '(KEEP SUBMIT UNITS PRIMARY BLKSIZE SECONDS DSNTYPE DIRBLK +
+             MGMTCLAS VOLUME STORCLAS DEVICE DATACLAS AUNITS ATRACKS +
+             UUNITS UTRACKS AEXTENTS UEXTENTS ADIRBLK UDIRBLK)'
+ .CURSOR = ZCMD
+ &KEEP = 'Y'
+ &SUBMIT = 'N'
+)REINIT
+)PROC
+ VER (&KEEP,NB,LIST,Y,N)
+ VER (&SUBMIT,NB,LIST,Y,N,E)
+ VER (&FROMDSN,NB,DSNAME)
+ VER (&DSNTYPE,NB,LIST,PDS,LIBRARY)
+ VER (&PRIMARY,NB,NUM)
+ VER (&SECONDS,NB,NUM)
+ VER (&LRECL,NB,NUM)
+ VER (&UNITS,NB,LIST,TRACK,TRACKS,CYLINDER,BLOCK,BLOCKS)
+ VER (&BLKSIZE,NB,NUM)
+ VER (&RECFM,NB)
+ VER (&EXPDT,STDDATE)
+ IF (&DSNTYPE = 'PDS')
+    VER (&DIRBLK,NB,NUM)
+)END
+./PANEL PANELVS
+)ATTR DEFAULT(~+_)
++ TYPE(TEXT) INTENS(LOW) SKIP(ON)
+$ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) COLOR(YELLOW)
+# TYPE(OUTPUT) INTENS(LOW) CAPS(OFF) JUST(LEFT)
+@ TYPE(OUTPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT)
+_ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) PAD('_')
+¦ AREA(SCRL  ) EXTEND(OFF )
+)BODY WINDOW(64,16) EXPAND(<<) ASIS
+%COMMAND ===> $ZCMD                                         +
+@FROMDSN                                       +
+¦PARMS                                                         ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+)AREA PARMS
++Keep data  . . . . .$Z+       Submit job . . . . .$Z+
++
++Organization . . . .#RECORG+  Creation date  . . .#CREDT      +
++Average length . . .$Z    +   Expiration date  . .$EXPDT      +
++Maximal length . . .$Z    +   Data class . . . . .$Z       +
++Management class . .$Z       +Storage class  . . .$Z       +
++
+@DNAME
++Space units  . . . .$Z       +Device type  . . . .$Z     +
++Primary quantity . .$Z     +  Secondary quantity .$Z     +
++Freespace %CI  . . .$Z     +  Freespace %CA  . . .$Z     +
++Volume serial  . . .$Z     +
++
+)INIT
+ .ZVARS  = '(KEEP SUBMIT AVGLRECL MAXLRECL DATACLAS MGMTCLAS STORCLAS +
+             DUNITS DDEVICE DPIMARY DSECONDS DFREECI DFREECA DVOLUME)'
+ .CURSOR = ZCMD
+ &KEEP = 'Y'
+ &SUBMIT = 'N'
+)REINIT
+)PROC
+ VER (&KEEP,NB,LIST,Y,N)
+ VER (&SUBMIT,NB,LIST,Y,N,E)
+ VER (&FROMDSN,NB,DSNAME)
+ VER (&DPRIMARY,NB,NUM)
+ VER (&DSECONDS,NB,NUM)
+ VER (&AVGLRECL,NB,NUM)
+ VER (&MAXLRECL,NB,NUM)
+ VER (&DUNITS,NB,LIST,TRACK,TRACKS,CYLINDER,BLOCK,BLOCKS)
+ VER (&EXPDT,STDDATE)
+)END
+./PANEL PANELKS
+)ATTR DEFAULT(~+_)
++ TYPE(TEXT) INTENS(LOW) SKIP(ON)
+$ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) COLOR(YELLOW)
+# TYPE(OUTPUT) INTENS(LOW) CAPS(OFF) JUST(LEFT)
+@ TYPE(OUTPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT)
+_ TYPE(INPUT) INTENS(HIGH) CAPS(ON) JUST(LEFT) PAD('_')
+¦ AREA(SCRL  ) EXTEND(OFF )
+)BODY WINDOW(64,16) EXPAND(<<) ASIS
+%COMMAND ===> $ZCMD                                         +
+@FROMDSN                                       +
+¦PARMS                                                         ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+¦                                                              ¦
+)AREA PARMS
++Keep data  . . . . .$Z+       Submit job . . . . .$Z+
++
++Organization . . . .#RECORG + Creation date  . . .#CREDT      +
++Average length . . .$Z    +   Expiration date  . .$EXPDT      +
++Maximal length . . .$Z    +   Data class . . . . .$Z       +
++Management class . .$Z       +Storage class  . . .$Z       +
++
+@DNAME
++Space units  . . . .$Z       +Device type  . . . .$Z     +
++Primary quantity . .$Z     +  Secondary quantity .$Z     +
++Freespace %CI  . . .$Z     +  Freespace %CA  . . .$Z     +
++Volume serial  . . .$Z     +
++
+@INAME
++Space units  . . . .$Z       +Device type  . . . .$Z     +
++Primary quantity . .$Z     +  Secondary quantity .$Z     +
++Freespace %CI  . . .$Z     +  Freespace %CA  . . .$Z     +
++Volume serial  . . .$Z     +
+)INIT
+ .ZVARS  = '(KEEP SUBMIT AVGLRECL MAXLRECL DATACLAS MGMTCLAS STORCLAS +
+             DUNITS DDEVICE DPRIMARY DSECONDS DFREECI DFREECA DVOLUME +
+             IUNITS IDEVICE IPRIMARY ISECONDS IFREECI IFREECA IVOLUME)'
+ .CURSOR = ZCMD
+ &KEEP = 'Y'
+ &SUBMIT = 'N'
+)REINIT
+)PROC
+ VER (&KEEP,NB,LIST,Y,N)
+ VER (&SUBMIT,NB,LIST,Y,N,E)
+ VER (&FROMDSN,NB,DSNAME)
+ VER (&DPRIMARY,NB,NUM)
+ VER (&DSECONDS,NB,NUM)
+ VER (&IPRIMARY,NB,NUM)
+ VER (&ISECONDS,NB,NUM)
+ VER (&AVGLRECL,NB,NUM)
+ VER (&MAXLRECL,NB,NUM)
+ VER (&IUNITS,NB,LIST,TRACK,TRACKS,CYLINDER,CYLINDERS,BLOCK,BLOCKS)
+ VER (&DUNITS,NB,LIST,TRACK,TRACKS,CYLINDER,CYLINDERS,BLOCK,BLOCKS)
+ VER (&EXPDT,STDDATE)
+)END
+./PANEL CONFIRM
+)ATTR
++  TYPE(TEXT) INTENS(LOW ) SKIP(ON ) COLOR(BLUE  )
+%  TYPE(TEXT) INTENS(HIGH) SKIP(ON ) COLOR(WHITE )
+~  TYPE(TEXT) INTENS(HIGH) CAPS(OFF) COLOR(YELLOW) HILITE(REVERSE)
+)BODY WINDOW(64,11)
++
++  ~Warning +
++
++   Keep data option is set to N. It mean, than any existing
++   data would be lost and this is last choice to save data.
++
++   Press%ENTER+key to confirm and continue
++   Press%CANCEL+or%EXIT+to cancel request
++
+)INIT
+)PROC
+)END
+./SKEL SKELJOB
+)SEL &BJC1 ¬= &Z
+&BJC1
+)ENDSEL
+)SEL &BJC2 ¬= &Z
+&BJC2
+)ENDSEL
+)SEL &BJC3 ¬= &Z
+&BJC3
+)ENDSEL
+)SEL &BJC4 ¬= &Z
+&BJC4
+)ENDSEL
+)SET SLASH = /
+)SET JCLCM = &SLASH.&SLASH.*
+)SEL &KEEP = N
+&JCLCM
+&JCLCM  Warning
+&JCLCM
+&JCLCM  This job reallocate existing data set &FROMDSN.
+&JCLCM  All existing data would be lost
+&JCLCM
+)ENDSEL
+./SKEL SKELPS
+)CM JOB SKELETON USED BY RESIZE PS DATA SET
+)IM SKELJOB
+//ALLOCATE EXEC PGM=IEFBR14
+//SYSUT2   DD  DISP=(NEW,CATLG),DSN=&TODSN,
+)SEL &DSNTYPE = LARGE OR &DSNTYPE = EXTENDED
+//             DSNTYPE=&DSNTYPE,
+)ENDSEL
+)SEL &UNITS = CYLINDER
+//             SPACE=(CYL,(&PRIMARY,&SECONDS)),
+)ENDSEL
+)SEL &UNITS = TRACK
+//             SPACE=(TRK,(&PRIMARY,&SECONDS)),
+)ENDSEL
+)SEL &UNITS = BLOCK
+//             SPACE=(&BLKSIZE,(&PRIMARY,&SECONDS)),
+)ENDSEL
+)SEL &EXPDT ¬= &Z
+//             EXPDT=&EXPDT,
+)ENDSEL
+//             DCB=(RECFM=&RECFM,LRECL=&LRECL,BLKSIZE=&BLKSIZE)
+)SEL &KEEP = Y
+//COPY     EXEC PGM=IEBGENER
+//SYSPRINT DD  SYSOUT=*
+//SYSUT1   DD  DISP=SHR,DSN=&FROMDSN
+//SYSUT2   DD  DISP=SHR,DSN=&TODSN
+//SYSIN    DD  *
+ GENERATE MAXFLDS=1
+)SEL &MAXLRECL ¬= &LRECL
+ RECORD FIELD=(&MAXLRECL)
+)ENDSEL
+//         IF  (COPY.RC = 0) THEN
+)ENDSEL
+//DELETE   EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+ DELETE &FROMDSN PURGE
+ ALTER &TODSN -
+       NEWNAME(&FROMDSN)
+)SEL &KEEP = Y
+//         ENDIF
+)ENDSEL
+//
+./SKEL SKELPO
+)CM JOB SKELETON USED BY RESIZE PO DATA SET
+)IM SKELJOB
+//ALLOCATE EXEC PGM=IEFBR14
+//SYSUT2   DD  DISP=(NEW,CATLG),DSN=&TODSN,
+)SEL &DSNTYPE = LIBRARY
+//             DSNTYPE=&DSNTYPE,
+)ENDSEL
+)SEL &UNITS = CYLINDER
+//             SPACE=(CYL,(&PRIMARY,&SECONDS,&DIRBLK)),
+)ENDSEL
+)SEL &UNITS = TRACK
+//             SPACE=(TRK,(&PRIMARY,&SECONDS,&DIRBLK)),
+)ENDSEL
+)SEL &UNITS = BLOCK
+//             SPACE=(&BLKSIZE,(&PRIMARY,&SECONDS,&DIRBLK)),
+)ENDSEL
+)SEL &EXPDT ¬= &Z
+//             EXPDT=&EXPDT,
+)ENDSEL
+//             DCB=(RECFM=&RECFM,LRECL=&LRECL,BLKSIZE=&BLKSIZE)
+)SEL &KEEP = Y
+//COPY     EXEC PGM=IEBCOPY
+//SYSPRINT DD  SYSOUT=*
+//SYSUT1   DD  DISP=SHR,DSN=&FROMDSN
+//SYSUT2   DD  DISP=SHR,DSN=&TODSN
+//SYSIN    DD  *
+ COPY INDD=SYSUT1,OUTDD=SYSUT2
+//         IF  (COPY.RC = 0) THEN
+)ENDSEL
+//DELETE   EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+ DELETE &FROMDSN PURGE
+ ALTER &TODSN -
+       NEWNAME(&FROMDSN)
+)SEL &KEEP = Y
+//         ENDIF
+)ENDSEL
+//
+./SKEL SKELVS
+)CM JOB SKELETON USED BY RESIZE VS DATA SET
+)IM SKELJOB
+//DEFINE   EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+  DEFINE CLUSTER( -
+    NAME(&TODSN) -
+    &AMORG -
+    &AMATTR -
+)SEL &EXPDT ¬= &Z
+    TO(&EXPDT) -
+)ENDSEL
+)SEL &AMORG = INDEXED
+    KEYS(&KEYLEN &RKP) -
+)ENDSEL
+)SEL &AMORG = LINEAR
+    RECORDSIZE(&AVGLRECL &MAXLRECL) -
+)ENDSEL
+)SEL &SMS NE NO
+)SEL &STORCLAS ¬= &Z
+    STORAGECLASS(&STORCLAS) -
+)ENDSEL
+)SEL &MGMTCLAS ¬= &Z
+    MANAGEMENTCLASS(&MGMTCLAS) -
+)ENDSEL
+)SEL &DATACLAS ¬= &Z
+    DATACLASS(&DATACLAS) -
+)ENDSEL
+)ENDSEL
+    SHAREOPTIONS(&SHROPT) -
+    ) -
+  DATA ( -
+    NAME(&TODSN..D) -
+    &DUNITS.S(&DPRIMARY &DSECONDS) -
+)SEL &SMS ¬= ONLY
+    VOLUMES(&DVOLUME) -
+)ENDSEL
+)SEL &DFREECA ¬= 0 | &DFREECI ¬= 0
+    FREESPACE(&DFREECI &DFREECA) -
+)ENDSEL
+    ) -
+)SEL &AMORG = INDEXED
+  INDEX ( -
+    NAME(&TODSN..I) -
+    &DUNITS.S(&IPRIMARY &ISECONDS) -
+)SEL &SMS ¬= ONLY
+    VOLUMES(&IVOLUME) -
+)ENDSEL
+)SEL &IFREECA ¬= 0 | &IFREECI ¬= 0
+    FREESPACE(&IFREECI &IFREECA) -
+)ENDSEL
+    ) -
+)ENDSEL
+  )
+)SEL &KEEP = Y
+//COPY     EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSUT1   DD  DISP=SHR,DSN=&FROMDSN
+//SYSUT2   DD  DISP=SHR,DSN=&TODSN
+//SYSIN    DD  *
+  REPRO INFILE=SYSUT1,OUTFILE=SYSUT2
+//         IF  (COPY.RC = 0) THEN
+)ENDSEL
+//DELETE   EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+ DELETE &FROMDSN PURGE
+ ALTER &TODSN -
+       NEWNAME(&FROMDSN)
+ ALTER &TODSN..D -
+       NEWNAME(&FROMDSN..D)
+)SEL &AMORG = INDEXED
+ ALTER &TODSN..I -
+       NEWNAME(&FROMDSN..I)
+)ENDSEL
+)SEL &KEEP = Y
+//         ENDIF
+)ENDSEL
+//
+./END
+*/

@@ -1,0 +1,765 @@
+DELNOENQ TITLE 'PROGRAM TO SCRATCH A LIST OF DATASETS'
+*-------------------------------------------------------------------*
+* Name            : DELNOENQ
+*
+* Function        : Scratch a list of datasets with or without the
+*                   SYSDSN ENQ. The specified datasets MUST be
+*                   uncataloged.
+*                   Read a list of dataset names and volume serials
+*                   from the SYSIN DDName and create perform DADSM
+*                   SCRATCH processing on them.
+*                   If we are APF authorized, we set up SVC Screening
+*                   before issuing the SCRATCH request. If we are not
+*                   APF authorized, we just try and delete the dataset
+*                   normally.
+*
+*                   *WARNING**WARNING**WARNING*
+*                   Be very careful to ensure that the dataset(s) you
+*                   are deleting are NOT in use on ANY system.
+*                   *WARNING**WARNING**WARNING*
+*
+* IBM Macros      : MODID, STORAGE, MODESET, SCRATCH, CAMLST, OPEN,
+*                   TESTAUTH, PUT, GET, CLOSE, UCBSCAN, RESERVE,
+*                   ENQ, DEQ, TIME, OBTAIN, LOCATE,
+*                   CVT, IEFUCBOB, IEESMCA, IKJTCB
+*
+* Programs Called : none
+*
+* Attributes      : Amode(24)
+*                   Rmode(24)
+*                   NORENT
+*                   NOREUS
+*                   NOREFR
+*                   AC(1)
+*
+* Register Usage  :
+* r1  -
+* r2  - CVT/SMCA
+* r3  - TCB
+* r4  - SVC Screening Table
+* r5  - work
+* r6  - branch and count
+* r7  - work
+* r8  - UCB
+* r9  - Max RC
+* r10 - branch and link
+* r11 - 2nd base
+* r12 - base
+* r13 - work area
+*
+*-------------------------------------------------------------------*
+* Example
+*
+* //ERASE  EXEC PGM=DELNOENQ
+* //STEPLIB  DD DISP=SHR,DSN=some.auth.loadlib
+* //SYSPRINT DD SYSOUT=*
+* //SYSIN    DD *
+*   DSN=SOME.UNCATLG.DATASET,VOL=OEMVOL
+*   DSN=ANOTHER.DATASET,VOL=ANOVOL
+* /*
+*
+*-------------------------------------------------------------------*
+* Changes
+* 07/05/93  Rob Scott - Code written
+* 02/25/99  Brian Pierce - allow either order in input card
+*           handle situation where dsn is aliased to another name
+* 30/06/99  Rob Scott -  Change message prefix from SSCR to NONQ
+* 08/07/99  Rob Scott -  Disallow deletion when cataloged version of
+*           the dataset is on SMS volume. SMS will intercept the
+*           SCRATCH in this case and causes the cataloged version
+*           being deleted!
+* 12/07/99  Rob Scott -  Correct code that issues NONQ004E.
+*-------------------------------------------------------------------*
+*
+*-------------------------------------------------------------------*
+* Copyright : Scott Enterprise Consultancy Ltd
+*-------------------------------------------------------------------*
+DELNOENQ CSECT
+DELNOENQ AMODE 24
+DELNOENQ RMODE 24
+         BAKR  R14,R0                 Linkage stack
+         LR    R12,R15                Copy entry address to base
+         USING DELNOENQ,R12           Address it
+         LA    R11,4095(R12)          Establish 2nd base
+         LA    R11,1(R11)             ..4K on from R12
+         USING DELNOENQ+4096,R11      address it
+         MODID ,                      Eyecatcher
+         LR    R2,R1                  Copy parms passed
+GETSTOR  EQU   *
+*-------------------------------------------------------------------*
+* Get some workarea storage and init to hex zeros
+*-------------------------------------------------------------------*
+         STORAGE OBTAIN,              Get the workarea storage         X
+               LENGTH=WORKLEN,        This much                        X
+               ADDR=(R13),            Put address in R13               X
+               SP=0,KEY=8,            Subpool 0 Key 8                  X
+               LOC=BELOW,             Below the line                   X
+               COND=NO                Unconditional
+         USING WORKAREA,R13           Address workarea
+         LR    R14,R13                Copy workarea address
+         L     R15,=A(WORKLEN)        Get length of workarea
+         XR    R0,R0                  Clear
+         XR    R1,R1                  Clear
+         MVCL  R14,R0                 Init to zeros
+         LA    R13,SAVEAREA           Point to savearea
+         MVC   4(4,R13),=C'F1SA'      Set Acronym
+         XR    R9,R9                  Clear rc
+INITWORK EQU   *
+*-------------------------------------------------------------------*
+* Open the datasets and write the titles
+*-------------------------------------------------------------------*
+         OPEN  (SYSIN,(INPUT))        Open the SYSIN
+         OPEN  (SYSPRINT,(OUTPUT))    Open the SYSPRINT
+         MVC   OUTCARD,TITLE          Copy the title
+         L     R2,CVTPTR              Get the CVT
+         USING CVTMAP,R2              Address it
+         L     R3,0(R2)               Get the TCB words
+         L     R3,4(R3)               Get current TCB
+         USING TCB,R3                 address it
+         L     R2,CVTSMCA             Get the SMCA
+         USING SMCABASE,R2            Address it
+         MVC   OUTCARD+39(4),SMCASID  Copy System id to title
+         DROP  R2
+         TIME  DEC,TIMEOUT,           Get the time                     x
+               DATETYPE=DDMMYYYY,     English format                   X
+               LINKAGE=SYSTEM         No SVC
+         LA    R1,TIMEOUT             Point to HHMMSSth
+         LA    R0,4                   Set the length
+         LA    R15,UWORK              Point to output area
+         BAL   R10,HEX2CHAR           Make it printable
+         MVC   OUTCARD+73(2),UWORK    Copy in HH
+         MVC   OUTCARD+76(2),UWORK+2  Copy in MM
+         MVC   OUTCARD+79(2),UWORK+4  Copy in SS
+         LA    R1,TIMEOUT+8           Point to HHMMSSth
+         LA    R0,4                   Set the length
+         LA    R15,UWORK              Point to output area
+         BAL   R10,HEX2CHAR           Make it printable
+         MVC   OUTCARD+53(2),UWORK    Copy in DD
+         MVC   OUTCARD+56(2),UWORK+2  Copy in MM
+         MVC   OUTCARD+59(4),UWORK+4  Copy in YYYY
+         PUT   SYSPRINT,OUTCARD       Put out the title
+         PUT   SYSPRINT,BLANKS        Followed by blanks
+         MVI   AUTHFLAG,X'00'         Assume not authorised
+         TESTAUTH FCTN=1              Test APF auth
+         LTR   R15,R15                Well ?
+         BNZ   NOTAUTH                Not APF auth - leave flag alone
+         OI    AUTHFLAG,X'80'         Set flag
+         PUT   SYSPRINT,NONQ008I      Tell user
+*-------------------------------------------------------------------*
+* We are running APF authorized - this means that we can use SVC
+* screening to bypass ENQ/DEQ.
+*
+* (1) We need to load the SVC Screen Table into non-pageable common
+*     storage (Chosen subpool = 245).
+*
+* (2) The SVC Screen routine to get control for SVC 48 (X'30') and
+*     SVC 56 (x'38') is just an IEFBR14 lookalike. For conveniance
+*     this is tagged behind the SVC Screen table. The address of this
+*     routine is placed at the start of the SVC Screen Table.
+*
+* (3) The address of the SVC Screen Table is placed into TCBSVCA2.
+*     This is only used when the TCBSVCS bit is on (which we do in
+*     the REMOVEDS routine).
+*-------------------------------------------------------------------*
+         MODESET KEY=ZERO,MODE=SUP    Turn into supervisor
+         STORAGE OBTAIN,              Get the SVC Screen Table         X
+               LENGTH=SSTLEN,         This much                        X
+               ADDR=(R4),             Put address in R4                X
+               SP=245,KEY=0,          Subpool 245 Key 0                X
+               LOC=BELOW,             Below the line                   X
+               COND=NO                Unconditional
+         ST    R4,@SVCSCR             Store address of SVC Screen table
+         L     R5,=A(SSTLEN)          Get the length
+         LA    R14,SSTSVCN            Point to the SVC Screen Model
+         LR    R15,R5                 Copy the length
+         MVCL  R4,R14                 Prime the SVC Screen Table
+         L     R4,@SVCSCR             Re-load address
+         LA    R15,SSTPGM-SSTSVCN(R4) Point to recovery program
+         STCM  R15,B'1111',0(R4)      Store in SVC Screen Table
+         STCM  R4,B'1111',TCBSVCA2    Store SVC Screen Table in TCB
+         MODESET KEY=NZERO,MODE=PROB  Turn into problem
+         B     READCARD
+NOTAUTH  EQU   *
+         PUT   SYSPRINT,NONQ007W      Issue non-auth warning
+         PUT   SYSPRINT,BLANKS        Blank line
+READCARD EQU   *
+*-------------------------------------------------------------------*
+* Read a card from the SYSIN dataset
+*-------------------------------------------------------------------*
+         GET   SYSIN,INCARD           Read a SYSIN card
+         MVC   OUTCARD(133),BLANKS    Blank the output card
+         MVC   OUTCARD+1(72),INCARD   Copy the input card
+         PUT   SYSPRINT,OUTCARD       Write it out
+         PUT   SYSPRINT,BLANKS        Blank line
+*-------------------------------------------------------------------*
+* Parse the card to see if it contains both DSN= and VOL= keywords
+*-------------------------------------------------------------------*
+         BAL   R10,PARSECRD           Parse the card
+         LTR   R15,R15                Got a valid card ?
+         BE    GOODCARD               Yes - process it
+*-------------------------------------------------------------------*
+* Invalid card - tell user and ignore it
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ001E      No - tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               read next card
+GOODCARD EQU   *
+*-------------------------------------------------------------------*
+* We have the required keywords and data.
+* Tell user what we have extracted from the SYSIN card and then
+* verify that the volume exists.
+*-------------------------------------------------------------------*
+         MVC   OUTCARD(133),NONQ005I  Copy the dataset message
+         MVC   OUTCARD+28(44),DATASET Copy the dataset name
+         PUT   SYSPRINT,OUTCARD       Tell user
+         MVC   OUTCARD(133),NONQ006I  Copy the volume message
+         MVC   OUTCARD+28(6),VOLSER   Copy the volser
+         PUT   SYSPRINT,OUTCARD       Tell user
+         XC    UCBAREA,UCBAREA        Clear the UCB area
+         XC    UCBWORK,UCBWORK        Clear the UCB work area
+         LA    R8,UCBAREA             Point to the UCB
+         USING UCBCMSEG,R8            Address it
+         UCBSCAN COPY,                Find the volume serial UCB       x
+               WORKAREA=UCBWORK,      Use this workarea                x
+               UCBAREA=UCBAREA,       Store UCB copy here              x
+               VOLSER=VOLSER,         Match this volser                x
+               DEVN=0,                Start at zero                    x
+               RANGE=ALL,             All of them                      x
+               DYNAMIC=YES,           Include Dynamic                  x
+               DEVCLASS=DASD          Its DASD
+         LTR   R15,R15                Found it ?
+         BZ    GOODUCB                Yes - OK
+*-------------------------------------------------------------------*
+* Volume serial could not be found - tell user and ignore card
+*-------------------------------------------------------------------*
+         MVC   OUTCARD(133),NONQ002E  No - tell user
+         MVC   OUTCARD+19(6),VOLSER   Copy the volume serial
+         PUT   SYSPRINT,OUTCARD       Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               Read next card
+GOODUCB  EQU   *
+*-------------------------------------------------------------------*
+* UCB is validated. We now check that the dataset is on the volume
+* and is uncataloged.
+*-------------------------------------------------------------------*
+         BAL   R10,CHECKDSN           Check the dataset
+         LTR   R15,R15                Check the rc
+         BZ    GOODDSN                if OK - scratch dataset
+         C     R15,=F'4'              dataset not on volume ?
+         BH    BADCATLG               no - check next
+*-------------------------------------------------------------------*
+* Dataset not on volume - tell user and set rc=12
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ009E      Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               Read next card
+BADCATLG EQU   *
+         C     R15,=F'8'              cataloged dataset ?
+         BH    BADCTVOL               no - check next
+*-------------------------------------------------------------------*
+* Dataset is cataloged - tell user and set rc=12
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ010E      Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               Read next card
+BADCTVOL EQU   *
+         C     R15,=F'12'             canniot determine SMS status?
+         BH    BADSMS                 no - check next
+*-------------------------------------------------------------------*
+* Cannot determine the SMS status of the cataloged dataset
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ012E      Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               Read next card
+BADSMS   EQU   *
+*-------------------------------------------------------------------*
+* Cataloged version of the dataset is on SMS volume
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ011E      Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+         LA    R9,12                  Set maxrc
+         B     NEXTCARD               Read next card
+GOODDSN  EQU   *
+*-------------------------------------------------------------------*
+* Volume serial and dataset OK, copy the UCB Type into the SCRATCH
+* parameter list and then SCRATCH the dataset.
+*-------------------------------------------------------------------*
+         MVC   SYSVOL(6),VOLSER       Copy the volser
+         MVC   VOLCUA(2),UCBCHAN      Copy the device number for later
+         MVC   VOLUCBT(4),UCBTYP      Copy the UCB type
+         BAL   R10,REMOVEDS           Remove the dataset
+         CLC   SCRRC,=F'0'            Did it work ?
+         BE    GOODRC                 Yes - tell user
+BADRC    EQU   *
+*-------------------------------------------------------------------*
+* Bad Return Code from SCRATCH - tell user and get next card
+*-------------------------------------------------------------------*
+         MVC   OUTCARD(133),NONQ004E  Get the message
+         LA    R1,SCRRC               Point to the message
+         LA    R0,4                   Set the length
+         LA    R15,UWORK              Point to the output field
+         BAL   R10,HEX2CHAR           Make it printable
+         MVC   OUTCARD+37(2),UWORK+6  Print the RC
+         LA    R1,SCRRSN              Point to the message
+         LA    R0,4                   Set the length
+         LA    R15,UWORK              Point to the output field
+         BAL   R10,HEX2CHAR           Make it printable
+         MVC   OUTCARD+45(8),UWORK    Print the RC
+         PUT   SYSPRINT,OUTCARD       Tell the user
+         PUT   SYSPRINT,BLANKS        Blank line
+         C     R9,SCRRC               Is > maxcc
+         BH    NEXTCARD               No - carry on
+         L     R9,SCRRC               Yes - copy Return Code
+         B     NEXTCARD               Get next card
+GOODRC   EQU   *
+*-------------------------------------------------------------------*
+* Good Return Code from SCRATCH - tell user and get next card
+*-------------------------------------------------------------------*
+         PUT   SYSPRINT,NONQ003I      Tell user
+         PUT   SYSPRINT,BLANKS        Blank line
+NEXTCARD EQU   *
+         B     READCARD               Read next card
+*
+ENDSYSIN EQU   *
+*-------------------------------------------------------------------*
+* We have finished reading the SYSIN cards - tidy up the SVC
+* Screening table (if used) and exit.
+*-------------------------------------------------------------------*
+         CLOSE (SYSIN)                Close the SYSIN
+         CLOSE (SYSPRINT)             Close the SYSPRINT
+         TM    AUTHFLAG,X'80'         Are we APF auth ?
+         BNO   RETURN00               No - ignore SVC Screen Table free
+         MODESET KEY=ZERO,MODE=SUP    Turn into supervisor
+         MVC   TCBSVCA2,=F'0'         Zero SVC Screen table address
+         STORAGE RELEASE,             Free the SVC Screen Table        X
+               LENGTH=SSTLEN,         This much                        X
+               ADDR=(R4),             Address in R4                    X
+               SP=245,KEY=0,          Subpool 245 Key 0                X
+               COND=NO                Unconditional
+         MODESET KEY=NZERO,MODE=PROB  Turn into problem
+RETURN00 EQU   *
+         BAL   R10,FREESTOR           Free the workarea
+         LR    R15,R9                 Set RC to maxrc
+         PR
+*
+*--------------------------------------------------------------------*
+* General Routines
+*--------------------------------------------------------------------*
+*
+CHECKDSN EQU   *
+*--------------------------------------------------------------------*
+* Check the dataset name and volser against the following criteria :
+* (1) Dataset Exists on the volume
+* (2) Dataset to be deleted is not cataloged
+* (3) Cataloged version of the dataset is not SMS managed
+*
+* Return Code : 0 - Dataset has been verified
+*               4 - Dataset not on volume
+*               8 - Dataset is cataloged
+*              12 - Volume cataloged dataset resides upon not found
+*              16 - Cataloged dataset is on SMS-volume
+*--------------------------------------------------------------------*
+         LA    R7,4                   Assume rc=4
+         MVC   OBTCAM(OBTL),OBTMODEL  Move in model macro
+         LA    R1,DATASET             Point to dataset name
+         ST    R1,OBTCAM+4            Store in parmlist
+         LA    R1,VOLSER              Point to volser
+         ST    R1,OBTCAM+8            Store in parmlist
+         LA    R1,CAMLSTWA            Point to workarea
+         ST    R1,OBTCAM+12           Store in parmlist
+         OBTAIN OBTCAM                Try to get the F1-DSCB
+         LTR   R15,R15                Is dataset on the volume
+         BNZ   CHECKRET               No - tell caller
+         LA    R7,8                   Assume rc=8
+         MVC   LOCCAM(LOCL),LOCMODEL  Move in model macro
+         MVC   LOCDSN,DATASET         Move dataset name to locate WORK
+         LA    R1,LOCDSN              Point to dataset name
+         ST    R1,LOCCAM+4            Store in parmlist
+         LA    R1,CAMLSTWA            Point to workarea
+         ST    R1,LOCCAM+12           Store in parmlist
+         LOCATE LOCCAM                Is dataset cataloged ?
+         LTR   R15,R15                find it
+         BNZ   CHECK00                no
+         CLC   CAMLSTWA+6(6),VOLSER   Compare volser (if any)
+         BE    CHECKRET               Dataset is catloged - error
+         LA    R7,12                  Assume rc = 12
+         LA    R5,TEMPUCB             Point to the UCB
+         UCBSCAN COPY,                Find the volume serial UCB       x
+               WORKAREA=TEMPWORK,     Use this workarea                x
+               UCBAREA=TEMPUCB,       Store UCB copy here              x
+               VOLSER=CAMLSTWA+6,     Match the catalog volser         x
+               DEVN=0,                Start at zero                    x
+               RANGE=ALL,             All of them                      x
+               DYNAMIC=YES,           Include Dynamic                  x
+               DEVCLASS=DASD          Its DASD
+         LTR   R15,R15                Found it ?
+         BZ    CHECKSMS               Yes - check SMS status
+         B     CHECKRET               No - tell user
+CHECKSMS EQU   *
+         LA    R7,16                  Assume rc=16
+         TM    UCBFL5-UCBCMSEG(R5),UCBSMS
+         BO    CHECKRET               Is it SMS ?
+CHECK00  XR    R7,R7                  Clear rc
+CHECKRET EQU   *
+         LR    R15,R7                 Copy rc
+         BR    R10                    Return
+*
+PARSECRD EQU   *
+*--------------------------------------------------------------------*
+* Get the dataset name and volser from the card
+* Card format :
+*
+*   DSN=<dataset-name>,VOL=<volser>
+*   VOL=<volser>,DSN=<dataset-name>
+*
+* Return Code : 0 - Got both DATASET and VOLSER
+*               8 - Error in card
+*--------------------------------------------------------------------*
+         MVC   DATASET(44),BLANKS     Clear the dataset name
+         MVC   VOLSER(6),BLANKS       Clear the volume serial
+         LA    R1,INCARD              Point to the input card
+         LA    R6,71                  Set max loop count
+         XR    R15,R15                Zero rc
+FINDDSN  EQU   *
+         CLC   0(4,R1),=C'DSN='       Is it DSN= ?
+         BE    GOTDSN                 Yes - found dsn
+         LA    R1,1(R1)               No - get next byte
+         BCT   R6,FINDDSN             Loop for all chars
+         LA    R15,8                  Set rc
+         BR    R10
+GOTDSN   EQU   *
+         LA    R7,DATASET             Point to dataset name
+         LA    R1,4(R1)               Point to start of dataset
+         S     R6,=F'4'               Adjust branch and count
+ISDSNE   EQU   *
+         CLI   0(R1),C','             End of dataset name ?
+         BE    ENDDSN                 Yes
+         CLI   0(R1),C' '             End of dataset name ?
+         BE    ENDDSN                 Yes
+         MVC   0(1,R7),0(R1)          Copy the dataset name byte
+         LA    R7,1(R7)               Update pointer
+         LA    R1,1(R1)               Get next input byte
+         BCT   R6,ISDSNE              loop thru dataset name
+         LA    R15,8                  Set rc
+         BR    R10                    go to return/error
+ENDDSN   EQU   *
+         LA    R1,INCARD              Point to the input card again
+         LA    R6,71                  Set max loop count
+FINDVOL  EQU   *                      Now locate the VOL=
+         CLC   0(4,R1),=C'VOL='       Is it VOL= ?
+         BE    GOTVOL                 Yes - found vol
+         LA    R1,1(R1)               No - get next byte
+         BCT   R6,FINDVOL             Loop for all chars
+         LA    R15,8                  Set rc
+         BR    R10
+GOTVOL   EQU   *
+         LA    R7,VOLSER              Point to volser
+         LA    R1,4(R1)               Point to start of dataset
+         S     R6,=F'4'               Adjust branch and count
+ISVOLE   EQU   *
+         CLI   0(R1),C','             End of volser?
+         BE    ENDVOL                 Yes
+         CLI   0(R1),C' '             End of volser?
+         BE    ENDVOL                 Yes
+         MVC   0(1,R7),0(R1)          Copy the volser byte
+         LA    R7,1(R7)               Update pointer
+         LA    R1,1(R1)               Get next input byte
+         BCT   R6,ISVOLE              loop thru volser
+         LA    R15,8                  Set rc
+         BR    R10                    go to return
+ENDVOL   EQU   *
+         XR    R15,R15                Zero rc
+         BR    R10
+*
+REMOVEDS EQU   *
+*        BR    R10  ********* FOR TESTING, COMMENT OUT for REAL *****
+*--------------------------------------------------------------------*
+* Remove the dataset
+*
+* Dynamically create the SCRATCH parm list in the workarea and plug
+* in the address of the dataset name and volume entry.
+*
+* If the program is running without APF authorization we skip the
+* next bit ...
+*
+* First of all, we get the ACTUAL UCB address for the dataset's
+* volume so that we can issue the RESERVE on the VTOC. We do this
+* because SCRATCH will be SVC screened to ENQ/RESERVE. We then ENQ
+* the dataset to a major of 'DELNOENQ' and a minor that is made up
+* of the volume followed by the dataset name.
+*
+* We flip the TCBSVCS flag in TCBFLGS7 in the TCB to indicate that
+* SVC Screening is enabled for this task. The TCBSVCA2 field has
+* previously been populated by the address of the SVC Screen table.
+*--------------------------------------------------------------------*
+         MVC   SCRCAM(SCRL),SCRMODEL  Copy the model scratch macro
+         MVC   VOLENT(2),=H'1'        Indicate 1 volser
+         MVC   VOLSTAT(2),=H'0'       Zero status bytes
+         LA    R1,DATASET             Point to the dataset name
+         STCM  R1,B'1111',SCRCAM+4    Store in SCRATCH parm list
+         LA    R1,VOLENT              Point to the volume entry
+         STCM  R1,B'1111',SCRCAM+12   Store in SCRATCH parm list
+         TM    AUTHFLAG,X'80'         Are we APF auth ?
+         BNO   ERASE                  No - bypass authorised bit
+*--------------------------------------------------------------------*
+* Get the actual UCB address for RESERVE. The binary device number
+* used from the earlier UCBSCAN COPY.
+*--------------------------------------------------------------------*
+         MODESET KEY=ZERO,MODE=SUP    Turn into supervisor
+         XC    UCBWORK,UCBWORK        Clear the UCB work area
+         UCBSCAN ADDRESS,             Find the volume serial UCB       x
+               WORKAREA=UCBWORK,      Use this workarea                x
+               UCBPTR=@UCB,           Store UCB address here           x
+               DEVN=VOLCUA,           For the stored dev number        x
+               LOC=ANY,               Anywhere in storage              x
+               NOPIN,                 Do not pin it                    x
+               RANGE=ALL,             All of them                      x
+               DYNAMIC=YES,           Include Dynamic                  x
+               DEVCLASS=DASD          Its DASD
+         LTR   R15,R15                Have we got it ?
+         BZ    ENQVTOC                Yes - no enqueue it
+         ABEND 987,DUMP               No - abend (should not happen)
+ENQVTOC  EQU   *
+*--------------------------------------------------------------------*
+* Issue the RESERVE on the VTOC for the volume and enq the dataset
+* and volume to the DELNOENQ major name.
+*--------------------------------------------------------------------*
+         LA    R7,SYSVOL              Point to the volser
+         RESERVE (SYSVTOC,(R7),E,6,SYSTEMS),                           X
+               UCB=@UCB
+         ENQ   (MAJOR,(R7),E,50,SYSTEMS)
+         OI    TCBFLGS7,TCBSVCS       Indicate SVC Screening
+ERASE    EQU   *
+         XR    R0,R0                  Clear R0
+         SCRATCH SCRCAM               Scratch the dataset
+         STCM  R0,B'1111',SCRRSN      Store the reason code
+         STCM  R15,B'1111',SCRRC      Store the Return Code
+         TM    AUTHFLAG,X'80'         Are we APF auth ?
+         BNO   DONESCR                No - bypass authorised bit
+*--------------------------------------------------------------------*
+* Turn off SVC Screening and DEQ the dataset and SYSVTOC RESERVE.
+*--------------------------------------------------------------------*
+         NI    TCBFLGS7,255-TCBSVCS   Turn off SVC Screening
+         DEQ   (MAJOR,(R7),50,SYSTEMS)
+         DEQ   (SYSVTOC,(R7),6,SYSTEMS)
+*--------------------------------------------------------------------*
+* SCRATCH sets the TCBFJMC bit (Step-Must-Complete). The STATUS macro
+* is required to reset it. As we have issued the RESERVE on the VTOC
+* outside of the SVC Screening it is OK to do this.
+*--------------------------------------------------------------------*
+         STATUS RESET,MC,STEP         Ensure SMC is off
+         MODESET KEY=NZERO,MODE=PROB  Turn back into problem state
+DONESCR  EQU   *
+         BR    R10
+*
+HEX2CHAR EQU   *
+*--------------------------------------------------------------------*
+* Convert a hex string to EBCDIC
+* Registers on entry :
+* R0 - Length of input hex bytes
+* R1 - Input hex bytes
+* R15- Output EBCDIC area
+*
+* R14 is used as a work register
+*
+*--------------------------------------------------------------------*
+LEFTHALF EQU   *
+         XR    R14,R14                Clear
+         ICM   R14,B'0001',0(R1)      Load up a byte (000000ab)
+         SRL   R14,4                  Remove last 4 bits (0000000a)
+LEFTNUM  EQU   *
+         CH    R14,=H'9'              00000000 - 00000009 ?
+         BH    LEFTLTTR               higher - must be A-F
+         AH    R14,=H'240'            xlate to F0-F9
+         B     LEFTDONE
+LEFTLTTR EQU   *
+         AH    R14,=H'183'            xlate to C1-C6
+LEFTDONE EQU   *
+         STCM  R14,B'0001',0(R15)     Store in output field
+         LA    R15,1(R15)             Point to next char
+RGHTHALF EQU   *
+         XR    R14,R14                Clear
+         ICM   R14,B'0001',0(R1)      Load up a byte (000000ab)
+         SLL   R14,28                 Remove first 4 bits (b0000000)
+         SRL   R14,28                 and reset           (0000000b)
+RGHTNUM  EQU   *
+         CH    R14,=H'9'              00000000 - 00000009 ?
+         BH    RGHTLTTR               higher - must be A-F
+         AH    R14,=H'240'            xlate to F0-F9
+         B     RGHTDONE
+RGHTLTTR EQU   *
+         AH    R14,=H'183'            xlate to C1-C6
+RGHTDONE EQU   *
+         STCM  R14,B'0001',0(R15)     Store in output area
+         LA    R15,1(R15)             Point to next char
+         LA    R1,1(R1)               Point to next input byte
+         BCT   R0,LEFTHALF            Loop for all bytes
+         BR    R10                    return
+*
+FREESTOR EQU   *
+*--------------------------------------------------------------------*
+* Free workarea storage
+*--------------------------------------------------------------------*
+         STORAGE RELEASE,             Release workarea storage         X
+               LENGTH=WORKLEN,        This much                        X
+               ADDR=(R13),            Use address in R13               X
+               SP=0,KEY=8,            Subpool 0 key 8                  X
+               COND=NO                Unconditional
+         BR    R10
+*
+*--------------------------------------------------------------------*
+* Constants, Variables and DSECTs
+*--------------------------------------------------------------------*
+         LTORG
+*
+SYSIN    DCB   DDNAME=SYSIN,          DD Name                          x
+               DSORG=PS,              Sequential                       x
+               MACRF=GM,              Input                            x
+               RECFM=FB,              Variable block                   x
+               LRECL=80,              Max LRECL                        x
+               EODAD=ENDSYSIN         End-of-data branch
+*
+SYSPRINT DCB   DDNAME=SYSPRINT,       DD Name                          x
+               DSORG=PS,              Sequential                       x
+               MACRF=PM,              Output                           x
+               RECFM=FBA,             Fixed block                      x
+               LRECL=133              Max LRECL
+*
+         DS    0F
+DUMMY    DC    F'0'
+@UCB     DC    F'0'                   UCB Address
+SYSVTOC  DC    CL8'SYSVTOC'           Major name for RESERVE
+MAJOR    DC    CL8'DELNOENQ'          Major name for DELNOENQ
+BLANKS   DC    CL133' '               Blanks
+*
+SCRMODEL CAMLST SCRATCH,DUMMY,,DUMMY,,OVRD
+SCRL     EQU   *-SCRMODEL             Length of SCRATCH
+LOCMODEL CAMLST NAME,DUMMY,,DUMMY
+LOCL     EQU   *-LOCMODEL             Length of LOCATE
+OBTMODEL CAMLST SEARCH,DUMMY,DUMMY,DUMMY
+OBTL     EQU   *-OBTMODEL             Length of OBTAIN
+*
+*--------------------------------------------------------------------
+* SVC Screening Table
+*--------------------------------------------------------------------
+SSTSVCN  DC    A(SSTPGM)              Address of error routine
+         DC    X'80'                  Emulate type-2 SVC
+         DC    X'00'                  AR mode not allowed
+         DC    X'0000'                No locks
+SSTMASK  DS    0C
+*--------------------------------------------------------------------
+* SVC Screen Mask Table
+* Entries marked x'80' allow the SVC to be executed, those marked
+* x'00' cause control to be passed to SSTPGM.
+*--------------------------------------------------------------------
+*                   0 1 2 3 4 5 6 7 8 9 A B C D E F
+         DC    XL16'80808080808080808080808080808080'  SVC 00 - 0F
+         DC    XL16'80808080808080808080808080808080'  SVC 10 - 1F
+         DC    XL16'80808080808080808080808080808080'  SVC 20 - 2F
+         DC    XL16'00808080808080800080808080808080'  SVC 30 - 3F
+         DC    XL16'80808080808080808080808080808080'  SVC 40 - 4F
+         DC    XL16'80808080808080808080808080808080'  SVC 50 - 5F
+         DC    XL16'80808080808080808080808080808080'  SVC 60 - 6F
+         DC    XL16'80808080808080808080808080808080'  SVC 70 - 7F
+         DC    XL16'80808080808080808080808080808080'  SVC 80 - 8F
+         DC    XL16'80808080808080808080808080808080'  SVC 90 - 9F
+         DC    XL16'80808080808080808080808080808080'  SVC A0 - AF
+         DC    XL16'80808080808080808080808080808080'  SVC B0 - BF
+         DC    XL16'80808080808080808080808080808080'  SVC C0 - CF
+         DC    XL16'80808080808080808080808080808080'  SVC D0 - DF
+         DC    XL16'80808080808080808080808080808080'  SVC E0 - EF
+         DC    XL16'80808080808080808080808080808080'  SVC F0 - FF
+*                   0 1 2 3 4 5 6 7 8 9 A B C D E F
+*--------------------------------------------------------------------
+* SVC Screen Recovery Routine
+*--------------------------------------------------------------------
+SSTPGM   DC    X'17FF'                Asm code for 'XR R15,R15'
+         DC    X'07FE'                Asm code for 'BR R14'
+SSTLEN   EQU   *-SSTSVCN              Length of storage required
+*
+*
+*
+TITLE    DC    CL133'1 DELNOENQ Version 2.3        System : ssss   Datex
+                : dd/mm/yyyy   Time : hh:mm:ss'
+NONQ001E DC    CL133'  NONQ001E  Syntax error in input card - Return CoX
+               de set to 12'
+NONQ002E DC    CL133'  NONQ002E  Volume xxxxxx not found - Return Code x
+               set to 12'
+NONQ003I DC    CL133'  NONQ003I  Dataset scratched from volume RC(00)'
+NONQ004E DC    CL133'  NONQ004E  Dataset not scratched RC(00) RSN(00000x
+               000) - Check DFP Diagnosis Reference'
+NONQ005I DC    CL133'  NONQ005I  Dataset Name  : '
+NONQ006I DC    CL133'  NONQ006I  Volume Serial : '
+NONQ007W DC    CL133'  NONQ007W  DELNOENQ is NOT APF Authorized'
+NONQ008I DC    CL133'  NONQ008I  DELNOENQ is APF Authorized'
+NONQ009E DC    CL133'  NONQ009E  Dataset not found on volume - Return Cx
+               ode set to 12'
+NONQ010E DC    CL133'  NONQ010E  Dataset specified is cataloged - Returx
+               n Code set to 12'
+NONQ011E DC    CL133'  NONQ011E  Cataloged version of the dataset is onx
+                SMS volume - Return Code set to 12'
+NONQ012E DC    CL133'  NONQ012E  Cannot determine SMS status of the catx
+               aloged version of the dataset - Return Code set to 12'
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                    SaveArea
+@SVCSCR  DS    F                      SVC Screen Table Address
+AUTHFLAG DS    X                      APF auth flag
+         DS    0F
+UWORK    DS    CL8                    work area
+TIMEOUT  DS    CL16                   Output from time
+SYSVOL   DC    CL6' '                 Volser to be RESERVEd
+LOCDSN   DS    CL44                   Datset Name
+DATASET  DS    CL44                   Datset Name
+         DS    0F
+VOLENT   DS    H                      Number of Volume entries
+VOLUCBT  DS    CL4                    UCB Type
+VOLSER   DS    CL6                    Volume serial
+VOLSTAT  DS    H                      Status byte
+VOLCUA   DS    H                      Device address
+INCARD   DS    CL80                   Input card
+OUTCARD  DS    CL133                  Output message
+         DS    0F
+SCRCAM   DS    CL(SCRL)               Area for SCRATCH
+         DS    0F
+LOCCAM   DS    CL(LOCL)               Area for LOCATE
+         DS    0F
+OBTCAM   DS    CL(OBTL)               Area for OBTAIN
+         DS    0F
+SCRRC    DS    F                      SCRATCH rc
+SCRRSN   DS    F                      SCRATCH rsn
+TEMPUCB  DS    CL48                   Area for TEMP UCB copy
+UCBAREA  DS    CL48                   Area for UCB copy
+TEMPWORK DS    CL100                  UCBSCAN temp work area
+UCBWORK  DS    CL100                  UCBSCAN work area
+         DS    0D
+CAMLSTWA DS    CL265                  Work area for CAMLST macros
+WORKLEN  EQU   *-WORKAREA
+*
+         CVT   DSECT=YES,LIST=NO
+         IEESMCA
+         IEFUCBOB
+         IKJTCB
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END   DELNOENQ

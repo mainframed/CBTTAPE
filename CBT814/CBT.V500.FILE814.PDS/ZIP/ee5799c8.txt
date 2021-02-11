@@ -1,0 +1,363 @@
+MVS disk linking program
+
+We currently run three guest MVS systems under VM/XA 2.1
+with the DASD for all systems being mini-disks owned by a
+VM machine called MVSMAST.  These mini-disks all have
+passwords to give at least some protection against uncontrolled
+access from VM.  Occasionally, it is necessary to link to one of
+the volumes normally only linked by another system (for
+example MVSTEST linking to MVSPROD to edit
+SYS1.PARMLIB when some changes to JESPARMS haven't
+worked).  Instead of logging on at the top level (can be risky!)
+we use this program to issue the link command for us.  The
+process is simplified as all the link passwords are the same, but
+obviously this need not be the case.  The program uses a table
+to hold all valid VOLIDs and their default link address (from
+the VM directory).  This table is built automatically each time
+the directory is updated on VM and an assembly/link job
+submitted to each of the MVS systems so that they always have
+the latest version.
+
+We run MVS/ESA 3.1.3.  The program runs as a started task,
+with communication via the MVS 'modify' command.
+
+         TITLE 'LINKDISK: LINK MVS DISKS'
+***   ISSUE VM LINK COMMANDS TO 'MVSMAST' DISKS VIA CP DIAGNOSE 8. ***
+*  INPUT: (VIA 'MODIFY' COMMAND)                                     *
+*     ONLY 'VOL=' IS REQUIRED, 'ACC=' DEFAULTS TO 'M' (= MW), AND    *
+*     'ADDR=' DEFAULTS ADDRESS FROM TABLE. 'ACC=' AND 'ADDR=' MAY    *
+*     BE SPECIFIED SINGLY/TOGETHER/IN ANY ORDER.                     *
+*                           |     R |                                *
+*     F LINKDISK,VOL=XXXXXX |,ACC=M |,ADDR=YYYY                      *
+***                         |     W |                              ***
+LINKDISK CSECT
+         BAKR  R14,0                   SAVE CALLER DATA ON STACK
+         LR    R12,R15                 GET ENTRY POINT
+         USING LINKDISK,R12            ESTABLISH ADDRESSABILITY
+* SET UP INITIAL HANDLING FOR 'MODIFY' COMMAND:                      *
+*  - EXTRACT ADDRESS OF COMMUNICATIONS AREA                          *
+*  - SET NUMBER OF MODIFY COMMANDS ALLOWED FOR THIS STC              *
+*  - FREE OFF START CIB                                              *
+         LA    R8,RESPONSE             ADDRESS OF RESPONSE AREA
+         EXTRACT (8),FIELDS=COMM       OBTAIN COMM. AREA ADDRESS
+         L     R8,RESPONSE             LOAD     "     "     "
+         USING COMLIST,R8              ADDRESSABILITY TO IEZCOM
+         L     R7,COMCIBPT             GET ADDRESS OF CIB
+         USING CIBNEXT,R7              ADDRESSABILITY TO IEZCIB
+         CLI   CIBVERB,CIBSTART        FIRST CIB FOR START COMMAND?
+         BNE   SETCOUNT                NO...GO AND SET COUNT
+         BAL   R9,FREEOFF              YES..GO AND FREE THE BLOCK
+SETCOUNT DS    0H
+         QEDIT ORIGIN=COMCIBPT,CIBCTR=1   SET LIMIT TO 1
+* WAIT FOR MODIFY COMMAND (NOTE: QEDIT CLEARS THE POSTED ECB WHEN    *
+* THE CIB IS FREED)...                                               *
+WAIT     DS    0H
+         WTO   'LINKDISK (V1.0) Waiting for Communications'
+         L     R4,COMECBPT             GET ADDRESS OF COMM. AREA ECB
+         WAIT  1,ECB=(R4),LONG=YES     WAIT FOR MODIFY COMMAND
+* MODIFY/P COMMAND - PROCESS IT...                                   *
+MODDED   DS    0H
+         L     R7,COMCIBPT             GET ADDRESS OF COMM. AREA
+         CLI   CIBVERB,CIBMODFY        MODIFY COMMAND?
+         BNE   TSTSTOP                 NO...MAYBE A 'STOP' COMMAND
+         LH    R4,CIBDATLN             YES..GET DATA LENGTH
+         BCTR  R4,0                    DECREMENT FOR 'EX' INSTRUCTION
+         CH    R4,=H'9'                MUST BE AT LEAST 10 BYTES
+         BL    ERR1                    NO...TOO LITTLE DATA PASSED
+         CH    R4,=H'25'               BUT NO MORE THAN 26 BYTES
+         BH    ERR2                    NO...TOO MUCH DATA PASSED
+         EX    R4,EXMVC                YES..MOVE DATA TO W/S
+         0C    CMND(26),=26X'40'       CHEAP UPPER CASE TRANSLATE
+* VALID COMBINATIONS HAVE SPECIFIC LENGTHS...                        *
+TESTCMND DS    0H
+         MVC   ADDR(4),=4C' '          SET DEFAULTS
+         MVC   COMMMODE(2),=C'MW'       "     "
+         LA    R4,1(R4)                PUT BACK 1 TAKEN FOR 'EX' INSTR
+         CLC   CMND(4),=C'VOL='        MUST START WITH 'VOL='...
+         BNE   ERR1                    NO...
+         CH    R4,=H'10'               WAS IT 10 BYTES?
+         BE    LEN10                   YES..
+         CH    R4,=H'16'               WAS IT 16 BYTES?
+         BE    LEN16                   YES..
+         CH    R4,=H'20'               WAS IT 20 BYTES?
+         BE    LEN20                   YES..
+         CH    R4,=H'26'               WAS IT 26 BYTES?
+         BE    LEN26                   YES..
+         B     ERR6                    NO...MUST BE INVALID LENGTH
+* LENGTH=10: JUST 'VOL='...                                          *
+LEN10    DS    0H
+         MVC   VOLID(6),CMND+4         SAVE VOLID
+         B     FINDVOL                 GO AND FIND VOLID IN TABLE
+* LENGTH=16: 'VOL=XXXXXX,ACC=Y'...                                   *
+LEN16    DS    0H
+         CLC   CMND+10(5),=C',ACC='    CORRECT FORMAT?
+         BNE   ERR6                    NO...
+         MVC   VOLID(6),CMND+4         SAVE VOLID
+         MVC   COMMMODE(1),CMND+15      SAVE ACCESS MODE
+         BAL   R9,CHEKMODE             ENSURE VALID MODE...
+         B     FINDVOL                 GO AND FIND VOLID IN TABLE
+* LENGTH=20: 'VOL=XXXXXX,ADDR=YYYY'...                               *
+LEN20    DS    0H
+         CLC   CMND+10(6),=C',ADDR='   CORRECT FORMAT?
+         BNE   ERR6                    NO...
+         MVC   VOLID(6),CMND+4         SAVE VOLID
+         MVC   ADDR(4),CMND+16         SAVE LINK ADDRESS
+         BAL   R9,CHEKADDR             ENSURE VALID LINK ADDRESS
+         B     FINDVOL                 GO AND FIND VOLID IN TABLE
+* LENGTH=26: 'VOL=XXXXXX,ADDR=YYYY,ACC=Z'  OR                        *
+*            'VOL=XXXXXX,ACC=Y,ADDR=ZZZZ'                            *
+LEN26    DS    0H
+         CLC   CMND+10(6),=C',ADDR='   FIRST FORMAT: 'ADDR=' OK?
+         BNE   LEN26A                  NO...TRY OTHER
+         CLC   CMND+20(5),=C',ACC='    FIRST FORMAT: 'ACC=' OK?
+         BNE   ERR6                    NO...ERROR
+         MVC   VOLID(6),CMND+4         SAVE VOLID
+         MVC   ADDR(4),CMND+16         SAVE LINK ADDRESS
+         BAL   R9,CHEKADDR             ENSURE VALID ADDRESS
+         MVC   COMMMODE(1),CMND+25     SAVE ACCESS MODE
+         BAL   R9,CHEKMODE             ENSURE VALID ACCESS MODE
+         B     FINDVOL                 OK: GO AND FIND VOLID IN TABLE
+LEN26A   DS    0H
+         CLC   CMND+10(5),=C',ACC='    SECOND FORMAT: 'ACC=' OK?
+         BNE   ERR6                    NO...ERROR
+         CLC   CMND+16(6),=C',ADDR='   SECOND FORMAT: 'ADDR=' OK?
+         BNE   ERR6                    NO...ERROR
+         MVC   VOLID(6),CMND+4         SAVE VOLID
+         MVC   COMMODE(1),CMND+15      SAVE ACCESS MODE
+         BAL   R9,CHEKMODE             ENSURE VALID ACCESS MODE
+         MVC   ADDR(4),CMND+22         SAVE LINK ADDRESS
+         BAL   R9,CHEKADDR             ENSURE VALID ADDRESS
+         B     FINDVOL                 OK: GO AND FIND VOLID IN TABLE
+* SCAN TABLE TO ENSURE VOLID IS THERE...                             *
+FINDVOL  DS    0H
+         LOAD  EP=LINKTABL             LOAD IT
+         LTR   R15,R15                 OK?
+         BNZ   ERR7                    NO...
+         LR    R6,R0                   YES..GET ADDRESS OF TABLE
+         L     R2,0(R6)                GET NO. OF ENTRIES IN TABLE
+         LA    R6,4(R6)                BUMP PAST COUNTER
+         USING LINKTAB,R6              ADDRESSABILITY TO TABLE
+SEARCH   DS    0H
+         CLC   LINKVOL(6),VOLID        IS OUR VOLID IN TABLE?
+         BE    SETADDR                 YES..SET UP ADDRESS IF REQUIRED
+         LA    R6,10(R6)               NO...BUMP TO NEXT ENTRY
+         BCT   R2,SEARCH               KEEP LOOKING
+         B     ERR3                    SHOW NOT IN TABLE
+* FOUND VOLID, NOW SET UP LINK ADDRESS IF REQUIRED...                *
+SETADDR  DS    0H
+         MVC   COMMADR1(4),LINKADDR    SET MVSMAST'S DISK ADDRESS
+         MVC   COMMADR2(4),LINKADDR    ASSUME LINK ADDRESS THE SAME
+         CLC   ADDR(4),=4C' '          WAS DIFFERENT ADDRESS PASSED?
+         BE    SETPASS                 NO...SET UP PASSWORD
+         MVC   COMMADR2(4),ADDR        YES..SET UP DIFFERENT ADDRESS
+* NOW SET UP RELEVANT PASSWORD...                                    *
+SETPASS  DS    0H
+         MVC   COMMPASS(4),=C'MXXX'    ASSUME PASSWORD FOR 'MW'
+         CLC   COMMMODE(2),=C'MW'      WAS IT MW?
+         BE    ISSUELNK                YES..ISSUE LINK
+         MVC   COMMPASS(4),=C'RYYY'    ASSSUME PASSWORD FOR 'RR'
+         CLC   COMMMODE(2),=C'RR'      WAS IT RR?
+         BE    ISSUELNK                YES..ISSUE LINK
+         MVC   COMMPAS(4),=C'WZZZ'     NO...SET PASSWORD FOR 'W '
+* PARMS SET UP, NOW ISSUE DIAGNOSE...                                *
+ISSUELNK DS    0H
+         ICM   R4,15,CMDFLGLN          RY = FLAGS AND COMMAND LENGTH
+         MODESET KEY=ZERO,MODE=SUP     GET INTO SUPERVISOR STATE
+         LRA   R2,COMMAND              RX -> COMMAND
+         DC    X'83',X'24',X'0008'     DIAGNOSE TO ISSUE LINK CMD
+         BZ    DIAGOK                  DIAGNOSE OK - CHECK RC FROM VM
+* DIAGNOSE FAILED...                                                 *
+DIAGBAD  DS    0H
+         WTO   'LINKDISK: CP Diagnose failed...abending!'
+         DS    F
+* DIAGNOSE OK - NOW SEE IF VM COMMAND WAS OK...IF NOT, PUT RETURN    *
+* CODE INTO MESSAGE. TEST FOR SOME COMMON RETURN CODES WE KNOW THE   *
+* MEANING OF AND PUT OUT EXPLICIT MESSAGES...                        *
+DIAGOK   DS    0H
+         MODESET KEY=NZERO,MODE=PROB   GET BACK INTO PBM STATE
+         LTR   R4,R4                   COMMAND OK?
+         BZ    CMDOK                   YES..
+         CH    R4,=H'107'              WAS IT HCP107E?
+         BE    NODISK                  YES..DISPLAY MESSAGE
+         CVD   R4,DWD1                 CONVERT RC TO DECIMAL
+         UNPK  WTODATA(3),DWD1+6(2)    UNPACK RC INTO MESSAGE
+         OI    WTODATA+2,X'F0'         SET CORRECT SIGN
+         WTO   MF=(E,WTOLIST)          DISPLAY ERROR
+         B     FREECIB
+* COMMAND ISSUED OK - TELL USER...                                   *
+CMDOK    DS    0H
+         MVC   WTOVOL3(6),VOLID        SET UP VOLID IN MESSAGE
+         MVC   WTOADDR3(4),COMMADR2    SET UP LINK ADDRESS IN MESSAGE
+         MVC   WTOMODE3(2),COMMMODE    SET UP LINK MODE IN MESSAGE
+         WTO   MF=(E,WTOLIST3)         DISPLAY ERROR
+         B     FREECIB
+* FREE OFF CIB STORAGE THEN GO BACK AND AWAIT ANOTHER MODIFY...      *
+FREECIB  DS    0H
+         BAL   R9,FREEOFF              FREE CIB
+         B     WAIT                    GO AND WAIT FOR ANOTHER MODIFY
+* WAS IT A STOP COMMAND ('P XXXX')? - IF SO, STOP!!!...              *
+TSTSTOP  DS    0H
+         CLI   CIBVERB,CIBSTOP         STOP COMMAND?
+         BNE   CIBERR                  NO...DISPLAY ERROR
+         B     RETURN                  YES..OK THEN - STOP
+* IF NOT 'STOP', THEN ITS AN INVALID CIB...                          *
+CIBERR   DS    0H
+         WTO   'LINKDISK: INVALID CIB TYPE ENCOUNTERED'
+         BAL   R9,FREEOFF              FREE CIB...
+         B     WAIT
+* VALID 'STOP' COMMAND, STOP...                                      *
+RETURN   DS    0H
+         WTO   'LINKDISK (V1.0) Ending...'
+         XR    R15,R15                 SET RC=0
+         PR    ,                       RESTORE CALLER DATA, RETURN
+* ERROR MESSAGES...                                                  *
+ERR1     DS    0H
+         WTO   'LINKDISK: No ''VOL='' entered, or it was invalid...'
+         B     FREECIB
+ERR2     DS    0H
+         WTO   'LINKDISK: Too much data passed - try again...'
+         B     FREECIB
+ERR3     DS    0H
+         WTO   'LINKDISK: ''VOL='' entered is not in table...'
+         B     FREECIB
+ERR4     DS    0H
+         WTO   'LINKDISK: Access Mode specified not "M", "W" or "R"...'
+         B     FREECIB
+ERR5     DS    0H
+         WTO   'LINKDISK: Link address specified is invalid...'
+         B     FREECIB
+ERR6     DS    0H
+         WTO   'LINKDISK: Parms invalid or none entered...'
+         B     FREECIB
+ERR7     DS    0H
+         WTO   'LINKDISK: Cannot load ''LINKTABL''...'
+         B     FREECIB
+ERR8     DS    0H
+         WTO   'LINKDISK: Volid entered is NOT in table...'
+         B     FREECIB
+NODISK   DS    0H
+         MVC   WTODATA2(6),VOLID
+         WTO   MF=(E,WTOLIST2)         DISPLAY ERROR
+         B     FREECIB
+* ENSURE ADDRESS GIVEN IS A VALID ONE (CONTAINS 0123456789ABCDEF)... *
+CHEKADDR DS    0H
+         TRT   ADDR(4),TRTAB           TEST FOR 'CHARACTER HEX'
+         BC    7,ERR5                  INVALID ADDRESS...BRANCH
+         BR    R9                      OK...RETURN
+* ENSURE ACCESS MODE GIVEN IS A VALID ONE (M, W, OR R)...            *
+CHEKMODE DS    0H
+CHEKMODM DS    0H
+         CLI   COMMMODE,C'M'           MW?
+         BER   R9                      YES..OK
+CHEKMODW DS    0H
+         CLI   COMMMODE,C'W'           W?
+         BNE   CHEKMODR                NO...CHECK FOR RR
+         MVI   COMMMODE+1,C' '         YES..MAKE IT JUST 'W'
+         BR    R9                      RETURN
+CHEKMODR DS    0H
+         CLI   COMMMODE,C'R'           RR?
+         BNE   ERR4                    NO...ERROR
+         MVI   COMMMODE+1,C'R'         YES..MAKE IT 'RR'
+         BR    R9                      RETURN
+* FREE OFF CIB STORAGE...                                            *
+FREEOFF  DS    0H
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(7)   FREE THE BLOCK
+         LTR   R15,R15                 OK?
+         BZR   R9                      OK...RETURN
+         ST    R15,FWD1                NO...SAVE RC
+         UNPK  UNPKFLD(3),FWD1+3(2)    UNPACK RC
+         TR    UNPKFLD(2),TRTAB2-240   TRANSLATE TO PRINTABLE HEX
+         MVC   CIBWTO+44(2),UNPKFLD    MOVE TO WTO TEXT
+CIBWTO   WTO   'LINKDISK: ERROR FREEING CIB, RC = X''__'' '
+         BR    R9                      RETURN FROM ROUTINE
+* CONSTANTS, DCBS, EQUATES, ETC...                                   *
+WTOLIST  DS    0F                      LIST FORM OF WTO MACRO
+         DC    AL2(WTOEND-WTOSTRT)     TEXT LENGTH
+         DC    BL2'1000000000000000'   MCS FLAGS
+WTOSTRT  EQU   *
+         DC    C'LINKDISK: LINK Command failed - see message HCP'
+WTODATA  DC    CL3' '
+         DC    CL1'E'
+         DC    BL2'0000000000000000'   DESCRIPTOR CODES
+         DC    BL2'0100000000000000'   ROUTING CODES
+WTOEND   EQU   *
+WTOLIST2 DS    0F                      LIST FORM OF WTO MACRO
+         DC    AL2(WTOEND2-WTOSTRT2)   TEXT LENGTH
+         DC    BL2'1000000000000000'   MCS FLAGS
+WTOSTRT2 EQU   *
+         DC    C'LINKDISK: MVSMAST volume '''
+WTODATA2 DC    C'XXXXXX'
+         DC    C''' is unknown - cannot LINK...'
+         DC    BL2'0000000000000000'   DESCRIPTOR CODES
+         DC    BL2'0100000000000000'   ROUTING CODES
+WTOEND2  EQU   *
+WTOLIST3 DS    0F                      LIST FORM OF WTO MACRO
+         DC    AL2(WTOEND3-WTOSTRT3)   TEXT LENGTH
+         DC    BL2'1000000000000000'   MCS FLAGS
+WTOSTRT3 EQU   *
+         DC    C'LINKDISK: MVSMAST volume '''
+WTOVOL3  DC    C'xxxxxx'
+         DC    C''' linked at address '
+WTOADDR3 DC    C'xxxx'
+         DC    C' ('
+WTOMODE3 DC    C'xx'
+         DC    C')'
+         DC    BL2'0000000000000000'   DESCRIPTOR CODES
+         DC    BL2'0100000000000000'   ROUTING CODES
+WTOEND3  EQU   *
+COMMAND  DC    C'LINK MVSMAST XXXX XXXX YY PASS=ZZZZ'
+COMMANDL EQU   *-COMMAND
+COMMADR1 EQU   COMMAND+13,4
+COMMADR2 EQU   COMMAND+18,4
+COMMMODE EQU   COMMAND+23,2
+COMMPASS EQU   COMMAND+31,4
+         DS    0D
+CMDFLGLN DC    X'00',AL3(COMMANDL)
+EXMVC    MVC   CMND(0),CIBDATA         EXECUTED MOVE
+CMND     DS    CL26                    MODIFY COMMAND BUFFER
+RESPONSE DS    F
+VOLID    DS    CL6                     VOLID TO BE LINKED
+ADDR     DS    CL4                     LINK ADDRESS
+FWD1     DS    F
+DWD1     DS    D
+UNPKFLD  DS    CL3
+TRTAB    DC    256X'FF'                TEST FOR VALID DISPLAYABLE HEX
+         ORG   TRTAB+X'C1'
+         DC    6X'00'                  A -> F
+         ORG   TRTAB+X'F0'
+         DC    10X'00'                 0 -> 9
+         ORG   TRTAB+256
+TRTAB2   DC    C'0123456789ABCDEF'     TRANSLATE TO PRINTABLE HEX
+         LTORG
+LINKTAB  DSECT
+LINKVOL  DS    CL6                     VOLID OF PACK
+LINKADDR DS    CL4                     DEFAULT LINK ADDRESS
+         TITLE 'LINKDISK: DSECT TO MAP COMMUNICATIONS AREA'
+         DSECT
+         IEZCOM
+         TITLE 'LINKDISK: DSECT TO MAP CIB'
+         DSECT
+         IEZCIB
+         END
+
+ This is an example of the LINKTABL table:
+
+          TITLE 'LINKTABL: MVS DISK VOLIDS AND ADDRESSES'
+***   READ BY 'LINKDISK' PROGRAM TO LOCATE MVS VOLIDS AND THEIR    ***
+*     DEFAULT LINK ADDRESS. THE PROGRAM THEN ISSUES:                 *
+*             LINK MVSMAST CCUU CCUU XX                              *
+***   WHERE CCUU IS THE ADDRESS, AND XX IS THE ACCESS MODE.        ***
+LINKTABL CSECT
+         DC    A(TABENTS)
+TABSTART EQU   *
+*              ---VOLID--- -ADDRESS-
+VOLID1   DC    CL6'XXXXXX',CL4'0999'
+VOLID2   DC    CL6'YYYYYY',CL4'07D3'
+TABENTS  EQU   (*-LINKTABL)/10
+         DC    XL6'FF
+         END
+
+
+Don Brook
+Systems Programmer (UK)                                  c Xephon 1991
+

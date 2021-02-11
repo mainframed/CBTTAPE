@@ -1,0 +1,38 @@
+
+## @FILE980.txt
+```
+//***FILE 980 is from Vladimir Mironov, via the ibmmainframes.com   *   FILE 980
+//*           forum.  This is a zap to Doug Nadel's TASID 5.21      *   FILE 980
+//*           load module, to fix a problem with displaying the     *   FILE 980
+//*           initiators, Option 4.  Since TASID belongs to IBM,    *   FILE 980
+//*           because it was written by Doug when he worked there,  *   FILE 980
+//*           we cannot publish its load module here.  But if you   *   FILE 980
+//*           download the load module from URL:                    *   FILE 980
+//*                                                                 *   FILE 980
+//*    https://www-01.ibm.com/support/docview.wss?uid=swg24009131   *   FILE 980
+//*                                                                 *   FILE 980
+//*           then the accompanying zap applies, if you have a      *   FILE 980
+//*           z/OS 2.2 or 2.3 system, to fix the "Initiators"       *   FILE 980
+//*           display.                                              *   FILE 980
+//*                                                                 *   FILE 980
+//*           BTW, the URL of the ibmmainframes.com posts which     *   FILE 980
+//*           are relevant here, is:                                *   FILE 980
+//*                                                                 *   FILE 980
+//*           http://ibmmainframes.com/about65233.html              *   FILE 980
+//*                                                                 *   FILE 980
+//*      ==>  Fixed JCL to put the comment before the //SYSIN       *   FILE 980
+//*           card.  (SBG)                                          *   FILE 980
+//*                                                                 *   FILE 980
+//*           I believe that this note applies best, when you       *   FILE 980
+//*           download the version of TASID which includes the      *   FILE 980
+//*           compiled panels in the load module, so you don't      *   FILE 980
+//*           have a problem or question with also updating the     *   FILE 980
+//*           ISPF panels.                                          *   FILE 980
+//*                                                                 *   FILE 980
+//*           Thanks to Bill Smith for alerting me to this          *   FILE 980
+//*           problem, and finding Vladimir's zap.                  *   FILE 980
+//*                                                                 *   FILE 980
+//*           email:  Bill Smith <sfowjs@sbcglobal.net>             *   FILE 980
+//*                                                                 *   FILE 980
+```
+

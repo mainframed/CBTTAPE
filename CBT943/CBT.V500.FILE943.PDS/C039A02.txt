@@ -1,0 +1,198 @@
+ Controlling printers under BMS
+INTRODUCTION
+Our operating environment is CICS 1.6.1 and MVS/XA.  In order to send reports to
+terminals and printers we use the BMS  commands ROUTE, SEND TEXT, and SEND PAGE.
+One problem with this method is that we cannot stop the printer once it has been
+started.
+When we use the CEMT purge command, the temporary storage queue that holds the
+BMS data is not deleted, and the printing transaction (CSPG) is restarted
+(although CSPG is defined with RESTART=NO).
+SOLUTION
+Our solution is to activate a transaction that gets as a parameter the name of
+the printer that we want to be stopped.  Then the transaction TcheatsU BMS so it
+assumes that the printing process has finished.  (This transaction is called the
+Tpurge transaction for the purge taskU.)
+IMPLEMENTATION
+When CSPG is started a special control block called the Message Control Block
+(MCB) is allocated.  Inside the MCB there are details that help BMS to print (eg
+the name of the temporary storage queue working with the current logical
+message).  Among other fields in the MCB are two that we use:
+%    MCBPAG - page number currently being displayed
+%    MCBPGCNT - total number of pages per destination.
+How does BMS use these two fields?  When CSPG is started (and the terminal or
+the printer is defined with PGESTAT=AUTOPAGE in the TCT), a loop is processed
+for all the pages and each page is sent to the printer in turn.  After all the
+pages are printed, ending actions take place (eg deleting the temporary storage
+queue that works with this logical message).  While this loop is processing, the
+index of the loop (actually the current page number being displayed) is stored
+in the MCBPAG field.  The loop ends when MCBPAG is equal to the MCBPGCNT field
+(the total number of pages in this logical message).  Our solution is to store
+the MCBPGCNT (the total number) in the MCBPAG (the current number), so that BMS
+assumes that all the pages have already been sent, and the task has finished
+normally, without printing the rest of the pages.
+NOTES
+1    The purge task must be initialised while the CSPG task is activated,
+because the CSPG task is the one that actually purges the output.
+2    In its present form, the purge program only skips to the last page of the
+output.  However, it would be a simple matter to alter the program so it could
+skip any other number of pages (eg skip forward 5 pages, skip back 3 pages,
+etc).
+PROGRAMS
+Two programs were written:
+1    Z79PUR - program that receives the printer name as a parameter and purges
+the output (actually goes inside the MCB).
+2    Z79DELP - program that receives the printer name from the terminal and
+links to Z79PUR.
+Z79PUR
+***********************************************************************
+* THIS PROGRAM IS USED TO "DELETE" OUTPUT ON CICS PRINTERS.           *
+* THE PROGRAM FINDS THE MCB USED IN THE TERMINAL (MESSAGE CONTROL     *
+* BLOCK) AND THEN PUTS IN THE CURRENT PAGE NUMBER THE NUMBER OF THE   *
+* LAST PAGE, SO THE BMS SEES THAT THERE'S NO MORE PAGES TO DISPLAY    *
+* AND IT STOPS PRINTING. IN THIS WAY "DELETE" IS PERFORMED.           *
+*  INPUT : THE PROGRAM CALL VIA "EXEC CICS LINK" WITH COMMAREA        *
+*          COMMAREA STRUCTURE :      4 BYTE - TERMINAL NAME           *
+*                                    2 BYTE - RC                      *
+*  OUTPUT: RC CONTAINS INDICATION                                     *
+*          0 - OPERATION O.K PRINTING WILL STOP                       *
+*          4 - NO MCB EXIST. (NO PRINTING TASK EXISTS IN THE TERMINAL)*
+*          8 - TERMINAL NOT FOUND IN TCT (TERMINAL NOT EXIST)         *
+*          12- ERROR IN SCAN FOR THE TERMINAL                         *
+* PROCESS: THIS PROGRAM IS A MIXTURE OF COMMAND AND MACRO LEVEL.      *
+*          THE PROGRAM RUNS ON POINTERS TILL THE MCB OF THE TERMINAL  *
+*          (IF EXIST) AND THEN MOVES TO THE CURRENT PAGE NUMBER FIELD *
+*          THE NUMBER OF THE TOTAL PAGE NUMBER.                       *
+* REGISTER USE:                                                       *
+*  R3                 -> CODE BASE REGISTER                           *
+ *  R5  = OSPWABAR     -> OSPWA (NOT USE)                              *
+*  R6  = MCBBAR       -> MCB                                          *
+*  R7                 -> TCTTETTE                                     *
+*  R8  = TCTTEAR      -> TCTTE                                        *
+*  R9                 -> COMMAREA                                     *
+*  R10 = DFHEIPLR     -> DYNAMIC STORAGE (BY DEFAULT FOR MIX PROGRAM) *
+*  R11 = DFHEIBR      -> EIB (EXEC INTERFACE BLOCK)                   *
+*  R12                -> TCA (TASK CONTROL AREA)                      *
+*  R13                -> CSA (COMMON SYSTEM AREA)                     *
+TCTTEAR  EQU      R8
+MCBBAR   EQU      R6
+OSPWABAR EQU      R5
+         DFHTCA   CICSYST=YES
+         DFHTCTZE CICSYST=YES
+         COPY     DFHCSADS
+         COPY     DFHOSPWA
+         COPY     DFHMCBDS
+         GBLB  &DFHEIMX            MIXTURE OF MACRO AND COMMAND LEVELS
+&DFHEIMX SETB  1
+COMAREA  DSECT
+TERMID   DS    CL4                 PRINTER NAME TO STOP PRINTING
+RC       DS    HL2                 RETURN CODE
+Z79PUR   CSECT
+         L     R9,DFHEICAP         ADDR OF COMMAREA
+         USING COMAREA,R9          GET ADDRESSABILITY TO COMMAREA
+*        LOCATE TERMINAL TCTTE ENTRY                                  *
+         MVC   TCATPTA,TERMID      MOVE TERMINAL ID TO BE FOUND
+         DFHTC CTYPE=LOCATE,TERM=ID,NORESP=FINDTERM,INVID=NOTERM,      X
+               ERROR=ERROR
+FINDTERM L     TCTTEAR,TCATPTA     GET ADDRESS OF REQUIRED TERMINAL
+         USING DFHTCTTE,TCTTEAR    ADDRESSABILITY TO THE TCTTE
+         L     R7,TCTTETEA         GET ADDR OF TCTTETTE
+*                                       (TERMINAL TABLE EXTENSION)
+         USING TCTTETTE,R7         AND ADDRESSABILITY TO IT
+         L     MCBBAR,TCTTEPGM     ADDR OF MCB (MESSAGE CONTROL BLOCK)
+         LA    MCBBAR,0(MCBBAR)    GET LEFMOST BYTE ZERO
+         LTR   MCBBAR,MCBBAR       DID MCB EXIST ?
+         BZ    NOMCB               NO. ERROR
+         MVC   MCBPAG,MCBPGCNT     ASSUME THE CURRENT PAGE IS THE LAST
+*                                  PAGE. SO THE BMS WILL FINISH
+*                                  PRINTING.
+         MVC   RC(2),=H'0'
+SOF      EXEC CICS RETURN        . RETURN TO CICS
+NOMCB    MVC   RC(2),=H'4'
+         B     SOF
+NOTERM   MVC   RC(2),=H'8'
+         B     SOF
+ERROR    MVC   RC(2),=H'12'
+         B     SOF
+         END
+Z79DELP
+Z79DELP:PROC OPTIONS(MAIN);
+/*********************************************************************/
+/*  PROGRAM THAT GETS FROM THE OPERATOR A REQUEST TO DELETE OUTPUT   */
+/*  ON A PRINTER. THE PROGRAM LINKS TO Z79PUR THAT DELETES THE       */
+/*  OUTPUT.                                                          */
+/*  NOTE: Z79PUR DELETES OUTPUT ONLY WHEN PRINTING TASK IS RUNNING   */
+/*        ON  THE TERMINAL (CSPG TRANSACTION) AND ONLY ONE LOGICAL   */
+/*        MESSAGE EACH TIME                                          */
+/*  INPUT: FROM THE SCREEN IN THE FORMAT: "ZPUR ZB" TO DELETE        */
+/*         OUTPUT ON PRINTER ZB.                                     */
+/*  OUTPUT: MESSAGE THAT EXPLAINS THE OPERATION RESULTS.             */
+/*********************************************************************/
+DCL 1 COM,                     /* PARAMETER BLOCK TO Z79PUR */
+      2 TERM     CHAR(4),
+      2 RC       FIXED BIN(15,0);
+ DCL 1 INPUT,                  /*  INPUT FROM TERMINAL       */
+      2 TRAN     CHAR(4),
+      2 LINE     CHAR(76) INIT(' ');
+DCL EZER         CHAR(76) VAR;
+DCL MSG          CHAR(79);
+DCL VEC_MSG(0:3) CHAR(79) STATIC INIT(
+     ' OUTPUT PURGE ',
+     ' PRINTING TASK NOT ACTIVE NOW',
+     ' TERMINAL NOT EXIST',
+     ' ERROR IN FIND TERMINAL ');
+DCL LEN          FIXED BIN(15,0) INIT(80);
+DCL I            FIXED BIN(15,0);
+/******/
+EXEC CICS HANDLE CONDITION ERROR(ERROR);
+EXEC CICS RECEIVE INTO(INPUT) LENGTH(LEN);
+I = VERIFY(LINE,' ');
+TERM = SUBSTR(LINE,I,LEN-I-3);
+EXEC CICS LINK PROGRAM('Z79PUR') COMMAREA(COM) ;
+MSG = VEC_MSG(RC/4);
+EXEC CICS SEND TEXT FROM (MSG) ERASE FREEKB;
+EXEC CICS RETURN;
+ERROR:
+  MSG = 'ERROR OCCURS'
+  EXEC CICS HANDLE CONDITION ERROR;       /* IF ANOTHER ABEND */
+  EXEC CICS SEND TEXT FROM (MSG) ERASE FREEKB;
+  EXEC CICS RETURN;
+END Z79DELP;
+
+
+Yuval Grossman
+Systems Programmer (Israel)   ) Yuval Grossman 1989
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

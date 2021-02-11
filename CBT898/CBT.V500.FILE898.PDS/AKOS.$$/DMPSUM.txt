@@ -1,0 +1,773 @@
+/******************************** REXX ********************************/
+/**********************************************************************/
+/* TRACE r                                                            */
+    Trace o;msg=Msg();x=Msg('Off')
+    Call On Error Name errproc;get_me_this_line_number;n_st = sigl +2
+/*--------------------------ooo000OOOO000ooo--------------------------*/
+/*                                                                    */
+/* Macro to process the dump statistics file that ir updated daily    */
+/* (or shutdown time) by CICS tran(DMPS) prog(ANZDUMPS).              */
+/*                                                                    */
+/* This routine takes a copy of the dump stats file and processes it  */
+/* to minimise ENQs.                                                  */
+/*                                                                    */
+/* Parameters:                                                        */
+/*    REGION(reg1,reg2,...,regn)  : Regions to report (default is ALL)*/
+/*    R(..)                                                           */
+/*                                                                    */
+/*    ABENDS(abc1,abc2,...,abcn)  : Abend codes (default is ALL)      */
+/*    A(..)                                                           */
+/*                                                                    */
+/*    TAG(abc1,abc2,...,abcn)     : Tag/highlight specified abends.   */
+/*    TA(..)                        TAG(ASRA) is the default if all   */
+/*                                  abends selected.                  */
+/*    ABBREV             or AB    : Abbreviated list reporting anend  */
+/*                                                                    */
+/*    JCL                or J     : Generate JCL in accordance with   */
+/*                                  the LPAR this feature is executed */
+/*                                  on and supplied parameters.       */
+/*    NE                          : No Notifications. Suppresses      */
+/*                                  sending emails.                   */
+/*                                                                    */
+/*  Date range can be entered in the following formats (remember      */
+/*  that JCL gen'd by this routine may blow the PARM= string length   */
+/*  of PGM=IKJEFT01):                                                 */
+/*    DATE(YYYYMMDD)     or D(..) : For that day only.                */
+/*        * or *                                                      */
+/*    -dd                         : From dd days in the past to today */
+/*        * or *                                                      */
+/*    FDATE(YYYYMMDD)    or F(..) : From date                         */
+/*    TDATE(YYYYMMDD)    or T(..) : to date (defaults to today        */
+/*                                  Dates default to ALL. Suggest -7  */
+/*                                  for weekly reports.               */
+/*  Last parameter remaining will be the dataset name unless you re   */
+/*  viewing/editing the actual dataset.  The dataset name is built as */
+/*  follows:                                                          */
+/*                                                                    */
+/*    byte 1   - literal 'P' if the sysid is not ANZC/H/I.            */
+/*    next 4   - literal 'CICS.'.                                     */
+/*    next 8   - jobname (up to 8 bytes with trail' spaces removed).  */
+/*    llq      - literal '.DUMPSTAT'.                                 */
+/*                                                                    */
+/* //SYSTCPD  - Eyecatcher                                            */
+/* //EDMATRIX - Eyecatcher                                            */
+/*                                                                    */
+/* eg's.,                                                             */
+/*    ABSUM REGION(CICS1P01) ABENDS(ASRA,APCT) -7                     */
+/*    ABSUM REGION(CICSIP01) ABENDS(ASRA) DATE(20001020)              */
+/*    ABSUM REGION(ALL) ABENDS() TAG(ASRA,AICA)                       */
+/*                                                                    */
+/* Mebers required to package this function.                          */
+/*    DMPSUM   - This driver                                          */
+/*    BR       o To browse the help details.                          */
+/*    $DATEMAN - Date manipulation routine.                           */
+/*    dataset  - Dump statistics dataset ('pCIX.cicsjobn.DUMPSTAT').  */
+/*                                                                    */
+/*--------------------------------------------------------------------*/
+    Call On Error Name errproc;get_me_this_line_number;n_en = sigl -2
+    x=Msg(msg)
+
+    Address ISPEXEC
+    ARG parm#
+    Parse SOURCE . . xcmd .
+    If parm# ¬= "" Then Signal byp1
+    "ISPEXEC CONTROL ERRORS RETURN"
+    "ISPEXEC ISREDIT MACRO (parm#) NOPROCESS"
+    If rc > 0 Then SIGNAL byp1
+    ima_macro = 'Y'
+    "ISREDIT (sysproc) = DATASET"           /* REXX where ABSUM found */
+
+byp1:
+    cactn = "RETURN"
+    cactn = "CANCEL"
+    "ISPEXEC CONTROL ERRORS" cactn
+
+ini1:
+    If parm# = '?' Then Do
+        Signal On Syntax Name staxroc
+        retsyn = help_me
+        X = $BR(xcmd "??")
+        Return 0
+    End
+    If parm# = '??' Then Signal help_me
+
+    If sysproc = 'SYSPROC' Then,
+       sysproc = 'TPM.TPM12.KARA.REXX'      /* REXX where ABSUM found */
+    action = 'VIEW'
+    vars   = 'BATCH,SREGN,SABND,FDATE,TDATE,TAG,SENDMAIL'
+    sender = 'CICSSUPP'                     /* Sender identifier      */
+    sysid  = Strip(storage(d2x(x2d(c2x(storage(10,4))) + x2d(154)),8))
+
+    zerrhm   = '*'
+    zerralrm = 'NO'
+    zerrsm   = ''
+
+    If Sysvar(Sysenv) = 'FORE' Then batch = 'N'
+    Else                            batch = 'Y'
+
+    If ima_macro = 'Y' Then Signal macro_1
+    Call parse_parms
+    If b_jcl = 'Y' Then Signal build_jcl
+
+/*--------------------------------------------------------------------*/
+/* Play it both ways. Dataset name can be passed as a parameter or    */
+/* pre-allocted in JCL.                                               */
+/*--------------------------------------------------------------------*/
+    If dsname /= '' Then Do
+        "ISPEXEC VPUT ("vars") SHARED"
+        "ISPEXEC &ACTION DATASET(&DSNAME) MACRO("xcmd")"
+    End
+    Else Do
+        "ISPEXEC LMINIT DATAID(DATAID) DDNAME(STATCOPY)"
+        If rc /= 0 Then Do
+            zerrlm = "Missing or invalid dataset name passed",
+                     "or DD 'STATCOPY' not allocated."
+            If batch = 'Y' Then Say zerrlm
+            Else "SETMSG MSG(ISRZ002)"
+            Exit
+        End
+        "ISPEXEC VPUT ("vars") SHARED"
+        "ISPEXEC &ACTION DATAID(&DATAID) MACRO("xcmd")"
+        "ISPEXEC LMFREE DATAID(&DATAID)"
+    End
+
+    Return 0
+
+
+/*--------------------------------------------------------------------*/
+/* Eexcute as a macro                                                 */
+/*--------------------------------------------------------------------*/
+macro_1:
+    "ISREDIT (status) = USER_STATE"
+    If parm# /= '' Then Call parse_parms
+    Else Do
+        "VGET ("vars") SHARED"
+        If sregn = '' Then Call parse_parms
+    End
+    If b_jcl = 'Y' Then Signal build_jcl
+
+    #tag = tag
+    tag  = Translate(tag,' ',',')
+
+/*--------------------------------------------------------------------*/
+/* Blout out parameters:                                              */
+/*--------------------------------------------------------------------*/
+    "ISREDIT (dsname) = DATASET"
+    If batch = 'Y' Then Address TSO "NEWSTACK"
+    qit = 'N'                               /* Set queue flag off     */
+    x = Output('*'Copies('-',70)'*')
+    x = Output(Substr("*",1,71)"*")
+    x = Output(Substr("* Processing datasets '"dsname"'",1,71)"*")
+    x = Output(Substr("* with the following parameters:-",1,71)"*")
+    x = Output(Substr("*   Region :" regn,1,71)"*")
+    x = Output(Substr("*   Tag    :" #tag,1,71)"*")
+    If fdate = min_date_x Then Do           /* Rem '_x' for real date */
+        "ISREDIT F'Dump statistics as at' FIRST"
+        "ISREDIT (line) = LINE .ZCSR"
+        xx = Word(line,7)
+        Parse VAR xx xx '.' .
+    End
+    Else xx = Substr(fdate,7,2)'/' ||,
+              Substr(fdate,5,2)'/' ||,
+              Substr(fdate,1,4)
+/*  x = Output(Substr("*",1,71)"*   From   :" xx)"*")                 */
+    If tdate = max_date_x Then Do           /* Rem '_x' for real date */
+        "ISREDIT F'Dump statistics as at' LAST"
+        "ISREDIT (line) = LINE .ZCSR"
+        xx = Word(line,7)
+        Parse VAR xx xx '.' .
+    End
+    Else xx = Substr(tdate,7,2)'/' ||,
+              Substr(tdate,5,2)'/' ||,
+              Substr(tdate,1,4)
+/*  x = Output(Substr("*",1,71)"*   To     :" xx)"*")                 */
+    x = Output(Substr("*",1,71)"*")
+    x = Output('*'Copies('-',70)'*')
+    "ISREDIT CURSOR = 1 0"
+    qit = 'Y'                               /* Set queue flag on      */
+
+    head1 = 'Code Times'
+    head2 = '---- -----'
+
+/*--------------------------------------------------------------------*/
+/* Process data accumulatingdeletion of redundant lines               */
+/*--------------------------------------------------------------------*/
+    edate = 99999999
+    odate = 0
+
+    "ISREDIT (last) = LINENUM .ZLAST"
+    process = 0
+    dmp.s = ''                              /* Systems dumps          */
+    dmp.t = ''                              /* Transaction dumps      */
+    dp    = ''                              /* Dates processed        */
+    md    = ''                              /* Missing dates          */
+    #d.   = 0
+    Do i=1 To last
+        "ISREDIT (line) = LINE" i
+        If line = '' Then Iterate
+        If Substr(line,1,1) = '*' Then Iterate
+        If Index(line,'Dump statistics as at') > 0 Then Do
+            ddate = Word(line,7)
+            Parse VAR ddate ddate '.' .
+            Parse VAR ddate dd '/' mm '/' yyyy .
+            xdate = yyyy || mm || dd
+            If xdate > tdate Then Leave
+            If xdate < fdate Then Iterate
+            If xdate > odate Then odate = xdate
+            If xdate < edate Then edate = xdate
+            process = 1
+            If Index(dp,ddate) = 0 Then dp = dp ddate
+            yd = $DATEMAN('E-N',ddate,,-1)   /* Yesterday's date      */
+            If Words(dp) > 1 Then,
+                If Index(dp,yd) = 0 & Index(md,yd) = 0 Then,
+                    md = md yd
+            Iterate
+        End
+        If process Then NOP
+        Else Iterate
+        If Index(line,'System D') > 0 Then Do
+            at = 'S'
+            Iterate
+        End
+        If Index(line,'Transaction D') > 0 Then Do
+            at = 'T'
+            Iterate
+        End
+        Parse var line code . nd .
+        If Index(' 'dmp.at' ',' 'code' ') = 0 Then dmp.at = dmp.at code
+        #d.at.code = #d.at.code + nd
+    End
+
+    #sv = 0
+    #td = 0
+    x = Output(sregn 'dump statistics as at' Time() 'on' Date('e')'.')
+    at = 'S'
+    dt = 'System'
+    Call print_dmps
+    at = 'T'
+    dt = 'Transaction'
+    Call print_dmps
+    x = Output(' ')
+    edate = Substr(edate,7,2)'/' ||,
+            Substr(edate,5,2)'/' ||,
+            Substr(edate,1,4)
+    odate = Substr(odate,7,2)'/' ||,
+            Substr(odate,5,2)'/' ||,
+            Substr(odate,1,4)
+    x = Output(#sv "SV's and" #td "transaction dumps recorded from",
+               edate "to" odate".")
+    x = Output('For more details look under Abend/FX or use the',
+               '"ABSUM" routine to')
+    x = Output('generate a detailed report by transaction/program.')
+    If md /= '' Then Do
+        x = Output(' ')
+        x = Output('No stats found for the following dates in the',
+                   'reporting range-')
+        md = Translate(Strip(md),',',' ')
+        x = Output(' ' Strip(md)'.')
+    End
+    qit = 'N'                               /* Set queue flag on      */
+    x = Output(' ')
+    x = Output('*'Copies('-',70)'*')
+    x = Output(' ')
+
+    If batch = 'Y' Then Do
+        Address TSO "EXECIO * DISKW ABNDSSUM (FINIS"
+        Address TSO "DELSTACK"
+        If sendmail = 'Y' Then Call set_email_parm
+        "ISREDIT CANCEL"
+        "ISREDIT MEND"
+    End
+    Else "ISREDIT USER_STATE = (status)"
+    Exit
+
+print_dmps:
+    anyd = 'N'
+    Do Forever
+        If dmp.at = '' Then Leave
+        Parse VAR dmp.at code dmp.at
+        If at = 'T' Then #td = #td + #d.at.code
+        xtra = ''
+        If Strip(code) = 'SM0102' Then Do
+            #sv = #sv + #d.at.code
+            xtra = '<--- Attention'
+        End
+        Else If Index(' 'tag' ',code) > 0 Then xtra = '<--- Attention'
+        line = ' ' Substr(code,1,8) '-' Right(#d.at.code,5) xtra
+        If anyd = 'N' Then Do
+            x = Output(dt 'dumps.')
+            anyd = 'Y'
+        End
+        x = Output(line)
+    End
+
+    Return 0
+
+Output:
+    Say Arg(1)
+    If batch = 'Y' & qit = 'Y' Then Queue Arg(1)
+    Return 0
+
+/*--------------------------------------------------------------------*/
+/* Set up Email parms other than userid                               */
+/*--------------------------------------------------------------------*/
+set_email_parm:
+    Address TSO "EXECIO * DISKR EDMATRIX (STEM linei. FINIS)"
+    Address TSO "NEWSTACK"
+    Parse VAR sregn regn1 ',' .
+    Do i=1 To linei.0
+        If Substr(linei.i,1,9) = Substr('ALL',1,8)':' Then NOP
+        Else Do
+            If Substr(linei.i,1,9) /= Substr(regn1,1,8)':' Then Iterate
+        End
+        xxx = Substr(linei.i,10)
+        Parse VAR xxx xxx .
+        Do Forever
+            Parse VAR xxx who ',' xxx
+            Call set_email_detl
+            If xxx = '' Then Leave
+        End
+    End
+    Address TSO "EXECIO * DISKW EMAILDAT (FINIS"
+    Address TSO "DELSTACK"
+
+    Return 0
+
+set_email_detl:
+    Signal On Syntax Name staxroc_2;retsyn = got_repday
+    repday = $DATEMAN('E-E',odate,edate)
+    repday = repday +1
+got_repday:Signal Off Syntax
+
+    Queue "%EMAIL "Strip(who)"@ANZ.COM -"
+    Queue "  FROM "sender"@"sysid".HOST.AU.ANZ -"
+    Queue "  MSGDD DD1 -"
+    Queue "  FILE '"dsname".SUM' -"
+    Queue "  SUBJECT '"sregn" Abends("sabnd") over last" repday,
+          "days on "sysid".'"
+          "days on "sysid".'"
+
+    Return 0
+
+/*--------------------------------------------------------------------*/
+/* Parse parameters (Expects parameter list in variable "parm#")      */
+/*--------------------------------------------------------------------*/
+Parse_parms:
+    Parse Upper VAR parm# parm#
+
+    trace = parse_cons('TRACE')
+    If trace = 'N' Then trace = parse_cons('/TR',,,3)
+
+    sendmail = parse_cons('NE','N','Y')
+
+    b_jcl = parse_cons('JCL',,,1)
+
+    sregn = parse_varb('R(')
+    If sregn = 'N' Then sregn = parse_varb('REGION(')
+    If sregn = 'N' Then sregn = parse_varb('REGIONS(')
+    If sregn /= 'N' Then Parse VAR sregn sregn ')' .
+    Parse VAR sregn ',' reg2
+    If reg2 = '' Then Parse VAR sregn . reg2
+    If b_jcl = 'Y' Then Do
+        If reg2 /= '' | sregn = 'N' | sregn = 'ALL' Then Do
+            Say '**********************************************'
+            Say '*                                            *'
+            Say '*              *** ERROR ***                 *'
+            Say '*                                            *'
+            Say '* You must supply a single valic CICS region *'
+            Say '* jobname. (Cannot be "ALL".)                *'
+            Say '*                                            *'
+            Say '**********************************************'
+            Exit
+        End
+    End
+
+    sabnd = parse_varb('A(')
+    If sabnd = 'N' Then sabnd = parse_varb('ABEND(')
+    If sabnd = 'N' Then sabnd = parse_varb('ABENDS(')
+    If sabnd /= 'N' Then Do
+        Parse VAR sabnd sabnd ')' .
+        If sabnd /= '' Then #tag = ''
+    End
+    Else Do
+        sabnd = ''
+        #tag = 'SM0102,ASRA'                /* Default tag for ALL abs*/
+    End
+
+    tag = parse_varb('TA(')
+    If tag = 'N' Then tag = parse_varb('TAG(')
+    If tag /= 'N' Then Parse VAR tag tag ')' .
+    Else tag = #tag
+
+/*--------------------------------------------------------------------*/
+/* End date of '-dd' is only acceptable if $DATEMAN() routine avail   */
+/* and data verfication made.                                         */
+/*--------------------------------------------------------------------*/
+    min_date = '19000101'
+    max_date = '30001231'
+    fdate = parse_varb('F(')
+    If fdate = 'N' Then fdate = parse_varb('FDATE(')
+    If fdate /= 'N' Then Do
+        Parse VAR fdate fdate ')' .
+        If fdate /= '' Then Do
+            tdate = parse_varb('T(')
+            If tdate = 'N' Then tdate = parse_varb('TDATE(')
+            If tdate /= 'N' Then Do
+                Parse VAR tdate tdate ')' .
+            End
+            Else tdate = max_date
+            Signal got_fdate
+        End
+    End
+    fdate = parse_varb('D(')
+    If fdate = 'N' Then fdate = parse_varb('DATE(')
+    If fdate /= 'N' Then Do
+        Parse VAR fdate fdate ')' .
+        If fdate /= '' Then Do
+            tdate = fdate
+            Signal got_fdate
+        End
+    End
+    fdate = parse_varb('-',min_date)
+    If fdate /= min_date & Datatype(fdate) = 'NUM' Then Do
+        Signal On Syntax Name staxroc_1
+        retsyn = got_fdate
+        y = $DATEMAN('E-N',,,'-'fdate)
+        Parse VAR y dd '/' mm '/' yy
+        fdate = yy || mm || dd
+    End
+    Else fdate = min_date
+    tdate = max_date
+
+got_fdate:Signal On Syntax Name staxroc_0;retsyn = got_dates
+    date = Substr(fdate,7,2)'/'||,
+           Substr(fdate,5,2)'/'||,
+           Substr(fdate,1,4)
+    If Word($DATEMAN('VER',date),1) = 'Error' Then fdate = min_date
+    date = Substr(tdate,7,2)'/'||,
+           Substr(tdate,5,2)'/'||,
+           Substr(tdate,1,4)
+    If Word($DATEMAN('VER',date),1) = 'Error' Then tdate = max_date
+
+got_dates:Signal Off Syntax
+    If ima_macro /= 'Y' & b_jcl /= 'Y' Then Do
+        dsname = ''
+        Do Forever
+            Parse VAR parm# dsn parm#
+            If dsn = '' Then Leave
+            If Substr(dsn,1,1) /= "'" Then dsn = "'"dsn"'"
+            If Sysdsn(dsn) = 'OK' Then Do
+                dsname = dsn
+                Leave
+            End
+        End
+    End
+
+    Return 0
+
+/*--------------------------------------------------------------------*/
+/* Parse string 'parm#' with 'mask'. Result set to 'N' if mask not    */
+/* found or set to 'Y' if found. Can pass positive/negative result    */
+/* substitution as the 2 and 3 parameter. Defaults are Y and N.       */
+/* Can set null return value for either by passing 'NULL'. Can set    */
+/* either to the original mask by entering '*' (suggest 'NULL' for the*/
+/* other value).                                                      */
+/* Can pass a mask length as fourth parameter. Comma delimit to pad   */
+/* out if prior parameters are not supplied.                          */
+/* Can pass 'WORD' as fourth parameter to return the word that        */
+/* contain that mask.                                                 */
+/*--------------------------------------------------------------------*/
+parse_cons: Procedure Expose parm#
+    Arg mask,posr,negr,maskl
+    If posr = ''     Then posr = 'Y'
+    If negr = ''     Then negr = 'N'
+    If posr = 'NULL' Then posr = ''
+    If negr = 'NULL' Then negr = ''
+    If posr = '*'    Then posr = mask
+    If negr = '*'    Then negr = mask
+    Select
+        When (maskl = 'WORD') Then Do
+            y#  = 0
+            xxx = parm#
+            Do i=1 To Words(xxx)
+                Parse VAR xxx x_x xxx
+                If Index(x_x,mask) > 0 Then Do
+                    y# = i
+                    posr = x_x
+                    Leave
+                End
+            End
+        End
+        When (Datatype(maskl) = 'NUM') Then Do
+            y#  = 0
+            xxx = parm#
+            Do i=1 To Words(xxx)
+                Parse VAR xxx x_x xxx
+                If Substr(x_x,1,maskl) = Substr(mask,1,maskl) Then Do
+                    y# = i
+                    Leave
+                End
+            End
+        End
+        Otherwise y# = Wordpos(mask,parm#)
+    End
+
+    If y# > 0 Then Do
+        parm# = Delword(parm#,y#,1)
+        Return posr
+    End
+    Return negr
+
+/*--------------------------------------------------------------------*/
+/* Parse string 'parm#' with 'mask'. Result set to 'N' if mask not    */
+/* found or set to next space delimeted value immediately following   */
+/* the mask (NULLs is a valid value).                                 */
+/* Can pass positive/negative result substitution as the 2 parameter. */
+/* Can pass 'NUM' as third parameter to check for numerics and return */
+/* negative result if not numeric.                                    */
+/*--------------------------------------------------------------------*/
+parse_varb: Procedure Expose parm#
+    Arg mask,negr,dt
+    If negr = '' Then negr = 'N'
+    parm## = ' 'parm#
+    m#     = ' 'mask
+    y# = Index(parm##,m#)
+    If y# > 0 Then Do
+        If Substr(parm##,y#+Length(m#),1) = '' Then Do
+            px = ''
+            data = "Parse VAR parm## p1 '"m#"' p2"
+        End
+        Else data = "Parse VAR parm## p1 '"m#"' px p2"
+        Interpret data
+        parm# = Strip(p1) Strip(p2)
+        If dt = 'NUM' & Datatype(px) /= 'NUM' Then Return negr
+        Else                                       Return px
+    End
+    Return negr
+
+/*--------------------------------------------------------------------*/
+/* Build JCL according to LPAR on.                                    */
+/*--------------------------------------------------------------------*/
+build_jcl:
+If Verify(Substr(sysid,4,1),'CHI') = 0 Then prod = ''
+Else                                        prod = 'P'
+userid = Userid()
+dumpstat= prod||'CIX.'sregn'.DUMPSTAT'
+statcopy= dumpstat'.COPY'
+sep    = '//*'Copies('-',67)'*'
+sepp   = '//*'Copies('=',67)'*'
+
+Address TSO "NEWSTACK"
+Queue "//"userid"DMS JOB ,'ABEND-REPORTING',MSGCLASS=V,CLASS=E,"
+Queue '//*  RESTART=STEP2      <--- Uncomment as required'
+Queue '//   NOTIFY=&SYSUID'
+Queue '//*'
+Queue '//*MAIN SYSTEM='sysid
+Queue sep
+Queue '//*  Original source and updates to JCL available from member:        *'
+Queue '//*    Execute command "TSO 'xcmd' JCL" and save for later use....    *'
+Queue sep
+If Length('//VARS SET R=R('sregn')') < 28 Then,
+ Queue Substr('//VARS SET R=R('sregn')',1,28) 'Selective regions'
+Else,
+ Queue '//VARS SET R=R('sregn') Selective regions'
+Queue '//  SET A=                   All ABENDS'
+Queue '//* SET A=A(SM0102,ASRA,AEYQ) Selective abends'
+Queue "//  SET TA=                  Don't tag/highlight any abends."
+Queue '//* SET TA=TAG(SM0102,ASRA)  Tag these two, default is'
+Queue '//*                          TA(SM0102,ASRA) if R(ALL) used'
+Queue '//  SET D=-8                 Last 7 days (run in morning, +1)'
+Queue '//* SET D=                   Uncomment for ALL dates'
+got_fdate:Signal On Syntax Name staxroc_0;retsyn = got_yesterday
+date = 'YYYYMMDD'
+date = $DATEMAN('E-N',Date('e'),,-1)
+Parse VAR date dd '/' mm '/' yy
+date = yy || mm || dd
+got_yesterday:Signal Off Syntax
+Queue '//* SET D=D('date')        Specific date (yesterday)'
+Queue '//* SET F=F('fdate')        F(YYYYMMDD)'
+Queue '//* SET T=T('tdate')        T(YYYYMMDD)'
+Queue '//*'
+If sendmail = 'Y' Then,
+  Queue '//* SET N=NE                 No notification via Email'
+Else,
+  Queue '//  SET N=NE                 No notification via Email'
+Queue '//*'
+Queue '//  SET DUMPSTAT='dumpstat '      Abend stats dataset.'
+Queue '//  SET STATCOPY='dumpstat'.COPY  Abend stats copy.'
+Queue '//*'
+Queue '//  SET SYSPROC='sysproc '         "'xcmd'" location'
+Queue sep
+Queue '//* Delete for reruns...                                              *'
+Queue sep
+Queue '//STEP0    EXEC PGM=IEFBR14'
+Queue '//SYSUT2   DD DISP=(MOD,DELETE),DSN=&STATCOPY,'
+Queue '//            UNIT=DISK,SPACE=(TRK,(0))'
+Queue '//*'
+Queue sep
+Queue '//* Take a copy and work off it to minimise ENQs                      *'
+Queue sep
+Queue '//STEP1    EXEC PGM=IEBGENER'
+Queue '//SYSPRINT DD SYSOUT=*'
+Queue '//SYSUT1   DD DISP=SHR,DSN=&DUMPSTAT'
+Queue '//SYSUT2   DD DISP=(NEW,CATLG),DSN=&STATCOPY,'
+Queue '//            UNIT=DISK,SPACE=(CYL,(10,2),RLSE)'
+Queue '//*'
+Queue sep
+Queue '//* Delete for reruns...                                              *'
+Queue sep
+Queue '//STEP2    EXEC PGM=IEFBR14'
+Queue '//ABNDSSUM DD DISP=(MOD,DELETE),DSN=&STATCOPY..SUM,'
+Queue '//            UNIT=DISK,SPACE=(TRK,(0))'
+Queue '//*EMAILDAT DD SPACE=(TRK,(0)),UNIT=SYSDA,'
+Queue '//*           DSN=&STATCOPY..EMAIL,'
+Queue '//*           DISP=(MOD,DELETE)'
+Queue '//*'
+Queue sep
+Queue '//* Proces abend report                                               *'
+Queue sep
+Queue '//STEP3    EXEC PGM=IKJEFT01,DYNAMNBR=65,'
+Queue "//*PARM=('ISPSTART CMD(%"xcmd" &STATCOPY &R &A &TA &D &F &T &N)'),"
+Queue "// PARM=('ISPSTART CMD(%"xcmd" &R &A &TA &D &F &T &N)'),"
+Queue '// REGION=4096K'
+QUEUE "//SYSPROC  DD DISP=SHR,DSN=&SYSPROC"
+Queue sep
+Queue '//* ANZ - ISPF environment                                            *'
+Queue sep
+Queue '//ISPPLIB  DD DISP=SHR,DSN=SYS1.ISPF.PANELS'
+Queue '//ISPSLIB  DD DISP=SHR,DSN=SYS1.ISPF.SKELS'
+Queue '//ISPMLIB  DD DISP=SHR,DSN=SYS1.ISPF.MSGS'
+Queue '//ISPTLIB  DD DISP=SHR,DSN=SYS1.ISPF.TABLES'
+Queue '//ISPPROF  DD SPACE=(TRK,(10,,10)),UNIT=SYSDA,DSN=&&ISPPROF,'
+Queue '//            DCB=(RECFM=FB,LRECL=80,BLKSIZE=6160)'
+Queue '//ISPLOG   DD DUMMY'
+Queue '//ISPLIST  DD DUMMY'
+Queue '//SYSTSPRT DD SYSOUT=*'
+Queue '//STATCOPY DD DISP=SHR,DSN=&STATCOPY'
+Queue '//ABNDSSUM DD SPACE=(TRK,(15,15),RLSE),UNIT=DISK,'
+Queue '//            DSN=&STATCOPY..SUM,'
+Queue '//            DISP=(NEW,CATLG),'
+Queue '//            DCB=(RECFM=FB,LRECL=80,BLKSIZE=0,DSORG=PS)'
+Queue '//*'
+Queue '//EMAILDAT DD SPACE=(TRK,(1,1)),UNIT=SYSDA,'
+Queue '//            DSN=&&EMAILDAT,                Email distribution file'
+Queue '//            DISP=(NEW,PASS),'
+Queue '//*           DSN=&STATCOPY..EMAIL,'
+Queue '//*           DISP=(NEW,CATLG),'
+Queue '//            DCB=(RECFM=FB,LRECL=80,BLKSIZE=6160)'
+Queue sep
+Queue '//* If the parameter length is too long, uncomment the appropriate    *'
+Queue "//* lines to execute from here. (Don't forget to comment out the      *"
+Queue '//* "PARM=" statement.)                                               *'
+Queue sep
+Queue '//SYSTSIN  DD *'
+Queue Substr('//* ISPSTART CMD(%'xcmd,1,50)'+'
+Queue Substr('//*   REGION('sregn')',1,50)'+'
+Queue Substr('//*   -8',1,50)'+'
+Queue '//*     )'
+Queue Substr('//*   'statcopy,1,50)'+'
+Queue Substr('//*   ABENDS()',1,50)'+'
+Queue Substr('//*   TAG(ASRA)',1,50)'+'
+Queue Substr('//*   DATE('date')',1,50)'+'
+Queue Substr('//*   FDATE('fdate')',1,50)'+'
+Queue Substr('//*   TDATE('tdate')',1,50)'+'
+Queue Substr('//*   NE',1,50)'+'
+Queue '//*'
+Queue sep
+Queue '//* Mailing MATRIX (keep up to date with new mailees)......           *'
+Queue '//* "ALL     :" represents all regions.                               *'
+Queue "//* Seperate multiple entries with an ','. '*' in column 1 will be    *"
+Queue '//* treated as a comment.                                             *'
+Queue sep
+Queue '//EDMATRIX DD *'
+/*--------------------------------------------------------------------*/
+/* //EDMATRIX - Eyecatcher                                            */
+/* Keep this matrix up to date if you want to use this REXX to        */
+/* generate JCL. Amend the Select;End block to reflect updates.       */
+/*--------------------------------------------------------------------*/
+Queue 'ALL     :KARAA                                              Test'
+Queue '*LL     :KARAA,GARTLANA,RODEC,COOPERP,MCKENZD               CICS Sup.'
+Queue '*ICSIP01:KARAA                                              CICS Sup.'
+/*--------------------------------------------------------------------*/
+Queue '/*'
+Queue '//*'
+Queue sepp
+Queue '//* FTP for mailing                                                   *'
+Queue sep
+Queue '//STEP4    EXEC PGM=IKJEFT1A'
+Queue '//SYSEXEC  DD DISP=SHR,DSN=SYS4.ANZ.CLIST'
+Queue '//SYSPRINT DD SYSOUT=*'
+Queue '//SYSTSPRT DD SYSOUT=*'
+Queue '//DD1      DD DUMMY'
+Queue '//STATCOPY DD DISP=(MOD,DELETE),DSN=&STATCOPY,'
+Queue '//            SPACE=(TRK,(0)),UNIT=DISK'
+Queue '//ABNDSSUM DD DISP=(MOD,DELETE),DSN=&STATCOPY..SUM,'
+Queue '//            SPACE=(TRK,(0)),UNIT=DISK'
+Queue sep
+/*--------------------------------------------------------------------*/
+/* //SYSTCPD  - Eyecatcher                                            */
+/* Keep this matrix up to date if you want to use this REXX to        */
+/* generate JCL. Amend the Select;End block to reflect updates.       */
+/*--------------------------------------------------------------------*/
+Queue '//* The SYSTCPD DD needs to change for each system as follows:-       *'
+Queue '//*       ANZD - SYS3.TCPIP.PARMLIB(TCPDAT09)                         *'
+Queue '//*       ANZU - SYS3.TCPIP.PARMLIB(TCPDAT18)                         *'
+Queue '//*       ANZP - SYS3.TCPIP.PARMLIB(TCPDAT04)                         *'
+Queue '//*       ANZF - SYS3.TCPIP.PARMLIB(TCPDAT10)                         *'
+Queue '//*       ANZH - SYS3.TCPIP.DATA                                      *'
+Queue '//*       ANZC - SYS3.TCPIP.DATA                                      *'
+Queue '//*       ANZI - SYS3.TCPIP.DATA                                      *'
+Queue '//*       ???? - Missing.to.give.jcl.error                            *'
+Queue sep
+Select
+    When (sysid = 'ANZD') Then systcpd = 'SYS3.TCPIP.PARMLIB(TCPDAT09)'
+    When (sysid = 'ANZU') Then systcpd = 'SYS3.TCPIP.PARMLIB(TCPDAT18)'
+    When (sysid = 'ANZP') Then systcpd = 'SYS3.TCPIP.PARMLIB(TCPDAT04)'
+    When (sysid = 'ANZF') Then systcpd = 'SYS3.TCPIP.PARMLIB(TCPDAT10)'
+    When (sysid = 'ANZH') Then systcpd = 'SYS3.TCPIP.DATA'
+    When (sysid = 'ANZC') Then systcpd = 'SYS3.TCPIP.DATA'
+    When (sysid = 'ANZI') Then systcpd = 'SYS3.TCPIP.DATA'
+    Otherwise systcpd = 'Missing.to.give.jcl.error'
+End
+Queue '//SYSTCPD  DD DISP=SHR,DSN='systcpd
+/*--------------------------------------------------------------------*/
+Queue '//*SYSTSIN  DD DISP=SHR,DSN=&STATCOPY..EMAIL        Mailing List'
+Queue '//SYSTSIN  DD DISP=(OLD,DELETE),DSN=&&EMAILDAT     Mailing List'
+Queue '//'
+Queue sep
+Queue '//* Comment out above 2 lines and change the dots below to re E-Mail  *'
+Queue '//* after changing RESTART=STEP4 in jobcard.                          *'
+Queue sep
+Queue "//SYSTSIN  DD *                                    Manual Mail"
+Queue "%EMAIL ....@ANZ.COM -"
+Queue "  FROM "sender"@"sysid".HOST.AU.ANZ -"
+Queue "  MSGDD DD1 -"
+Queue "  FILE '"statcopy".SUM' -"
+Queue "  SUBJECT 'CICS.... Abends() over last xxx days on "sysid".'"
+Queue ''
+If Sysdsn("'"dumpstat"'") /= 'OK' Then Do
+    zerrlm = "Note that '"dumpstat"'" Sysdsn("'"dumpstat"'")'.'
+    "SETMSG MSG(ISRZ002)"
+End
+"VGET ZTEMPF"
+Address TSO "ALLOC DD(ZTEMPF) DS('"ztempf"') SHR REU"
+Address TSO "EXECIO * DISKW ZTEMPF (FINIS"
+Address TSO 'DELSTACK'
+"LMINIT DATAID(DATAID) DDNAME(ZTEMPF)"
+"EDIT DATAID(&DATAID)"
+"LMFREE DATAID(&DATAID)"
+Address TSO "FREE DD(ZTEMPF)"
+
+Exit
+
+/*--------------------------------------------------------------------*/
+/* Help details...                                                    */
+/*--------------------------------------------------------------------*/
+Help_me:
+    Do i=n_st-1 To n_en+1
+        Say Center(Strip(Sourceline(i),'t'),79)
+    End
+
+    Exit
+
+errproc:Call Off Error;Return Sigl

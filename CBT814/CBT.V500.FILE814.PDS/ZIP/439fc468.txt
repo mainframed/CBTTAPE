@@ -1,0 +1,228 @@
+Hiperbatch - a new era for batch jobs?
+
+Hiperbatch (high performance batch) is an implementation of
+the data in memory concept, consisting at the moment of
+intercepting certain types of DASD I/O and satisfying them
+from expanded storage rather than DASD.  Data is kept in
+expanded storage-only Hiperspaces managed by a new system
+address space - the Data Lookaside Facility (DLF).  The new
+versatile MVPG (Move Page) instruction carries out all
+transfers to main storage.  Expanded storage acts as a faster
+and larger DASD cache which is very efficient for read
+operations; writing always operates both on DASD and
+expanded storage.  Avoiding DASD accesses dramatically
+reduces elapsed times (by an average of 50% or even more)
+whereas CPU times tend to increase slightly.
+
+
+REQUIREMENTS
+
+Hiperbatch requires a 3090 model S or J (or equivalent), with
+expanded storage, support for the MVPG instruction, MVS/SP
+3.1.3, and DFP 3.1.0.  Check the level of your software
+carefully (particularly DFP) - with MVS/SP 3.1.3 and DFP
+3.2, we had to apply PTFs up to 9007 level.  Read the
+information APAR II04791 and notice that there are still open
+APARs at the time of writing.  Hiperbatch is not fully
+stabilized.
+
+
+WHICH FILES ARE CONCERNED?
+
+A big advantage with Hiperbatch, as opposed for example to
+batch LSR, is that there is no need to modify existing JCL in
+order to exploit it.  Unfortunately not all files can benefit by it.
+It is restricted to sequential files accessed by QSAM and
+VSAM files accessed in NSR, defined with SHAREOPTION 1
+or 2, and with CI sizes of 4096 or multiples of 4096.  Utilities
+using BSAM, BPAM, or EXCP like IEBGENER, DFSORT,
+IEBCOPY, IFASMFDP etc, are not suitable - IDCAMS or
+ICEGENER (the DFSORT replacement for IEBGENER) are.
+Only the data part of VSAM KSDS files is appropriate for
+Hiperbatch.
+
+
+HOW DOES IT WORK?
+
+At every opening of a QSAM or VSAM file, DLF is asked
+whether that file is eligible for Hiperbatch or not (parameters
+are discussed below).  If it is, it becomes a DLF object: blocks
+of data are kept in expanded storage in 4K frames as they are
+retrieved from DASD or, alternatively, are directly retrieved by
+their Relative Block Number (RBN) from expanded storage if
+they are already there.  Blocks in expanded storage are
+managed by a kind of Most Recently Used (MRU) method,
+because the last retrieved blocks are the most unlikely ones to
+be re-accessed in the near future.
+
+
+Retained and non-retained objects
+
+Non-retained objects are flushed from expanded storage as
+soon as no more tasks require them.  This is particularly
+relevant for table files accessed at the same time by several
+CICS or batch jobs.  Retained objects stay in expanded storage
+even if no task needs them.  They are deleted when the source
+file is deleted, otherwise they must be deleted explicitly by the
+COFMSTCN utility.  To be loaded in expanded storage,
+retained objects must be opened first in output mode and
+preferably loaded sequentially.  You cannot create retained
+objects by a sequential read (IBM documentation is rather
+unclear about it).  This applies ideally to transient files created
+by a job, read, and then re-read in other steps or by other jobs,
+and eventually deleted before the batch window has finished.
+
+
+ParametErS
+
+The main parameters are defined in the COFDLFxx member of
+PARMLIB, for example :
+
+        CLASS
+        MAXEXPB(70)        /*   70 megabytes of ES for Hiperbatch   */
+        PCTRETB(99)        /*   Percent of max for retained objects */
+        CONEXIT(COFXDLF1)  /*   Installation exit                   */
+
+You also have to indicate which files should be managed by
+Hiperbatch.  The most straightforward method is by using
+RACF 1.9 to define eligible files as profiles for the general
+resource class, DLFCLASS.
+
+If you do not have RACF 1.9, you must implement the DLF
+'connection/deconnection' exits provided by IBM as
+COFXDLF1 or COFXDLF2 in SYS1.SAMPLIB.  We don't
+advise you to use COFXDLF1 because it is too basic.  It has a
+table with the DSNAMEs of eligible files, so it must be re-
+assembled to take into account any change.  It is better to use
+COFXDLF2 (renaming it to COFXDLF1), which is more
+powerful and flexible; it is included in PTF UY56040 (9007).
+Here are the main components you should install.
+
+o      DLFX subsystem (update IEFSSNxx member of
+      PARMLIB): anchor point for some blocks (like the
+      COFXTAB, the table of eligible files).
+
+o      Member COFXITxx of PARMLIB, containing the
+      DSNAMEs of eligible files (generic names are permitted),
+      and possibly volumes they reside on and job names
+      allowed to access them through Hiperbatch. For example:
+
+      BLDLIST  FORCE(NO)
+          DSN(PROD.VSAM.HIPERBAT)   RETAIN(YES)
+          DSN(PROD.TEST.HIPERB)     RETAIN(YES)
+          DSN(PROD.TEST.NORETAIN)   VOL(PRD001) JOBS(PAYROLL)
+          DSN(PROD.FILE.TEMP*)      RETAIN(YES) JOBS(PROD*)
+      BLDEND
+
+o      Procedure DLF must be updated to look like this:
+
+      //DLF      PROC NN=00
+      //DLF      EXEC PGM=COFMISDO,PARM='NN=&NN'
+      //IEFPARM  DD   DISP=SHR,DSN=SYS1.PARMLIB
+      //DLFXPARM DD   DISP=SHR,DSN=SYS1.PARMLIB(COFXIT00) <-eligible files
+      //DLFXLOG  DD   DISP=SHR,DSN=SYS1.DLFXLOG    <- log ds (FBM,121,968)
+
+o      Program COFXUPDT in SAMPLIB must be assembled.
+      It enables you to refresh the in-storage list of eligible files,
+      here is an example:
+
+//REFRESH  EXEC PGM=COFXUPDT
+//*
+//DLFXPARM DD   DISP=SHR,DSN=SYS1.PARMLIB(COFXIT00)
+//SYSUDUMP DD   SYSOUT=*
+//DLFXLOG  DD   SYSOUT=*
+//*
+//LIST     EXEC PGM=COFXUPDT
+//*
+//SYSUDUMP DD   SYSOUT=*
+//DLFXLOG  DD   SYSOUT=*
+//DLFXPARM DD   *
+      LIST
+
+
+OPC/A INTERFACE
+
+Another way of invoking Hiperbatch is to define the concerned
+files as OPC/A 'special resources'.  The DLF exit, CSYDLFX,
+in the OPCSAMP library must be installed.  OPC/A issues
+SYSZDLF enqueues to record the DSNAMEs of eligible files:
+you may list them by a command D GRS,RES=(SYSZDLF,*).
+The DLF exit, when invoked during open instructions,
+confirms that the OPC/A-managed jobs may use these files
+through Hiperbatch as retained objects.  When OPC/A finds
+that no more jobs need a file, it begins cleaning up, starting a
+procedure, CSYPROC, which in turn submits the clean-up job,
+CSYJCLIN.  The first approach to Hiperbatch may be to
+proceed by using the COFXDLF2 exit rather than the OPC/A
+interface.
+
+
+CONTROLLING DLF
+
+To start DLF, issue: S DLF,SUB=MSTR.  To display how
+much expanded storage is used by Hiperbatch, issue: F
+DLF,ST (or F  DLF,SB or F DLF,SM to get it into blocks or
+into megabytes).
+
+To display which files are currently under control of
+Hiperbatch, issue: D DLF, which is in fact equivalent to D
+GRS, RES=(SYSVSDO,*).
+
+There is no need to stop DLF when you are going to stop the
+whole MVS system and IPL, because write operations always
+affect DASD, not only expanded storage.
+
+
+MEASURING
+
+The SMF record types 14 (for sequential readings), 15 (for
+sequential writings), and 64 (for VSAM) appear to have five
+new fields, reflecting hit and miss ratios (see Figure 1).
+
+IBM has also delivered an on-line TSO monitor, COFDMON,
+a very handy tool to keep in sight how expanded storage is
+used, which part of a DLF object is being accessed, the hit
+ratios of jobs currently using it, etc.
+
+Here are some statistics from our experience, showing the
+profit you can get from implementing Hiperbatch.  We tested
+Hiperbatch against a sequential file defined with LRECL=80,
+BLKSIZE=27960, SPACE=(CYL,(40,6)), and 500,000
+records.  This file is located on a 3390 DASD connected to a
+3990-3 controller with the DASD fastwrite function active.
+Our PR/SM partition was given 128 megabytes of expanded
+storage, 254 megabytes of main storage, and 3 dedicated
+processors (representing 70 MIPS or so).  Hiperbatch could use
+up to 70 megabytes (MAXEXPB was set to 70).
+
+1st operation: loading the sequential file (IDCAMS REPRO)
+
+      EXCPs      CPU time      Elapsed time
+
+Without Hiperbatch      2898      5.9 seconds      49-57 seconds
+
+With Hiperbatch      2898      6.3 seconds      50-60 seconds
+
+2nd operation: reading the file sequentially
+
+      EXCPs      CPU time      Elapsed time
+
+Without Hiperbatch      1440      1.3 seconds      18-21 seconds
+
+With Hiperbatch       1440      2 seconds      3-8 seconds
+
+
+BIBLIOGRAPHY
+
+o      Hiperbatch/DLF Presentation Guide, IBM ITSC
+      Poughkeepsie (December 1989).
+
+o      MVS/ESA Application Development Guide: Hiperbatch  (GC28-1200-0).
+
+o      MVS/ESA SPL Application Development Guide (GC28-
+      1852-1), Chapter 10: Using Hiperbatch with DLF.
+
+Thierry Falissard
+Systems Engineer
+Sogem-Banque La Henin (France)                  c Xephon 1991
+

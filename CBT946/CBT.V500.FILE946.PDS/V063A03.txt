@@ -1,0 +1,780 @@
+RSCS console log management
+
+The people that manage the data communication facilities in
+our shop are sometimes required to examine the RSCS console
+file to resolve problems with the various devices connected to
+VM.  Initially we were logging on to the RSCS user-id and
+manually closing the file and then routing it to a printer or to
+another user-id's reader for browsing.  Needless to say this
+sometimes created problems when someone left RSCS logged
+on a console, or worse, accidently logged RSCS off.  In
+addition, once printed, the console log was lost for future
+reference.
+
+To get around this problem I developed a tool that could be
+used to manage the RSCS console logs.  This facility consists
+of a special disconnected virtual machine (DVM) to which
+RSCS sends its console logs.  The logs can be sent in one of
+two ways.  First, we have a timer facility (in our case
+VMUTIL) that tells RSCS to close its console log every day at
+midnight.  The second way is to have an authorized user send a
+command to the DVM which in turn can issue a CP command
+to RSCS to close its console log.  In our case the DVM is
+called RSCSLOG.
+
+Using RSCSLOG it is possible to have a specific RSCS
+console log sent to your reader, or if required, printed directly
+from RSCSLOG to a system defined printer.  I prefer the
+reader since I can issue the PEEK command to view it and use
+the power of XEDIT to locate specific information.
+RSCSLOG also has a facility to get a list of the RSCS console
+logs which it is maintaining.  In our case we only maintain logs
+for the previous 30 calendar days because we have never had a
+reason to look back any further than this.
+
+The RSCSLOG is a standard G class user-id which is started up
+by AUTOLOG1 at system IPL time.  A sample of the
+RSCSLOG VM directory entry is supplied at the end of this
+article.  The only special privilege that RSCSLOG has, is to be
+able to issue the CP console close command to RSCS.  This
+must be defined to the RSCS user-id as a start-up parameter.
+Also, RSCS must spool its console to RSCSLOG when RSCS
+starts up.  The VM/IPF product is required for the WAKEUP
+command.
+
+Our RSCSLOG facility has run successfully on both VM/SP
+HPO and VM/XA.  It has not been tried on VM/SP, but I
+doubt that this will be a problem.
+
+A list of users who are authorized to examine the RSCS
+console logs is supplied in the AUTHCHEK EXEC of
+RSCSLOG.  In addition, one Super User is defined to
+RSCSLOG in the RSCSLOG EXEC.  The Super User can
+shut-down the RSCSLOG machine and examine the console
+log from RSCSLOG.
+
+An authorized user can issue the following commands to the
+RSCSLOG DVM:
+
+o      SMSG RSCSLOG GETLIST - Get a date/time sorted list
+      of RSCS console logs on the RSCSLOG user-id's 191
+      mini-disk.
+
+o      SMSG RSCSLOG GETLOG logname - Have RSCSLOG
+      send a specific RSCS console log to your reader.
+
+o      SMSG RSCSLOG PRINT logname - Have RSCSLOG
+      send a specific RSCS console log to a system printer.
+
+o      SMSG RSCSLOG CLOSELOG - Have RSCSLOG close
+      the currently opened RSCS console log.
+
+In addition to the above, the Super User can issue the following
+commands:
+
+o      SMSG RSCSLOG CONSOLE - Close the RSCSLOG
+      console file and forward it to the Super User's reader.
+
+o      SMSG RSCSLOG QUIT - Shut-down the RSCSLOG user-id
+      so that maintenance work can be done if required.
+
+Although the REXX coding for RSCSLOG could have been
+done as one large program, I decided to break it up into
+modules for two reasons.  First, I find it simpler to test and
+maintain.  Second, I could use it as a training tool for new
+programmers.  There are nine separate programs, all of which
+are on the RSCSLOG user-id's 192 mini-disk.  We keep the
+programs on a disk separate from the 191 to reduce the chance
+of someone deleting any of the code.  The 192 mini-disk is
+appropriate since it is automatically defined as the D disk at
+user start-up.
+
+The REXX code for the various modules is provided below,
+with the function of each module explained in the comments.
+There is one piece of code called INCDATE EXEC which is
+used in the LOGPURGE EXEC.  This function is used to
+determine files older than 30 calendar days for deletion.  The
+code for this module can be found in issue 25 of VM Update
+(September 1988) and was supplied by Philippe Taymans.  If
+you don't have access to this edition it would be a simple
+matter to code your own function to do this job.  Also supplied
+at the end of this article is the suggested PROFILE EXEC and
+the RSCSLOG directory entry.
+
+
+RSCSLOG EXEC
+
+/*      This EXEC controls the execution of the RSCS logging DVM.    */
+/*      Messages from authorized users and reader files are          */
+/*      detected by this EXEC. This EXEC will process the following  */
+/*      requests from authorized users:                              */
+/*                                                                   */
+/*          PRINT logname ------> spool the requested RSCS console   */
+/*              log to the system printer                            */
+/*          GETLIST ------------> create a list of all the RSCS      */
+/*              console logs for the requesting user                 */
+/*          GETLOG logname -----> send a copy of the requested       */
+/*              console log to the requesting user                   */
+/*          CONSOLE ------------> close the console spool file and   */
+/*              and send it to the maintenance user                  */
+/*          CLOSELOG -----------> close the current RSCS console     */
+/*              file                                                 */
+    trace 'o'
+    address command
+    arg Disconnect
+    if Disconnect = 'DISC'
+        then 'EXECIO * CP (SKIP STRING DISCONN'
+/*  Let's set up the console file to catch any problems with the     */
+/*  program. To do this we need to identify the VM user-id who will  */
+/*  be responsible for maintaining this facility.                    */
+    SuperUser = 'VMUSERID'
+    'EXECIO * CP (SKIP STRING SPOOL CONSOLE TO' SuperUser 'START'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Let's send out an audit trail to tell the world we are starting  */
+/*  up.                                                              */
+    MLine1 = 'Program start up.'
+    call RSCSMess ExecName, MLine1
+/*  Establish any variables required by the program.                 */
+/*  MaxDisk ---> the percentage utilization of the 191 mini-disk     */
+/*      before a message is issued                                   */
+    MaxDisk = 90
+/*  Set up the environment for the execution of this program and     */
+/*  then set up an eternal loop to wait for SMSG data to come in.    */
+    'CP SET EMSG OFF'
+    do forever
+        'WAKEUP (RDR SMSG NOEXT'
+        select
+/*  A message has been received. Let's parse it to see what we are   */
+/*  supposed to do.                                                  */
+            when rc = 1
+            then do
+                pull . Userid Process Opt1 Opt2 Opt3 Opt4 .
+                select
+                    when Process = 'PRINT'
+                        then call PrtCntl Userid Opt1
+                    when Process = 'GETLIST'
+                        then call LogList Userid
+                    when Process = 'GETLOG'
+                        then call GetLog Userid Opt1
+                    when Process = 'CONSOLE'
+                        then call GetConsole Userid
+                    when Process = 'CLOSELOG'
+                        then call CloseConsole Userid
+                    when Process = 'QUIT'
+                        then call ShutDown Userid
+                    otherwise call Unknown Userid Process
+                end
+            end
+/*  A file has come into the reader queue so we should go and get    */
+/*  it or purge it.                                                  */
+            when rc = 4 | rc = 101 then call RdrCntl
+/*  We got a return code from WAKEUP that we don't know what to do   */
+/*  with.                                                            */
+            otherwise do
+                'WAKEUP (RESEXT'
+                say 'RSCSLOG processing terminated.'
+                say
+                'CP SET SMSG OFF'
+                'CP SET EMSG ON'
+                exit
+            end
+        end
+/*  While we are doing something here let's check to make sure that  */
+/*  the 191 mini-disk is not getting too crowded.                    */
+        'QUERY DISK A (STACK FIFO'
+        parse pull Header
+        parse pull . . . . . . . . Used .
+        parse var Used . '-' Percent
+        if Percent > MaxDisk
+        then do
+            MLine1 = 'The 191 mini-disk of the RSCSLOG user-id has',
+                     'become too full and should be cleaned.'
+            call RSCSMess ExecName MLine1
+        end
+    end
+/*  Get Console Routine                                              */
+/*      This routine permits a Super User to close the console       */
+/*      spool file of the RSCSLOG user-id. The spool file will be    */
+/*      sent to the authorized user's reader for examination.        */
+GetConsole:
+    procedure expose ExecName,
+                     SuperUser
+    arg RequestUser
+    MLine1 = 'User' RequestUser 'has requested that the RSCSLOG user-id'
+    MLine2 = 'console file be closed for examination.'
+    call RSCSMess ExecName, MLine1, MLine2
+    if SuperUser ¬= RequestUser
+    then do
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MESSAGE' RequestUser Warning
+        return
+    end
+    'QUERY DISK A'
+    'LISTFILE * * A (DATE'
+    'EXECIO * CP (SKIP STRING SPOOL CONSOLE CLOSE'
+     return
+/*  Close Console Routine                                            */
+/*      This routine permits an authorized user to have the RSCS     */
+/*      user-id close its current spool file and send the file to    */
+/*      the reader of the RSCSLOG user-id for processing.            */
+CloseConsole:
+    procedure expose ExecName
+    arg RequestUser
+    MLine1 = 'User' RequestUser 'has requested that RSCS close the'
+    MLine2 = 'current spool file.'
+    call RSCSMess ExecName, MLine1, MLine2
+    if ¬ UserChek(RequestUser)
+    then do
+        MLine1 = 'User' RequestUser 'is not authorized to get a',
+                 'list of the files.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+    'EXECIO * CP (SKIP STRING SMSG RSCS CP SPOOL CONSOLE CLOSE'
+     return
+/*  Shut-Down Routine                                                */
+/*      This routine permits a Super User to shut-down the RSCSLOG   */
+/*      user-id for maintenance.                                     */
+ShutDown:
+    procedure expose ExecName,
+                     SuperUser
+    arg RequestUser
+    MLine1 = 'User' RequestUser 'has requested that the RSCSLOG',
+             'user-id be shut-down.'
+    call RSCSMess ExecName, MLine1
+    if SuperUser ¬= RequestUser
+    then do
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MESSAGE' RequestUser Warning
+        return
+    end
+    'EXECIO * CP (SKIP STRING LOGOFF'
+     return
+/*  Unknown Message Routine                                          */
+/*      We have just received a message but we don't know what to do */
+/*      with it. Just in case this routine saves the info from the   */
+/*      message and writes it out to the collection file.            */
+Unknown:
+    procedure expose ExecName
+    arg RequestUser Process
+    MLine1 = 'User-id' RequestUser 'issued the invalid command',
+             Process'.'
+    call RSCSMess ExecName, MLine1
+    Warning = 'The command' Process 'was not recognized. Try again'.
+    'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+    return
+
+
+PRTCNTL EXEC
+
+/*      This EXEC is called by the "RSCSLOG" EXEC. Its function is   */
+/*      to print an RSCS log as requested by an authorized user. The */
+/*      "RSCSLOG" EXEC passes the "PRTCNTL" EXEC the filetype of     */
+/*      the RSCSLOG in the format "MMDDhhmm" and the user-id of the  */
+/*      person requesting that the log be printed. This EXEC will    */
+/*      execute the following specific functions:                    */
+/*                                                                   */
+/*      - verify that the log requested exists                       */
+/*      - if it does not exit send a message to the requesting user  */
+/*      - if it does exist then spool the printer with a dist of the */
+/*        requesting user                                            */
+/*      - print the requested log                                    */
+/*      - send the requesting user a message when the log has been   */
+/*        sent to the printer                                        */
+/*      - restore the printer distribution.                          */
+    trace 'o'
+    address command
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Get the filetype of the RSCS log to be printed as well as the    */
+/*  user-id of the requesting user.                                  */
+    arg RequestUser LogType
+/*  Let's let the world know where we are in case anything happens.  */
+    MLine1 = 'User-id' RequestUser 'just asked to have the RSCSLOG with',
+             'filetype' LogType 'printed.'
+    call RSCSMess ExecName, MLine1
+/*  Let's do a check to see that the user is authorized.             */
+    if ¬ UserChek(RequestUser)
+    then do
+        MLine1 = 'User' RequestUser 'is not authorized to print',
+                 'an RSCS console log.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+/*  Now we check to make sure that the log requested is available.   */
+    RSCSLog = 'RSCSLOG' LogType 'A'
+    'STATE' RSCSLog
+    if rc ¬= 0
+    then do
+        Message = 'The RSCS log with the filetype of' LogType 'does',
+                  'not exist.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Message
+        'DROPBUF'
+        return
+    end
+/*  We have the log so we'll set up the printer, print it out, and   */
+/*  let the user know. When we finish we'll restore the printer.     */
+    'EXECIO * CP (SKIP STRING SPOOL PRT FOR * CLASS T NOCONT DIST',
+        RequestUser
+    'PRINT' RSCSLog
+    Message = 'The RSCSLOG with the filetype' LogType 'has just been',
+              'sent to the printer.'
+    'EXECIO * CP (SKIP STRING MSG' RequestUser Message
+    'EXECIO * CP (SKIP STRING SPOOL PRT CLASS A DIST TECHSUPP'
+    'DROPBUF'
+    return
+
+
+LOGLIST EXEC
+
+/*      This EXEC uses the output created by the "LOGFILES" EXEC     */
+/*      and reformats the file so that the list of logfiles can be   */
+/*      sent to the requesting user.                                 */
+    trace 'o'
+    address command
+    arg RequestUser
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Leave an audit trail about so that we can track things later if  */
+/*  we have to.                                                      */
+    MLine1 = 'User' RequestUser 'has asked for a list of log files.'
+    call RSCSMess ExecName, MLine1
+/*  Set up any variables required by the program.                    */
+    LogList = 'RSCSCONS LISTING A'
+/*  Let's check and see if the requesting user-id is authorized to   */
+/*  get the list of log files.                                       */
+    if ¬ UserChek(RequestUser)
+    then do
+        MLine1 = 'User' RequestUser 'is not authorized to get a',
+                 'list of the files.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+/*  We have an authorized user so let's go get a list of the log     */
+/*  files.                                                           */
+    call LogFiles
+    if result ¬= 0
+    then do
+        MLine1 = 'No log files were found on the A disk.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'There are no RSCS console logs available.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+/*  We have a list of files. We'll format then into something better */
+/*  than a CMS EXEC file and send them to the user.                  */
+    'STATEW' LogList
+    if rc = 0 then 'ERASE' LogList
+    'EXECIO * DISKR CMS EXEC A (FINIS'
+    if rc ¬= 0
+    then do
+        MLine1 = 'Return code' rc 'received while trying to read',
+                 '"CMS EXEC A" file.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'An error occurred while trying to get a list of',
+                  'the RSCS console logs.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        Warning = 'Please notify the Technical Support personnel.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+    Record = 'RSCS Console Log  --  List of Available Log Files'
+    'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    Record = ''
+    'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    Record = left('File Name & File Type',21),
+             copies(' ',5),
+             left('Closed Date & Time',18)
+    'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    Record = left('---------------------',21),
+             copies(' ',5),
+             left('------------------',18)
+    'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    Record = ''
+    'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    do i = 1 to queued()
+        parse pull . . FName FType . . . . . FDate FTime .
+        if FType = 'NETLOG' then iterate
+        FDate = right(FDate,8,'0')
+        FTime = right(FTime,8,'0')
+        Record = center(Fname FType,21),
+                 copies(' ',5),
+                 center(FDate FTime,18)
+        'EXECIO 1 DISKW' LogList '0 F 50 (FINIS STRING' Record
+    end
+/*  We're all finished. Let's send the file to the user and tell him */
+/*  or her its on the way.                                           */
+    'EXEC SENDFILE' LogList 'TO' RequestUser
+    Warning = 'The file "'LogList'" has been sent to your',
+              'reader. Use the PEEK command to view it.'
+    'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+    MLine1 = 'The list of log files has been created and sent to the',
+             'requesting user.'
+    call RSCSMess ExecName, MLine1
+    'DROPBUF'
+    return
+
+
+LOGFILES EXEC
+
+/*      This EXEC creates a list of all the "RSCSLOG" files which    */
+/*      currently reside on the A disk. The files are sorted in      */
+/*      ascending sequence of CMS file date. Note that we use the    */
+/*      XEDIT "SORT" instead of the CMS SORT since it has more       */
+/*      flexibility.                                                 */
+    trace 'o'
+    address command
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Create a "CMS EXEC" file of all the RSCSLOG files which reside   */
+/*  on the A disk.                                                   */
+    MLine1 = 'Creating a sorted list of files with filename RSCSLOG.'
+    call RSCSMess ExecName, MLine1
+    'LISTFILE RSCSLOG * A (EXEC DATE'
+    if rc ¬= 0
+    then do
+        MLine1 = 'Return code' rc 'received from the LISTFILE command.'
+        call RSCSMess ExecName, MLine1
+        'DROPBUF'
+        return 1
+    end
+/*  Let's sort the CMS EXEC file in ascending sequence of CMS file   */
+/*  date.                                                            */
+    queue 'TOP'
+    queue 'SORT * 70 71 64 65 67 68'
+    queue 'FILE'
+    'XEDIT CMS EXEC A (NOPROF'
+    if rc ¬= 0
+    then do
+        MLine1 = 'Return code' rc 'received from the XEDIT command.'
+        call RSCSMess ExecName, MLine1
+        'DROPBUF'
+        return 1
+    end
+    MLine1 = 'CMS EXEC file containing list of files has been created.'
+    call RSCSMess ExecName, MLine1
+    'DROPBUF'
+    return 0
+
+
+GETLOG EXEC
+
+/*      This EXEC is called by the "RSCSLOG" EXEC. Its function is   */
+/*      to send a requested RSCS logfile to an authorized user. The  */
+/*      "RSCSLOG" EXEC passes this EXEC the filetype of the RSCS     */
+/*      log in the format "MMDDhhmm" and the user-id of the person   */
+/*      requesting the log. If the log cannot be located a message   */
+/*      is sent to the requesting user otherwise a copy of the log   */
+/*      is sent to the requester's reader.                           */
+    trace 'o'
+    address command
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Get the filetype of the requested log and the user-id of the     */
+/*  requester.                                                       */
+    arg RequestUser LogType
+/*  Let's tell the world what we're up to.                           */
+    MLine1 = 'The RSCS log with the filetype of' LogType 'has just',
+             'been requested by'
+    MLine2 = 'the user' RequestUser||'.'
+    call RSCSMess ExecName, MLine1, MLine2
+/*  Let's make sure the user has the required authorization.         */
+    if ¬ UserChek(RequestUser)
+    then do
+        MLine1 = 'User' RequestUser 'is not authorized to get a',
+                 'specific log file.'
+        call RSCSMess ExecName, MLine1
+        Warning = 'You are not authorized to issue that command.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Warning
+        'DROPBUF'
+        return
+    end
+/*  First thing we do is check to see if the requested log exists.   */
+    RSCSLog = 'RSCSLOG' LogType 'A'
+    'STATE' RSCSLog
+    if rc ¬= 0
+    then do
+        Message = 'The RSCS log with the filetype' LogType 'does not',
+                  'exist.'
+        'EXECIO * CP (SKIP STRING MSG' RequestUser Message
+        'DROPBUF'
+        return
+    end
+/*  The log exists so we'll send it on its merry way and let the     */
+/*  requester know.                                                  */
+    'EXEC SENDFILE' RSCSLog RequestUser
+    Message = 'The RSCS log with the filetype' LogType 'has just',
+              'been sent to your reader.'
+    'EXECIO * CP (SKIP STRING MSG' RequestUser Message
+    'DROPBUF'
+    return
+
+
+RDRCNTL EXEC
+
+/*      This program is called by the "RSCSLOG" EXEC. No parameters  */
+/*      are passed between the two programs. The output from this    */
+/*      program is the RSCS console log set up as a CMS file on the  */
+/*      A disk. This EXEC is only called when it has been found      */
+/*      that there are one or more spool files in the reader queue.  */
+/*      This program only accepts valid console logs from RSCS. Any  */
+/*      other reader files are purged.                               */
+    trace 'o'
+    address command
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Let's make sure we have some room on the A disk to read this     */
+/*  spool file in.                                                   */
+    call LogPurge
+/*  Get a list of all the files in the reader queue so we can see    */
+/*  what we have.                                                    */
+    'EXECIO * CP (STRING QUERY RDR * ALL'
+/*  The first record is the query reader header which we don't need. */
+    parse pull Header
+/*  Pull the information about the first file in the reader queue    */
+/*  and then blow the buffer away which may contain other reader     */
+/*  files.                                                           */
+    parse pull Sender File . Type . . . RDate RTime .
+/*  Make sure the file can be read in from the queue. Also let's     */
+/*  let the user know that we are processing a reader file.          */
+    'EXECIO * CP (SKIP STRING CHANGE RDR' File 'NOHOLD'
+    MLine1 = 'Spool file' File 'of type' Type 'with the date' RDate,
+             'and time' Rtime 'has just'
+    MLine2 =  'been received from user-id' Sender'.'
+    call rscsmess Execname, MLine1, MLine2
+/*  Let's check and see that this is a valid console file from the   */
+/*  user-id RSCS.                                                    */
+    if Sender = 'RSCS' & Type = 'CON'
+        then nop
+/*  Oops! Reader file must have got here by mistake. Let's tell the  */
+/*  user and then purge it.                                          */
+    else do
+        MLine1 = 'Spool file' File 'is invalid and has been purged.'
+        call RSCSMESS ExecName, MLine1
+        'EXECIO * CP (SKIP STRING PURGE RDR' File
+        'DROPBUF'
+        return
+    end
+/*  We've got a valid console log from RSCS so let's read it onto    */
+/*  the A disk. Note that the filetype is made up of the date and    */
+/*  time of the reader file (ie the date and time the reader file    */
+/*  creation started).                                               */
+    parse var RDate Month '/' Day
+    parse var RTime Hour ':' Minute ':' Second
+/*  Make sure we don't have a file of this name/type already on the  */
+/*  A disk. If we do we'll increase the Minute field by 1 until we   */
+/*  don't get a match.                                               */
+    do forever
+        LogFile = 'RSCSLOG' Month||Day||Hour||Minute 'A'
+        'STATEW' LogFile
+        if rc ¬= 0 then leave
+        Minute = Minute + 1
+    end
+/*  We've done all we can so let's read it in. If this doesn't work  */
+/*  something is seriously wrong, so we'll notify the operator and   */
+/*  crap out. Otherwise we'll return to the caller.                  */
+    'EXEC RECEIVE' File LogFile
+    if rc ¬= 0
+    then do
+        'MSG OPERATOR RSCSLOG just failed. Contact Technical Support.'
+        'CP LOGOFF'
+    end
+    'DROPBUF'
+    return
+
+
+LOGPURGE EXEC
+
+/*      This program is called by the RDRCNTL EXEC. The function of  */
+/*      LOGPURGE is to purge any RSCS log files from the A disk      */
+/*      that are older than 30 calendar days. This routine is called */
+/*      each time a new log is received so as to ensure that we do   */
+/*      not run out of room on the A disk for a new log.             */
+    trace 'o'
+    address command
+    'MAKEBUF'
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Tell the user what we are about and then set up any variables    */
+/*  we may need.                                                     */
+    MLine1 = 'Start of execution for program.'
+    call RSCSMess ExecName, MLine1
+    PurgePeriod = -30
+    PurgeDate = incdate(date(s) PurgePeriod)
+/*  Let's go get sorted list of all the log files that are on the    */
+/*  A disk.                                                          */
+    call LogFiles
+    if result ¬= 0 then return
+/*  Set up a loop to read in the list of files and purge any that    */
+/*  are older than the purge date.                                   */
+    'EXECIO * DISKR CMS EXEC A (FINIS'
+    if rc ¬= 0
+    then do
+        MLine1 = 'Return code' rc 'received when trying to read the'
+                 'CMS EXEC file.'
+        call RSCSMess ExecName, MLine1
+        'DROPBUF'
+        return
+    end
+    do i = 1 to queued()
+        parse pull . . FName FType FMode . . . . FDate .
+        parse var FDate mm '/' dd '/' yy
+        FDate = '19'||yy||right(mm,2,'0')||right(dd,2,'0')
+        if FDate < PurgeDate
+        then do
+            'ERASE' FName FType FMode
+            if rc = 0
+            then do
+                MLine1 = 'RSCS log file' FName FType 'with CMS date',
+                         Fdate 'just erased from A disk.'
+                call RSCSMess ExecName, MLine1
+            end
+            else do
+                MLine1 = 'RSCS log file' FName FType 'with CMS date',
+                         Fdate 'could not be erased from A disk.'
+                call RSCSMess ExecName, MLine1
+            end
+        end
+    end
+/*  Okay we're all finished so let's tell the user and get out.      */
+    MLine1 = 'All log files older than' PurgeDate 'have been erased.'
+    call RSCSMess ExecName, MLine1
+    'DROPBUF'
+    return
+
+
+RSCSMESS EXEC
+
+/* RSCSLOG Message Management Program                               */
+/* This EXEC can display up to 9 lines of messages on the console   */
+/* and is called as follows:                                        */
+/*      call RSCSMESS Caller, line01, line02, ..., line10           */
+/* Note that each line to be displayed must be separated by a ","   */
+/* (ie comma).                                                      */
+   trace 'o'
+   address command
+/*  Check if this EXEC has been loaded into user storage and if it  */
+/*  has not then use the EXECLOAD to load it.                       */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/* Get the number of arguments passed to this program.              */
+   say
+   if arg() = 0
+   then do
+       say date(o) time() 'User-id:' userid()
+       say 'RSCSMESS EXEC called with no arguments.'
+       return
+   end
+/* Set up first line of the console message to be displayed.        */
+   say date(o) time() 'User-id:' userid() '& Caller:' arg(1)
+/* Now set up a loop to display any remaining lines.                */
+   if arg() < 2 then return
+   do i = 2 to arg()
+        say arg(i)
+   end
+   return
+
+
+USERCHEK EXEC
+
+/*      This function determines if the user issuing the command to  */
+/*      RSCSLOG is authorized.                                       */
+    trace 'o'
+    address command
+/*  Check if this EXEC has been loaded into user storage and if it   */
+/*  has not then use the EXECLOAD to load it.                        */
+    parse source . . ExecName .
+    'EXECSTAT' ExecName 'EXEC'
+    if rc = 4 then 'EXECLOAD' ExecName 'EXEC'
+/*  Get the user-id issuing the command request.                     */
+    arg RequestUser
+/*  If the user-id is authorized return a TRUE value otherwise       */
+/*  return FALSE.                                                    */
+    select
+        when RequestUser = 'VMUSER1'  then return 1
+        when RequestUser = 'VMUSER2'  then return 1
+        when RequestUser = 'etc.'     then return 1
+        otherwise return 0
+     end
+
+
+PROFILE EXEC
+
+/* PROFILE EXEC */
+   trace 'o'
+   address command
+   'CP SET EMSG ON'
+   'CP SPOOL CONSOLE * START'
+   'CP SPOOL PRINT CLASS T'
+/* Let's see if the user-id is running in disconnect mode. */
+   'EXECIO * CP (STRING QUERY' userid()
+   parse pull . . Disconnect .
+   if Disconnect = 'DSC'
+   then do
+       push 'RSCSLOG'
+       exit
+   end
+   say
+   say 'Enter the command "RSCSLOG" to start this user-id.'
+   say
+   exit
+
+
+RSCSLOG USER-ID DIRECTORY ENTRY
+
+USER RSCSLOG PASSWORD 3M 3M G
+  ACCOUNT XXXX XXXXXXXX
+  IPL CMS PARM AUTOCR
+  CONSOLE 009 3215
+  SPOOL 00C 2540 READER *
+  SPOOL 00D 2540 PUNCH  A
+  SPOOL 00E 1403        A
+  LINKS TO CMS SYSTEM AND IPF MINIDISKS
+* 191 = STORAGE FOR RSCS CONSOLE LOGS
+  MDISK 191 3380 XXX 030 VOLSER MR RPSWD WPSWD MPSWD
+* 192 = EXECUTABLE PROGRAMS AND SOURCE CODE
+  MDISK 192 3380 XXX 002 VOLSER MR RPSWD WPSWD MPSWD
+
+John Purdie
+Assistant Manager - Technical Support
+Export Development Corporation (Canada)
+

@@ -1,0 +1,350 @@
+/* REXX - Command to edit a load module or recfm=u sequential.       */
+/*                                                                   */
+/*     ** requires assembler program TC listed in comments below **  */
+/*                                                                   */
+/*        This is a pretty rough implementation.  Be careful!!!      */
+/*                                                                   */
+/*     Syntax: (assuming you name the exec EDITU)                    */
+/*          from an ISPF command line,                               */
+/*             TSO EDITU dataset(member)                             */
+/*       or    TSO EDITU dataset    (if editing a sequential ds)     */
+/*                                                                   */
+/*  Doug Nadel - version 1.02 - June 8, 2000                         */
+/*                                                                   */
+/*     How this works:                                               */
+/*         1) Create a temp VB data set                              */
+/*         2) Use ISPF services to copy data to temp data set        */
+/*         3) Edit temp dataset                                      */
+/*         4) If data was saved, call program 'TC' to save data back.*/
+/*                TC does update in place for pds members and        */
+/*                standard I/O for sequential.                       */
+/*         5) Browse the output to see if it looks OK                */
+/*                                                                   */
+/*  ISPF 4.8 or higher is recommended because at that level, the     */
+/*  editor remembers the length of variable lines and can rewrite    */
+/*  them at their original length.  Users of previous versions       */
+/*  will have problems with any records that have trailing blanks.   */
+/*-------------------------------------------------------------------*/
+Parse Upper Arg indataset .
+Call verify_parameters
+Call read_dataset
+Call create_and_edit_temp_dataset
+Call process_changes
+Exit
+/*-------------------------------------------------------------------*/
+verify_parameters:
+Parse Var indataset dataset '('member')'
+If substr(dataset,1,1)="'" & member <> '' Then
+  dataset=dataset"'"
+If indataset='' Then
+  Call msgexit 'No data set name was supplied.'
+If sysdsn(dataset) <> 'OK' Then
+  Call msgexit dataset' can not be allocated.'
+Call listdsi dataset
+If sysdsorg='PS' & member<>'' Then
+  Call msgexit 'Member name specified for a sequential data set.'
+If sysdsorg='PO' & member= '' Then
+  Call msgexit 'No member name was supplied.'
+If sysdsorg<>'PS' & sysdsorg<>'PO' Then
+  Call msgexit dataset 'is not sequential or partitioned'.
+If member <> '' & sysdsn(indataset) <> 'OK' Then
+  Call msgexit member 'is not a member in 'dataset'.'
+If sysdssms='PDSE' Then
+  Call msgexit dataset 'is a PDSE data set.'
+If sysrecfm <> 'U' Then
+  Call msgexit dataset 'is not RECFM=U.'
+Parse Value 0 0 0 With lineno maxlen linelen. line. trb. preserve
+Parse Value 0 0 0 With newlineno newmaxlen newlinelen. newline. newtrb.
+Return                                 /* end of verify_paranmeters  */
+/*-------------------------------------------------------------------*/
+read_dataset:
+address tso 'ALLOC F(A1) DA('dataset') SHR REU'
+Address ispexec
+'VGET (ZENVIR) SHARED'
+'LMINIT  DATAID(DID) DDNAME(A1) ENQ(SHRW)'
+'LMOPEN  DATAID('did') OPTION(INPUT)'
+If sysdsorg='PO' Then
+  'LMMFIND DATAID('did') MEMBER('member')'
+getrc=rc
+Do While(getrc=0)
+  'LMGET DATAID('did') MODE(INVAR) DATALOC(LINE) DATALEN(LEN)',
+    ' MAXLEN(32760)'
+  getrc=rc
+  If getrc=0 Then
+    Do
+      lineno=lineno+1
+      trb.lineno=verify(reverse(line),' ')
+      maxlen=max(maxlen,len)
+      linelen.lineno=len
+      line.lineno=line
+    End
+End
+'LMFREE DATAID('did')'
+totallines=lineno
+Address tso 'FREE F(A1)'
+If lineno=0 | maxlen>32756 Then
+  Call msgexit,
+    'At least one line is longer than 32756 bytes or the member is',
+    'empty.'
+Return                                 /* end of read_dataset        */
+/*-------------------------------------------------------------------*/
+create_and_edit_temp_dataset:
+Address tso 'ALLOC NEW DEL UNIT(VIO) DSO(PS) RECFM(V B) ',
+  'LRECL('maxlen+4') F(A2) REU SP(1,1) CYLINDER'
+Address tso 'EXECIO * DISKW A2 (FINIS STEM LINE.'
+Address ispexec
+Drop line.
+'LMINIT DATAID(DID) DDNAME(A2) ENQ(SHRW)'
+If substr(zenvir,5,4)>' 4.5' Then
+  preserve='PRESERVE'
+Else
+  Do
+    Say 'You are running an older version of ISPF.'
+    Say 'As a result, this program can not verify that the',
+      'lengths of lines have not changed during the edit session.',
+      'Trailing blanks may cause errors also.'
+    Say 'Be extra careful making changes.'
+  End
+w=' Make changes only with hex mode and CHANGE commands. Do not type',
+  'directly into the edit area because this can change nondisplay',
+  'characters.'
+If sysdsorg='PS' Then
+  Call msg center('*** WARNING ***',75,'-')||w
+Else
+  Call msg center('*** WARNING ***',75,'-'),
+    'Do not change the number of lines or the length of any lines.',
+    'Doing so may destroy your load module member and result in',
+    'I/O errors!!.'||w
+'EDIT   DATAID('did') 'preserve
+editrc=rc
+'LMFREE DATAID('did')'
+Return                                 /* end of
+                                          Create_and_edit_temp_dataset*
+                                                                     */
+/*-------------------------------------------------------------------*/
+process_changes:
+Address ispexec
+If editrc=4 Then
+  Do
+    Call msg 'No changes were made. The data was not saved.'
+    Signal out
+  End
+If editrc>4 Then
+  Do
+    'SETMSG MSG(ISRZ002)'
+    Signal out
+  End
+Address tso 'EXECIO * DISKR A2 (FINIS STEM NEWLINE.'
+getrc=rc
+If getrc=0 Then
+  Do a=1 to newline.0
+    newtrb.a=verify(reverse(newline.a),' ')
+    newmaxlen=max(newmaxlen,length(newline.a))
+    newlinelen.a=length(newline.a)
+  End
+newtotallines=newline.0
+Drop line.
+If sysdsorg='PO' Then
+  Do
+    If newtotallines <> totallines Then
+      Do
+        Call msg,
+          'The number of lines changed!  There were 'totallines'',
+          'lines, but now there are 'newtotallines' lines.'
+        Signal out
+      End
+    If substr(zenvir,5,4)>' 4.5' Then
+      Do a= 1 to newtotallines
+        If newlinelen.a <> linelen.a Then
+          Do
+            Call msg ' The length of line number 'a' has changed (was',
+              linelen.a', is now 'newlinelen.a').'
+            Signal out
+          End
+        If newtrb.a <> trb.a Then
+          Do
+            Call msg 'The number of trailing blanks changed on line 'a,
+              '(was' trb.a', is now 'newtrb.a').'
+            Signal out
+          End
+      End
+  End
+Address tso 'ALLOC F(A1) DA('indataset') REU SHR'
+'SELECT PGM(TC) PARM('sysdsorg')'
+If rc=0 Then
+  Call msg,
+    'Changes were saved.  The current browse session shows the results.'
+Else
+  Call msg,
+    'An error occurred and the data may not have been saved or may be',
+    'corrupted.  Browse was invoked to show the results.'
+'CONTROL ERRORS RETURN'
+'BROWSE DATASET('indataset')'
+If rc>7 Then
+  'SETMSG MSG(ISRZ002)'
+'CONTROL ERRORS CANCEL'
+Address tso 'FREE F(A1)'
+out:
+Address tso 'FREE F(A2)'
+Return                                 /* end of Process_changes     */
+/*-------------------------------------------------------------------*/
+msg:
+Parse Arg zerrlm
+Parse Value 'YES *' With zerralrm zerrhm zerrsm
+Address ispexec 'SETMSG MSG(ISRZ002)'
+Return
+/*-------------------------------------------------------------------*/
+msgexit:
+Call msg Arg(1)
+Exit
+/*-------------------------------------------------------------------
+* TC - COPY FROM A VB DATA SET TO A U DATA SET.
+* SOURCE IS DDNAME A2 (VB)
+* TARGET IS DDNAME A1 (U) - PDS UPDATES ARE DONE UPDATE-IN-PLACE!!!
+*******************************************************************
+* THIS ROUTINE HAS NO ERROR CHECKING AT ALL.  IT ASSUMES THE
+* INPUT DATA SET EXACTLY MATCHES THE EXISTING OUTPUT MEMBER
+* IN THE NUMBER OF LINES AND THE LENGTH OF EACH LINE.
+* IT ALSO ASSUMES THE DATA SETS CAN BE READ OR WRITTEN TO.
+* IF EITHER IF THESE ARE NOT TRUE, RUN FOR THE HILLS BECAUSE THERE
+* IS GONNA BE A LOUD *BOOM*
+*
+* THERE IS AN ESTAE TO CATCH 913 OR OPEN ABENDS BUT IT IS PLACED
+* SO THAT IT ISN'T ACTIVE AT CLOSE.  THUS SPACE ABENDS MAY NOT BE
+* CAUGHT ON THE FINAL CLOSE.
+*
+*******************************************************************
+TC       CSECT
+TC       AMODE 31
+TC       RMODE ANY
+         STM   14,12,12(13)
+         LR    12,15
+         USING TC,12
+         XR    6,6                 SET R6=0 MEANING OUTPUT DSORG=PS
+         L     1,0(1)              GET ADDR OF 1ST PARM
+         CLI   3(1),C'S'           IS IT REALLY PS?
+         BE    ITISPS              YES
+         LA    6,1(0,0)            NO, IT MUST BE PO, R6=1
+ITISPS   DS    0H
+         LA    0,DYNSIZE
+         GETMAIN  RU,LV=(0),SP=0,LOC=BELOW
+         ST    1,8(13)             SAVE SAVEAREA ADDR IN CALLERS AREA
+         ST    13,4(0,1)           SAVE CALLERS  ADDR IN OWN SAVEAREA
+         LR    13,1                SET UP OWN SAVEAREA
+*---- MOVE DCBS BELOW THE LINE -------
+         LA    VDCBP,VDCB-SAVEAREA(13)
+         LA    UDCBP,UDCB-SAVEAREA(13)
+         LR    2,VDCBP             GET ADDRESS TO STORE DCBS/DCBES
+         LA    4,VDCB              GET ADDRESS OF STATIC DCBS/DCBES
+         LA    3,ENDDCBS-VDCB      GET LENGTH OF DCBS AND DCBES
+         LR    5,3
+         MVCL  2,4                 MOVE DCBS/DCBES BELOW 16M LINE
+         LA    1,DCBLNGPS(VDCBP)   GET ADDRESS OF INPUT DCBE
+         ST    1,0(VDCBP)          STORE INTO INPUT DCB
+         LA    1,DCBLNGPS(UDCBP)   GET ADDRESS OF OUTPUT DCBE
+         ST    1,0(UDCBP)          STORE INTO OUTPUT DCB
+*---- SET UP ESTAE ----------------------
+ABENDPT  LA    ABENDREG,ABENDPT
+         LA    10,STAE@-SAVEAREA(13)
+         STM   0,15,SAVEREGS-SAVEAREA(13)
+         CLI   POSTESTAE-SAVEAREA(13),X'FF'
+         BNE   ESTAE1
+         B     EODAD
+ESTAE1   MVI   POSTESTAE-SAVEAREA(13),X'FF'
+         ESTAE STAEXIT,CT,MF=(E,(10))
+*---- COPY INPUT FILE TO OUTPUT  --------
+         USING IHADCB,UDCBP
+         LA    10,OPENLST-SAVEAREA(13)
+         LTR   6,6                 IS OUTPUT SEQUENTIAL
+         BZ    OPENPS              YES
+         OPEN  ((VDCBP),INPUT,(UDCBP),UPDAT),MODE=31,MF=(E,(10))
+         B     READLOOP
+*
+OPENPS   DS    0H
+         MVC   4(DCBLNGPS-4,UDCBP),MDCB+4-SAVEAREA(13)
+         OPEN  ((VDCBP),INPUT,(UDCBP),OUTPUT),MODE=31,MF=(E,(10))
+*
+READLOOP GET   (VDCBP)             READ INPUT (VB) FILE
+         LA    READBUF,4(0,1)      GET ADDRESS OF DATA JUST READ IN
+         LH    READLEN,0(1)        GET LENGTH OF DATA JUST READ IN
+         SH    READLEN,=H'4'       SUBTRACT RDW LENGTH
+         LTR   6,6                 IS OUTPUT SEQUENTIAL
+         BZ    WRITEPS             YES
+         GET   (UDCBP)             READ OUTPUT FILE TO START UPDATE
+         LR    WRITEBUF,1          GET BUFFER ADDRESS FOR WRITE
+         LH    WRITELEN,DCBLRECL   GET LENGTH FOR WRITE
+         MVCL  WRITEBUF,READBUF    COPY READ LINE TO WRITE BUFFER
+         PUTX  (UDCBP)             REWRITE OUTPUT LINE
+         B     READLOOP            GO BACK FOR MORE
+*
+WRITEPS  STH   READLEN,DCBLRECL
+         LA    0,4(1)              USE READ BUFFER AS WRITE BUFFER
+         PUT   (UDCBP)
+         B     READLOOP
+*---- END OF READ LOOP ------------------
+SYNAD    DS    0H
+EODAD    DS    0H
+         ESTAE 0,MF=(E,(10))
+         LA    10,CLOSLST-SAVEAREA(13)
+         CLOSE ((UDCBP),,(VDCBP)),MODE=31,MF=(E,(10))
+         LA    0,DYNSIZE           SETUP FOR EXIT
+         XR    2,2                 ASSUME NO ABEND - RETURN CODE 0
+         CLI   ABENDED-SAVEAREA(13),X'FF'  SEE IF ABEND OCCURED
+         BNE   GOODBYE
+         LA    2,4(0,0)            ABENDED - RETURN CODE 4
+GOODBYE  LR    1,13
+         L     13,4(13)
+         FREEMAIN RU,LV=(0),A=(1),SP=0  FREE DYNAMIC STORAGE
+         LR    15,2                RETURN 0 OR 4 IN REG 15
+         L     14,12(13)           GET OLD REGISTERS
+         LM    0,12,20(13)         GET OLD REGISTERS
+         BR    14                  RETURN TO CALLER
+*---- ESTAE PROCESSING ROUTINES ---------
+STAEXIT  DS    0H
+         DROP  12
+         USING STAEXIT,2
+         LR    2,15
+         LA    3,12(0,0)
+         CR    0,3                 IF R0 NOT EQUAL 12
+         BE    NOWORKA             NO WORK AREA
+         SETRP RETADDR=STAERTN,RC=4,FRESDWA=YES,DUMP=NO,RETREGS=YES
+         LA    15,4(0,0)
+         LA    0,STAERTN
+         BR    14
+NOWORKA  SETRP RC=0
+         BR    14
+         DROP  2
+         USING TC,12
+STAERTN  LM    0,15,SAVEREGS-SAVEAREA(13) RESTORE ALL THE OLD REGS
+         MVI   ABENDED-SAVEAREA(13),X'FF'
+         BR    ABENDREG                   BRANCH BACK TO ABEND PROGRAM
+*---- STORAGE DEFINITIONS AND EQUATES ---
+WRITEBUF EQU   2                   REGISTER 2 POINTS TO WRITE BUFFER
+WRITELEN EQU   3                   REGISTER 3 IS WRITE BUFFER LENGTH
+READBUF  EQU   4                   REGISTER 4 POINTS TO READ BUFFER
+READLEN  EQU   5                   REGISTER 5 IS READ BUFFER LENGTH
+UDCBP    EQU   8                   REGISTER 8 POINTS TO WRITE DCB
+VDCBP    EQU   9                   REGISTER 9 POINTS TO READ DCB
+ABENDREG EQU   11                  REG 11 IS ADDR TO GOTO AFTER ABEND
+**** DCBS AND DCBES THAT WILL BE COPIED BELOW THE LINE ****
+SAVEAREA DS    9D
+SAVEREGS DS    16F
+STAE@    ESTAE MF=L
+VDCB     DCB   DSORG=PS,MACRF=(GL),DDNAME=A2,DCBE=VDCBE
+VDCBE    DCBE  RMODE31=BUFF,SYNAD=SYNAD,EODAD=EODAD
+UDCB     DCB   DSORG=PS,MACRF=(GL,PL),DDNAME=A1,DCBE=UDCBE
+UDCBE    DCBE  RMODE31=BUFF,SYNAD=SYNAD,EODAD=EODAD
+MDCB     DCB   DSORG=PS,MACRF=(PM),DDNAME=A1,DCBE=UDCBE
+OPENLST  OPEN  (,,,),MODE=31,MF=L
+CLOSLST  CLOSE (,,),MODE=31,MF=L
+POSTESTAE DC   XL1'00'
+ABENDED   DC   XL1'00'
+ENDDCBS  DS    0D
+DYNSIZE  EQU   *-SAVEAREA
+         LTORG
+         DCBD  DSORG=PS
+         IHASDWA
+TC       CSECT
+         END   TC
+*/
+

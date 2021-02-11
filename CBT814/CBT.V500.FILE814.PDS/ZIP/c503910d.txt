@@ -1,0 +1,330 @@
+Volume pooling using IGGPRE00
+
+One of the challenges of DASD space management is ensuring that production jobs
+have the work space they need - when they need it.  Our shop, like many others,
+had one DASD work pool.  Development jobs and TSO users often allocated space
+for themselves not realising they had allocated space that would be needed for
+production jobs.  The problem could easily be corrected when discovered but,
+unfortunately, that was typically in the middle of the night.  The solution was
+to implement multiple work pools for different processing needs.
+
+We decided on three different work pools: production (the WP pool); long-term
+development, including partitioned datasets used for TSO (the WL pool); and
+short-term development (the WS pool).  Implementing a separate work pool for
+production reserved critical space for these jobs.  Development job space
+allocation problems would be resolved during the day.  We now concentrate clean-
+up and archive efforts on the short-term development pool.
+
+Two changes were needed to implement the strategy: a change to the DADSM pre-
+processing user exit (module IGGPRE00) and implementation of volume-naming
+standards.  DADSM accepts or rejects volume allocations based upon the return
+code from the pre-processing user exit.  We changed the pre-processing user exit
+to return an acceptable or unacceptable return code to DADSM depending on the
+job account number and DASD volume serial number.  The change, as implemented,
+also keeps users from allocating non-temporary datasets on PUBLIC volumes.
+
+The exit first checks the allocation to see if it is for a tape dataset, a
+temporary dataset, or a VIO dataset.  If so, the allocation is allowed.  The
+exit then checks for a VSAM dataset allocation.  As long as the VOLSER requested
+is not a PUBLIC volume, the allocation is allowed.  After checking for specific
+VOLSER allocations (all are allowed except for PUBLIC volumes), the exit
+processes allocations based on whether it was requested by a production or
+development job.  The exit differentiates between them based on the first two
+digits of the job accounting information.  Using the volume serial identifier as
+a mask, the return code is set.  Volume serial numbers that match are accepted
+for allocation and volume serial numbers that don't match are rejected.  If the
+volume serial number is rejected, the cycle is repeated until an acceptable
+volume is found or all the candidate volumes are exhausted.  Cycle repetition is
+done because you cannot change the parameters passed from DADSM to the pre-
+processing user exit once inside the exit.  This parameter list consists of the
+job or TSO name, space requested for allocation, dataset organisation, and the
+MVS volume selected for the allocation.  This is a low overhead function about
+750 bytes long.
+
+*---------------------------------------------------------------------*
+*    MODULE : IGGPRE00                                                *
+* FUNCTIONS : PREVENT VSAM DATASET ALLOCATIONS ON WORK VOLUMES.       *
+*             PREVENT DATASET ALLOCATIONS ON PUBLIC VOLUMES EXCEPT    *
+*             FOR TEMP DATASETS.                                      *
+*             CONFINE NON-SPECIFIC ALLOCATION REQUESTS OF ALL         *
+*             DATASETS BY KEYING OFF THE ACCOUNTING FIELD OF          *
+*             THE JOB CARD AND MATCHING AGAINST AN INTERNAL TABLE     *
+*             THEN ALLOWING OR DISALLOWING THE ALLOCATION FOR         *
+*             N*WP (FOR PRODUCTION) OR                                *
+*             N*WL (FOR TESTING) LONG TERM (PDS'S) OR                 *
+*             N*WS (FOR TESTING) SHORT TERM.                          *
+*  ON ENTRY : R1  = A(PARMLIST)                                       *
+*   ON EXIT : R15 = RETURN CODE                                       *
+*                   WHERE 0 - OK, ALLOW USE                           *
+*                         4 - USE ANOTHER DEVICE                      *
+*                         8 - FAIL REQUEST                            *
+*        IEXREASN = REASON CODE                                       *
+*                  WHERE  0 - REQUEST SUCCESSFUL                      *
+*                         4 - VSAM DATASET NOT ALLOWED ON WORK OR     *
+*                             PUBLIC VOLUMES.                         *
+*---------------------------------------------------------------------*
+IGGPRE00 CSECT
+         USING *,R15                   TEMPORARY BASE
+         B     START                   BRANCH AROUND MODULE NAME
+         DC    CL8'IGGPRE00'
+         DC    CL8'&SYSDATE'
+         DC    CL8' &SYSTIME'
+START    STM   R14,R12,12(R13)         SAVE REGISTERS
+         LR    R12,R15                 LOAD ENTRY ADDRESS
+         DROP  R15                     DROP TEMPORARY BASE
+         USING IGGPRE00,R12            BASE REGISTER 12
+         USING PARMLIST,R1             ADDRESSABILITY FOR THE PARM LIST
+         CLI   IEXFUNC,X'01'           ALLOCATION REQUEST?
+         BNE   EXIT0                   NO, BRANCH
+         TM    IEXFLAG,IEXVIO          IS THIS A VIO DATASET
+         BO    EXIT0                   YES, ALLOW ALLOCATION
+PHASE1   L     R2,IEXUCB               UCB ADDRESS
+         USING UCBCMSEG,R2             ADDRESSABILITY FOR THE UCB
+         TM    UCBTBYT3,UCB3DACC       DIRECT ACCESS DEVICE?
+         BNO   EXIT0                   NO, BRANCH
+         TM    IEXFLAG,IEXMF1          JFCB AVAILABLE?
+         BO    NOJFCB                  NO, BRANCH
+         L     R3,IEXPTR1              JFCB ADDRESS
+         USING INFMJFCB,R3             ADDRESSABILITY FOR THE JFCB
+         TM    JFCDSRG2,JFCORGAM       IS THIS A VSAM DATASET?
+         BO    CHECKVOL                YES, BRANCH
+         TM    JFCBIND2,JFCTEMP        IS THIS A TEMP DATASET?
+         BO    EXIT0                   YES, ALLOW ALLOC
+         B     PHASE2                  ELSE TEST FOR PROD/TEST STATS
+NOJFCB   L     R3,IEXFMT1              DSCB1 ADDRESS
+         USING IECSDSL1,R3             ADDRESSABILITY FOR THE DSCB
+         TM    DS1DSORG+1,JFCORGAM     IS THIS A VSAM DATASET?
+         BZ    PHASE2                  NO, CHECK FOR PROD. STATUS
+CHECKVOL CLI   UCBVOLI+1,X'EF'         IS SECOND CHAR NUMERIC
+         BNH   EXIT0                   NO ALLOW ALLOCATION
+         CLI   UCBVOLI+2,C'W'          IS THIRD CHAR W
+         BNE   PUBCHECK                NO CHECK FOR PUB PACK
+         CLI   UCBVOLI+3,C'S'          IF FOURTH CHAR S
+         BE    DONT                    YES DISALLOW ALLOCATION
+         CLI   UCBVOLI+3,C'P'          IS FOURTH CHAR P
+         BE    DONT                    YES DISALLOW ALLOCATION
+         B     EXIT0                     ELSE ALLOW IT.
+PUBCHECK CLC   UCBVOLI+2(L'PB),PB      IT IS A PB PACK
+         BNE   EXIT0                   NO ALLOW ALLOCATION
+DONT     MVC   IEXREASN,=H'4'          REASON CODE
+         B     EXIT8                   FAIL REQUEST
+PHASE2   TM    FLAG,NORUN              ARE WE RUNNING YET ??
+         BO    EXIT0                   NO, SKIP THIS PART
+         L     R3,IEXPTR1              JFCB ADDRESS
+         USING INFMJFCB,R3             ADDRESSABILITY FOR THE JFCB
+         L     R4,16                   CVT ADDRESS
+         USING CVT,R4                  ADDRESSABILITY FOR THE CVT
+         L     R5,CVTTCBP              POINTER TO TCB ADDRESS
+         L     R5,4(R5)                CURRENT TCB ADDRESS
+         USING TCB,R5                  ADDRESSABILITY FOR THE TCB
+         L     R6,TCBJSCB              ADDRESS OF THE JSCB
+         USING IEZJSCB,R6              ADDRESSABILITY FOR THE JSCB
+JSCB     C     R6,JSCBACT              IS THIS THE ACTIVE JSCB
+         BE    CONT                    YES CONTINUE ON
+         L     R6,JSCBACT              NO LOAD NEXT ADDRESS
+         B     JSCB                       AND LOOP THRU AGAIN
+CONT     ICM   R7,7,JSCBJCTA           ADDRESS OF JCT
+         BZ    EXIT0                   EXIT IF ADDRESS IS INVALID
+         LA    R7,16(,R7)              BEGINNING OF JCT
+         USING INJMJCT,R7              ADDRESSABILITY FOR THE JCT
+         ICM   R8,7,JCTACTAD           ADDRESS OF ACT
+         BZ    EXIT0                   EXIT IF ADDRESS IS INVALID
+         LA    R8,16(,R8)              BEGINNING ACT
+         USING IEFAACTB,R8             ADDRESSABILITY FOR ACT
+         LA    R5,ACTACCNT             ADDRESS OF ACCOUNTING FIELDS
+SPECALC  ICM   R9,15,JSCDSABQ          ADDRESS FOR QDB FOR DSAB
+         BZ    EXIT0                   EXIT IF INVALID ADDRESS
+         USING QDB,R9                  ADDRESSABILITY FOR QDB
+         ICM   R10,15,QDBFELMP         ADDRESS OF DSAB
+         BZ    EXIT0                   EXIT IF ADDRESS IS INVALID
+         USING DSAB,R10                ADDRESSABILITY FOR THE DSAB
+         CLC   DSABID,=C'DSAB'         IS THIS A DSAB?
+         BNE   EXIT0                   NO, EXIT
+SIOTLOOP XR    R8,R8                   CLEAR REGISTER 8
+         ICM   R8,7,DSABSSVA           SWA VIRTUAL ADDRESS OF SIOT
+         BZ    EXIT0                   EXIT IF ADDRESS IS INVALID
+         LA    R8,16(,R8)              BEGINNING OF SIOT
+         USING INDMSIOT,R8             ADDRESSABILITY FOR SIOT
+         C     R3,SJFCBPTR             SAME JFCB?
+         BE    VUNT                    YES, CORRECT SIOT FOUND
+         ICM   R10,15,DSABFCHN         CHAIN FORWARD
+         BNZ   SIOTLOOP                LOOP IF VALID ADDRESS
+         B     EXIT0                   ELSE, EXIT
+VUNT     ICM   R8,15,SVOLUNAD          ADDRESS OF VUNT
+         BZ    EXIT0                   EXIT IF INVALID ADDRESS
+         USING VOLUNTAB,R8             ADDRESSABILITY FOR THE VUNT
+         MODE31                           SWITCH TO 31 BIT MODE FOR VUNT
+         TM    VOLSTATA,VOLSPEC        SPECIFIC VOLUME REQUEST?
+         BNO   TESTASCB                  NO CONTINUE PROCESSING
+*                                        YES CHECK FOR PUB PACK
+         CLI   UCBVOLI+1,X'EF'         IS SECOND CHAR NUMERIC
+         BNH   EXIT0                   NO ALLOW ALLOCATION
+         CLC   UCBVOLI+2(L'PB),PB      IS IT A PB
+         BNE   EXIT0                   NO ALLOW ALLOCATION
+         MVC   IEXREASN,=H'4'          REASON CODE
+         MODE24                        SWITCH BACK TO 24 BIT MODE
+         B     EXIT8                   FAIL REQUEST
+TESTASCB MODE24                        SWITCH BACK TO 24 BIT MODE
+         CLC   JCTUSER(L'SCH),SCH      IS THE USER THE SCH
+         BE    P2PROD                  YES TREAT AS PROD
+         L     R11,JSCBCSCB            LOAD ADDRESS OF CSCB
+         USING CHAIN,R11               ADDRESSABILITY FOR CSCB
+         TM    CHACT,CHTERM            TEST FOR TERMINAL
+         BO    P2TEST                  TERMINAL TASK, TREAT AS TEST
+TESTACCT CLI   1(R5),X'00'             TEST FOR X'00000000' ACTNO
+         BE    P2PROD                  YES STC'S ARE PROD
+         LA    R8,IGGPROD              LOAD ADDRESS OF ACCT TABLE
+LOOP     CLC   1(2,R5),0(R8)           IS IT PROD ?
+         BE    P2PROD                  YES CHECK FOR PROD PACK
+         CLI   0(R8),X'00'             HAVE WE CHECKED ALL ACCTNOS ?
+         BE    P2TEST                  YES, IT MUST BE TEST.
+         AH    R8,=H'2'                NO, ADD OFFSET
+         B     LOOP                     AND TRY AGAIN
+P2PROD   CLI   UCBVOLI+1,X'EF'         IS SECOND CHAR NUMERIC
+         BNH   EXIT4                   NO DON'T DO IT HERE
+         CLC   UCBVOLI+2(2),=C'WP'     IS THIS A PRODUCTION PACK
+         BE    EXIT0                   YES ALLOW ALLOCATION
+         B     EXIT4                   ELSE FAIL REQUEST
+P2TEST   TM    IEXFLAG,IEXMF1          JFCB AVAILABLE?
+         BO    P2NOJFCB                NO, BRANCH
+         L     R3,IEXPTR1              JFCB ADDRESS
+         USING INFMJFCB,R3             ADDRESSABILITY FOR THE JFCB
+         TM    JFCDSRG1,JFCORGPO       IS THIS A PDS DATASET?
+         BO    P2LONG                    YES PUT ON LONG TERM PACKS
+         CLC   JFCBDQTY,ZERO            IS THERE A DIRECTORY AMOUNT
+         BNE   P2LONG                    YES IT'S A PDS PUT ON LONG TERM
+         B     P2SHORT                   ELSE PUT ON SHORT TERM PACK
+P2NOJFCB L     R3,IEXFMT1              DSCB1 ADDRESS
+         USING IECSDSL1,R3             ADDRESSABILITY FOR THE DSCB
+         TM    DS1DSORG,JFCORGPO       IS THIS A PDS DATASET?
+         BNO   P2SHORT                   NO PUT ON SHORT TERM PACK
+P2LONG   CLI   UCBVOLI+1,X'EF'         IS SECOND CHAR NUMERIC
+         BNH   EXIT4                   NO DON'T DO IT HERE
+         CLC   UCBVOLI+2(2),=C'WL'     IS THIS A DEVELOPMENT PACK
+         BE    EXIT0                   YES ALLOW ALLOCATION
+         B     EXIT4                   ELSE FAIL REQUEST
+P2SHORT  CLI   UCBVOLI+1,X'EF'         IS SECOND CHAR NUMERIC
+         BNH   EXIT4                   NO DON'T DO IT HERE
+         CLC   UCBVOLI+2(2),=C'WS'     IT THIS A SHORT TERM PACK
+         BE    EXIT0                   YES ALLOW ALLOCATION
+         B     EXIT4                   ELSE FAIL REQUEST
+*                             EXIT ROUTINE                            *
+EXIT0    MODE24                        MAKE SURE WE ARE IN 24 BIT MODE
+         XR    R15,R15                 RC = 0
+         XC    IEXREASN,IEXREASN       REASON CODE = 0
+         B     EXIT
+EXIT4    LA    R15,4                   RC = 4
+         B     EXIT
+EXIT8    LA    R15,8                   RC = 8
+         B     EXIT
+EXIT     L     R14,12(,R13)            RESTORE REGISTER 14
+         LM    R0,R12,20(R13)          RESTORE REGISTERS 0 - 12
+         BR    R14                     RETURN TO CALLER
+FLAG     DC    X'00'
+NORUN    EQU   X'80'
+*        EQU   X'40'
+*        EQU   X'20'
+*        EQU   X'10'
+*        EQU   X'08'
+*        EQU   X'04'
+*        EQU   X'02'
+*        EQU   X'01'
+PB       DC    C'PB'
+SCH      DC    C'SCH'
+ZERO     DC    X'000000'
+IGGPROD  DC    C'AY'
+         DC    C'IS'
+         DC    C'MA'
+         DC    C'MB'
+         .
+         etc
+         .
+         DC    C'TR'
+         DC    C'VV'
+         DC    C'X1'
+         DC    C'YC'
+         DC    C'YL'
+IGGEND   DC    3X'00'
+         LTORG
+PARMLIST IECIEXPL DSECT=YES
+         CVT   DSECT=YES
+         IEESMCA
+         IEFUCBOB PREFIX=YES,LIST=YES
+         IEFJFCBN LIST=YES
+         IECSDSL1 1
+         IKJTCB   LIST=YES
+         IEZJSCB
+         IHADSAB
+SIOT     DSECT
+         IEFASIOT
+         IEFAJCTB
+*        DSECT
+         IEECHAIN
+QDB      DSECT
+QDBQDB   DS    CL4                     ACRONYM IN EBCDIC QDB-
+QDBATTR  DS    XL2                     QUEUE ATTRIBUTES
+QDBRV001 DS    XL2                     RESERVED
+QDBNELMS DS    F                       NUMBER OF ELEMENTS ON QUEUE
+QDBFELMP DS    A                       POINTER TO FIRST ELEMENT
+QDBLELMP DS    A                       POINTER TO LAST ELEMENT
+QDBFPTDS DS    XL2                     FORWARD POINTER DISPLACEMENT
+QDBBPTDS DS    XL2                     BACKWARD POINTER DISPLACEMENT
+QDBPRSZ  DS    XL2                     PRIORITY FIELD SIZE
+QDBPRDS  DS    XL2                     PRIORITY FIELD DISPLACEMENT
+QDBRV002 DS    A                       RESERVED
+VOLUNTAB DSECT
+VOLID    DS    CL6                     VOLUME SERIAL NUMBER
+VOLSTAT  DS    0CL4                    STATUS BYTES
+VOLSTATA DS    XL1                     REQUEST INDICATORS
+VOLPUB   EQU   X'80'                   REQUEST NEEDS PUBLIC VOLUME
+VOLPRV   EQU   X'40'                   REQUEST NEEDS PRIVATE VOLUME
+VOLSPEC  EQU   X'20'                   REQUEST IS FOR SPECIFIC VOL
+VOLSTG   EQU   X'10'                   REQUEST NEEDS STORAGE VOLUME
+VOLNSHR  EQU   X'08'                   VOLUME MUST BE NON-SHAREABLE
+VOLRESVE EQU   X'04'                   VOLUME RESERVE WORK BIT
+VUDADSM  EQU   X'02'                   REQUIRES DADSM
+VOLDEFER QU    X'01'                   DEFER MOUNT REQUEST
+VOLSTATB DS    XL1                     REQUEST STATUS
+VOLALOC  EQU   X'80'                   ENTRY HAS BEEN ALLOCATED
+VOLMNTD  EQU   X'40'                   VOL MUST BE MOUNTED BY
+*                                      END OF ALLOCATION
+VDEVREQD EQU   X'20'                   ETIOT DEVICE ENTRY REQUIRED
+VUPROCED EQU   X'10'                   WORK BIT-AFFINITY PROCESSED
+VUDNALOC EQU   X'08'                   RECOVERY NECESSARY FOR THIS ENTRY
+VUDADSME EQU   X'04'                   RECOVERABLE DADSM ERROR
+*                                      HAS OCCURRED
+VUVINELG EQU   X'02'                   VOLUME IS MOUNTED ON INELIGIBLE
+*                                      OR UNLOCKED UNIT
+VUAFFWRK EQU   X'01'                   VOLUME AFFINITY WORK BIT
+VOLSTATC DS    XL1                     DEVICE CLASS
+VOLTAREQ EQU   X'80'                   TAPE REQUEST
+VOLCOREQ EQU   X'40'                   COMM. REQUEST
+VOLDAREQ EQU   X'20'                   DIRECT ACCESS REQUEST
+VOLGRREQ EQU   X'10'                   GRAPHICS REQUEST
+VOLURREQ EQU   X'08'                   UNIT RECORD REQUEST
+VOL      EQU   X'04'                   RECOVERY ATTEMPTED
+VOLSTATD DS    XL1                     REQUEST STATUS
+VUMUGDON EQU   X'80'                   MULTI-UNIT/GEN WORK BIT
+VUREALOC EQU   X'40'                   REARRANGE WORK BIT
+VUDMNDOF EQU   X'20'                   DEMAND REQ DEV IS OFFLINE
+VUDMNDAL EQU   X'10'                   DEMAND REQ DEV IS ALLOC'D
+VUUNALSW EQU   X'08'                   MUST BACKOUT ALLOCATION
+VUDMUNIQ EQU   X'04'                   FIRST REQ FOR UNAVAILABLE
+*                                      DEMANDED UNIT
+VUVLUNIQ EQU   X'02'                   FIRST REQ WITH VALIDITY CHECK
+*                                      FOR THIS VOLUME
+VURCVYPR EQU   X'01'                   RECOVERY PROCESSING DONE
+VOLUNTID DS    XL2                     UNIT IDENTIFIER
+VOLALGTP DS    A                       ADDR OF ALGORITHM ENTRY
+VOLSIOTP DS    A                       SIOT ADDRESS
+VUUCBP   DS    A                       PTR TO UCB OR PTR TO UCB POOL
+*                                      IF SU18 IN SYSTEM
+VUGRID   DS    A                       PTR GROUP ID OR PTR TO THE GROUP
+*                                      ID LIST IF SU18 IS IN THE SYSTEM
+         END
+
+
+Edward Rohwer
+Staff Systems Programmer
+DST Systems Inc (USA)    © DST Systems Inc 1987
+

@@ -1,0 +1,876 @@
+CONV     TITLE 'ARCHIVER --- CONVERT FUNCTION'
+*---------------------------------------------------------------------*
+*---     THIS ROUTINE CONVERTS A PREVIOUS VERSION ARCHIVE TO THE  ----*
+*---     VERSION-4 FORMAT, MODIFYING THE DATA                     ----*
+*---     COMPRESSION/COMPACTION AS NEEDED.  ALL CONVERSION        ----*
+*---     PROCEEDS FROM THE VSAM2 ARCHIVE TO THE VSAM1 ARCHIVE.    ----*
+*---     AS IN MOST FUNCTIONS OF THE ARCHIVER, ITEM SELECTION IS  ----*
+*---     PROVIDED AND ALL GENERICS ARE HONORED.                   ----*
+*---------------------------------------------------------------------*
+ARCHCONV CSECT
+R0       EQU   0                   R
+R1       EQU   1                    E
+R2       EQU   2                     G
+R3       EQU   3                      I
+R4       EQU   4                       S
+R5       EQU   5                        T
+R6       EQU   6                         E
+R7       EQU   7                          R
+R8       EQU   8
+R9       EQU   9                   E
+R10      EQU   10                   Q
+R11      EQU   11                    U
+R12      EQU   12                     A
+R13      EQU   13                      T
+R14      EQU   14                       E
+R15      EQU   15                        S
+         COPY #ARCBITS
+         USING ARCHCONV,R15
+         #STAMP
+         STM   R14,R12,12(R13)     STORE ENTRY REGISTERS
+         LR    R11,R15             COPY ROUTINE BASE REGISTER
+         DROP  R15                 DROP THE OLD BASE
+         USING ARCHCONV,R11        DEFINE THE NEW BASE REGISTER
+         LA    R14,72(,R13)        POINT DOWN THE SAVE AREA STACK
+         ST    R14,8(,R13)         STORE FORWARD POINTER
+         ST    R13,4(,R14)         AND BACK POINTER
+         LR    R13,R14             COPY NEW SAVE AREA POINTER
+         L     R14,4(,R13)         RECOPY BACK POINTER
+         L     R14,12(,R14)        RECOPY ORIG. REG 14
+         LA    R10,0(,R11)         COPY ORIGINAL BASE REGISTER
+         AH    R10,PASSIT-2        BUMP BY A BASE'S WORTH
+         USING ARCHCONV+4096,R10   AND DECLARE IT
+         USING MAINWK,R12          BASE THE MAIN WORK AREA
+         L     R3,=F'32768'
+         LA    R5,0(R3,R3)
+         GETMAIN R,LV=(5),SP=12    GRAB STORAGE FOR WORK AREAS
+         ST    R1,BPBUF1
+         LR    R4,R1               COPY ITS ADDRESS
+         LA    R15,0
+         LA    R14,0
+         MVCL  R4,R14              CLEAR THE AREA
+         LA    R1,0(R3,R1)
+         ST    R1,BPBUF2
+         XC    FCOUNT,FCOUNT       CLEAR FUNCTION RECORD COUNT
+         XC    MCNT,MCNT           AND MEMBER COUNT
+         MVC   VS1MODE,=CL8'OUTPUT' SET THE I/O MODE
+         LA    R1,VSAM1DD          LOAD THE PARM POINTER
+         LA    R0,0                AND THE 'OPEN' FLAG
+         CALL  ARCHVSOP            CALL THE 'OPEN' FUNCTION
+         LTR   R15,R15             OPEN OK ??
+         BNZ   ENDITALL            NOPE; CAN'T WORK
+         BAL   R14,OPEN2           GO OPEN THE VSAM CLUSTER
+         SHOWCB ACB=(*,ACB2),                                          X
+               FIELDS=(LRECL,KEYLEN),                                  X
+               AREA=(S,CALLIST),                                       X
+               LENGTH=8,                                               X
+               MF=(G,GENWK)
+         LM    R7,R8,CALLIST       COPY KEYLEN AND LRECL VALUES
+         C     R8,=A(OLDKLEN)      IS KEY LENGTH RIGHT ??
+         BE    KEYOK2              YES ---
+         #PUT  ERR2                AND PUT IT OUT
+         #PUT  ERR4                AND PUT IT OUT
+         #PUT  ERR6                PRINT ERROR MESSAGE
+         B     ENDITALL            GO DO TERMINATION STUFF
+KEYOK2   DS    0H
+         C     R7,MINREC           IS LRECL LARGE ENOUGH ??
+         BNL   RECOK2              YES ---
+         #PUT  ERR2                AND PUT IT OUT
+         #PUT  ERR5                ERROR MESSAGE
+         #PUT  ERR6                PRINT ERROR MESSAGE
+         B     ENDITALL            GO DO TERMINATION STUFF
+RECOK2   DS    0H
+         XC    MCNT,MCNT             COUNTERS
+         EJECT
+*---------------------------------------------------------------------*
+*---     HERE'S THE MEAT OF THE PROCESSING. THE BASIC PROCESS IS   ---*
+*---           THIS:                                               ---*
+*---                                                               ---*
+*---     1. USING THE CONTROL INFORMATION WE WERE GIVEN AND THE    ---*
+*---        INFORMATION WE'VE DEVELOPED, LOCATE THE HEADER RECORD  ---*
+*---        FOR THE FIRST MEMBER. WE'LL USE THE VS1BUF2 AREA FOR   ---*
+*---        HEADER/KEY CONSTRUCTION.                               ---*
+*---                                                               ---*
+*---     2. LOOP THROUGH THE MEMBER, READING THE RECORDS AND       ---*
+*---        COPYING THEM INTO THE OUTPUT VSAM BUFFER, WRITING AS   ---*
+*---        EACH BUFFER GETS FULL.  IN ORDER TO GET THE COPY DONE, ---*
+*---        WE NEED TO USE THE 'EXPLODE' ROUTINE FROM THE OLD      ---*
+*---        VERSION OF THE ARCHIVER AND THE COMPACT ROUTINE FROM   ---*
+*---        THIS VERSION.  NOTE THAT THE ARCHIVE HEADER RECORD     ---*
+*---        NOW CONTAINS A LEVEL WORD THAT CAN BE INTERROGATED     ---*
+*---        TO DETERMINE THE METHOD OF COMPACTION AND/OR THE       ---*
+*---        APPROPRIATE COMPACTION/DECOMPACTION TABLE.             ---*
+*---                                                               ---*
+*---     3. AT END-OF-FILE FOR THE MEMBER, UPDATE THE VERSION      ---*
+*---        NUMBER, IF NOT SUPPLIED, AND LOOK FOR THE NEXT ITEM    ---*
+*---        TO COPY.                                               ---*
+*---------------------------------------------------------------------*
+         L     R6,VS2BUF2          POINT TO THE VSAM BUFFER
+         USING OLDREC,R6           BASE THE RECORD DSECT
+         XC    0(OLDKLEN,R6),0(R6) START AT THE BEGINNING !!
+         MODCB RPL=(*,RPL5),                                           X
+               OPTCD=(DIR,FKS,KGE,SYN,NUP),                            X
+               ACB=(*,ACB2),                                           X
+               ARG=(*,VS2BUF2),                                        X
+               AREA=(*,VS2BUF2),                                       X
+               AREALEN=(*,VS2LIM),                                     X
+               MF=(G,GENWK)        POSITION TO CLUSTER START
+         L     R1,RPL5             COPY THE RPL ADDRESS
+         POINT RPL=(1)             GET TO IT
+NEXTHDR  DS    0H
+         L     R6,VS2BUF2          POINT TO THE RECORD
+         MVI   OLDTT,OLDHDR        INITIAL RECORD TYPE
+         #IF   VRS,OFF,INCVERS
+         IC    R15,OLDT+7          INSERT A 'TYPE' BYTE
+         LA    R15,1(,R15)         INCREMENT BY ONE
+         STC   R15,OLDT+7          SAVE UPDATED VALUE
+         B     GETHDR              GO READ ANOTHER HEADER RECORD
+INCVERS  DS    0H
+         ICM   R15,3,OLDVER        INSERT THE VERSION NUMBER
+         AL    R15,=F'1'           INCREMENT BY ONE
+         STCM  R15,3,OLDVER        SAVE UPDATED VALUE
+GETHDR   DS    0H
+         L     R1,RPL5             COPY RPL ADDRESS
+         GET   RPL=(1)             AND READ A HEADER RECORD
+         LTR   R15,R15             ANYTHING LEFT ??
+         BNZ   ENDITALL            NOPE; ALL DONE
+         SHOWCB RPL=(*,RPL5),                                          X
+               FIELDS=RECLEN,                                          X
+               AREA=(S,VS2LEN2),                                       X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        FETCH THE RECORD LENGTH
+         CLI   OLDTT,OLDHDR        HEADER RECORD ??
+         BNE   ENDITALL            NOPE; ALL DONE ---
+         LA    R1,OLDTT            POINT TO THE HEADER
+         BAL   R14,OLDCHK          GO CHECK THE OLD ARCHIVE NAME(S)
+         LTR   R15,R15             PASS THE CHECK ??
+         BNZ   NEXTHDR             NOPE ---
+*---------------------------------------------------------------------*
+*---     AT THIS POINT, WE'VE DETERMINED THAT THIS ITEM NEEDS TO   ---*
+*---     BE CONVERTED. USING A LOCAL SUBROUTINE, WE'LL CONVERT     ---*
+*---     THE HEADER RECORD IN ITS ENTIRETY. PLEASE NOTE THAT NO    ---*
+*---     PDS DIRECTORY DATA IS MODIFIED; IT'S JUST COPIED          ---*
+*---     'AS-IS'. AT THIS POINT, WE EXAMINE THE HEADER TO          ---*
+*---     DETERMINE WHETHER WE REALLY HAVE COMPRESSED DATA IN THE   ---*
+*---     OLD ARCHIVE, SINCE LOAD MODULE DATA WAS NOT COMPRESSED.   ---*
+*---     NOW WE CHECK THE VERSION NUMBER.  IF WE'RE NOT REPLACING  ---*
+*---     A SIMILAR VERSION, WE WILL TRY TO WRITE THIS HEADER.      ---*
+*---     EACH TIME WE GET A DUPLICATE RECORD INDICATION FROM       ---*
+*---     VSAM, WE'LL INCREMENT THE VERSION NUMBER BY ONE AND TRY   ---*
+*---     AGAIN.  THIS WILL DETERMINE THE MAJORITY OF THE KEY FOR   ---*
+*---     ALL SUBSEQUENT RECORDS IN THIS ITEM AS WELL.  IF, ON THE  ---*
+*---     OTHER HAND, WE'RE REPLACING ANY DUPLICATE DATA, WE'LL     ---*
+*---     SIMPLY CALL ARCHERAS TO REMOVE ANY PRE-EXISTING ITEM OF   ---*
+*---     A MATCHING KEY.                                           ---*
+*---------------------------------------------------------------------*
+         BAL   R14,HDRCNV          GO CONVERT THE HEADER RECORD
+         L     R1,VS1BUF1          LOAD SPARE-BUFFER ADDRESS
+         L     R7,VS1BUF2          LOAD THE RECORD POINTER
+         USING REC,R7              AND BASE ITS DSECT
+         MVC   0(RECKLEN,R1),RECTT SAVE THAT KEY, FOR LATER
+PUTHDR   DS    0H
+         L     R1,VS1BUF2          LOAD THE RECORD POINTER
+         L     R0,VS1LEN2          AND LENGTH
+         BAL   R14,VSPUT           GO WRITE THE RECORD (MAYBE)
+         LTR   R15,R15             DUPLICATE RECORD ??
+         BZ    DONOTES             NOPE; ALL IS OK ---
+         #IF   REPL,ON,DELEIT      DELETE FOR REPLACEMENT ??
+         ICM   R15,15,RECVER       INSERT THE VERSION NUMBER
+         BCTR  R15,R0              UP BY ONE
+         STCM  R15,15,RECVER
+         B     PUTHDR              GO RETRY THE PUT
+DELEIT   DS    0H
+         LR    R1,R6               LOAD THE BUFFER POINTER
+         CALL  ARCHERAS            DELETE THE DUPLICATE ITEM
+         B     PUTHDR              AND GO RETRY THE 'PUT'
+         DROP  R6,R7
+         TITLE 'NOTE DATA CONVERSION'
+*---------------------------------------------------------------------*
+*---     THE HEADER IS NOW CONVERTED AND WRITTEN. AS A SIDE        ---*
+*---     BENEFIT, I NOW HAVE THE CORRECT VERSION NUMBER SET IN     ---*
+*---     THE RECORD KEY.  NOW DO THE OLD 'COMMDATA' RECORDS,       ---*
+*---     CONVERTING THEM TO THE NEW FORMAT 'NOTE' RECORDS. THESE   ---*
+*---     RECORDS ARE ALWAYS COMPRESSED IN THE OLD ARCHIVE, SO WE   ---*
+*---     NEED TO 'EXPLODE' THEM AND COMPACT THEM USING OUR NEW     ---*
+*---     AND IMPROVED COMPACTION MECHANISM.                        ---*
+*---------------------------------------------------------------------*
+DONOTES  DS    0H
+         L     R7,VS2BUF2          LOAD HEADER-RCD ADDRESS
+         L     R6,VS2BUF1          POINT TO THE OTHER BUFFER
+         USING OLDREC,R6
+         MVC   0(OLDKLEN,R6),0(R7) COPY THAT KEY
+         MVI   OLDTT,OLDCOMM       RESET TO NOTE TYPE
+         MODCB RPL=(*,RPL4),                                           X
+               OPTCD=(SEQ,FKS,KGE,SYN,NUP),                            X
+               ARG=(*,VS2BUF1),                                        X
+               ACB=(*,ACB2),                                           X
+               AREA=(*,VS2BUF1),                                       X
+               AREALEN=(*,VS2LIM),                                     X
+               MF=(G,GENWK)        POSITION TO ITEM NOTE START
+         L     R1,RPL4             COPY THE RPL ADDRESS
+         POINT RPL=(1)             GET TO IT
+         L     R7,VS1BUF2          LOAD OUTPUT BUFFER POINTER
+         USING REC,R7
+         MVI   RECTT,#RTNOTE       SET TYPE FOR NOTES
+         LA    R0,1                LOAD INITIAL SEQ# VALUE
+         STCM  R0,15,RECSEQ#       SAVE THAT NUMBER
+         LA    R0,RECKLEN          LOAD KEY LENGTH
+         ST    R0,VS1LEN2          SAVE AS INITIAL RECORD LENGTH
+NT1      DS    0H
+         L     R1,RPL4             POINT TO THE RPL
+         GET   RPL=(1)             GO READ A MEMBER NOTE RECORD
+         LTR   R15,R15             DID IT COMPLETE OK ??
+         BNZ   NTDONE              NOPE; ASSUME WE'RE DONE WITH NOTES
+         SHOWCB RPL=(*,RPL4),                                          X
+               FIELDS=RECLEN,                                          X
+               AREA=(S,VS2LEN1),                                       X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        FETCH THE RECORD LENGTH
+         CLI   OLDTT,OLDCOMM       COMMDATA RECORD ??
+         BNE   NTDONE
+         L     R1,VS2BUF2          POINT TO ORIGINAL KEY
+         CLC   1(OLDKLEN-5,R6),1(R1) STILL IN THE RIGHT ITEM ??
+         BNE   NTDONE              NOPE; GO DO THE DATA RECORDS
+         LA    R5,OLDDATA          POINT TO NOTE DATA
+         L     R4,VS2LEN1          LOAD RECORD LENGTH
+         LA    R4,0(R4,R6)         POINT TO
+         BCTR  R4,R0                 LAST DATA BYTE
+NT2      DS    0H
+         L     R2,BPBUF1           POINT TO EXPLODE OUTPUT AREA
+         LA    R3,3(,R5)           POINT TO INPUT AREA
+         LA    R8,0                CLEAR A REG.
+         ICM   R8,7,0(R5)          LOAD INPUT LENGTH
+         CALL  EXPLODE,((3),(8),(2)),MF=(E,CALLIST)
+         LR    R3,R2               COPY INPUT ADDRESS
+         LR    R8,R0               AND LENGTH
+         L     R2,BPBUF2           LOAD ANOTHER OUTPUT AREA
+         STCM  R0,3,3(R2)          STORE ORIGINAL RECORD LENGTH
+         LA    R2,5(,R2)           POINT TO COMPACT OUTPUT AREA
+         ST    R8,DWORK            SAVE THE LENGTH
+         CALL  COMPACT,((3),DWORK,(2)),MF=(E,CALLIST)
+         L     R3,BPBUF2           RELOAD AREA POINTER
+         LR    R2,R0               COPY THE LENGTH
+         LA    R2,2(,R2)           ACCOUNT FOR EXPAND LENGTH FIELD
+         STCM  R2,7,0(R3)          SAVE THE LENGTH
+         #ADDBLK BUFFER=2,                                             X
+               RECORD=3(,R3),                                          X
+               LENGTH=0(,R3),                                          X
+               ERR=TOOLONG,                                            X
+               RTN=VSPUT
+         ICM   R2,7,0(R5)
+         LA    R5,3(R2,R5)         POINT TO NEXT INPUT SEGMENT
+         CR    R5,R4               PAST THE END LET ??
+         BL    NT2                 NOPE ---
+         B     NT1                 YES; GET ANOTHER RECORD
+NTDONE   DS    0H
+         #ADDBLK BUFFER=2,                                             X
+               LAST=YES,                                               X
+               RTN=VSPUT
+NT5      DS    0H
+*---------------------------------------------------------------------*
+*---     NOTE DATA IS COPIED. NOW UPDATE THE NOTE DATA LAST        ---*
+*---     SEQUENCE NUMBER FIELD IN THE HEADER RECORD. WE'LL USE     ---*
+*---     THE VS1BUF1 BUFFER AREA FOR THIS UPDATE.                  ---*
+*---------------------------------------------------------------------*
+         ICM   R2,15,RECSEQ#       LOAD THE SEQUENCE NUMBER
+         BCTR  R2,R0               BACK UP TO LAST TRUE VALUE
+         XC    RECSEQ#,RECSEQ#     CLEAR THAT VALUE
+         MVI   RECTT,#RTHDR        SET 'HEADER' TYPE
+         MODCB RPL=(*,RPL1),                                           X
+               OPTCD=(DIR,FKS,KEQ,SYN,UPD),                            X
+               ACB=(*,ACB1),                                           X
+               ARG=(*,VS1BUF2),                                        X
+               AREA=(*,VS1BUF2),                                       X
+               AREALEN=(*,VS1LIM),                                     X
+               MF=(G,GENWK)        VSAM SETUP FOR UPDATE
+         L     R1,RPL1             POINT TO THE RPL
+         GET   RPL=(1)             READ THE HEADER RECORD
+         LTR   R15,R15             DID WE GET IT OK ??
+         BZ    NT6                 YES ---
+         L     R4,RPL1             LOAD THE RPL ADDRESS
+         ABEND 100,DUMP            AND DIE HOFFIBLY
+NT6      DS    0H
+         SHOWCB RPL=(*,RPL1),                                          X
+               FIELDS=RECLEN,                                          X
+               AREA=(S,VS1LEN2),                                       X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        FETCH THE RECORD LENGTH
+         STCM  R2,15,RSRNOT#       UPDATE NOTE-RECORD COUNT
+         MODCB RPL=(*,RPL1),                                           X
+               OPTCD=(DIR,FKS,KEQ,SYN,UPD),                            X
+               ACB=(*,ACB1),                                           X
+               ARG=(*,VS1BUF2),                                        X
+               AREA=(*,VS1BUF2),                                       X
+               AREALEN=(*,VS1LEN2),                                    X
+               MF=(G,GENWK)        VSAM SETUP FOR UPDATE
+         L     R1,RPL1             LOAD THE RPL ADDRESS
+         PUT   RPL=(1)             AND UPDATE THE RECORD
+         LTR   R15,R15             DID WE UPDATE IT OK ??
+         BZ    NTEND               YES ---
+         L     R4,RPL1             LOAD THE RPL ADDRESS
+         ABEND 100,DUMP            AND DIE HORRIBLY
+         DROP  R6,R7
+         TITLE 'ITEM DATA CONVERSION'
+NTEND    DS    0H
+         L     R7,VS2BUF2          LOAD HEADER-RCD ADDRESS
+         L     R6,VS2BUF1          POINT TO THE OTHER BUFFER
+         USING OLDREC,R6
+         MVC   0(OLDKLEN,R6),0(R7) COPY THAT KEY
+         MVI   OLDTT,OLDMEMB       RESET TO DATA TYPE
+         MODCB RPL=(*,RPL4),                                           X
+               OPTCD=(SEQ,FKS,KGE,SYN,NUP),                            X
+               ARG=(*,VS2BUF1),                                        X
+               ACB=(*,ACB2),                                           X
+               AREA=(*,VS2BUF1),                                       X
+               AREALEN=(*,VS2LIM),                                     X
+               MF=(G,GENWK)        POSITION TO ITEM DATA START
+         L     R1,RPL4             COPY THE RPL ADDRESS
+         POINT RPL=(1)             GET TO IT
+         L     R7,VS1BUF2          LOAD OUTPUT BUFFER POINTER
+         USING REC,R7
+         LA    R0,1                LOAD INITIAL SEQ# VALUE
+         STCM  R0,15,RECSEQ#       SAVE THAT NUMBER
+         MVI   RECTT,#RTDATA       SET TYPE FOR DATA
+         LA    R0,RECKLEN          LOAD KEY LENGTH
+         ST    R0,VS1LEN2          SAVE AS INITIAL RECORD LENGTH
+DT1      DS    0H
+         L     R1,RPL4             POINT TO THE RPL
+         GET   RPL=(1)             GO READ A MEMBER DATA RECORD
+         LTR   R15,R15             DID IT COMPLETE OK ??
+         BNZ   DTDONE              NOPE; ASSUME WE'RE DONE WITH DATA
+         SHOWCB RPL=(*,RPL4),                                          X
+               FIELDS=RECLEN,                                          X
+               AREA=(S,VS2LEN1),                                       X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        FETCH THE RECORD LENGTH
+         CLI   OLDTT,OLDMEMB       DATA RECORD ??
+         BNE   DTDONE
+         L     R1,VS2BUF2
+         CLC   1(OLDKLEN-5,R6),1(R1) STILL IN THE RIGHT ITEM ??
+         BNE   DTDONE              NOPE; ALL FINISHED ---
+         LA    R5,OLDMEM           POINT TO DATA DATA
+         L     R4,VS2LEN1          LOAD RECORD LENGTH
+         LA    R4,0(R4,R6)         POINT TO
+         BCTR  R4,R0                 LAST DATA BYTE
+DT2      DS    0H
+         #IF   EXPL,OFF,NOEXPL
+         L     R2,BPBUF1           POINT TO EXPLODE OUTPUT AREA
+         LA    R3,3(,R5)           POINT TO INPUT AREA
+         LA    R8,0                CLEAR A REG.
+         ICM   R8,7,0(R5)          LOAD INPUT LENGTH
+         CALL  EXPLODE,((3),(8),(2)),MF=(E,CALLIST)
+         LR    R3,R2               COPY INPUT ADDRESS
+         L     R2,BPBUF2           LOAD ANOTHER OUTPUT AREA
+         STCM  R0,3,3(R2)          STORE ORIGINAL RECORD LENGTH
+         LA    R2,5(,R2)           POINT TO COMPACT OUTPUT AREA
+         ST    R0,DWORK            SAVE THE LENGTH
+         LR    R8,R0
+         CALL  COMPACT,((3),DWORK,(2)),MF=(E,CALLIST)
+         L     R3,BPBUF2           RELOAD AREA POINTER
+         AH    R0,=H'2'            ACCOUNT FOR 'TRUE LENGTH' FIELD
+         STCM  R0,7,0(R3)          STORE LENGTH
+         LR    R2,R0               AND COPY IT
+         B     EXPLD
+NOEXPL   DS    0H
+         L     R2,BPBUF2           POINT TO EXPLODE OUTPUT AREA
+         LA    R3,3(,R5)           POINT TO INPUT AREA
+         LA    R8,0                CLEAR A REG.
+         ICM   R8,7,0(R5)          LOAD INPUT LENGTH
+         STCM  R8,3,3(R2)          STORE ORIGINAL RECORD LENGTH
+         LA    R2,5(,R2)           POINT TO COMPACT OUTPUT AREA
+         ST    R8,DWORK            SAVE THE LENGTH
+         CALL  COMPACT,((3),DWORK,(2)),MF=(E,CALLIST)
+         L     R3,BPBUF2           RELOAD AREA POINTER
+         STCM  R0,7,0(R3)          STORE LENGTH
+         LR    R2,R0               AND COPY IT
+EXPLD    DS    0H
+         STCM  R2,7,0(R3)          SAVE THE LENGTH
+         #ADDBLK BUFFER=2,                                             X
+               RECORD=3(,R3),                                          X
+               LENGTH=0(,R3),                                          X
+               ERR=TOOLONG,                                            X
+               RTN=VSPUT
+         LA    R2,0
+         ICM   R2,7,0(R5)
+         LA    R5,3(R2,R5)         POINT TO NEXT INPUT SEGMENT
+         CR    R5,R4               PAST THE END LET ??
+         BL    DT2                 NOPE ---
+         B     DT1                 YES; GET ANOTHER RECORD
+DTDONE   DS    0H
+         #ADDBLK BUFFER=2,                                             X
+               LAST=YES,                                               X
+               RTN=VSPUT
+DT5      DS    0H
+         L     R1,MCNT             LOAD MEMBER COUNT
+         LA    R1,1(,R1)           INCREMENT BY ONE
+         ST    R1,MCNT             SAVE UPDATED COUNT
+         L     R6,VS1BUF1          POINT TO OLD (CONVERTED) KEY
+         MVI   LINE,C' '
+         MVC   LINE+1(L'LINE-1),LINE
+         #FORMAT OLDTT,,INMSG
+         #PUT  LINE
+         L     R6,VS1BUF2          POINT TO NEW KEY
+         MVI   LINE,C' '
+         MVC   LINE+1(L'LINE-1),LINE
+         #FORMAT RECTT,,OUTMSG
+         #PUT  LINE
+         B     NEXTHDR             GO DO ANOTHER ITEM
+         SPACE 3
+*---------------------------------------------------------------------*
+*---     IF WE REACH THIS LABEL, WE'VE GOT AT LEAST ONE RECORD     ---*
+*---     THAT CANNOT BE MADE TO FIT IN THE OUTPUT ARCHIVE          ---*
+*---     CLUSTER. ISSUE AN ERROR MESSAGE AND ERASE THE             ---*
+*---     PARTIALLY-COPIED ITEM.                                    ---*
+*---------------------------------------------------------------------*
+TOOLONG  DS    0H
+         L     R6,VS1BUF1          POINT TO OLD (CONVERTED) KEY
+         MVI   LINE,C' '
+         MVC   LINE+1(L'LINE-1),LINE
+         #FORMAT OLDTT,,LNGREC
+         #PUT  LINE                PRINT THE ERROR
+         L     R1,RECTT            POINT TO THE RECORD KEY
+         CALL  ARCHERAS            DELETE PARTIAL ITEM
+         B     NEXTHDR             GO FOR ANOTHER ITEM
+LNGREC   DC    AL1(LNGRECE-LNGRECS)
+LNGRECS  DC    C' CANNOT BE CONVERTED. AT LEAST ONE RECORD TOO LONG.'
+LNGRECE  EQU   *
+         DROP  R6,R7
+INMSG    DC    AL1(INEND-INMSG1)
+INMSG1   DC    C' WAS CONVERTED TO ---   '
+INEND    EQU   *
+OUTMSG   DC    AL1(OUTEND-OUTMSG1)
+OUTMSG1  DC    C' ON OUTPUT VSAM CLUSTER. '
+OUTEND   EQU   *
+ENDITALL DS    0H
+         #PUT  ERR14
+         L     R0,MCNT             COPY MEMBER COUNT
+         CVD   R0,DWORK            DECIMALIZE IT
+         MVC   LINE,MCMSG          COPY IN THE MESSAGE SKELETON
+         ED    LINE+2(20),DWORK    ADD IN THE ACTUALS
+         #PUT  LINE                AND OUTPUT THE RESULTS
+         LA    R1,VSAM1DD          POINT TO THE DDNAME
+         LA    R0,4                SET 'CLOSE' REQUEST
+         CALL  ARCHVSOP            CALL THE VSAM 'CLOSE' ROUTINE
+         BAL   R14,CLOSE2          CLOSE THE VSAM CLUSTER
+         FREEMAIN R,SP=12          RELEASE ALL MY STORAGE
+         XC    BPBUF1,BPBUF1
+         XC    BPBUF2,BPBUF2
+         L     R13,4(,R13)         COPY BACK S.A. POINTER
+         LM    R14,R12,12(R13)     RESTORE REGISTERS
+         LA    R15,0               ALWAYS RC = 0
+         MVI   12(R13),255
+         BR    R14                 AND RETURN TO CALLER
+         TITLE 'VSAM CLOSE AND CONTROL-BLOCK FREEMAINS'
+*---------------------------------------------------------------------*
+*---     THIS LITTLE LOCAL SUBROUTINE IS THE COUNTERPART TO THE    ---*
+*---     VSOPEN ROUTINE. HERE, THE VSAM CLUSTER # 2 IS CLOSED      ---*
+*---     AND ALL RELATED STORAGE, WORK AREAS, ETC. ARE FREE'D.     ---*
+*---     ALL RELATED VALUES IN THE ##ARCHWK AREA ARE ALSO RESET.   ---*
+*---------------------------------------------------------------------*
+CLOSE2   DS    0H
+         STM   R14,R12,IOSAVE      SAVE ENTRY REGISTERS
+         NC    ACB2,ACB2           WAS IT OPENED ??
+         BZR   R14                 NOPE ---
+         MVI   ACB2,X'80'          MARK AS LAST FOR CLOSE
+         CLOSE ,MF=(E,ACB2)        CLOSE THE CLUSTER
+         ST    R3,VS2LIM           SAVE RECORD LENGTH LIMIT
+         XC    ACB2(32),ACB2       CLEAR THE VSAM I/O CONTROL WORDS
+         LM    R14,R12,IOSAVE      RESTORE THE REGISTERS
+         BR    R14                 RETURN TO (LOCAL) CALLER
+         TITLE 'VSAM CLUSTER OPEN AND BLOCK-BUILD'
+*---------------------------------------------------------------------*
+*---     THIS LITTLE LOCAL SUBROUTINE OPENS THE VSAM CLUSTER FOR   ---*
+*---     INPUT.  ALL VSAM-RELATED GETMAINS ARE DONE FROM SUBPOOL   ---*
+*---     11, TO ALLOW A SUBPOOL-WIDE FREEMAIN AT THE END OF        ---*
+*---     PROCESSING. NOTE THAT ALL VSAM CONTROL BLOCKS ARE         ---*
+*---     'GENCB'D IN GETMAINED AREAS, FOR THE SAME FLEXIBILITY.    ---*
+*---------------------------------------------------------------------*
+OPEN2    DS    0H
+         STM   R14,R12,IOSAVE      SAVE ENTRY REGISTERS
+         SHOWCB FIELDS=(ACBLEN,RPLLEN),AREA=(S,DWORK),LENGTH=8,        X
+               MF=(G,GENWK)
+         LM    R4,R5,DWORK         LOAD THE TWO LENGTHS
+         LA    R6,0(R5,R5)         PLAN FOR TWO RPL'S
+         LA    R6,0(R6,R4)         PLUS THE ACB
+         GETMAIN R,LV=(6),SP=11    GRAB SOME STORAGE
+         ST    R1,ACB2             SAVE AS ACB ADDRESS
+         LR    R2,R1               COPY ITS ADDRESS
+         GENCB BLK=ACB,                                                X
+               WAREA=(2),                                              X
+               LENGTH=(4),                                             X
+               AM=VSAM,                                                X
+               STRNO=2,                                                X
+               DDNAME=(*,VSAM2DD),                                     X
+               MACRF=(KEY,DIR,SEQ,IN),                                 X
+               MF=(G,GENWK)
+         MVI   ACB2,X'80'          MARK AS LAST FOR OPEN
+         LA    R3,0(R4,R2)         POINT TO RPL PART OF AREA
+         LA    R6,0(R5,R5)         TWO RPL'S LENGTH
+         GENCB BLK=RPL,                                                X
+               WAREA=(3),                                              X
+               LENGTH=(6),                                             X
+               COPIES=2,                                               X
+               ACB=(2),                                                X
+               AM=VSAM,                                                X
+               MF=(G,GENWK)
+         ST    R1,RPL4             SAVE ITS ADDRESS
+         LA    R1,0(R5,R1)         POINT TO SECOND RPL
+         ST    R1,RPL5             SAVE ITS ADDRESS
+         OPEN  ,MF=(E,ACB2)        OPEN THE CLUSTER
+         SHOWCB ACB=(2),FIELDS=LRECL,AREA=(S,VS2LIM),LENGTH=4,         X
+               MF=(G,GENWK)
+         L     R3,VS2LIM           LOAD THE RECORD LENGTH
+         LA    R5,0(R3,R3)         FIGURE TWO BUFFERS
+         GETMAIN R,LV=(5),SP=11    GRAB SPACE FOR A BUFFER AREA
+         ST    R1,VS2BUF1          SAVE BUFFER
+         LA    R2,0(R3,R1)         POINT TO SECOND BUFFER
+         ST    R2,VS2BUF2          AND SAVE ITS ADDRESS
+         LA    R14,0               SOURCE ADDRESS IS ZERO
+         LA    R15,0               LENGTH/PAD IS ZEROS
+         L     R4,VS2BUF1          POINT TO AREA START
+         MVCL  R4,R14              CLEAR ONE BUFFER
+         XC    VS2LEN1,VS2LEN1     INITIAL BYTES USED = ZERO
+         XC    VS2LEN2,VS2LEN2     INITIAL BYTES USED = ZERO
+         LM    R14,R12,IOSAVE      RESTORE THE REGISTERS
+         BR    R14                 RETURN TO (LOCAL) CALLER
+         TITLE 'VSAM I/O OUTPUT '
+*---------------------------------------------------------------------*
+*---     THIS LITTLE LOCAL SUBROUTINE DOES ALL THE VSAM WRITING    ---*
+*---     FOR THE COPY FUNCTION, WITH THE EXCEPTION OF THE ERASURE  ---*
+*---     OF A DUPLICATE ITEM.  THE BASIC ASSUMPTIONS ARE THAT THE  ---*
+*---     VS1BUF1 AREA IS THE RECORD TO BE WRITTEN AND ITS LENGTH   ---*
+*---     IS ACCURATELY REPORTED IN THE VS1LEN1 FIELD.  THE         ---*
+*---     INITIAL-LOAD CONDITION IS PROPERLY HANDLED HERE, IF       ---*
+*---     NECESSARY.                                                ---*
+*---------------------------------------------------------------------*
+VSPUT    DS    0H
+         STM   R14,R12,IOSAVE      SAVE ENTRY REGISTERS
+         L     R4,RPL2             LOAD RPL ADDRESS
+         LR    R5,R1               LOAD BUFFER ADDRESS
+         LR    R6,R0               LOAD RECORD LENGTH
+         MODCB RPL=(4),            RPL ADDRESS                         X
+               OPTCD=(DIR,FKS,NUP,MVE,KEQ), OPTION CODES ---           X
+               ARG=(5),            KEY ADDRESS                         X
+               AREA=(5),           BUFFER ADDRESS                      X
+               RECLEN=(6),         RECORD LENGTH                       X
+               MF=(G,GENWK)
+         PUT   RPL=(4)             OUTPUT THE VSAM RECORD
+         LR    R3,R15              SAVE THAT RETURN CODE
+         SHOWCB RPL=(4),                                               X
+               FIELDS=FDBK,        FETCH THE RPL FEEDBACK FIELD        X
+               AREA=(S,DWORK),                                         X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        GET RECORD LENGTH
+         B     *+4(R3)             CHECK THE 'PUT' RETURN CODE
+         B     VSPUT5              ALL IS OK
+         B     VSPUT1              RPL SHOWS SOMETHING HAPPENING
+         B     VSPUT3              LOGICAL ERROR
+         B     VSPUTDIE            PHYSICAL ERROR
+VSPUT1   DS    0H
+         LA    R8,0                CLEAR A COUNTER REGISTER
+VSPUT2   DS    0H
+         CH    R8,=H'3'            PAST THE LIMIT YET ??
+         BH    VSPUTDIE            YES ---
+         LA    R8,1(,R8)           NOPE; INCREMENT COUNTER
+         PUT   RPL=(4)             OUTPUT THE VSAM RECORD
+         LR    R3,R15              SAVE THAT RETURN CODE
+         SHOWCB RPL=(4),                                               X
+               FIELDS=FDBK,        FETCH THE RPL FEEDBACK FIELD        X
+               AREA=(S,DWORK),                                         X
+               LENGTH=4,                                               X
+               MF=(G,GENWK)        GET RECORD LENGTH
+         B     *+4(R3)             CHECK THE 'PUT' RETURN CODE
+         B     VSPUT5              ALL IS OK
+         B     VSPUT2              RPL SHOWS SOMETHING HAPPENING
+         B     VSPUT3              LOGICAL ERROR
+         B     VSPUTDIE            PHYSICAL ERROR
+VSPUT3   DS    0H                  LOGICAL ERROR HAS OCCURED
+         CLI   DWORK+3,8           DUPLICATE KEY ??
+         BNE   VSPUT4              NOPE ---
+         LA    R15,4               LOAD THE RETURN CODE
+         B     VSPUT5              AND TERMINATE
+VSPUT4   DS    0H
+         CLI   DWORK+3,116         INITIAL LOAD IN PROGRESS ??
+         BNE   VSPUTDIE            NOPE; SOME OTHER ERROR
+         MODCB RPL=(4),            RPL ADDRESS                         X
+               OPTCD=(SEQ,NUP,MVE,KEQ), OPTION CODES ---               X
+               MF=(G,GENWK)
+         LR    R7,R15
+         PUT   RPL=(4)             RE-DO THE PUT
+         LTR   R15,R15             OK NOW ??
+         BNZ   VSPUTDIE            NOPE; STILL SHAFTED
+         CLOSE ,MF=(E,ACB1)        CLOSE THE CLUSTER
+         OPEN  ,MF=(E,ACB1)        AND RE-OPEN THE CLUSTER
+VSPUT5   DS    0H
+         L     R14,IOSAVE          RELOAD R14
+         LM    R0,R12,IOSAVE+8     RESTORE OTHER REGS
+         BR    R14                 AND RETURN TO CALLER
+VSPUTDIE DS    0H
+*        WTO   'ARCHIVER --- VSAM I/O ERROR. R4 --> RPL',ROUTCDE=11
+         ABEND 100,DUMP
+         TITLE 'OLD-ARCHIVE NAME CHECK '
+*---------------------------------------------------------------------*
+*---     THIS DIDDLY LITTLE LOCAL SUBROUTINE DUPLICATES THE        ---*
+*---     FUNCTION OF THE ARCHKNAM SUBROUTINE, WITH ONE             ---*
+*---     DIFFERENCE: IT ONLY CHECKS THE FIRST 8 CHARACTERS OF      ---*
+*---     EACH QUALIFIER.  THIS IS BECAUSE THE INPUT IS ASSUMED TO  ---*
+*---     BE FROM THE OLD FORMAT ARCHIVE, WHERE QUALIFIER DATA WAS  ---*
+*---     IN 8-CHARACTER CHUNKS.  THIS IS THE ONLY PIECE OF THE     ---*
+*---     VERSION 4 ARCHIVER THAT ACTUALLY DEFINCES THE FIELDS OF   ---*
+*---     THE VERSION 3 ARCHIVE KEY.                                ---*
+*---------------------------------------------------------------------*
+         SPACE 3
+OLDCHK   DS    0H
+         STM   R14,R12,IOSAVE      STORE ENTRY REGISTERS
+         LA    R15,0               INITIAL RETURN CODE
+         ST    R15,IOSAVE+4        AND SET FOR RETURN
+         LR    R8,R1               COPY RECORD ADDRESS
+         USING OLDREC,R8
+         LA    R1,OLDN             POINT TO ITEM NAME
+         LA    R2,Q1               POINT TO INPUT QUALIFIER
+         LA    R7,Q4               POINT TO LAST QUALIFIER
+         LA    R6,10               AND QUALIFIER LENGTH
+CHK1     DS    0H
+         BAL   R14,CHKQ            GO CHECK THE QUALIFIER
+         B     NOMATCH             TEST FAILED; SET NOMATCH RETURN CODE
+         LA    R1,8(,R1)           POINT TO NEXT VALUE
+         BXLE  R2,R6,CHK1          AND LOOP, CHECKINGLY
+         #IF   VRS,OFF,MATCH       WAS VERSION NUMBER GIVEN ??
+         ICM   R0,15,OLDVER        LOAD THE VERSION NUMBER
+         C     R0,Q5               DOES IT MATCH ??
+         BNE   NOMATCH             NOPE; FAIL THE TEST
+MATCH    DS    0H
+         LM    R14,R12,IOSAVE      RESTORE ENTRY REGISTERS
+         BR    R14                 AND RETURN TO CALLER
+NOMATCH  DS    0H
+         MVC   IOSAVE+4(4),=F'4'   NON-ZERO RETURN CODE FOR FAILURE
+         B     MATCH               AND RETURN TO CALLER
+         DROP  R8
+         TITLE 'GENERIC/NONGENERIC QUALIFIER COMPARISON'
+*---------------------------------------------------------------------*
+*---     WE DO SOME STRANGE THINGS WITH MASKS, 'AND' AND COMPARE   ---*
+*---     INSTRUCTIONS HERE.  THE STEPS ARE RELATIVELY SIMPLE,      ---*
+*---     ONCE THEY'RE UNDERSTOOD, BUT CAN BE A LITTLE STRANGE TO   ---*
+*---     GRASP IF YOU DON'T WORK IT OUT ONCE OR TWICE WITH PAPER   ---*
+*---     AND PENCIL.  THE BASIC STEPS ARE THESE:                   ---*
+*---                                                               ---*
+*---     1. COPY THE QUALIFIER FROM THE CONTROL STATEMENT TO THE   ---*
+*---        GENWK AREA. THEN MAKE A COPY OF IT, IMMEDIATELY        ---*
+*---        FOLLOWING THE FIRST.                                   ---*
+*---                                                               ---*
+*---     2. EVERY PLACE WE HAVE A 'GENERIC' CHARACTER, REPLACE IT  ---*
+*---        WITH A BLANK. ALSO, EVERY NON-GENERIC CHARACTER IS     ---*
+*---        REPLACED WITH A X'FF'.                                 ---*
+*---                                                               ---*
+*---     3. TO MAKE THE COMPARISON, DO THIS:                       ---*
+*---                                                               ---*
+*---        A. 'AND' THE INPUT VALUE WITH THE FIRST MASK. ALL      ---*
+*---           CHARACTERS THAT ARE NOT GENERICS WILL BE UNCHANGED  ---*
+*---           AND ALL GENERICS WILL BE REPLACED BY BLANKS.        ---*
+*---                                                               ---*
+*---        B. COMPARE THE RESULT WITH THE SECOND MASK.  ALL       ---*
+*---           NON-GENERIC CHARACTERS WILL BE CHECKED FOR EXACT    ---*
+*---           MATCHES AND ALL GENERIC CHARACTERS WILL BE BLANKS   ---*
+*---           COMPARED TO BLANKS, MAKING THEM EQUAL.              ---*
+*---                                                               ---*
+*---     SIMPLE, ISN'T IT ??                                       ---*
+*---------------------------------------------------------------------*
+CHKQ     DS    0H
+         MVC   GENWK(8),0(R2)      COPY THE MEMBER NAME
+         MVC   GENWK+8(8),GENWK    AND DUPLICATE IT
+         CLC   =CL10'%%%%%%%%',0(R2) ALL ITEMS ??
+         BE    MATCH               YES; NOTHING TO FILTER
+         LA    R5,GENWK+7          POINT TO STRING END
+         LA    R3,GENWK            AND STRING START
+         LA    R4,1                AND BXLE INCREMENT
+F1       DS    0H
+         CLI   0(R3),C'%'          GENERIC CHARACTER ??
+         BNE   F2                  NOPE ---
+         MVI   0(R3),C' '          YES; REPLACE WITH A BLANK
+         MVI   8(R3),C' '          YES; REPLACE WITH A BLANK
+         B     F3                  DO OTHER MASK
+F2       DS    0H
+         MVI   0(R3),X'FF'         ANYTHING GOES HERE
+F3       DS    0H
+         BXLE  R3,R4,F1            LOOP FOR MASKS
+*---------------------------------------------------------------------*
+*---     SEARCH MASKS ARE BUILT. NOW DO THE COMPARE                ---*
+*---------------------------------------------------------------------*
+TSTX     DS    0H
+         MVC   GENWK+16(8),0(R1)  COPY THE QUALIFIER TO BE CHECKED
+         NC    GENWK+16(8),GENWK  MASK OUT THE GENERIC CHARS
+         CLC   GENWK+16(8),GENWK+8 REMAINDER MATCH ??
+         BE    4(,R14)             YES; RETAIN MAINLINK AND SUBCHAIN
+         BNE   0(,R14)             NOPE; FAIL THE TEST
+         TITLE 'HEADER RECORD FORMAT CONVERSION'
+*---------------------------------------------------------------------*
+*---     THIS LOCAL SUBROUTINE PERFORMS THE CONVERSION OF VERSION  ---*
+*---     3 HEADER RECORDS TO THE VERSION 4 FORMAT, WITH THE        ---*
+*---     EXPANDED FIELDS PADDED AS APPROPRIATE.  HERE, I ALSO SET  ---*
+*---     THE EXPL FLAG, TO DETERMINE WHETHER THE INPUT MEMBER IS   ---*
+*---     IN A COMPRESSED FORMAT OR NOT. ANY ATTEMPT TO USE THE     ---*
+*---     'EXPLODE' ROUTINE ON A LOAD MODULE FROM A VERSION 3       ---*
+*---     ARCHIVE WILL FAIL, SINCE VERSION 3 DIDN'T SUPPORT         ---*
+*---     COMPRESSION FOR LMODS.                                    ---*
+*---------------------------------------------------------------------*
+HDRCNV   DS    0H
+         L     R6,VS1BUF2          LOAD OUTPUT POINTER
+         USING REC,R6
+         L     R7,VS2BUF2          AND INPUT POINTER
+         USING OLDREC,R7
+         MVI   RECTT,#RTHDR        MARK AS A HEADER RECORD
+         MVC   RECN,=CL10' '       START WITH BLANKS
+         MVC   RECN(8),OLDN
+         MVC   RECG,=CL10' '       START WITH BLANKS
+         MVC   RECG(8),OLDG
+         MVC   RECSG,=CL10' '      START WITH BLANKS
+         MVC   RECSG(8),OLDSG
+         MVC   RECT,=CL10' '       START WITH BLANKS
+         MVC   RECT(8),OLDT
+         XC    RECSEQ#,RECSEQ#     RECORD SEQUENCE NUMBER
+         XC    RSRNOT#,RSRNOT#     LAST NOTE RECORD SEQUENCE NUMBER
+         MVI   @RSRFLG1,X'06'      SET THE VERSION NUMBER
+         MVI   @RSRFLG2,X'01'      SET THE VERSION NUMBER
+         MVI   @RSRFLG3,X'00'      SET THE VERSION NUMBER
+         MVI   @RSRFLG4,X'00'      SET THE VERSION NUMBER
+         MVC   RECVER,=F'-1'       INITIAL VERSION
+         MVC   RECVER+2(2),OLDVER  COPY OLD VERSION DATA
+         MVC   RSRDEV,OHDDEV       SOURCE DEVICE TYPE
+         MVC   RSRREC,OHDREC       SOURCE DATASET RECORD FORMAT
+         MVC   RSRLRE,OHDLRE       SOURCE DATASET LRECL
+         MVC   RSRBLK,OHDBLK       SOURCE DATASET BLKSIZE
+         MVC   RSRDSO,OHDDSO       SOURCE DATASET DSORG
+         MVC   RSRLMOD,OHDLMOD     SET TO X'FF' FOR LOAD MODULES
+         MVC   RSRRCNT,OHDRCNT     RECORD COUNT
+         OI    OHDTIME+3,X'0F'
+         UNPK  DWORK,OHDTIME       UNPACK TIME
+         MVC   RSRTIME(2),DWORK+1  MOVE THE HOUR OVER
+         MVI   RSRTIME+2,C':'      SEPARATOR
+         MVC   RSRTIME+3(2),DWORK+3 MOVE THE MINUTES
+         MVI   RSRTIME+5,C':'
+         MVC   RSRTIME+6(2),DWORK+5 AND SECONDS
+         ICM   R4,15,OHDDATE       LOAD THE DATE
+         LR    R5,R4               SAVE THE DATE VALUE
+         N     R5,=A(X'FFFF')      GET JUST JULIAN DAY# IN R5
+         SRL   R4,16               AND DECIMAL YEAR IN R4
+         SLL   R4,4
+         LA    R4,15(,R4)          ADD A ZONE TO THE YEAR
+         XC    DWORK,DWORK         CLEAR THE WORK AREA AGAIN
+         ST    R5,DWORK+4          STORE THE DAY AND
+         CVB   R5,DWORK            CONVERT IT TO BINARY
+         ST    R4,DWORK+4          NOW DO THE
+         CVB   R4,DWORK            FOR THE YEAR
+         LA    R15,SYTAB           LOAD STANDARD YEAR DATE-TABLE
+         LA    R0,3                'ANDING' VALUE IN R0
+         NR    R0,R4               IS THIS A LEAP YEAR ??
+         BNZ   *+8                 NOPE - - -
+         LA    R15,LYTAB           YES, USE LEAP-YEAR TABLE INSTEAD
+         LA    R2,0                LOAD INITIAL MONTH NUMBER
+MA2      DS    0H
+         CH    R5,0(,R15)          TOO MANY DAYS FOR THIS MONTH ??
+         BNH   MA3                 NOPE, IT'S THIS MONTH
+         SH    R5,0(,R15)          YES, ACCOUNT FOR THIS MONTH
+         LA    R15,2(,R15)         BUMP TABLE POINTER
+         LA    R2,1(,R2)           AND MONTH NUMBER
+         B     MA2                 AND LOOP, CONVERTING
+MA3      DS    0H
+         LA    R2,1(,R2)           FINAL ADJUSTMENT TO MONTH NUMBER
+         MH    R2,=H'1000'         MAKE ROOM FOR DAY
+         AR    R2,R5               AND ADD IT IN
+         MH    R2,=H'1000'         MAKE ROOM FOR YEAR
+         AR    R2,R4               AND ADD IT IN
+         CVD   R2,DWORK            CONVERT RESULT TO PACKED
+         UNPK  RSRDATE,DWORK(8)    ADD THE ZONES
+         OC    RSRDATE,=8X'F0'     FORCE ALL NUMERICS
+         MVI   RSRDATE+2,C'/'
+         MVI   RSRDATE+5,C'/'      ADD PUNCTUATION MARKS
+         L     R3,VS2LEN2          LOAD INPUT RECORD LENGTH
+         LA    R2,OHDPDIR-OLDREC   POINT TO DIRDATA START
+         SR    R3,R2               COMPUTE DIRDATA LENGTH
+         LA    R2,OHDPDIR          POINT TO DIRDATA START
+         LR    R5,R3               COPY THAT LENGTH
+         LA    R4,RSRPDIR          POINT TO THE OUTPUT AREA
+         MVCL  R4,R2               COPY THE DIRECTORY DATA
+         S     R4,VS1BUF2          COMPUTE RECORD LENGTH
+         ST    R4,VS1LEN2          AND SAVE IT
+         #SET  EXPL,OFF
+         CLI   RSRLMOD,0           IS THIS A LOAD MODULE ??
+         BNE   ENDCNV              YES ---
+         #SET  EXPL,ON             NO; NEEDS TO BE 'EXPLODED'
+ENDCNV   DS    0H
+         BR    R14                 RETURN TO CALLER
+         DROP  R6,R7
+SYTAB    DC    H'31,28,31,30,31,30,31,31,30,31,30,31'
+LYTAB    DC    H'31,29,31,30,31,30,31,31,30,31,30,31'
+         LTORG
+ERR1     DC    CL133'0*** ERROR *** ERROR OPENING THE VSAM1 CLUSTER.'
+ERR2     DC    CL133'0*** ERROR *** ERROR OPENING THE VSAM2 CLUSTER.'
+ERR4     DC    CL133'0*** ERROR *** THE VSAM CLUSTER KEY LENGTH IS INVAX
+               LID.  IS THIS THE CORRECT VSAM CLUSTER?'
+ERR5     DC    CL133'0*** ERROR *** THE VSAM CLUSTER RECORD LENGTH IS TX
+               OO SMALL. IT MUST ALLOW 12000-BYTE RECORDS.'
+ERR6     DC    CL133'0*** ERROR *** THIS CONTROL STATEMENT WILL BE IGNOX
+               RED.'
+ERR14    DC    CL133'0          CONVERT PROCESSING COMPLETED.  TOTALS FX
+               OLLOW: '
+MCMSG    DC    CL133' '
+         ORG   MCMSG+2
+         DC    X'40202020'
+         DC    X'6B202020'
+         DC    X'6B202020'
+         DC    X'6B202020'
+         DC    X'6B202120'
+         DC    C' TOTAL ITEM(S) PROCESSED.'
+         ORG
+         LTORG
+MINREC   DC    A(RECSIZE)
+         SPACE 3
+         COPY  #RECS
+         COPY  ##ARCHWK
+         TITLE 'VSAM ARCHIVE RECORD FORMAT - PRE-VERSION 4 '
+OLDREC   DSECT
+OLDTT    DS    CL1   RECORD TYPE -------------+
+OLDN     DS    CL8   MEMBER NAME              |
+OLDG     DS    CL8   MEMBER GROUP             |
+OLDSG    DS    CL8   MEMBER SUBGROUP          +-- VSAM KEY
+OLDT     DS    CL8   MEMBER TYPE              |
+OLDVER   DS    XL2   MEMBER VERSION           |
+OLDSEQ#  DS    XL4   RECORD SEQUENCE NUMBER --+
+OLDKLEN  EQU   *-OLDTT   LENGTH OF KEY
+OLDDATA  EQU   *     COMPRESSED RECORD DATA
+         SPACE 3
+*
+* RECORD TYPES (ALL TYPES NOT DEFINED HERE ARE RESERVED)
+*
+OLDHDR   EQU   X'00'
+OLDCOMM  EQU   X'02'
+OLDMEMB  EQU   X'80'
+*
+* HEADER RECORD DESCRIPTION
+*
+         ORG   OLDDATA
+OHDDEV   DS    XL4                 SOURCE DEVICE TYPE
+OHDREC   DS    XL1                 SOURCE DATASET RECORD FORMAT
+OHDLRE   DS    XL2                 SOURCE DATASET LRECL
+OHDBLK   DS    XL2                 SOURCE DATASET BLKSIZE
+OHDDSO   DS    XL2                 SOURCE DATASET DSORG
+OHDLMOD  DS    XL1                 SET TO X'FF' FOR LOAD MODULES
+OHDT1LEN EQU   *-OLDREC
+OHDTIME  DS    XL4                 TIME OF UNLOAD
+OHDDATE  DS    PL4                 DATE OF UNLOAD
+OHDT2LEN EQU   *-OLDREC
+OHDRCNT  DS    XL4                 RECORD COUNT
+OHDT3LEN EQU   *-OLDREC
+OHDPDIR  DS    CL74                PDS DIRECTORY ENTRY
+OHDT4LEN EQU   *-OLDREC
+*
+* COMMENT RECORD DESCRIPTION
+*
+         ORG   OLDDATA
+OCMDATA  DS    CL68                UP TO 68 BYTES OF USER COMMENT DATA
+*
+* MEMBER DATA RECORD DESCRIPTION
+*
+         ORG   OLDDATA
+OLDMEM   DS    C                   COMPRESSED MEMBER DATA
+         END

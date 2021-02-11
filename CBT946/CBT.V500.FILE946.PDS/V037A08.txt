@@ -1,0 +1,204 @@
+Mutual exclusion for CMS
+
+One of the drawbacks of CMS is that simultaneous attempts at
+updating the same CMS file by two different CMS users cannot be
+made without corruption of the mini-disk.  The only way round
+this is somehow to lock the file or resource that you wish to
+update.
+
+This can be done with IUCV to another CMS machine, which is
+the resource control machine; this will then reply 'yes' or 'no' to a
+lock request.
+
+Obviously this uses extra CPU and requires time slices for the
+other CMS machine.
+
+One solution would be for the user CMS machine to access a lock
+file and obtain the lock for itself, but you then have the danger of
+that lock file being corrupted by two different CMS users updating
+it concurrently.
+
+If CMS supported release/reserve this would not happen so why
+not add that support to access a lock file?  Then, provided that all
+the EXEC modules that do updates on shared disks use this
+facility, no corruption will occur.
+
+For example: I wish to edit a maclib member on a shared disk:
+
+  zlock 192maclb on  /*  Request lock on resource 192maclib so no-one
+                     /*  can do any updates to it
+  access 192 d       /*  Refresh access to disk to make sure I have
+                     /*  current version (must be done)
+  xedit 192maclb maclib d ( prof test mem test
+                     /*  Edit the member with special profile to do
+                     /*  work required
+  zlock 192maclb off /*  Free the locked resource so others can do
+                     /*  work on that maclib
+
+This issues a reserve CCW to the lock disk using DIAG 20.
+
+When the disk is reserved normal FSREAD and FSWRITE
+macros are used to check and obtain the lock.  The release DIAG
+is then issued to free the disk for other CMS users that have issued
+'ZLOCK resource ON' calls, and enables them to access the lock
+file.
+
+The mini-disk must be in CMS format but defined as:
+
+    mdisk 39f 3380 0001 01 vmpk01 mwv all all all
+
+All users must then have a link to this disk in their directory entry,
+but they do not have to access this disk as that will be done by the
+zlock module once reserve is obtained.  The disk holding the lock
+file will be accessed as X by the zlock module.
+
+Using DIAG 20 to issue the reserve CCW will stop anyone from
+accessing or updating any file on that disk until the release CCW
+is issued.
+
+The last thing that the zlock module does before returning control
+is to invoke an EXEC called zreacc which will re-access all of the
+shared disks so that any EXEC/module that has locked a resource
+on one of these disks is sure of working on a current version.
+
+Note: It is highly advisable to have only one lockable resource on
+a particular mini-disk.  If more than one resource lock is being
+used there will still be the possibility of simultaneous updating of
+the disk by users of each resource.
+
+EXEC:
+
+ZREACC - will issue CMS access commands
+
+MODULE:
+
+WAKEUP - is the IBM module supplied with ISPF to perform
+time/interrupt  functions.
+
+This program was written under VM/SP5.
+
+         TITLE 'ZLOCK   ISSUE RESERVE/RELEASE TO MINI DISK'
+         PRINT NOGEN,ON
+***********************************************************************
+*        PROGRAM NAME         ZLOCK                                   *
+*        PROGRAM TITLE        ISSUE RESERVE/RELEASE TO MINI DISK      *
+*              HOW TO GENERATE                                        *
+*          ASSEMBLE ZLOCK                                             *
+*          LOAD ZLOCK ( RLDSAVE
+*          GENMOD ZLOCK
+*          NUCXLOAD ZLOCK
+*     THIS WILL GENERATE ZLOCK AS A NUCLEUS EXTENSION
+*     NOTE IT CANNOT BE CALLED BY PROGRAMS WITH ORIGIN TRANS
+*     AS IT INVOKES WAKEUP WHICH IS A TRANSIENT.
+*    TO INVOKE:
+*       BY EXEC OR COMMAND LINE
+*          ZLOCK (RESOURCE) (ON/OFF) (NOWAIT)
+*       WHERE    RESOURCE = RESOURCE NAME YOU WISH TO LOCK
+*                ON/OFF   = ON IS LOCK OFF IS UNLOCK
+*                NOWAIT   = OPTIONAL PARAMETER IF LOCK CANNOT BE
+*                           OBTAINED THEN RETURN WITH RET CODE OF 800
+*                           IF NOWAIT IS NOT SPECIFIED THEN ZLOCK
+*                           WILL ATTEMPT TO GET LOCK EVERY 10 SEC
+*                           UNTIL LOCK IS OBTAINED
+*     BY ASSEMBLE PROGRAM
+*       LA    R1,PLIST
+*       ICM   R1,B'1000',=X'00'
+*       SVC   202
+*       DC    AL4(ERROR)
+*PLIST  DS    0H
+*       DC    CL8'ZLOCK'
+*       DC    CL8'RESOURCE'
+*       DC    CL8'ON'
+*       DC    2F'-1'
+*       LAYOUT OF RESOURCE FILE                                      *
+*  COL      1    1    2    2    3    3    4    4    5    5           *
+*  1...5....0....5....0....5....0....5....0....5....0....5           *
+*  <RESID >    <USERD >    <STATE >    <ENQUEUED USERS * 5 >         *
+*       LOCKING AND ENQUEING LOGIC                                   *
+*       IF A USER REQUESTS A LOCK .                                  *
+*       FIRST THE DISK IS RESERVED, THEN ACCESS                      *
+*       NEXT THE RESOURCE FILE IS READ UNTIL EITHER END OF FILE      *
+*       IS REACHED OR THE RESOURCE IS FOUND                          *
+*       IF END OF FILE IS REACHED THAT RESOURCE IS ADDED TO THE FILE *
+*       AND CONTROL RETURNED TO THE USER.                            *
+*       IF THE RESOURCE IS FOUND THE SETTING AND USER ID ARE CHECKED *
+*       IF THE RESOURCE IS OFF THEN THE USER IS GIVEN OWNERSHIP      *
+*       OF THE RESOURCE .                                            *
+*       IF THE SETTING IS ON THEN THE USERID MUST MATCH THAT OF      *
+*       THE RESOURCE OWNER, IF THEY DO THEN OWNERSHIP IS AGAIN       *
+*       GIVEN TO THAT USER UNLESS THEY HAVE REQUESTED AN OFF         *
+*       IF AN OFF HAS BEEN REQUESTED AND ANOTHER USER IS ENQUEUED    *
+*       THEN THE ENQUEUED USER IS GIVEN THE RESOURCE WITH AN ON      *
+*       AND AN SMSG IS SENT TO THEM TO TELL THEM THEY HAVE BEEN      *
+*       GIVEN OWNERSHIP.                                             *
+*       ALL ENTRIES IN ENQUEUE TABLE ARE MOVED UP BY ONE             *
+*       IF THE USERID AND OWNER DO NOT MATCH THEN THE USER WILL BE   *
+*       ENQUEUED (UNLESS THEY HAVE SPECIFIED NOWAIT ON THE LOCK CALL *
+*       ENQUEUING.                                                   *
+*       FIVE ENTRIES HAVE BEEN SET ASIDE ON A RESOURCE RECORD AS AN  *
+*       ENQUEUE TABLE. WHEN A USER REQUEST A LOCK BUT OWNERSHIP      *
+*       IS ACTIVE ELSEWHERE THEN THEY WILL BE ENQUEUED BY THE        *
+*       FOLLOWING RULES                                              *
+*       STARTING AT TABLE ENTRY ONE                                  *
+*       IF IT IS BLANK THEN THE USER ID IS INSERTED,GOTO WRITE       *
+*       IF THE ID MATCHES THE USERID THEN GOTO WAIT                  *
+*       REPEAT FOR ALL FIVE                                          *
+*       IF NO MATCH THEN WAIT 10 SECONDS AND RETRY LOCKING AGAIN     *
+*       WRITE.                                                       *
+*       RE-WRITE RESOURCE ENTRY TO FILE                              *
+*       WAIT.                                                        *
+*       WAIT UNTIL OWNER OF RESOURCE ISSUES AN SMSG TO WAKE USER UP  *
+*       THEN RE-TRY LOCK AGAIN.                                      *
+*       ( THIS IS A FAILSAFE IF ANYONE TRIES TO ISSUE AN SMSG TO     *
+*         THE USER IT MIGHT ASSUME THAT IT NOW HAS LOCK,HOWEVER      *
+*         IT WILL GO AND GET THE LOCK BY GOING THROUGH THE WHOLE     *
+*         PROGRAM AGAIN)                                             *
+        EJECT
+*             PROGRAM ENTRY                                           *
+ZLOCK   CSECT
+        BALR  R12,0               ESTABLISH ADDRESSABILITY
+        USING *,R12
+        LR    R9,R1               SAVE PLIST ADDRESS
+        USING WSTORAGE,R5         ADDRESS WORKING STORAGE
+*             GET WORKING STORAGE                                     *
+        DMSFREE DWORDS=100,                                            *
+                TYPE=USER,                                             *
+                ERR=ABORT,                                             *
+                AREA=LOW,                                              *
+                TYPCALL=SVC
+        LR    R5,R1               ESTABLISH ADDR TO WORKING STORAGE
+        ST    R0,WDWORDS          STORE NUMBER OF DOUBLEWORDS OF W.S.
+        ST    R14,R14SAVE         SAVE RETURN ADDRESS
+        MVC   PLIST,0(R9)         SAVE PLIST
+        SYSUID                             GET USERID
+        MVC   USER,0(R2)                 AND SAVE IT
+*             MAIN PROGRAM                                            *
+START   DS    0H
+*            RESERVE DISK                                             *
+        MVC   WRCCW,CWRCCW1       SET UP RESERVE CCW
+        LA    R8,BUFFER
+        STCM  R8,B'0111',WADDR
+        XR    R2,R2               R2 POINT TO DEV ADDRESS
+        LH    R2,DEV1             LOAD DEVICE ADDR
+        LA    R8,WRCCW             R8 IS THE CCW
+        ICM   R8,B'1000',=X'00'
+        DC    X'83280020'         DO DIAG 20 TO RESERVE THE DISK
+*       OK WE HAVE GOT DISK NOW ACCESS IT AND CHECK RESOURCE          *
+        LA    R1,ACCESS           FIRST ACCESS DISK
+        ICM   R1,B'1000',=X'00'   WITH CMS ACCESS COMMAND
+        SVC   202
+        DC    AL4(ABORT2)         ANY PROBLEMS ABORT
+        LA    R2,FILE             ADDRESS FSCB
+        USING FSCBD,R2
+        L     R8,=F'0'            MAKE SURE FSCB IS AT RECORD 1
+        ST    R8,FSCBAITN
+        OC    PLIST,=CL80' '      MAKE SURE PLIST IS BLANK FILLED
+
+This article will be continued next month when the rest of the code will
+be published.
+
+S Pittockm G Gould
+System Programmers
+Potterton International Ltd (UK) ) Potterton International 1989
+
+

@@ -1,0 +1,1595 @@
+*---------------------------------------------------------------------*
+*  Copyright 2011 by Clemson University Research Foundation           *
+*                                                                     *
+*  Licensed under the Apache License, Version 2.0 (the "License");    *
+*  you may not use this file except in compliance with the License.   *
+*  You may obtain a copy of the License in this library as member     *
+*  $LICENSE, or from                                                  *
+*                                                                     *
+*      http://www.apache.org/licenses/LICENSE-2.0                     *
+*                                                                     *
+*  Unless required by applicable law or agreed to in writing,         *
+*  software distributed under the License is distributed on an "AS    *
+*  IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either    *
+*  express or implied.  See the License for the specific language     *
+*  governing permissions and limitations under the License.           *
+*---------------------------------------------------------------------*
+++* XSUB
+++* DECLARE MOD STRING = 'SRVJSMVS'
+++* DECLARE ONLY BOOLEAN CMDLINE = TRUE   /* USE FOR JUST ASMPC */
+//&<MOD>  JOB ,'ASSEMBLE AND LINK',TIME=(,8)
+/*JOBPARM Q=H,LINES=50
+//LASER   OUTPUT DEST=LASER,UCS=PR12,CHARS=PR12,FCB=85@8
+//LASER4  OUTPUT DEST=LASER,FORMDEF=RULE4,FCB=4UP
+++* IF ONLY
+//STEP1   EXEC ASMPC,
+//        COPT=',TEST,RENT',
+//        MAC=SYSTEMS
+++* ELSE
+//STEP1   EXEC ASMPCL,PDS='SYSTEMS.SRV.LOAD',NAME=&<MOD>,
+//        COPT=',TEST,RENT',LOPT=',LET,NCAL,TEST,RENT',SYSOUT='(,)',
+//        MAC=SYSTEMS
+++* ENDIF
+//P.SYSPRINT DD SYSOUT=A,OUTPUT=*.LASER
+//P.SYSIN    DD *
+         SMLIST CONVERT=YES
+SRVJSMVS title "Jobstream Handler Service Processor."
+         srvmod name=srvjsmvs,dates='1991'
+*---------------------------------------------------------------------*
+*                                                                     *
+*  Copyright (c) 1991 Clemson University                              *
+*                                                                     *
+*  Program     SRVJSMVS                                               *
+*                                                                     *
+*  Abstract    This server is the batch jobstream service processor.  *
+*              It will process JES2 jobstreams, and either submit     *
+*              them for batch execution or write them to an output    *
+*              file.                                                  *
+*                                                                     *
+*  Special     The JES2 internal reader interface used by this        *
+*  Note        program is pretty obscure. It is a sanctioned          *
+*              interface though and is documented in manual           *
+*              GG22-9207 "JES2 Internal Reader Processing".           *
+*                                                                     *
+*  Parameters:                                                        *
+*    Documented in the Service Processors User's Guide and Reference. *
+*    The following function calls are supported.                      *
+*                                                                     *
+*    JS_START         ID=JS,FEEDBACK=tag                              *
+*    JS_TERMINATE     ID=JS                                           *
+*    JS_GET_FEEDBACK  ID=JS,FEEDBACK=tag                              *
+*    JS_SET_OPTION    ID=JS,OPTION=(option,value)  HOLD/SCAN/etc      *
+*    JS_APPEND_LINE   ID=JS,LINE=(address,length)                     *
+*    JS_SUBMIT        ID=JS,JOBNAME=jobname,JOBID=jobid               *
+*    JS_SAVE          ID=JS,FILE=(name,length,<APPEND|REPLACE>)       *
+*                                                                     *
+*    The FEEDBACK parameter designates a fullword in which the        *
+*    address of the Jobstream handler's feedback area will be         *
+*    returned.  This area contains information in addition to that    *
+*    supplied by the actual return code.  It is mapped by the         *
+*    JS_FEEDBACK mapping macro.                                       *
+*                                                                     *
+*  Program     reentrant, problem key and state, standard linkage,    *
+*  Attributes  non-authorized, amode(31), rmode(24)                   *
+*                                                                     *
+*  Change                                                             *
+*  History     01/02/91 MJM - NEW                                     *
+*              03/29/91 MJM - Added support for instream data sets    *
+*                             following "/*XMIT" JES2 statements and  *
+*                             the equivalent JES3 XMIT JCL statement. *
+*                             (We don't have JES3, but this code can  *
+*                             handle the statement anyways).          *
+*                                                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+             eject
+             copy smsyms           | Copy Structured Macros symbols.
+             copy srvesmac         | Copy Environment Support symbols.
+             copy srvstmac         | Copy String Handler symbols.
+             copy srvjsmac         | Copy Jobstream Handler symbols.
+*---------------------------------------------------------------------*
+*  Symbols for use by the Block macro's COPY parameters option.
+*---------------------------------------------------------------------*
+js_parmmap   js_parmlist id=jspm_,dsect=yes   Done only for BLOCK instr
+*---------------------------------------------------------------------*
+*  Symbols for Jobstream Handler options.
+*---------------------------------------------------------------------*
+&jso_undefined            seta 0   | Not a Jobstream option.
+&jso_hold                 seta 1   |  HOLD option.
+&jso_inform               seta 2   |  INFORM option.
+&jso_jobhold              seta 3   |  JOBHOLD option.
+&jso_reroute              seta 4   |  REROUTE option.
+&jso_scan                 seta 5   |  SCAN option.
+*---------------------------------------------------------------------*
+*  Symbols for append_line processing states.
+*---------------------------------------------------------------------*
+&al_s_new                 seta  1  | Start of a new JCL statement.
+&al_s_job_stmt            seta  2  | New JOB statement.
+&al_s_dd_stmt             seta  3  | New DD statement.
+&al_s_xmit_stmt           seta  4  | New JES3 XMIT statement.
+&al_s_null_stmt           seta  5  | Job terminator statement.
+&al_s_jes2xmit_stmt       seta  6  | /*XMIT statement.
+&al_s_job_parms           seta  7  | In parameters field of JOB.
+&al_s_job_insert          seta  8  | At end of JOB parameters.
+&al_s_job_comments        seta  9  | Comments field of JOB stmt.
+&al_s_dd_parms            seta 10  | In parameters field of DD.
+&al_s_dd_comments         seta 11  | Comments field of DD stmt.
+&al_s_instream            seta 12  | Scan instream data lines.
+*---------------------------------------------------------------------*
+*  Symbols for append_line processing actions.
+*---------------------------------------------------------------------*
+&al_a_append              seta  1  | Append current line to jobstream.
+&al_a_replace             seta  2  | Replace line with another.
+&al_a_insert              seta  3  | Insert new line before current.
+*---------------------------------------------------------------------*
+*                                                                     *
+*  Macro:      MSG (condition),(parameters)                           *
+*              MSG (parameters)                                       *
+*  Purpose:    Conditionally invoke the message subroutine.           *
+*                                                                     *
+*---------------------------------------------------------------------*
+         macro
+         msg
+         aif   (n'&syslist eq 1).nocond
+         aif   (n'&syslist eq 2).cond
+         mnote 8,'wrong number of parms'
+         mexit
+.cond    if    &syslist(1)                   If conditions apply.
+         callsub message,&syslist(2)          Invoke message routine.
+         endif                               EndIf.
+         mexit
+.nocond  callsub message,&syslist(1)         Invoke message routine.
+         mend
+         eject
+*---------------------------------------------------------------------*
+*                                                                     *
+*  Main program code.                                                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+ block name=SRVJSMVS,type=program,amode=31,rmode=24,basereg=(r12,r9),  +
+               parmmap=(js_parmmap,js_parmmap_l),                      +
+               options=(*srvprc,long,                                  +
+               (parms,vl,copy,(count,pwa_#parms),                      +
+               (copyerror,,&js_wrong_number_of_parms))),               +
+               subopts=(*swa,loadbase)
+   es_id   id=es,spepa=pwa_es_epa,sptoken=pwa_es_token,esva=pwaaesv
+   st_id   id=st,spepa=pwa_st_epa,sptoken=pwa_st_token
+   mvc     js_fb_reason,=f'0'       | Initialize reason code.
+   l       r1,js_prm_functioncode   | R1 -> function code.
+   l       r1,0(r1)                 | R1 := function code.
+   caseblk reg=r1,mult=1            | Case on FunctionCode.
+   case &js_start                   | -------------------------START---
+     callsub start                  |
+   case &js_terminate               | ---------------------TERMINATE---
+     callsub terminate              |
+   case &js_get_feedback            | ------------------GET_FEEDBACK---
+     callsub get_feedback           |
+   case &js_set_option              | --------------------SET_OPTION---
+     callsub set_option             |
+   case &js_append_line             | -------------------APPEND_LINE---
+     callsub Append_Line            |
+   case &js_submit                  | ------------------------SUBMIT---
+     callsub submit_jobstream       |
+   case &js_save                    | --------------------------SAVE---
+     callsub save_to_file           |
+   case other                       | ----------------------***ERROR***
+     msg     (JS00004C,*js_prm_functioncode)
+     errexit code=&js_invalid_function
+   endcase                          | EndCase.
+ endblk block=srvjsmvs,rc=0         |
+ eject
+***********************************************************************
+*                                                                     *
+*  Subroutine: Start                                                  *
+*  Abstract:   Initialize all exit-related variables.                 *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=start
+*---------------------------------------------------------------------*
+*  Establish environment for using service processors ourselves.
+*---------------------------------------------------------------------*
+   l       r2,pwaaesv                  | r2 -> A(Env Support Vector).
+   l       r2,0(,r2)                   | r2 -> Env Support Vector.
+   using   esv,r2                      | Establish addressability.
+   mvc     pwa_es_epa,esvesepa         | Copy Env. Sup. EPA.
+   mvc     pwa_es_token,esvestkn       | Copy Env. Sup. TOKEN.
+   drop    r2                          | Drop addressability.
+*                                      |
+   es_load_module id=es,spid=st        | Load String Handler.
+   if (not,(%es_success))              | If unable to load.
+     sth     r15,pwa_rc                |   Save RC in PWA.
+     msg     (JS00001C)                |   Set up an error message.
+     errexit code=&js_environment_support_error
+   endif                               | EndIf.
+*                                      |
+   st_start id=st,sizelength=2         | Start string handler.
+   if (not,(%st_success))              | If unable to start.
+     sth     r15,pwa_rc                |   Save RC in PWA.
+     msg     (JS00002C)                |   Set up an error message.
+     errexit code=&js_string_handler_error
+   endif                               | EndIf.
+*---------------------------------------------------------------------*
+*  Initialize all option values for options supported by this exit.
+*---------------------------------------------------------------------*
+   mvi     pwa_hold,c"N"               | /HOLD = false.
+   mvi     pwa_inform,c"N"             | /INFORM = false.
+   mvi     pwa_reroute,c"N"            | /REROUTE = false.
+   mvi     pwa_typrun,c" "             | /JOBHOLD & /SCAN = false.
+*---------------------------------------------------------------------*
+*  Obtain the first segment of storage for holding jobstream lines.
+*---------------------------------------------------------------------*
+   es_obtain_storage id=es,size=psd_stg_incr,address=pwa_stg_current
+   if (%es_storage_not_available)      | If not enough storage.
+     msg     (JS00014S)                |   Not enough stg message.
+     errexit code=&js_storage_not_available
+   elseif (not,(%es_success))          | ElseIf unexpected error.
+     sth     r15,pwa_rc                |   Save RC in PWA.
+     msg     (JS00000C)                |   Format error message.
+     errexit code=&js_environment_support_error
+   endif                               | EndIf.
+   mvc   pwa_stg_anchor,pwa_stg_current  Copy address to anchor word.
+   l     r2,pwa_stg_current            | r2 -> New stg block.
+   using stg,r2                        | Establish addressability.
+   mvc   stg_link,=f'0'                | Force link to null.
+   mvc   stg_size,psd_stg_incr         | Remember amount allocated.
+   l     r0,stg_size                   | r0 := total size of stg.
+   s     r0,=a(stg_l)                  | r0 := size of stg_area.
+   st    r0,stg_free                   | Save remaining # bytes free.
+   drop  r2                            | Drop addressability.
+*---------------------------------------------------------------------*
+*  Initialize the JCL parsing state.  Values are used by js_append_line
+*  for tracking where it is within the jobstream being constructed.
+*---------------------------------------------------------------------*
+   mvc   al_job_count,=f'0'            | No JOB statements.
+   mvc   al_job_name,psd_blanks        | No current JOB.
+   mvc   al_state,=f'&al_s_new'        | Initial JCL parsing state.
+*---------------------------------------------------------------------*
+*  If FEEDBACKA parameter specified, return address of feedback area.
+*---------------------------------------------------------------------*
+   if (clc,pwa_#parms,ge,=f'4')        | If FEEDBACKA specified.
+     l    r1,js_prm_s_feedbacka        |   r1 -> FEEDBACKA parm.
+     la   r0,js_fb_start               |   r0 -> Start of feedback.
+     st   r0,0(,r1)                    |   Return feedbacka parm.
+   endif                               | EndIf.
+*---------------------------------------------------------------------*
+*  Make sure no unwanted parameters were specified.
+*---------------------------------------------------------------------*
+   if (clc,pwa_#parms,gt,=f'4')        | If too many parms.
+     msg     (JS00003C,"START",5)      |   Format a message.
+     errexit code=&js_wrong_number_of_parms
+   endif                               | EndIf.
+ endblk block=start
+ eject
+***********************************************************************
+*                                                                     *
+*  Subroutine: Terminate                                              *
+*  Abstract:   Release all resources held by this session.            *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=terminate
+*---------------------------------------------------------------------*
+*  Mark pwa to be released on exit and return.
+*---------------------------------------------------------------------*
+   smctrl freepwa=yes                        | Release the PWA on exit.
+ endblk block=terminate
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Get_Feedback                                            *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Get_Feedback
+   if (clc,pwa_#parms,ne,=f'3')        | If wrong number of parms.
+     msg     (JS00003C,"GET_FEEDBACK",12)  Format a message.
+     errexit code=&js_wrong_number_of_parms
+   endif                               | EndIf.
+*---------------------------------------------------------------------*
+*  Return the address of the feedback information area.
+*---------------------------------------------------------------------*
+   l    r1,js_prm_gf_feedbacka         | r1 -> FEEDBACKA parm.
+   la   r0,js_fb_start                 | r0 -> Start of feedback.
+   st   r0,0(,r1)                      | Return feedbacka parm.
+ endblk block=Get_Feedback
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Set_Option                                              *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Set_Option
+   if (clc,pwa_#parms,ne,=f'4'),and,(clc,pwa_#parms,ne,=f'6')
+     msg     (JS00003C,"SET_OPTION",10)    Format a message.
+     errexit code=&js_wrong_number_of_parms
+   endif                               | EndIf.
+   callsub look_up_option,(*js_prm_so_name,*js_prm_so_name_len)
+   if      (ch,r15,eq,=h'&jso_undefined')
+     msg     (JS00005E,*js_prm_so_name,*js_prm_so_name_len)
+     errexit code=&js_invalid_parameter
+   endif
+*---------------------------------------------------------------------*
+*  Set the specified option.
+*---------------------------------------------------------------------*
+   caseblk reg=r15,mult=1               | Case on option#.
+   case &jso_hold                       | -------------------------HOLD
+     callsub set_boolean_option,(pwa_hold)
+   case &jso_inform                     | -----------------------INFORM
+     callsub set_boolean_option,(pwa_inform)
+   case &jso_jobhold                    | ----------------------JOBHOLD
+     callsub set_boolean_option,(&w.boolean)
+     if (cli,&w.boolean,eq,c"Y")        | If /JOBHOLD = TRUE.
+       if (cli,pwa_typrun,eq,c" ")      |   If TYPRUN not already set.
+         mvi pwa_typrun,c"H"            |     Set TYPRUN=HOLD.
+       elseif (cli,pwa_typrun,ne,c"H")  |   ElseIf not already =HOLD.
+         msg (JS00007E,"JOBHOLD",7,"SCAN",4)  Format an error message.
+         errexit code=&js_invalid_parameter   Exit w/return-code.
+       endif                            |   EndIf.
+     elseif (cli,pwa_typrun,eq,c"H")    |   ElseIf /JOBHOLD was set.
+       mvi pwa_typrun,c" "              |     Reset to blanks.
+     endif                              | EndIf.
+   case &jso_reroute                    | ----------------------REROUTE
+     callsub set_boolean_option,(pwa_reroute)
+   case &jso_scan                       | -------------------------SCAN
+     callsub set_boolean_option,(&w.boolean)
+     if (cli,&w.boolean,eq,c"Y")        | If /SCAN = TRUE.
+       if (cli,pwa_typrun,eq,c" ")      |   If TYPRUN not already set.
+         mvi pwa_typrun,c"S"            |     Set TYPRUN=SCAN.
+       elseif (cli,pwa_typrun,ne,c"S")  |   ElseIf not already =SCAN.
+         msg (JS00007E,"SCAN",4,"JOBHOLD",7)  Get Xsub to format msg.
+         errexit code=&js_invalid_parameter   Exit w/return-code.
+       endif                            |   EndIf.
+     elseif (cli,pwa_typrun,eq,c"S")    |   ElseIf /SCAN was set.
+       mvi pwa_typrun,c" "              |     Reset to blanks.
+     endif                              | EndIf.
+   endcase                              | EndCase
+ endblk block=Set_Option
+*---------------------------------------------------------------------*
+* Working storage for setting options.
+*---------------------------------------------------------------------*
+                swa
+&w.boolean      ds      c      | Boolean value: "Y" or "N".
+                endswa
+                eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Look_Up_Option                                          *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Look_Up_Option
+*---------------------------------------------------------------------*
+*  Set up a capitalized copy of the option's name in pwa_work.
+*---------------------------------------------------------------------*
+   lm  r4,r5,0(r1)                       | r4 -> Name. r5 -> Length.
+   icm r5,b'1111',0(r5)                  | r5 := Length of name.
+   if  (treg,r5,np),or,(c,r5,gt,=f'16')  | If too short or too long.
+     la    r15,&jso_undefined            |   Option not exit-defined.
+     leave block=*                       |   Return to caller.
+   endif                                 | EndIf.
+   st    r5,pwa_work_len                 | Save length of name.
+   bctr  r5,0                            | Subtract 1 for EX instr.
+   exi   r5,(mvc,pwa_work(0),0(r4))      | Copy option name to the SWA.
+   exi   r5,(oc,pwa_work(0),psd_blanks)  | Fold name to upper case.
+   la    r5,1(,r5)                       | Restore actual name length.
+*---------------------------------------------------------------------*
+*  Recognize the specified option and set R15 accordingly.
+*---------------------------------------------------------------------*
+   if ((c,r5,eq,=f'4'),and,(clc,=c"HOLD",eq,pwa_work)),or,             +
+               ((c,r5,eq,=f'1'),and,(clc,=c"H",eq,pwa_work))       HOLD
+     la   r15,&jso_hold              |
+   elseif ((c,r5,eq,=f'6'),and,(clc,=c"INFORM",eq,pwa_work)),or,       +
+               ((c,r5,eq,=f'1'),and,(clc,=c"I",eq,pwa_work))     INFORM
+     la   r15,&jso_inform            |
+   elseif ((c,r5,eq,=f'7'),and,(clc,=c"JOBHOLD",eq,pwa_work)),or,      +
+               ((c,r5,eq,=f'2'),and,(clc,=c"JH",eq,pwa_work))   JOBHOLD
+     la   r15,&jso_jobhold           |
+   elseif ((c,r5,eq,=f'7'),and,(clc,=c"REROUTE",eq,pwa_work)),or,      +
+               ((c,r5,eq,=f'1'),and,(clc,=c"R",eq,pwa_work))    REROUTE
+     la   r15,&jso_reroute           |
+   elseif ((c,r5,eq,=f'4'),and,(clc,=c"SCAN",eq,pwa_work)),or,         +
+               ((c,r5,eq,=f'1'),and,(clc,=c"S",eq,pwa_work))       SCAN
+     la   r15,&jso_scan              |
+   else                              | Else.
+     la   r15,&jso_undefined         |                 Not exit-defined
+   endif                             | EndIf.
+ endblk block=Look_Up_Option
+                eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Set_Boolean_Option (Option's Flag)                      *
+* Abstract:   Use the provided value to set the option's flag:        *
+*                                                                     *
+*             Value          Option Flag is set to                    *
+*             -----------    ---------------------                    *
+*             ..missing..    "Y"                                      *
+*             "TRUE"         "Y"                                      *
+*             "FALSE"        "N"                                      *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=set_boolean_option
+   l   r3,0(r1)                      | r3 -> Option's flag character.
+   slr r4,r4                         | r4 -> .missing. value.
+   if  (clc,pwa_#parms,ge,=f'6')     | If (value,length) provided.
+     l     r4,js_prm_so_value        |   r4 -> Option's value.
+     la    r4,0(,r4)                 |   Discard high-order bit.
+   endif                             | EndIf.
+   if  (treg,r4,z)                   | If r4 -> .missing. value.
+     mvi   0(r3),c"Y"                |   Set default boolean value.
+     leave block=*                   |   Return to caller.
+   endif                             | EndIf.
+   mvi 0(r3),c"N"                    | Value to use if bad-source.
+*                                    |
+   l   r5,js_prm_so_value_len        | r5 -> Length of option's value.
+   icm r5,b'1111',0(r5)              | r5 := Length of option's value.
+   if  (treg,r5,np),or,(c,r5,gt,=f'5') If too short or too long.
+     msg     (JS00006E,pwa_work,pwa_work_len)
+     errexit code=&js_invalid_parameter  Exit with return-code.
+   else                              | Else.
+     bctr r5,0                       |   Subtract 1 for EX instr.
+     exi  r5,(mvc,&w.value(0),0(r4)) |   Copy option value to the SWA.
+     exi  r5,(oc,&w.value(0),psd_blanks) Fold value to upper case.
+     la   r5,1(,r5)                  |   Restore actual name length.
+     if   (c,r5,eq,=f'4'),and,(clc,=c"TRUE",eq,&w.value)
+       mvi 0(r3),c"Y"                |     Set option's flag.
+     elseif (c,r5,eq,=f'5'),and,(clc,=c"FALSE",eq,&w.value)
+       mvi 0(r3),c"N"                |     Set option's flag.
+     else                            |   Else.
+       msg     (JS00006E,pwa_work,pwa_work_len)
+       errexit code=&js_invalid_parameter Exit with return-code.
+     endif                           |   EndIf.
+   endif                             | EndIf.
+ endblk block=set_boolean_option
+*---------------------------------------------------------------------*
+* Working storage for recognizing boolean option values.
+*---------------------------------------------------------------------*
+                swa
+&w.value        ds    cl5            | TRUE or FALSE
+                endswa
+                eject
+***********************************************************************
+*                                                                     *
+* Subroutine: append_line                                             *
+*                                                                     *
+* Abstract  : Append a new line to the jobstream being built, after   *
+*             performing any needed processing on it.  Processing of  *
+*             new lines being added to the jobstream is done to:      *
+*             1. count JOB statements.                                *
+*             2. extract jobnames.                                    *
+*             3. make optional modifications to the jobstream.        *
+*             4. insert optional JES2 control statements.             *
+*                                                                     *
+*             Throughout execution of this routine and its children,  *
+*             the following register usage is in effect:              *
+*                                                                     *
+*             R4 -> Start of output line.                             *
+*             R5 := Total length of output line.                      *
+*             R6 -> Current scan position.                            *
+*             R7 -> Scan limit (Column 72 or end-of-line).            *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=append_line
+*---------------------------------------------------------------------*
+*  Validate the input parameters.
+*---------------------------------------------------------------------*
+   if (clc,pwa_#parms,ne,=f'4')       | If wrong number of parms.
+     msg     (JS00003C,"APPEND_LINE",11)    Format a message.
+     errexit code=&js_wrong_number_of_parms
+   endif                              | EndIf.
+*                                     |
+   l    r4,js_prm_al_line             | r4 -> Start of output line.
+   l    r5,js_prm_al_line_len         | r5 -> Line's total length.
+   icm  r5,b'1111',0(r5)              | r5 := Line's total length.
+   if   m,then                        | If negative length, then.
+     msg     (JS00008E)               |   Negative length invalid.
+     errexit code=&js_invalid_parameter
+   elseif (c,r5,gt,=f'80')            | ElseIf too long.
+     msg  (JS00009E)                  |   Line truncated to 80-chars.
+     l    r5,=f'80'                   |   Use only 80 bytes of line.
+   endif                              | EndIf.
+   lr   r6,r4                         | r6 -> Current position.
+   la   r7,70(,r4)                    | r7 -> Scan limit (column 71).
+   if   (c,r5,lt,=f'71')              | If line is shorter than 71.
+     la   r7,0(r5,r4)                 |   r7 -> Past final source char.
+     bctr r7,0                        |   r7 -> Final source position.
+   endif                              | EndIf.
+   stm  r4,r7,al_source               | Save calculated positions.
+*---------------------------------------------------------------------*
+*  Parse the current line to either find a JOB statement or decode one.
+*---------------------------------------------------------------------*
+   rbit pwa_f,pwa_f_jcl_problem       | No problems found yet.
+   mvi  al_line_done,c"N"             | Not done with line yet.
+   loop until                         | Loop over the current line.
+     l       r3,al_state              |   r3 := parsing state.
+     caseblk reg=r3,wreg=r1,mult=1    |   Case on State.
+     case &al_s_new                   |   Start of a new JCL statement.
+       callsub classify_JCL_statement |
+     case &al_s_job_stmt              |   New JOB statement.
+       callsub start_of_job           |
+     case &al_s_dd_stmt               |   New DD statement.
+       callsub check_for_instream     |
+     case &al_s_xmit_stmt             |   New JES3 XMIT statement.
+       mvi     al_dd_type,c"D"        |     Use "DD DATA" rules.
+       callsub scan_dd_parms          |
+     case &al_s_jes2xmit_stmt         |   New /*XMIT statement.
+       callsub scan_jes2xmit_parms    |
+     case &al_s_null_stmt             |   Job terminator statement.
+       callsub end_of_job             |
+     case &al_s_job_parms             |   In parameters field of JOB.
+       callsub scan_job_parms         |
+     case &al_s_job_insert            |   At end of JOB parameters.
+       callsub insert_job_parms       |
+     case &al_s_job_comments          |   Comments field of JOB stmt.
+       callsub Scan_jcl_Comments      |
+       if (treg,r15,z)                |     If out of comments.
+         callsub add_jes2_control     |       At jes2 insert point.
+       endif                          |     EndIf.
+     case &al_s_dd_parms              |   In parameters field of DD.
+       callsub scan_dd_parms          |
+     case &al_s_dd_comments           |   Comments field of DD stmt.
+       callsub scan_jcl_comments      |
+       if (treg,r15,z)                |     If out of comments.
+         mvc al_state,=f'&al_s_instream'      In instream data set.
+       endif                          |     EndIf.
+     case &al_s_instream              |   Scan instream data lines.
+       callsub scan_instream          |
+     endcase                          |   EndCase.
+   endloop until,(cli,al_line_done,eq,c"Y")
+   errexit (tbit,pwa_f,pwa_f_jcl_problem),code=&js_jcl_problem
+ endblk block=append_line
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Classify_JCL_Statement,(Type)                           *
+* Abstract  : Scan the new output line to determine if it begins one  *
+*             of the statement types we are interested in.  If it     *
+*             doesn't, the statement type will be set to unknown. The *
+*             following statement types are recognized:               *
+*                                                                     *
+*             1) JOB statement.                                       *
+*             2) DD statement.                                        *
+*             3) JOB terminator.                                      *
+*             4) /*XMIT JES2 statement (instream data follows)        *
+*                                                                     *
+*             After a statement has been recognized, the current      *
+*             source pointer will be updated to the start of the      *
+*             first parameter on the line, if there is one.  If not,  *
+*             the source position will point to column 72 (which may  *
+*             contain a continuation character) or the end of the     *
+*             line, whichever comes first.                            *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Classify_JCL_Statement
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  Check for "/*XMIT" first.
+*---------------------------------------------------------------------*
+   if (c,r5,ge,=f'6'),and,(clc,=c"/*XMIT",eq,0(r4))   If /*XMIT stmt.
+     mvc   al_state,=f'&al_s_jes2xmit_stmt' Set statement type.
+     la    r6,6(,r4)                    |   r6 -> past "/*XMIT".
+     st    r6,al_current                |   Update Current position.
+     leave block=*                      |   Return to caller.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  Make sure the line begins with "//", signifying a normal JCL line.
+*---------------------------------------------------------------------*
+   if (c,r5,lt,=f'2'),or,(clc,=c"//",ne,0(r4)) If not "//" then.
+     callsub append_jcl,((r4),al_length)
+     mvi     al_line_done,c"Y"          |   Done with this line.
+     leave   block=*                    |   Return to caller.
+   endif                                | EndIf.
+   la    r6,2(,r4)                      | Point past the "//".
+*---------------------------------------------------------------------*
+*  If a JCL comment "//*", mark line as done and return.
+*---------------------------------------------------------------------*
+   if (c,r5,ge,=f'3'),and,(cli,0(r6),eq,c"*")  If "//*", then.
+     callsub append_jcl,((r4),al_length)
+     mvi     al_line_done,c"Y"          |   Done with this line.
+     leave   block=*                    |   Return to caller.
+   endif                                | EndIf.
+   eject
+*---------------------------------------------------------------------*
+*  Scan up to the "operation" field of "//label operation".
+*---------------------------------------------------------------------*
+   lr   r1,r6                           | r1 -> start of "label" field.
+   loop while,(cr,r6,le,r7)             | Scan for first blank.
+     leave loop=*,(cli,0(r6),eq,c" ")   |   Leave when found.
+     la      r6,1(,r6)                  |   Advance to next char.
+   endloop while                        | EndLoop.
+   lr   r2,r6                           | r2 -> first blank.
+*                                       |
+   loop while,(cr,r6,le,r7)             | Scan for "operation" field.
+     leave loop=*,(cli,0(r6),ne,c" ")   |   Leave when found.
+     la    r6,1(,r6)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+*---------------------------------------------------------------------*
+*  If all blanks follow the first "//", the line is a Null JCL stmt.
+*---------------------------------------------------------------------*
+   if (cr,r2,eq,r1),and,(cr,r6,gt,r7)   | If all blanks after "//".
+     mvc   al_state,=f'&al_s_null_stmt' |   Set type to terminator.
+     st    r6,al_current                |   Update Current position.
+     leave block=*                      |   Return to caller.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  Classify as either a "JOB" or "DD" statement, or unknown.
+*---------------------------------------------------------------------*
+   lr    r3,r6                          | r3 -> start of "operation".
+   loop  while,(cr,r3,le,r7)            | Scan for next blank.
+     leave loop=*,(cli,0(r3),eq,c" ")   |   Leave when found.
+     la    r3,1(,r3)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+   sr      r3,r6                        | r3 := length of "operation".
+*                                       |
+   if (c,r3,eq,=f'3'),and,(clc,=c"JOB",eq,0(r6))
+     mvc  al_state,=f'&al_s_job_stmt'   |   JOB statement.
+   elseif (c,r3,eq,=f'2'),and,(clc,=c"DD",eq,0(r6))
+     mvc  al_state,=f'&al_s_dd_stmt'    |   DD statement.
+   elseif (c,r3,eq,=f'4'),and,(clc,=c"XMIT",eq,0(r6))
+     mvc  al_state,=f'&al_s_xmit_stmt'  |   JES3 XMIT statement.
+   else                                 | Else....unknown operation.
+     callsub append_jcl,((r4),al_length)
+     mvi     al_line_done,c"Y"          |   Done with this line.
+     leave   block=*                    |   Unknown statement type.
+   endif                                | EndIf.
+*                                       |
+   la   r6,0(r3,r6)                     | r6 -> past "operation".
+   st   r6,al_current                   | Update Current position.
+ endblk block=Classify_JCL_Statement
+               eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Start_of_Job                                            *
+* Abstract  : Bump JOB count and get the new job's name.              *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Start_of_Job
+   l    r1,al_line_type                 | r1 -> line type flag.
+   mvi  0(r1),js_f_job_start            | 1st line of a JOB statement.
+   lm   r4,r7,al_source                 | Get Start/Length/Current/End.
+   l    r0,al_job_count                 |
+   a    r0,=f'1'                        | Add 1 to # job stmts.
+   st   r0,al_job_count                 |
+   mvc  al_prev_comma,=f'0'             | No parm-breaks found yet.
+   mvc  al_prev_blanks,=f'0'            | No squeezable-blanks found.
+*---------------------------------------------------------------------*
+*  Scan the label part of "//label JOB" to obtain the JOB name.
+*---------------------------------------------------------------------*
+   la   r1,2(,r4)                       | r1 -> Start of jobname.
+   lr   r3,r1                           | r3 -> Start of Jobname.
+   loop while,(cr,r3,le,r7)             | Loop over jobname field.
+     leave loop=*,(cli,0(r3),eq,c" ")   |   Done when blank found.
+     la    r3,1(,r3)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+   lr  r2,r3                            | r2 -> first blank.
+   sr  r2,r1                            | r2 := length of jobname.
+   mvc al_job_name,psd_blanks           | Set jobname to blanks.
+   st  r2,al_job_name_length            | Save name's *real* length.
+   if  (treg,r2,p)                      | If non-null jobname.
+     if (cl,r2,gt,=f'8')                |   If too long.
+       la  r2,8                         |     Use 1st eight chars.
+     endif                              |   EndIf.
+     bctr r2,0                          |  Subtract 1 for EX instr.
+     exi  r2,(mvc,al_job_name(0),0(r1))    Set current JOB's name.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  Locate the first parameter on the JOB statement, if any.
+*---------------------------------------------------------------------*
+   slr  r6,r3                           | Get length from blanks.
+   if   (cl,r6,ge,=f'5')                | If >=2 blanks before "JOB".
+     st r3,al_prev_blanks               |   Save this location.
+     lr r3,r6                           |   Remember # blanks (+3).
+   endif                                | EndIf.
+   l    r6,al_current                   | r6 -> past "JOB".
+   loop while,(cr,r6,le,r7)             | Loop for a non-blank.
+     leave loop=*,(cli,0(r6),ne,c" ")   |   Done when one found.
+     la    r6,1(,r6)                    |   Advance one character.
+   endloop while                        | EndLoop.
+   if (cr,r6,le,r7)                     | If a parameter is present.
+     lr r3,r6                           |   r3 -> non-blank or end.
+     sl r3,al_current                   |   r3 := #blanks after "JOB".
+     if (cl,r3,ge,=f'2')                |   If >= 2 blanks after "JOB"
+       mvc al_prev_blanks,al_current    |     Save this location.
+     endif                              |   EndIf.
+     st  r6,al_current                  |   Update current position.
+     mvc al_state,=f'&al_s_job_parms'   |   In parameters of JOB stmt.
+   else                                 | Else, no parameters on line.
+     if  (cl,r3,le,=f'5')               |   If <=2 blanks before.
+       mvc al_prev_blanks,=f'0'         |     Can't squeeze 2 blanks.
+     endif                              |   EndIf.
+     l   r2,al_current                  |   r2 -> past "JOB".
+     la  r2,1(,r2)                      |   r2 -> past "JOB ".
+*                                       |      -> col73 if "JOB" @ 69.
+     st  r2,al_current                  |   Update current position.
+     mvc al_state,=f'&al_s_job_insert'  |   At insertion point.
+   endif                                | EndIf.
+ endblk block=Start_of_Job
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: End_of_Job                                              *
+* Abstract  : Reset the current jobname to blanks.                    *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=End_of_Job
+   callsub append_jcl,(*al_start,al_length,jls_f_job_end)
+   mvi     al_line_done,c"Y"            | Done with this line.
+   mvc     al_job_name,psd_blanks       | Set jobname to blanks.
+   mvc     al_state,=f'&al_s_new'       | Go back to Start state.
+ endblk block=End_of_Job
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Scan_Job_Parms                                          *
+* Abstract  : Scan from the current source position in a JOB          *
+*             statement for the end of the (positional and keyword)   *
+*             parameters field.  If the end is not found on the       *
+*             current line, the line will be appended to the job      *
+*             stream, al_line_done will be set to "Y" and the value   *
+*             of al_state will be left unchanged.   If found, the     *
+*             current position will be updated to point to the column *
+*             immediately following the final parameter.              *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Scan_Job_Parms
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  If a continuation of a previous line, advance past the "// " that
+*  should start this line.  If this line is not a legal continuation
+*  of the previous line, issue a message and proceed without JOB stmt
+*  modification.
+*---------------------------------------------------------------------*
+   if (cr,r6,eq,r4)                     | If Current = Start.
+     if (c,r5,ge,=f'3')                 |   If line is long enough.
+       if (clc,=c"// ",eq,0(r6))        |    If it is a continuation.
+         la   r1,3(,r6)                 |      r1 -> past "// ".
+         loop while,(cr,r1,le,r7)       |      Scan for a non-blank.
+           leave loop=*,(cli,0(r1),ne,c" ")      Done when found.
+           la    r1,1(,r1)              |        Advance to next char.
+         endloop while                  |      EndLoop.
+         sr   r1,r4                     |      r1 := offset to char.
+         if   (c,r1,le,=f'15')          |      If not past column 16.
+           la r6,0(r1,r4)               |        r6 -> 1st non-blank.
+         endif                          |      EndIf.
+       endif                            |    EndIf.
+     endif                              |  EndIf.
+*                                       |
+     if (cr,r6,eq,r4)                   |  If still at start of line.
+       sbit  pwa_f,pwa_f_jcl_problem    |     Bad JCL statement.
+       msg     (js00010e)               |     Continuation not received
+       callsub add_jes2_control         |     Insert JES2 stmt(s) and
+       leave   block=*                  |     return to next state.
+     else                               |  Else.
+       mvc al_prev_comma,=f'0'          |    No ',' found yet.
+       lr  r1,r6                        |    r1 -> 1st non-blank.
+       slr r1,r4                        |    r1 := offset to parm.
+       if  (cl,r1,eq,=f'3')             |    If column 4 (only 1 blank)
+         mvc al_prev_blanks,=f'0'       |      No squeezable blanks.
+       else                             |    Else, can squeeze if need.
+         la r1,2(,r4)                   |      r1 -> Column 3.
+         st r1,al_prev_blanks           |      Squeezable blanks.
+       endif                            |    EndIf.
+     endif                              |  EndIf.
+   endif                                | EndIf.
+   eject
+*---------------------------------------------------------------------*
+*  Locate the next blank that is not within a quoted string.
+*---------------------------------------------------------------------*
+   loop while,(cr,r6,le,r7)             | Loop over rest of line.
+     leave loop=*,(cli,0(r6),eq,c" ")   |   Done when blank found.
+     if (cli,0(r6),eq,c",")             |   If between parms.
+       st r6,al_prev_comma              |     Remember where it is.
+     elseif (cli,0(r6),eq,c"''")        |   ElseIf quotation mark.
+       loop until                       |     Loop over quoted string.
+         la r6,1(,r6)                   |       Advance to next char.
+         if (cr,r6,gt,r7)               |       If string never closed.
+           callsub append_jcl,(*al_start,al_length,                    +
+               jls_f_job_stmt)
+           mvi   al_line_done,c"Y"      |         Done w/this line.
+           sbit  pwa_f,pwa_f_jcl_problem          Bad JCL statement.
+           msg   (js00011e)             |         End-quote missing.
+           callsub add_jes2_control     |         Add JES2 stmt(s).
+           leave block=*                |         Continue processing.
+         endif                          |       EndIf.
+       endloop until,(cli,0(r6),eq,c"''")     EndLoop.
+     endif                              |   EndIf.
+     la  r6,1(,r6)                      |   Advance to next char.
+   endloop while                        | EndLoop
+*---------------------------------------------------------------------*
+*  Determine if the end of the parameters have been found.
+*---------------------------------------------------------------------*
+   bctr r6,0                            | r6 -> Last non-blank char.
+   if   (cli,0(r6),eq,c",")             | If parms continued.
+     callsub append_jcl,(*al_start,al_length,jls_f_job_stmt)
+     mvi     al_line_done,c"Y"          |   Return for next line.
+   else                                 | Else.
+     la  r6,1(,r6)                      |   r6 -> Column for insert.
+     st  r6,al_current                  |   Update current position.
+     mvc al_state,=f'&al_s_job_insert'  |   At insertion point.
+   endif                                | EndIf.
+ endblk block=Scan_Job_Parms
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Insert_Job_Parms                                        *
+* Abstract  : Implement options that require parameters to be added   *
+*             to the JOB statement.                                   *
+* Entry     : The current line contains the final JOB stmt parameter. *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Insert_Job_Parms
+   if (cli,pwa_typrun,eq,c" ")          | If nothing to insert.
+     mvc   al_state,=f'&al_s_job_comments'  Move to comments-state.
+     leave block=*                      |   Return immediately.
+   endif                                | EndIf.
+   lm      r4,r7,al_source              | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  Create a copy of the JOB statement line in working storage.
+*---------------------------------------------------------------------*
+   mvi al_char72,c" "                   | Assume no continuation.
+   if  (c,r5,ge,=f'72')                 | If line >= 72 chars long.
+     mvc al_char72,71(r4)               |  Copy char @ col 72.
+   endif                                | EndIf.
+   la r3,1(,r6)                         | r3 -> Position for "," +1.
+   sr r3,r4                             | r3 := Column# for ",".
+   la r0,pwa_work                       | r0 -> Buffer for copy.
+   lr r1,r5                             | r1 := line's length.
+   if (cr,r1,lt,r3)                     | If length < column#.
+     if (c,r3,gt,=f'71')                |   If special-case col#.
+       la  r1,71                        |     r1 := desired length.
+     else                               |   Else.
+       lr r1,r3                         |     r1 := desired length.
+     endif                              |   EndIf.
+   endif                                | EndIf.
+   st   r1,pwa_work_len                 | Save new line's length.
+   icm  r1,b'1000',psd_blanks           | Pad copy with blanks.
+   mvcl r0,r4                           | Copy line & pad w/blanks.
+   eject
+*---------------------------------------------------------------------*
+*  Add a continuation comma to line, splitting at last parm if needed.
+*---------------------------------------------------------------------*
+   if (c,r3,le,=f'71')                  | If room to add a comma.
+     la      r3,pwa_work-1(r3)          |   r3 -> place for ",".
+     mvi     0(r3),c","                 |   Add continuation-comma.
+     callsub append_jcl,(pwa_work,pwa_work_len,<jobstmt>)
+   elseif (clc,al_prev_blanks,ne,=f'0') | ElseIf squeezable blanks.
+     l    r14,al_prev_blanks            |   r14->first of blanks.
+     sl   r14,al_start                  |   r14:=offset to blanks.
+     la   r14,pwa_work+1(r14)           |   r14->start of blanks.
+     if   (c,r3,eq,=f'73')              |   If "JOB" is in col 69.
+       la   r15,pwa_work+68             |     r15:= length to move
+       slr  r15,r14                     |     minus 1 for EXI.
+       exi  r15,(mvc,0(0,r14),2(r14))   |     Squeeze 2 blanks.
+       mvc  pwa_work+69(2),=c" ,"       |     "JOB ," in col 67.
+     else                               |   Else.
+       la  r15,pwa_work+69              |     r15:= length to move
+       slr r15,r14                      |     minus 1 for EXI.
+       exi r15,(mvc,0(0,r14),1(r14))    |     Squeeze out 1 blank.
+       la  r3,pwa_work-2(r3)            |     r3 -> place for ",".
+       mvi 0(r3),c","                   |     Add continuation.
+     endif                              |   EndIf.
+     callsub append_jcl,(pwa_work,pwa_work_len,<jobstmt>)
+   elseif (clc,al_prev_comma,ne,=f'0')  | ElseIf break-point known.
+     l       r14,al_prev_comma          |   r14->"," between parms.
+     sl      r14,al_start               |   r14:=offset to ",".
+     la      r14,pwa_work+1(r14)        |   r14->copy of parm.
+     la      r15,pwa_work+71            |   r15->column 72.
+     slr     r15,r14                    |   r15:=length to move.
+     st      r15,pwa_parameter_length   |   Save as parm's len.
+     bctr    r15,0                      |   Subtract 1 for EXIs.
+     exi     r15,(mvc,pwa_parameter(0),0(r14)) Copy parameter.
+     bctr    r15,0                      |   Subtract 1 for EXIs.
+     mvi     0(r14),c" "                |   Fill in old copy of
+     exi     r15,(mvc,1(0,r14),0(r14))  |   parameter with blanks.
+     callsub append_jcl,(pwa_work,pwa_work_len,<jobstmt>)
+     mvc     pwa_work_len,=f'72'        |   Inserting 72-byte line.
+     fill    pwa_work,c" ",length=72    |   Set new line to:
+     mvc     pwa_work(2),=c"//"         |   "//"      in column 1.
+     la      r14,pwa_work+3             |   r14 -> place for parm.
+     l       r15,pwa_parameter_length   |   r15 := length to move.
+     la      r0,pwa_parameter           |   r0  -> saved parm.
+     lr      r1,r15                     |   r1  := length t0 move.
+     mvcl    r14,r0                     |   Copy saved parameter.
+     mvi     0(r14),c","                |   Mark as continued.
+     mvc     pwa_work+71(1),al_char72   |   Continuation-char 72.
+     callsub append_jcl,(pwa_work,pwa_work_len,<jobstmt>)
+   else                                 | Else.
+     mvc     al_state,=f'&al_s_job_comments'  Give up.
+     sbit    pwa_f_jcl_problem          |     Note we had problem.
+     msg     (js00012e)                 |     Cut a message.
+     leave   block=*                    |   Return immediately.
+   endif                                | EndIf.
+   eject
+*---------------------------------------------------------------------*
+*  Continue the JOB statement with the additional parameter(s).
+*---------------------------------------------------------------------*
+   mvc  pwa_work_len,=f'72'             | Inserting 72-byte line.
+   fill pwa_work,c" ",length=72         | Set new line to:
+   mvc  pwa_work(2),=c"//"              |   "//"      in column 1.
+   mvc  pwa_work+5(7),=c"TYPRUN="       |   "TYPRUN="           6.
+   if   (cli,pwa_typrun,eq,c"H")        | If TYPRUN=HOLD.
+     mvc pwa_work+12(4),=c"HOLD"        |   "HOLD"             13.
+   elseif (cli,pwa_typrun,eq,c"S")      | ElseIf TYPERUN=SCAN.
+     mvc pwa_work+12(4),=c"SCAN"        |   "SCAN"             13.
+   else                                 | Else.
+     msg     (js00000c)                 |   Cut a message.
+     errexit code=&js_internal_error    |   Internal error.
+   endif                                | EndIf.
+   mvc  pwa_work+63(8),=c"**XSUB**"     |   "**XSUB**"         64.
+   mvc  pwa_work+71(1),al_char72        |   Continuation-char  72.
+   callsub append_jcl,(pwa_work,pwa_work_len,<jobstmt>)
+*---------------------------------------------------------------------*
+*  All parameter(s) inserted, move on to the next state.
+*---------------------------------------------------------------------*
+   mvi al_line_done,c'y'                | Done with this line.
+   if  (cli,al_char72,ne,c' ')          | If comments are continued.
+     mvc al_state,=f'&al_s_job_comments'   Comments-state in next line.
+   else                                 | Else.
+     callsub add_jes2_control           |  Add JES2 control stmt(s).
+   endif                                | EndIf.
+ endblk block=Insert_Job_Parms
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Scan_JCL_Comments                                       *
+* Abstract  : Scan over the comments field of the current JCL stmt.   *
+* Returns   : r15=0 if past comments.  r15=8 if still in comments.    *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Scan_JCL_Comments
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  If a continuation of a previous line, advance past the "// " that
+*  should start this line.  If this line is not a legal continuation
+*  of the previous line, treat it as if it were a new statement.
+*---------------------------------------------------------------------*
+   if (cr,r6,eq,r4)                     | If Current = Start.
+     if (c,r5,ge,=f'3')                 |   If line is long enough.
+       if (clc,=c"// ",eq,0(r6))        |    If it is a continuation.
+         la  r6,3(,r6)                  |      r6 -> past the "// ".
+       endif                            |    EndIf.
+     endif                              |  EndIf.
+     if (cr,r6,eq,r4)                   |  If still at start of line.
+       la    r15,0                      |    Out of comments.
+       leave block=*                    |    Return to caller.
+     endif                              |  EndIf.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  If column-72 is non-blank, still in comments on next line.
+*---------------------------------------------------------------------*
+   callsub append_jcl,(pwa_work,pwa_work_len)
+   mvi     al_line_done,c"Y"            | Done with this line.
+   if (c,r5,ge,=f'72'),and,(cli,71(r4),ne,c" ") If column 72 ¬blank.
+     mvc   al_char72,71(r4)             |   Copy that character.
+     la    r15,8                        |   Still in comments.
+   else                                 | Else.
+     la    r15,0                        |   Out of comments.
+   endif                                | EndIf.
+ endblk block=Scan_JCL_Comments
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Add_Jes2_Control                                        *
+* Abstract  : Add JES2 control statements to the job stream.          *
+*             This routine is invoked after all lines of a JOB stmt   *
+*             have been added to the jobstream, but before any        *
+*             processing on a subsequent statement can begin.         *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Add_JES2_Control
+*---------------------------------------------------------------------*
+*  Check JES2 options and insert appropriate /*JOBPARM statements.
+*---------------------------------------------------------------------*
+   if (cli,pwa_hold,eq,c"Y")              | If /HOLD specified.
+     mvc     pwa_work(l'&s.jobparm),&s.jobparm
+     mvc     pwa_work+10(3),=c"Q=H"
+     mvc     pwa_work_len,=a(l'&s.jobparm)
+     callsub append_jcl,(pwa_work,pwa_work_len)
+   endif                                  | EndIf.
+*
+   if (cli,pwa_inform,eq,c"Y")            | If /INFORM specified.
+     mvc     pwa_work(l'&s.jobparm),&s.jobparm
+     mvc     pwa_work+10(1),=c"I"
+     mvc     pwa_work_len,=a(l'&s.jobparm)
+     callsub append_jcl,(pwa_work,pwa_work_len)
+   endif                                  | EndIf.
+*
+   if (cli,pwa_reroute,eq,c"Y")           | If /REROUTE specified.
+     mvc     pwa_work(l'&s.jobparm),&s.jobparm
+     mvc     pwa_work+10(3),=c"Q=R"
+     mvc     pwa_work_len,=a(l'&s.jobparm)
+     callsub append_jcl,(pwa_work,pwa_work_len)
+   endif                                  | EndIf.
+*
+   mvc  al_state,=f'&al_s_new'  <--- Start processing current line.
+ endblk block=Add_JES2_Control
+*---------------------------------------------------------------------*
+* Patterns for JES2 control statements to be inserted.
+*---------------------------------------------------------------------*
+            ssd
+&s.jobparm  dc     cl72"/*JOBPARM"
+            org    &s.jobparm+63
+            dc     c"**XSUB**"        <--- ends in column 71.
+            org
+            endssd
+            eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Check_For_Instream                                      *
+* Abstract  : Examine the current DD statement to see if it defines   *
+*             an instream data set.                                   *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Check_For_Instream
+   lm   r4,r7,al_source                 | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  Locate the first parameter on the DD statement, if any.
+*---------------------------------------------------------------------*
+   loop while,(cr,r6,le,r7)             | Loop for a non-blank.
+     leave loop=*,(cli,0(r6),ne,c" ")   |   Done when one found.
+     la    r6,1(,r6)                    |   Advance one character.
+   endloop while                        | EndLoop.
+*                                       |
+   if (cr,r6,gt,r7)                     | If no parameter is present.
+     callsub append_jcl,((r4),al_length)    Add line to jobstream.
+     mvi     al_line_done,c"Y"          |   Done with this line.
+     mvc     al_state,=f'&al_s_new'     |   Back to normal processing.
+     leave   block=*                    |   Return to caller.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  See if the parameter is "*" or "DATA", defining an instream dataset.
+*---------------------------------------------------------------------*
+   if  (cli,0(r6),eq,c"*")              | If "DD *" statement.
+     la  r6,1(,r6)                      |   r6 -> past "*" parameter.
+     mvi al_dd_type,c"*"                |   In a "DD *" statement.
+   else                                 | Else, check for "DD DATA".
+     la r1,1(,r7)                       |   r1 -> 1 past last position.
+     sr r1,r6                           |   r1 := remaining length.
+     if (c,r1,ge,=f'4'),and,(clc,=c"DATA",eq,0(r6))
+       la  r6,4(,r6)                    |     r6 -> past "DATA" parm.
+       mvi al_dd_type,c"D"              |     In a "DD *" statement.
+     else                               |   Else.
+       callsub append_jcl,((r4),al_length)    Add line to jobstream.
+       mvi     al_line_done,c"Y"        |     Done with this line.
+       mvc     al_state,=f'&al_s_new'   |     Back to normal state.
+       leave   block=*                  |     Return to caller.
+     endif                              |   EndIf.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  See if the parameter is "*" or "DATA", defining an instream dataset.
+*---------------------------------------------------------------------*
+   st  r6,al_current                    | Update current position.
+   mvc al_dlm,psd_blanks                | No DLM= recognized yet.
+   mvc al_state,=f'&al_s_dd_parms'      | Scan for DLM= keyword.
+ endblk block=Check_For_Instream
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Scan_DD_Parms   (Also used for Scan_XMIT_Parms)         *
+* Abstract  : Scan from the current source position in a DD or XMIT   *
+*             JCL statement looking for the DLM=xx keyword.  If       *
+*             found, save the specified delimiter and continue        *
+*             scanning until the end of the parameters have been      *
+*             located.                                                *
+* Note      : Because we are following the same syntax rules and      *
+*             looking for the same parameter in both the DD and XMIT  *
+*             statements, the code simply processes an XMIT statement *
+*             from this point on as if it were a DD statement.        *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Scan_DD_Parms
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  If a continuation of a previous line, advance past the "// " that
+*  should start this line.  If this line is not a legal continuation
+*  of the previous line, just proceed as if we were within the instream
+*  data set.
+*---------------------------------------------------------------------*
+   if (cr,r6,eq,r4)                     | If Current = Start.
+     if (c,r5,ge,=f'3')                 |   If line is long enough.
+       if (clc,=c"// ",eq,0(r6))        |    If it is a continuation.
+         la   r1,3(,r6)                 |      r1 -> past "// ".
+         loop while,(cr,r1,le,r7)       |      Scan for a non-blank.
+           leave loop=*,(cli,0(r1),ne,c" ")      Done when found.
+           la    r1,1(,r1)              |        Advance to next char.
+         endloop while                  |      EndLoop.
+         sr   r1,r4                     |      r1 := offset to char.
+         if   (c,r1,le,=f'15')          |      If not past column 16.
+           la r6,0(r1,r4)               |        r6 -> 1st non-blank.
+         endif                          |      EndIf.
+       endif                            |    EndIf.
+     endif                              |  EndIf.
+*                                       |
+     if (cr,r6,eq,r4)                   |  If still at start of line.
+       mvc   al_state,=f'&al_s_instream'     1st line of instream data.
+       leave block=*                    |    Return to process it.
+     endif                              |  EndIf.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  Locate the next blank that is not within a quoted string, looking
+*  for DLM=xx during the scan.
+*---------------------------------------------------------------------*
+   loop while,(cr,r6,le,r7)             | Loop over rest of line.
+     leave loop=*,(cli,0(r6),eq,c" ")   |   Done when blank found.
+     if    (cli,0(r6),eq,c"''")         |   If quotation mark.
+       loop until                       |     Loop over quoted string.
+         la    r6,1(,r6)                |       Advance to next char.
+         leave loop=*,(cr,r6,gt,r7)     |       If string never closed.
+       endloop until,(cli,0(r6),eq,c"''")     EndLoop.
+     elseif (clc,al_dlm,eq,psd_blanks) |    Elseif no DLM found yet.
+       la r1,1(,r7)                     |     r1 -> past scan area.
+       sr r1,r6                         |     r1 := remaining length.
+       if (c,r1,ge,=f'6')               |     If enough for DLM=xx.
+         if (clc,=c"DLM=",eq,0(r6))     |       If at "DLM=".
+           mvc  al_dlm,4(r6)            |         Save xx DLM value.
+         endif                          |       EndIf.
+       endif                            |     EndIf.
+     endif                              |   EndIf.
+     la  r6,1(,r6)                      |   Advance to next char.
+   endloop while                        | EndLoop
+*---------------------------------------------------------------------*
+*  Determine if the end of the parameters have been found.
+*---------------------------------------------------------------------*
+   bctr r6,0                            | r6 -> Last non-blank char.
+   if   (cli,0(r6),eq,c",")             | If parms continued.
+     callsub append_jcl,((r4),al_length)    Add line to jobstream.
+     mvi     al_line_done,c"Y"          |   Done with this line.
+   else                                 | Else.
+     la  r6,1(,r6)                      |   r6 -> Column for insert.
+     st  r6,al_current                  |   Update current position.
+     mvc al_state,=f'&al_s_dd_comments' |   In DD comments field.
+   endif                                | EndIf.
+ endblk block=Scan_DD_Parms
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Scan_jes2XMIT_parms                                     *
+* Abstract  : Scan from the current source position in a /*XMIT stmt  *
+*             looking for the DLM=xx keyword.  If found, save the     *
+*             specified delimiter and continue scanning until the     *
+*             end of the parameters have been located.                *
+* Note      : The manual says not to continue /*XMIT statements. For  *
+*             consistency with the rest of this program, any illegally*
+*             continued lines are considered part of the instream     *
+*             data set.  In other words, the code does not check for  *
+*             continuations at all - any continuation is illegal.     *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Scan_JES2XMIT_parms
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  Locate the first parameter following node-specification.
+*---------------------------------------------------------------------*
+   loop while,(cr,r6,le,r7)             | Loop over rest of line.
+     leave loop=*,(cli,0(r6),ne,c" ")   |   Done when nonblank found.
+     la    r6,1(,r6)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+   loop while,(cr,r6,le,r7)             | Loop over node-specification.
+     leave loop=*,(cli,0(r6),eq,c" ")   |   Done when blank found.
+     la    r6,1(,r6)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+   loop while,(cr,r6,le,r7)             | Loop over rest of line.
+     leave loop=*,(cli,0(r6),ne,c" ")   |   Done when nonblank found.
+     la    r6,1(,r6)                    |   Advance to next char.
+   endloop while                        | EndLoop.
+*---------------------------------------------------------------------*
+*  Determine the instream end-of-data delimiter.
+*---------------------------------------------------------------------*
+   la r1,1(,r7)                         | r1 -> past scan area.
+   sr r1,r6                             | r1 := remaining length.
+   if (c,r1,ge,=f'6')                   | If enough for DLM=xx.
+     if (clc,=c"DLM=",eq,0(r6))         |   If at "DLM=".
+       mvc  al_dlm,4(r6)                |     Save xx DLM value.
+     endif                              |   EndIf.
+   endif                                | EndIf.
+   mvi     al_dd_type,c"D"              | Always use "DD DATA" rules.
+   callsub append_jcl,((r4),al_length)    Add line to jobstream.
+   mvi     al_line_done,c"Y"            | Done: no continuation allowed
+   mvc     al_state,=f'&al_s_instream'  | Now in instream data set.
+ endblk block=Scan_JES2XMIT_Parms
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Scan_Instream                                           *
+* Abstract  : Scan instream data for a data-terminator line.          *
+* Note      : While the rules for locating the data-delimiter are     *
+*             commented as being for "DD" statement instream data     *
+*             sets, they also apply for "/*XMIT" statements.          *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=Scan_Instream
+   lm r4,r7,al_source                   | Get Start/Length/Current/End.
+*---------------------------------------------------------------------*
+*  Check for the end of the instream data set:
+*    1) Any "//" JCL line will terminate a "DD *" data set.
+*    2) The two-character delimiter specified on DLM=xx.
+*    3) "/*" in the input stream if no DLM=xx was specified.
+*---------------------------------------------------------------------*
+   if (c,r5,ge,=f'2')                   | If two-chars or longer.
+     if (cli,al_dd_type,eq,c"*")        |   If "DD *" instream data.
+       if (clc,=c"//",eq,0(r4))         |     If any JCL statement.
+         mvc   al_state,=f'&al_s_new'   |       Data terminated.
+         leave block=*                  |       Return immediately.
+       endif                            |     EndIf.
+     endif                              |   EndIf.
+     if (clc,al_dlm,ne,psd_blanks)      |   If DLM=xx in effect.
+       if (clc,al_dlm,eq,0(r4))         |     If line has delimiter.
+         mvc   al_state,=f'&al_s_new'   |       Data terminated.
+       endif                            |     EndIf.
+     elseif (clc,=c"/*",eq,0(r4))       |   ElseIf starts with "/*".
+       if (c,r5,lt,=f'3'),or,(cli,2(r4),eq,c" ") If terminator.
+         mvc al_state,=f'&al_s_new'     |       Data terminated.
+       endif                            |     EndIf.
+     endif                              |   EndIf.
+   endif                                | EndIf.
+*---------------------------------------------------------------------*
+*  Done with the current line...go back for the next one.
+*---------------------------------------------------------------------*
+   callsub append_jcl,((r4),al_length)  | Add line to jobstream.
+   mvi     al_line_done,c"Y"            | Done with this line.
+ endblk block=Scan_Instream
+                eject
+***********************************************************************
+*                                                                     *
+* Subroutine: append_jcl,(Line,Length{,Flag})                         *
+* Abstract  : Add a new line to the jobstream being built.            *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=append_jcl
+   lm  r4,r5,0(r1)                     | r4 -> Text, r5 -> Length.
+   l   r5,0(,r5)                       | r5 := length of line.
+   slr r6,r6                           | r6 := Flag byte to use.
+   if  (tbit,4(r1),x'80',off)          | If Flag parameter specified.
+     l  r15,8(,r1)                     |   r15 -> Flag byte to use.
+     l8 r6,0(r15)                      |   r6 := Flag byte to use.
+   endif                               | EndIf.
+*---------------------------------------------------------------------*
+*  Make sure the current STG block has enough space to hold the line.
+*---------------------------------------------------------------------*
+   l     r8,pwa_stg_current            | r8 -> Current stg block.
+   using stg,r8                        | Establish addressability.
+   la    r3,jsl_l(,r5)                 | r3 := amount of stg needed.
+   if    (c,r3,gt,stg_free)            | If more than we have in STG.
+     es_obtain_storage id=es,          |   Obtain a new STG block and  +
+               size=psd_stg_incr,      |   link it to the end of the   +
+               address=stg_link        |   STG chain.
+     if (not,(%es_success))            |   If unable to obtain.
+       sth     r15,pwa_rc              |     Save RC in PWA.
+       msg     (JS00001S)              |     Format error message.
+       errexit code=&js_environment_support_error
+     endif                             |   EndIf.
+     mvc  pwa_stg_current,stg_link     |   Switch current to new block.
+     l    r8,stg_link                  |   r8 -> New STG block.
+     mvc  stg_link,=f'0'               |   Force link to null.
+     mvc  stg_size,psd_stg_incr        |   Remember amount allocated.
+     l    r0,stg_size                  |   r0 := total size of stg.
+     s    r0,=a(stg_l)                 |   r0 := size of stg_area.
+     st   r0,stg_free                  |   Save remaining # bytes free.
+   endif                               | EndIf.
+*---------------------------------------------------------------------*
+*  Add the new line to the end of the jobstream.
+*---------------------------------------------------------------------*
+   la      r14,stg+stg_l               | r14 -> past end of STG.
+   sl      r14,stg_free                | r14 -> next free byte in STG.
+   using   jsl,r14                     | Establish addressability.
+   stc     r6,jsl_flags                | Set line's flag byte value.
+   stc     r5,jsl_length               | Save length of line.
+   bctr    r5,0                        | Subtract 1 for EXI instr.
+   exi     r5,(mvc,jsl_text(0),0(r4))  | Copy line to end of jobstream.
+   l       r1,stg_free                 | r1 := remaining free bytes.
+   la      r5,jsl_l+1(,r5)             | r5 := # bytes used for line.
+   slr     r1,r5                       | Adjust remaining bytes.
+   st      r1,stg_free                 | Save adjusted value.
+ endblk block=append_jcl
+ eject
+*---------------------------------------------------------------------*
+*                                                                     *
+* Subroutine: Submit_Jobstream                                        *
+*                                                                     *
+*---------------------------------------------------------------------*
+ block type=subroutine,name=Submit_Jobstream
+*---------------------------------------------------------------------*
+*  If no JOB statements in jobstream, issue an error message.
+*---------------------------------------------------------------------*
+   if (clc,al_job_count,eq,=f'0')     | If no job statements present.
+     msg     (js00013e)               |   Issue a message.
+     errexit code=&js_jcl_problem     |   Indicate we had a problem.
+   endif                              | Endif.
+*---------------------------------------------------------------------*
+*  Write entire jobstream to an internal reader.
+*---------------------------------------------------------------------*
+*  callsub  open_reader               |
+*  loop through jobstream lines.
+*    callsub write_line_to_reader
+*  endloop
+*  callsub  close_reader
+ endblk block=Submit_Jobstream
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Save_To_File                                            *
+* Abstract  : Write the entire jobstream to a file.                   *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=save_to_file
+ endblk block=save_to_file
+ eject
+***********************************************************************
+*                                                                     *
+* Subroutine: Message,(msg_tag,arg1,...)                              *
+* Abstract  : Format a message and update the feedback area.          *
+*                                                                     *
+***********************************************************************
+ block type=subroutine,name=message
+*---------------------------------------------------------------------*
+*  Use the supplied parameters to set up for an ST_FORMAT call.
+*---------------------------------------------------------------------*
+   lr  r3,r1                          | r3 -> Parameter list.
+   l   r4,0(,r3)                      | r4 -> A(Message to issue).
+   l   r4,0(,r4)                      | r4 -> Message to issue.
+   l8  r1,0(r4)                       | r1 := message length.
+   sth r1,&w.length                   | Save for later.
+   st  r1,&w.length                   | Save as fullword also.
+   l8  r1,1(r4)                       | r1 := reason-code.
+   st  r1,js_fb_reason                | Save reason-code in feedback.
+   mvi &w.formatted,c'n'              | Set msg-formatted flag...
+   if  (clc,pwa_stepa,ne,=f'0'),and,  | If String Handler loaded, and  +
+               (clc,pwa_sttkn,ne,=f'0'),and,  String Handler started,  +
+               (tbit,0(r3),x'80',off) |       and arguments to format.
+     la  r1,4(,r3)                    |   r1 -> 1st argument.
+     loop while,(tbit,0(r1),X'80',off)    Loop over argument list.
+       la r1,4(,r1)                   |     r1 -> next argument.
+     endloop while                    |   EndLoop.
+     slr     r1,r4                    |   r1 := length of arg-list.
+     srl     r1,2                     |   r1 := number of arguments.
+     st      r1,&w.count              |   Save for ST_FORMAT.
+     es_clear_debug_info id=es,action=inhibit
+     st_format id=st,control=2(r4),sourcelist=(4(r3),&w.count),        +
+               string=js_fb_msgtext,resultlen=js_fb_msglen
+     if        (%st_success)          |   If successful format.
+       mvi     &w.formatted,c'Y'      |     Set formatted-flag.
+     else                             |   Else.
+       sth                r15,&w.rc   |     Save bad return-code.
+       es_save_debug_info id=es,text=(2(r4),&w.length4),label="MESSAGE"
+       es_save_debug_info id=es,hex=(&w.rc,l'&w.rc),label="RETCODE"
+       es_save_debug_info id=es,text="ST_FORMAT failed while attempting+
+                to format a message: return code follows."
+     endif                            |   EndIf.
+     es_clear_debug_info id=es,action=enable
+   endif                              | EndIf.
+*                                     |
+   if (cli,&w.formatted,eq,c'N')      | If format not called or failed.
+     la   r0,js_fb_msgtext            |   r0 -> mvcl destination.
+     la   r1,l'js_fb_msgtext          |   r1 := length of destination.
+     la   r14,2(,r4)                  |   r14 -> mvcl source.
+     lh   r15,&w.length               |   r15 := length of source.
+     icm  r15,b'1000',=c' '           |   Pad destination w/blanks.
+     mvcl r0,r14                      |   Copy message w/o formatting.
+     mvc  js_fb_msglen,&w.length      |   Copy message length.
+   endif                              | EndIf.
+*
+ endblk block=message
+*---------------------------------------------------------------------*
+* Working storage for formatting messages.
+*---------------------------------------------------------------------*
+            swa
+&w.count    ds  f                | Number of source arguments.
+&w.length4  ds  f                | Length of control string (msg).
+&w.length   ds  h                | Length of control string (msg).
+&w.rc       ds  h                | Returncode from ST_FORMAT.
+            endswa
+ eject
+***********************************************************************
+*                                                                     *
+*  Error exit for all functions.                                      *
+*                                                                     *
+***********************************************************************
+ block type=errexit
+*
+*  Save module/offset, registers, and return-code.
+*
+   stm   r0,r15,pwa_gdiregs      | save registers at time of error.
+   la    r0,4(,r12)              | point to module identification.
+   st    r0,pwa_gdimodid         | save in general debug area.
+   mvc   pwa_gdirc,0(r14)        | copy return code.
+   slr   r14,r12                 | calculate offset at time of error.
+   sth   r14,pwa_gdioffst        | save in debug area.
+   es_save_debug_info id=es,gdi=pwa_gdi
+   lh    r15,pwa_gdirc           | r15 := return-code for this call.
+ endblk
+ eject
+***********************************************************************
+*                                                                     *
+*  Copy-Error exit.                                                   *
+*                                                                     *
+***********************************************************************
+ block type=errexit,name=copy_exit
+*
+*  Save module/offset, registers, and return-code.
+*
+   stm   r0,r15,pwa_gdiregs      | save registers at time of error.
+   la    r0,4(,r12)              | point to module identification.
+   st    r0,pwa_gdimodid         | save in general debug area.
+   mvc   pwa_gdirc,0(r14)        | copy return code.
+   slr   r14,r12                 | calculate offset at time of error.
+   sth   r14,pwa_gdioffst        | save in debug area.
+   es_save_debug_info id=es,gdi=pwa_gdi
+   lh    r15,pwa_gdirc           | r15 := return-code for this call.
+ endblk
+ eject
+*---------------------------------------------------------------------*
+*
+*  static data
+*
+*---------------------------------------------------------------------*
+           psd
+           ltorg
+psd_stg_incr  dc f'32768'      | Enough for about 400 80-byte lines.
+psd_blanks dc   cl16" "        | For compares and captialization.
+*---------------------------------------------------------------------*
+* Messages are made up of a message identifier followed by a control
+* string.  The message identifier has the format
+*
+*   JSnnnnns
+*
+* where the characters JS always begin a Jobstream Handler's message,
+* nnnnn is the unique message number, and s indicates the message's
+* severity.
+*
+* Severity                  Meaning
+* --------   ---------------------------------------------
+*    I       Informational.
+*    W       Warning message.
+*    E       An error occurred, but execution can continue.
+*    S       Severe error.  Execution cannot continue.
+*    X       Filename syntactically invalid.
+*    C       Critical error.  Indicates a probable programming error.
+*
+*---------------------------------------------------------------------*
+            macro
+            dm    &msgid,&text
+            lclc  &oldloc,&reason
+&reason     setc  '&msgid'(3,5)
+&oldloc     setc  '&sysloc'
+&msgid      dc    a(msgt&sysndx)
+msgs        loctr ,
+msgt&sysndx dc    al1(msgl&sysndx.,&reason),c'&msgid',c' ',c&text
+msgl&sysndx equ   *-msgt&sysndx-2
+&oldloc     loctr ,
+            mend
+*
+  dm JS00000C,"Unknown or internal error."
+  dm JS00001C,"Unable to load the String Handler."
+  dm JS00002C,"Unable to start the String Handler."
+  dm JS00003C,"Wrong number of parameters for the {CL?} function."
+  dm JS00004C,"Invalid function-code parameter: {I}."
+  dm JS00005E,"Option {CL?} is unknown."
+  dm JS00006E,"Invalid value supplied for option {CL?}."
+  dm JS00007E,"Options {CL?} and {CL?} are mutually exclusive."
+  dm JS00008E,"Negative line length invalid for APPEND_LINE function."
+  dm JS00009E,"Line truncated to 80 characters."
+  dm JS00010E,"Illegal JOB statement: expected continuation not receive+
+               d."
+  dm JS00011E,"Illegal JOB statement: ending quote not found."
+  dm JS00012E,"Unable to append parameters to this JOB statement."
+  dm JS00013E,"The JCL being submitted does not contain any JOB stateme+
+               nts.  Check for possible JCL errors."
+  dm JS00014S,"Not enough storage to operate."
+*
+*
+           endpsd
+           eject
+*---------------------------------------------------------------------*
+*                                                                     *
+*  Program Work Area                                                  *
+*                                                                     *
+*---------------------------------------------------------------------*
+                     pwa
+pwa_#parms           ds  f           | Number of parms passed in.
+                     org &ppl.       | Overlay program parameter list.
+                     js_parmlist dsect=no
+                     org ,           | Back to normal offsets.
+pwa_es_epa           ds  a           | Environment Support EPA.
+pwa_es_token         ds  f           | Environment Support TOKEN.
+pwa_st_epa           ds  a           | String Handler EPA.
+pwa_st_token         ds  f           | String Handler TOKEN.
+pwa_stg_anchor       ds  a           | Addr of 1st stg block.
+pwa_stg_current      ds  a           | Addr of current stg block.
+pwa_rc               ds  h           | Saved return-code from s.p.
+*                                    | Option values:
+pwa_hold             ds  c           |   /*JOBPARM Q=H  ("Y" or "N").
+pwa_inform           ds  c           |   /*JOBPARM I    ("Y" or "N").
+pwa_reroute          ds  c           |   /*JOBPARM Q=R  ("Y" or "N").
+pwa_typrun           ds  c           |   Typrun =       (" "|"H"|"S").
+*
+* Miscellaneous working storage.
+*
+pwa_work_len         ds  f           | Length of pwa_work's contents.
+pwa_work             ds  cl256       | Changed/inserted line.
+pwa_parameter        ds  cl72        | Saved parm from JOB statement.
+pwa_parameter_length ds  f           | Length of saved parameter.
+*                                    |
+pwa_line#            ds  f           | Current line number.
+pwa_line_len         ds  f           | Length of current input line.
+pwa_line             ds  cl80        | Text of output line.
+pwa_s99error         ds  h           | Dynalloc's error-code.
+pwa_ddname           ds  cl8         | DDNAME of internal reader.
+pwa_jobid            ds  cl8         | Job identifier.
+pwa_f                ds  x           | State information.
+pwa_f_allocated      equ b'10000000' |   Internal reader allocated.
+pwa_f_acb            equ b'01000000' |   ACB successfully built.
+pwa_f_opened         equ b'00100000' |   File successfully opened.
+pwa_f_rpl            equ b'00010000' |   RPL successfully built.
+pwa_f_in_error       equ b'00001000' |   Halted due to an error.
+pwa_f_truncated      equ b'00000100' |   Output line truncated.
+pwa_f_in_progress    equ b'00000010' |   Jobstream not ENDREQed yet.
+pwa_f_jcl_problem    equ b'00000001' |   Problem found in JCL stmt.
+*
+* The following fields describe static storage used for parsing lines.
+*
+al_job_name          ds  cl8         | Current JOB's name.
+al_job_name_length   ds  f           | Length of jobname.
+al_job_count         ds  f           | Count of JOBs in jobstream.
+al_line_done         ds  c           | Done with this line (Y or N).
+al_line_type         ds  b           | Current line's type.
+al_state             ds  f           | Current parsing state.
+al_source            equ *           | Source-position variables:
+al_start             ds  a           |   Start of line.
+al_length            ds  f           |   Length of source area.
+al_current           ds  a           |   Current character.
+al_end               ds  a           |   Past end of source area.
+al_insert_state      ds  f           | Parameters added to JOB stmt.
+al_char72            ds  c           | Character in column 72.
+al_dlm               ds  cl2         | Value of DLM=xx parameter.
+al_dd_type           ds  c           | Instream data "*" or "D".
+al_prev_comma        ds  a           | -> to ',' between parameters.
+al_prev_blanks       ds  a           | -> to squeezable blanks.
+*
+* Control blocks and parmlists for Internal Reader use.
+*
+pwa_acb              acb ,           |   Access Control Block.
+pwa_acb_l            equ *-pwa_acb   |   Length of access control block
+                     ds  0f          |   Align to a fullword boundary.
+pwa_acbpl            ds  cl(pwa_acbal_l) Used by GENCB BLK=ACB.
+*                                    |
+pwa_rpl              rpl am=vsam     |   Request Parameter Block.
+pwa_ral_l            equ *-pwa_rpl   |   Length of request parm block.
+                     ds  0f          |   Align to a fullword boundary.
+pwa_rplpl            ds  cl(pwa_rplal_l) Used by GENCB BLK=RPL.
+*
+* Error tracking and debugging information.
+*
+                     js_feedback dsect=no
+                     es_gdi      dsect=no,prefix=pwa_gdi
+                     endpwa
+                     eject
+*---------------------------------------------------------------------*
+* Storage block for holding jobstream lines.                          *
+*---------------------------------------------------------------------*
+stg               dsect
+stg_link          ds     a           | Link to next stg block.
+stg_size          ds     f           | Size of stg_area below.
+stg_free          ds     a           | Remaining bytes in stg_area.
+stg_area          ds     0c          | Area for jobstream_line storage.
+stg_l             equ    *-stg       | Length of stg block header info.
+*---------------------------------------------------------------------*
+* Jobstream line (stored w/in stg_area)                               *
+*---------------------------------------------------------------------*
+jsl               dsect
+jsl_flags         ds     b           | Information about this line.
+jsl_f_job_start   equ    b'10000000' |   Line is 1st line of JOB stmt.
+jsl_f_job_stmt    equ    b'01000000' |   Line is part of a JOB stmt.
+jsl_f_job_end     equ    b'00100000' |   Line is a job-terminator.
+jsl_length        ds     x           | Length of jobstream line's text.
+jsl_text          ds     0c          | Actual text of jobstream line.
+jsl_l             equ    *-jsl       | Length of this dsect.
+                  eject
+           es_esv         ,    |
+*          iefzb4d0       ,    | Dynamic allocation (SVC99) data areas.
+*          iefzb4d2       ,    | Dynamic allocation text unit keys.
+*          ifgrpl    dsect=yes | Request parameter list mapping.
+           end
+//C.SYSPRINT DD SYSOUT=A,OUTPUT=*.LASER4
+//C.SYSLIB DD
+//         DD
+//         DD DSN=SYSTEMS.SRV.SOURCE,DISP=SHR
+//         DD DSN=SYSTEMS.RACF.MACLIB,DISP=SHR
+//         DD DSN=SYS1.MODGEN,DISP=SHR
+//         DD DSN=SYS2.MACLIB,DISP=SHR
+//         DD DSN=SYSTEMS.JES2.SOURCE,DISP=SHR

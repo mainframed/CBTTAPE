@@ -1,0 +1,929 @@
+*---------------------------------------------------------------------*
+* RMTLOG  - MVS Remote Syslog Facility.                               *
+*---------------------------------------------------------------------*
+* RMTLOG  - Main module.                                              *
+*---------------------------------------------------------------------*
+* 04/20/2010 John C. Miller - software@jmit.com                       *
+* 03/22/2011 JCM - Changed common storage area to LOC=24 so that the  *
+* DCB/DCBE in common storage will work correctly.                     *
+*---------------------------------------------------------------------*
+* Purpose: mirror MVS hardcopy messages to an RFC 3194 compliant      *
+* remote syslog server.  Sends messages via UDP port 514.             *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Development notes:                                                  *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Environment is z/OS 1.10.  Code uses EZASMI facility for managing   *
+* the TCP/IP sockets environment.  MCSOPER and MCSOPMSG macros are    *
+* used to create and operate the extended MCS console.  The console   *
+* code uses a combination of Access Register (AR) mode for            *
+* accessing MDBs in data spaces, and primary mode for normal          *
+* execution.                                                          *
+*---------------------------------------------------------------------*
+* This code may be useful for examples of how to code for datagram    *
+* (UDP) and stream (TCP) sockets communication, EMCS consoles, and    *
+* Access Register (AR) mode coding in general.  Use of multiple       *
+* ECBs to handle multiple events, and coding to handle MODIFY and     *
+* STOP commands is also illustrated.                                  *
+*                                                                     *
+* Asynchronous vs. synchronous sockets:                               *
+* -------------------------------------                               *
+* The TCP/IP socket calls are synchronous blocking calls, which       *
+* means that the address space is suspended while waiting for         *
+* socket I/O to complete.  This design decision was made because it   *
+* simplifies coding somewhat, and because I did not see any real      *
+* benefit to coding for asynchronous socket operation.  If there is   *
+* any delay in writing to the remote syslog server, the EMCS          *
+* console will continue to queue messages until it's buffers are      *
+* depleted.  This provides a reasonable mechanism for buffering       *
+* between the z/OS syslog and unix/syslogd environment.  The same     *
+* scenario (EMCS buffering) would take place with either synchronous  *
+* or asynchronous sockets in the case of a non-responsive syslog      *
+* server.                                                             *
+*                                                                     *
+* Operation notes:                                                    *
+* ----------------                                                    *
+* For best results the syslogd server should be dedicated only to     *
+* handling remote syslog requests, and should have plenty of disk     *
+* space for logs.  There's no reason that a syslogd server could      *
+* not handle remote logging for multiple or even many different       *
+* servers, including MVS systems using this program.                  *
+*                                                                     *
+* It is also recommended that syslog-ng (Syslog Next Generation) be   *
+* used in lieu of the standard BSD Syslogd server that is still       *
+* packaged with many Linux distributions.  One of the main            *
+* advantages of using syslog-ng is that it supports TCP               *
+* connections.                                                        *
+*---------------------------------------------------------------------*
+* This program runs as a started task, and mirrors all MVS hardcopy   *
+* syslog messages to a RFC 3164 compliant syslogd server.  The main   *
+* purpose for this program is to provide a facility for MVS logs to   *
+* be mirrored to another platform for security purposes. This         *
+* capability is a common requirement for PCI compliance.              *
+*                                                                     *
+* This facility also enables MVS messages to be aggregated with       *
+* logs from other machines for ease of management, and use of log     *
+* management tools like splunk.                                       *
+*---------------------------------------------------------------------*
+* The syslogd server to which this program sends messages can be a    *
+* simple Linux server running SuSE, Red Hat, or most any Linux        *
+* distribution.  Follow the instructions for your particular Linux    *
+* distribution for enabling the Linux server to allow remote syslog   *
+* connections.  This typically involves adding a switch to the        *
+* syslogd daemon (usually the "-r" switch.)  The Linux firewall       *
+* must also be configured to allow access to UDP port 514, which is   *
+* the remote syslogd port that this program uses.                     *
+*                                                                     *
+* To end the program, issue the MVS STOP command like this:           *
+*    P RMTLOG                                                         *
+*                                                                     *
+* This program must reside in an APF authorized library.              *
+*                                                                     *
+* The starup PROC for this program is simple:                         *
+*                                                                     *
+* //RMTLOG   PROC                                                     *
+* //LOGGER   EXEC PGM=RMTLOG,TIME=1440                                *
+* //PARMS    DD   DISP=SHR,DSN=pds.name(PARMS)                        *
+* //SYSTCPD  DD   DISP=SHR,DSN=tcpip.tcpdata                          *
+* //SYSPRINT DD   SYSOUT=*                                            *
+*                                                                     *
+*---------------------------------------------------------------------*
+* Parameter file:                                                     *
+* This program uses a parameter file allocated to the DDNAME: PARMS.  *
+* Parameters currently allowed in the parameter file are as follows:  *
+*                                                                     *
+*  SERVER   syslog server name.                                       *
+*  CNAME    MCS Console name to be created.                           *
+*  PRI      Per RFC 3194, the message priority.  See the docs for RFC *
+*           3194 at http://tools.ietf.org/html/rfc3164 for more info. *
+*                                                                     *
+* # Sample RMTLOG parameter file:                                     *
+* #                                                                   *
+*   SERVER    syslog.jmit.com                                         *
+*   PROTO     TCP | UDP                                               *
+*   PORT      514                                                     *
+*   TIMESRC   MESSAGE | SYSTEM                                        *
+*   CNAME     RLG01                                                   *
+*   PRI       035                                                     *
+*   RETRYINT  15                                                      *
+*   RETRIES   0                                                       *
+*   SIZE      512                                                     *
+*   QLIMIT    524288                                                  *
+*---------------------------------------------------------------------*
+* This program should run at a fairly high dispatching priority, so   *
+* that messages don't get backed up and cause problems.  The code     *
+* operates approximately as follows:                                  *
+*                                                                     *
+* Initialization:                                                     *
+* - Initialize the TCP/IP sockets environment, and connect to the     *
+*   syslogd server specified by the SERVER parameter in PARMS file.   *
+* - Dynamically create a software extended MCS console, specifying    *
+*   that the hardcopy message set is to be routed to the MCS cons.    *
+* Operation:                                                          *
+* - Wait on three different ECBs, and dispatch based on which ECB is  *
+*   posted.                                                           *
+* -- If the CIB ECB is posted, then process STOP and MODIFY commands. *
+*    At this time only the STOP (P) command is implemented, but other *
+*    modify commands (F) can easily be added.                         *
+* -- If the MSG ECB is posted, then read and process Message Data     *
+*    Blocks (MDB's) that contain the syslog messages.  Write these    *
+*    messages to the remote syslogd server.  This initial version of  *
+*    the code mirrors all hardcopy messages to the remote syslog      *
+*    server, but some ability to only mirror selected messages, and   *
+*    the use of different PRI codes for different messages is a       *
+*    likely enhancement to be made to the code.                       *
+* -- If the ALTERT ECB is posted, then handle errors with the MCS     *
+*    console interface.                                               *
+* Shutdown:                                                           *
+* - When the STOP command is issued against the started task, the     *
+*   extended MCS console is shut down, the syslog server connection   *
+*   is closed, and the started task ends.                             *
+*---------------------------------------------------------------------*
+*
+*=====================================================================*
+* RMTLOG Remote logging program copyright 2010-2017 John C. Miller.   *
+*---------------------------------------------------------------------*
+* This program is free software: you can redistribute it and/or       *
+* modify it under the terms of the GNU General Public License as      *
+* published by the Free Software Foundation, either version 3 of      *
+* the License, or (at your option) any later version.                 *
+*                                                                     *
+* This program is distributed in the hope that it will be useful,     *
+* but WITHOUT ANY WARRANTY; without even the implied warranty of      *
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the       *
+* GNU General Public License in member $GPL for more details.         *
+*---------------------------------------------------------------------*
+         GBLB  &NODEBUG
+&NODEBUG SETB  0
+RMTLOG   CSECT
+RMTLOG   AMODE ANY
+RMTLOG   RMODE ANY
+         PRINT GEN,DATA
+         YREGS                     Do register equates.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Prolog - Get private and common storage areas and set up.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         BAKR  R14,0                Save caller env.
+         LR    R12,R15              Load base reg.
+         USING RMTLOG,R12           Addressability.
+         MODID ,                    Eyecatcher.
+         LR    R2,R1                Save R1 contents.
+         STORAGE OBTAIN,LENGTH=DYNL Obtain private work area.
+         LR    R13,R1               Load base reg.
+         USING DATD,R13             DSECT addressability
+         MVC   4(4,R13),=C'F1SA'    Indicate Fmt1 save area.
+         STORAGE OBTAIN,LENGTH=RLCOMML,LOC=24 Common storage area.
+         LR    R11,R1                   Addressability to common area.
+         USING RLCOMM,R11               "
+         ST    R2,R1SAVE            Save R1 contents.
+         LR    R1,R2                Get original R1 for CPPL/PUTLINE.
+         BAL   R14,SETUP            Set up.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Set up for ECB for console messages and console alerts.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         LA    R1,ECBMSG           -> ECB for console messages.
+         ST    R1,AECBMSG          Store ECB ptr in ECB list.
+         LA    R1,ECBALRT          -> ECB for cosole ALERT.
+         ST    R1,AECBALRT         Store ECB ptr in ECB list.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Set up for CIB for MODIFY (F) and STOP (P) commands.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         LA    R9,COMADDR          -> com area.
+         EXTRACT (R9),FIELDS=COMM,  extract the com area               X
+               MF=(E,EXTRACT)
+         L     R9,COMADDR          -> com area.
+         USING COM,R9              Use R9 as base rweg for com area.
+         ICM   R7,B'1111',COMCIBPT get address of the CIB
+         BZ    NOCIB               no start CIB
+         BAL   R14,DOCIB           process the CIB
+NOCIB    DS    0H
+         CLI   DONE,1              STOP issued?
+         BE    EXIT                Yes, exit.
+         QEDIT ORIGIN=COMCIBPT,                                        X
+               CIBCTR=1            Set modify limit to 1.
+         L     R1,COMECBPT         -> com ecb.
+         O     R1,=X'80000000'     Set high bit - last ecb in list.
+         ST    R1,AECBMOD          Put addr of modify ECB in ECB list.
+*---------------------------------------------------------------------*
+* Call RLINIT1 routine to:                                            *
+* - Read, parse and validate PARMS file.                              *
+*---------------------------------------------------------------------*
+RLINIT1  CALL  RLINIT1             Call init1 routine.
+         CLI   CC,0                Successful?
+         BNE   EXIT                No, exit.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Get extended MCS console, and start capturing messages.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         BAL   R14,GETCONS         Get extended MCS console.
+*---------------------------------------------------------------------*
+* Call RLINIT2 routine to:                                            *
+* - Do hostname lookup on server name.                                *
+* - Other setup tasks.                                                *
+*---------------------------------------------------------------------*
+RLINIT2A DS    0H
+         LA    R1,STARTIN2         -> Msg - Starting init phase 2.
+         BAL   R14,MSG             Display message.
+RLINIT2B DS    0H
+         CALL  RLINIT2             Call init routine.
+         CLI   CC,0                Successful?
+         BE    LOOP0               Yes, start processing.
+         TM    FLAG,FRETRMSG       No - was retry message sent already?
+         BO    NORETRYM            Don't reissue message
+         LA    R1,MRETRYC          -> Msg - Retrying connection.
+         BAL   R14,MSG             Display message.
+         OI    FLAG,FRETRMSG       Say we've already
+NORETRYM DS    0H
+         STIMER WAIT,DINTVL=RETRYINT Wait a spell.
+*        BAL   R14,DOCIB           Check for STOP command entered.
+         BAL   R14,CKSTOP          Check for STOP command entered.
+         CLI   DONE,1              STOP command entered?
+         BE    EXIT                Yes, leave.
+         CALL  RECON               Try to reconnect.
+         B     RLINIT2B            Try again.
+*---------------------------------------------------------------------*
+* Main Loop:                                                          *
+* Wait on a list of ECBs, and go do appropriate things when one of    *
+* the ECBs is posted.                                                 *
+*---------------------------------------------------------------------*
+LOOP0    DS    0H
+         LA    R1,RECRDING         -> Msg.
+         BAL   R14,MSG             Display message.
+LOOP     DS    0H
+         NI    FLAG,X'FF'-FRETRMSG Turn off retry message flag.
+         CLI   DONE,1              Done flag set?
+         BE    RLCLOS              Yes, release storage and exit.
+WAIT     DS    0H
+         WAIT  ECBLIST=ECBS        Wait for ECB to be posted.
+         L     R1,ECBMSG           Load message ECB.
+         N     R1,=X'40000000'     Check for ECB post.
+         BZ    CKALRT              Not posted, check next ECB.
+         XC    ECBMSG,ECBMSG       Clear ECB, and...
+         BAL   R14,GETMSGS         Get messages.
+CKALRT   DS    0H
+         L     R1,ECBALRT          Load alert ecb
+         N     R1,=X'40000000'     Check for ECB post.
+         BZ    CKCIB               Not posted, check next.
+         XC    ECBALRT,ECBALRT     Clear ECB.
+         BAL   R14,DOALERT         Do console alert processing.
+CKCIB    DS    0H
+         ICM   R1,B'1111',COMCIBPT Get CIB pointer.
+         BZ    LOOP                No CIB, back to main loop.
+         BAL   R14,DOCIB           Process CIB.
+         B     LOOP                Back to main loop
+*---------------------------------------------------------------------*
+* Call close routine to:                                              *
+* - Close socket.                                                     *
+* - Other cleanup tasks.                                              *
+*---------------------------------------------------------------------*
+RLCLOS   DS    0H
+         CALL  RLCLOS              Call shutdown routine.
+*---------------------------------------------------------------------*
+* Exit - Release storage and return to caller.                        *
+*---------------------------------------------------------------------*
+EXIT     DS    0H
+         BAL   R14,DEACT           Deactivate console.
+         STORAGE RELEASE,LENGTH=RLCOMML,ADDR=(11) Release common strg.
+         LR    R1,R13
+         STORAGE RELEASE,LENGTH=DYNL,ADDR=(1)
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*  MSG - WTO a message, and write it to SYSPRINT if open.             *
+*---------------------------------------------------------------------*
+MSG      DS    0H
+         BAKR  R14,0               Save callers environment.
+         MVC   WTOPL,WTOPLM        Set up parm list.
+         LR    R2,R1               Point R2 to msg text passed in R1.
+         WTO   TEXT=(R2),          WTO the message.                    X
+               MF=(E,WTOPL)
+         CLI   SYSPOK,C'Y'         OK to write to SYSPRINT?
+         BNE   NOSYSP0             No, branch around.
+         MVC   BUFFER,BLANKS       Clear message buffer.
+         LA    R4,BUFFER           -> buffer.
+         SR    R5,R5               Clear reg.
+         LH    R5,0(R2)            Len of MVCL.
+         LR    R7,R5               Len of MVCL.
+         LA    R8,2(R2)            -> message text.
+         MVCL  R4,R8
+         PUT   GTEXTOUT,BUFFER     Write data to SYSPRINT.
+NOSYSP0  DS    0H
+         PR                        Return to caller.
+*
+*---------------------------------------------------------------------*
+* Write data to SYSPRINT.                                             *
+*---------------------------------------------------------------------*
+PUTLINE  DS    0H
+         BAKR  R14,0               Save callers environment.
+         CLI   SYSPOK,C'Y'         OK to write to SYSPRINT?
+         BNE   NOSYSP1             No, branch around.
+         PUT   GTEXTOUT,BUFFER     Write data to SYSPRINT.
+NOSYSP1  DS    0H
+         PR
+*
+*---------------------------------------------------------------------*
+* Console ALERT processing.  Called by ALERT ECB.                     *
+* Display a message explaining what happened.                         *
+*---------------------------------------------------------------------*
+DOALERT  DS    0H
+         BAKR  R14,0               Save caller's environment.
+         SAC   512                 Go AR mode.
+         SYSSTATE ASCENV=AR        Tell macros the mode.
+         L     R2,CSA              Load address of the status area
+         LAM   R2,R2,CSAALET       Get ALET for status area
+         USING MCSCSA,R2           Addressability
+         MVC   XCSCQSTA,MCSCQSTA   Copy status bytes.
+         SAC   0                   Go Primary mode.
+         SYSSTATE ASCENV=P         Tell macros the mode.
+ACSCMLIM DS    0H
+         CLI   MCSCMLIM,1          Memory limit?
+         BZ    ACSCDLIM            No, check next.
+         LA    R1,ZCSCMLIM         -> Msg.
+         BAL   R14,MSG             Display it.
+         B     DOALERT0            Done.
+ACSCDLIM DS    0H
+         CLI   MCSCDLIM,1          Queue depth limit?
+         BZ    ACSCINTR            No, check next.
+         LA    R1,ZCSCDLIM         -> Msg.
+         BAL   R14,MSG             Display it.
+         B     DOALERT0            Done.
+ACSCINTR DS    0H
+         CLI   MCSCINTR,1          Queue depth limit?
+         BZ    ACSCALRT            No, check next.
+         LA    R1,ZCSCINTR         -> Msg.
+         BAL   R14,MSG             Display it.
+         B     DOALERT0            Done.
+ACSCALRT DS    0H
+         CLI   MCSCALRT,1          Queue depth limit?
+         BZ    DOALERT0            No, check next.
+         LA    R1,ZCSCALRT         -> Msg.
+         BAL   R14,MSG             Display it.
+DOALERT0 DS    0H
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+* GETMSGS - This routine is entered when the msg ECB is posted.       *
+* ACSMODE=Primary on entry.                                           *
+* - Issue MCSOPMSG to retrieve MDB.                                   *
+* - Parse the MDB for general, control and text objects.              *
+*---------------------------------------------------------------------*
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+GETMSGS  DS    0H
+         BAKR  R14,0               Save regs.
+MSGLP    DS    0H                  Top of message loop.
+         ICM   R8,B'1111',CNID     Get console ID.
+         BZ    GETMSGX             Leave if CNID is zeros.
+         SAC   0                   Set primary mode for modeset.
+         MODESET MF=(E,SUP)        Go supervisor mode.
+         SAC     512               Go AR mode for MCSOPMSG.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+         MCSOPMSG REQUEST=GETMSG,  Get an MDB.                         X
+               NAME=CNAME,         Specify our console name.           X
+               RTNCODE=RC,         Save retncode here.                 X
+               RSNCODE=RSN,        Save rsn code here.                 X
+               MF=(E,MCSOPMPL)
+         LAE   R8,0(0,R1)          Get MDB address in AR/GPR 8.
+         USING MDB,R8              Addressability to the MDB.
+         SAC   0                   Go primary mode for modeset.
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         MODESET MF=(E,PROB)       Go problem mode.
+         SAC   512                 Back to AR mode.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+         XC    MDBFLAG,MDBFLAG     Clear my MDB processing flag.
+         CLC   RC,=F'8'            Get MDB successful?
+         BL    MDBOK               Yes, keep going.
+GETMSGX  DS    0H
+         PR
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* MDB was retrieved.  Parse it.  AR/GPR 8 -> MDB.                     *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+MDBOK    DS    0H
+         LR    R5,R8               -> MDB.
+         AH    R5,MDBLEN           Point to end of MDB.
+         LR    R6,R8               -> MDB.
+         LA    R8,MDBHLEN(R8)      -> first object in MDB.
+OBJLP    DS    0H
+         LH    R3,MDBTYPE          Get MDB object type in reg.
+         C     R3,=A(MDBGOBJ)      Is it GEN type?
+         BNE   NOTGO               No, check for other types.
+         TM    MDBFLAG,MDBFGO      Was GEN object already found?
+         BO    NXTOBJ              Yes, then skip this object.
+         BAL   R14,FNDMDBG         No, process this one as GEN obj.
+         B     NXTOBJ              Now go on to next object.
+NOTGO    DS    0H                  Not GEN - Check next.
+         C     R3,=A(MDBCOBJ)      CTL object?
+         BNE   NOTCO               No, check next.
+         TM    MDBFLAG,MDBFCO      See if already did CTL object.
+         BO    NXTOBJ              Yes, then skip this object.
+         BAL   R14,FNDMDBC         No, process this as the CTL obj.
+         B     NXTOBJ              Go index to next object.
+NOTCO    DS    0H                  Not CTL object.
+NXTOBJ   DS    0H
+         TM    MDBFLAG,MDBFGO+MDBFCO GEN & CTL obects found?
+         BO    FNDTXT             Yes, go find text objects now.
+         AH    R8,MDBLEN          -> next object.
+         CR    R8,R5              Are we past the end of MDB?
+         BL    OBJLP              No, get next object.
+         B     MSGLP              Yes, must be missing objs.  Skip it.
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*                                                                     *
+*  FNDTXT:   ENTRY VIA BRANCH (NOT A SUBROUTINE)                      *
+*  Function: Process all text objects in all MDBs for this message.   *
+*            Text objects are always ordered, but it cannot be        *
+*            assumed that they are contiguous.                        *
+*  Operation:                                                         *
+*      find end of MDB                                                *
+*      get pointer to next MDB in message                             *
+*      loop through MDBs                                              *
+*         loop through objects                                        *
+*             when text object                                        *
+*               call GOTMDBT to process text object                   *
+*             otherwise ignore object                                 *
+*           skip to next object                                       *
+*             add object length                                       *
+*             if end of MDB, move to next MDB                         *
+*                                                                     *
+*---------------------------------------------------------------------*
+FNDTXT   DS    0H
+         LR    R8,R6               Set R8 back to start of MDB
+TXTLP    DS    0H
+         LR    R5,R8               Calc end of mbd in R5
+         AH    R5,MDBLEN           Start+mdblen in header
+         LAE   R6,0(0,R8)          Calc prefix address in R6
+         SH    R6,=AL2(MDBPLNNO)   Prefix=start-prefix length
+         USING MDBPRFX,R6          Get addressability
+         L     R6,MDBPNEXT         Get forward pointer in R6
+         DROP  R6                  R6 no longer base for prefix
+         LA    R8,MDBHLEN(R8)      Bump to 1st object
+TOBJLP   DS    0H                  Loop through the objects.
+         LH    R3,MDBTYPE          Get MDB type.
+         C     R3,=A(MDBTOBJ)      Check for text object.
+         BNE   NOTTXT              Not text object.
+         BAL   R14,FNDMDBT         Process text object
+NOTTXT   DS    0H
+         AH    R8,MDBLEN           Bump to next object
+         CR    R8,R5               See if this is the end
+         BL    TOBJLP              No, get another object
+         LTR   R6,R6               Check for more MDBs for message
+         BZ    MSGLP               Done with message
+         LR    R8,R6               Next mdb
+         B     TXTLP               Process the mdb
+         DROP  R8
+*---------------------------------------------------------------------*
+*                                                                     *
+*  FNDMDBG:  BRANCH ENTERED, ASCMODE=AR, R8=ADDR(general object)      *
+*  Function: process MDB general object                               *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+FNDMDBG  DS    0H
+         BAKR  R14,0               Save callers environment.
+         USING MDBG,R8             Addressability to MDB gen object.
+         OI    MDBFLAG,MDBFGO      Set bit saying gen object found.
+         MVC   TIMEMDB,MDBGTIMH    Save timestamp.
+         MVC   DATEMDB,MDBGDSTP    Save date stamp.
+*        SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+*        SAC   0                   Go PRIMARY mode.
+         PR
+         DROP  R8
+*---------------------------------------------------------------------*
+*                                                                     *
+*  FNDMDBC:  BRANCH ENTERED, ASCMODE=AR, R8=ADDR(control object)      *
+*  Function: process MDB control object                               *
+*                                                                     *
+*---------------------------------------------------------------------*
+FNDMDBC  DS     0H
+         BAKR  R14,0               Save callers environment.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+         USING MDBSCP,R8           Addressability to ctl prog object.
+         CLC   MDBCPNAM,=C'MVS '   Confirm this is an MVS object.
+         BNE   FNDCEX              It's not, so leave now.
+         MVC   JOBNMDB,MDBCOJBN    Save jobname from MDBC.
+         OI    MDBFLAG,MDBFCO      Set flag saying cntl object found.
+         LH    R1,MDBCTOFF2        Get offset to text.
+         ST    R1,TXTOFF           Save for retrieving text.
+FNDCEX   DS    0H
+         PR
+         DROP  R8
+*---------------------------------------------------------------------*
+*                                                                     *
+*  FNDMDBT:  BRANCH ENTERED, ASCMODE=AR, R8=ADDR(text object)         *
+*  Function: process MDB text objects                                 *
+*  Operation:                                                         *
+*      Addressability to text object.                                 *
+*      BAL to routine to select or reject this text record.           *
+*      If accepted, move text to buffer for RLWRITE.                  *
+*      Call RLWRITE to write record as remote log record.             *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+FNDMDBT  DS    0H
+         BAKR  R14,0               Save callers environment.
+         SAC   512                 Set AR mode.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+         USING MDBT,R8             Addressability to text object.
+         SR    R1,R1               Clear reg.
+         LH    R1,MDBTLEN          Get text object length.
+         S     R1,=A(MDBTMSGT-MDBTLEN) Subtract non-text size.
+         S     R1,TXTOFF           Minus offset to text.
+         C     R1,=A(L'BUFFER2)    Make sure its not too long for buf.
+         BNH   GOTT1               Ok.
+         L     R1,=A(L'BUFFER2)    Not ok, truncate at buf length.
+GOTT1    DS    0H
+         ST    R1,BUFFERL          Store length of data.
+         LA    R4,BUFFER2          -> buffer.
+         LR    R3,R1               length
+         LR    R5,R1               length
+         LAE   R2,MDBTMSGT         Get address of text
+         A     R2,TXTOFF           Bump past prefix info
+         MVCL  R4,R2               Move data from data space.
+         SAC   0                   Set primary mode.
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         L     R9,RETRIES          Load number of retries in reg.
+WRITELP  DS    0H
+         CALL  RLWRITE,(BUFFER2,BUFFERL),VL,MF=(E,PARMLST)
+         CLI   CC,X'00'            Write OK?
+         BE    MDBTRTN             Yes, we're done.
+*---
+* Write failed.  Check for a CIB (Modify, stop) and process that
+* if present.  Then wait for RETRYINT, and retry the write.
+* NOTE: Consider changing code to add a wait ECB to the ECB chain,
+* rather than doing the wait here outside the ECB loop.
+*---
+*        BAL   R14,DOCIB
+         BAL   R14,CKSTOP
+         CLI   DONE,1
+         BE    RLCLOS
+WRRETRY  DS    0H
+         STIMER WAIT,DINTVL=RETRYINT Wait for RETRYINT.
+         CLC   ERRNO,=F'0'         Non zero ERRNO?
+         BE    ERRNOZ              No.
+         CALL  RECON
+ERRNOZ   DS    0H
+         BCT   R9,WRITELP
+         NC    RETRIES,RETRIES     Is RETRIES=0?
+         BZ    WRITELP             Yes, infinite loop.
+MDBTRTN  DS    0H
+         PR
+         DROP  R8
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* CHKSTOP:                                                            *
+* Check CIB for STOP command.  This routine is called for pieces of   *
+* code that are outside of the main ECB loop.  This means anywhere    *
+* that an STIMER is set to retry a failed operation.                  *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+CKSTOP   DS    0H
+         BAKR  14,0                Save caller's environment.
+         L     R9,COMADDR          -> com area.
+         USING COM,R9              Use R9 as base reg for com area.
+         ICM   R7,B'1111',COMCIBPT Try to get a CIB pointer.
+         BZ    CKSTOP0             No CIB, so don't process.
+         USING CIB,R7              R7 -> CIB
+         CLI   CIBVERB,CIBSTOP     Check for stop CIB
+         BNE   CKSTOP0             If stop command, then stop.
+         MVI   DONE,1              Set flag to done.
+CKSTOP0  DS    0H
+         CLI   CIBVERB,CIBMODFY    Check for modify
+         BNE   CKSTOP00            No, we're done.
+         LH    R3,CIBDATLN         get text length in R3
+         C     R3,=A(5)            Cmd len = 5?
+         BL    NOTRESU0            No, too short.
+         CLC   =C'RESUME',CIBDATA  RESUME command?
+         BNE   NOTRESU0            No, look at next.
+         BAL   R14,RESUMECN        Yes, go do MCSOPMSG RESUME.
+NOTRESU0 DS    0H
+CKSTOP00 DS    0H
+         DROP  R7                  Drop Reg.
+         QEDIT ORIGIN=COMCIBPT,    We're done with this CIB. Free it.  X
+               BLOCK=(R7)
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* Setup:                                                              *
+* Set up storage for macro models.                                    *
+* Set up com area for modify, stop, etc.                              *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+SETUP    DS    0H
+         BAKR  R14,0               Save regs.
+         MVI   DONE,0              Init flag.
+         LA    R2,MACROS           -> MACRO storage. (tgt of MVCL)
+         LA    R3,MACROSL          Get length of move.
+         LA    R5,MACROSL          Get length of move.
+         LA    R4,MACROSM          -> MACRO models. (src of MVCL)
+         MVCL  R2,R4               Populate all MACRO storage.
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* DOCIB: Process CIB when COM ECB is posted.                          *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+DOCIB    DS    0H
+         BAKR  R14,0               Save callers environment.
+CIBLOOP  DS    0H
+         ICM   R7,B'1111',COMCIBPT -> CIB.
+         BNZ   CHEKCIB             If it's there then process it.
+         USING CIB,R7              CIB addressed by R7.
+         PR                        If not, then return to caller.
+CHEKCIB  DS    0H                  Check for STOP command.
+*        WTO   'IN DOCIB - DATA AREAS:'
+         CLI   CIBVERB,CIBSTOP     Check for stop CIB
+         BNE   CKSTART             No, check next.
+         MVI   DONE,1              Flag for done.
+         B     DELCIB              Now delete this CIB.
+CKSTART  DS    0H
+*        CLI   CIBVERB,CIBSTART    Check for start CIB
+*        BNE   CKDATA              CIB not used by this prog
+         CLI   CIBVERB,CIBMODFY    Check for modify
+         BNE   DELCIB              No, we're done.
+         LH    R3,CIBDATLN         get text length in R3
+         C     R3,=A(5)            Cmd len = 5?
+         BL    NOTRESUM            No, too short.
+         CLC   =C'RESUME',CIBDATA  RESUME command?
+         BNE   NOTRESUM            No, look at next.
+         BAL   R14,RESUMECN        Yes, go do MCSOPMSG RESUME.
+NOTRESUM DS    0H
+*        LH    R3,CIBDATLN         get text length in R3
+*        C     R3,=A(L'CMDACT)     check cmd length
+DELCIB   DS    0H
+         QEDIT ORIGIN=COMCIBPT,    We're done with this CIB. Free it.  X
+               BLOCK=(R7)
+         B     CIBLOOP             Check for more CIBs.
+*
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* GETCONS - Get MCS console.                                          *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+         SYSSTATE ASCENV=P         Tell macros primary mode
+GETCONS  DS    0H
+         BAKR  R14,0               Save caller's environment.
+         LA      R1,OPERPRM        Build operparm defaults.
+         USING   MCSOPPRM,R1       Map area.
+         XC      OPERPRM(MCSOPLEN),OPERPRM Clear operparm parm list.
+         MVI     MCSOAUTH,MCSOMSTR Set master authority.
+         MVI     MCSORCFL,MCSORCAL All route codes.
+         MVC     MCSOKEY,=C'RLOG    ' Set key.
+         OI      MCSOMISC,MCSOINTY
+         OI      MCSOMSC2,MCSOUNKY
+         OI      MCSOFLAG,MCSOVRDY Override RACF OPERCMDS settings.
+         OI      MCSOMISC,MCSOHDCY Specify hardcopy message set.
+         MVC     MCSOSTOR,SIZEH    Specify data space size (SIZE).
+         MODESET MF=(E,SUP)        Set supv move to activate console.
+         MCSOPER REQUEST=ACTIVATE, Activate the console.               X
+               QRESUME=QRESUMEN,   Resume percentage.                  X
+               ALERTPCT=ALERTPCN,  Alert percentage.                   X
+               QLIMIT=QLIMIT,      Message queue limit.                X
+               NAME=CNAME,         Cons name is in CNAME.              X
+               TERMNAME=CNAME,     Also use CNAME for termname.        X
+               OPERPARM=OPERPRM,   Use my OPERPARMS always, not RACF.  X
+               MSGDLVRY=FIFO,      FIFO message delivery.              X
+               MSGECB=ECBMSG,      ECB to be posted when msg queued.   X
+               ALERTECB=ECBALRT,   ECB to be posted when alert occurs. X
+               MCSCSA=CSA,         Returned status area address.       X
+               MCSCSAA=CSAALET,    Returned status area alet.          X
+               CONSID=CNID,        Returned console id.                X
+               RTNCODE=RC,         Store return code here.             X
+               RSNCODE=RSN,        Store reason code here.             X
+               MF=(E,MCSOPPL)
+         MODESET MF=(E,PROB)       Go back to PROBLEM state.
+         ICM   R15,15,RC           Get return code and set COND.
+         STC   R15,CC              Save return code.
+         BZ    $ACTOK              If non-zero, process error
+*ACTERR  DS    0H
+         LA    R1,ACTBAD           -> Msg.
+         BAL   R14,MSG             Display msg.
+         B     ACTEXIT
+$ACTOK   DS    0H
+         LA    R1,ACTOK            -> Msg.
+         BAL   R14,MSG             Display msg.
+ACTEXIT  DS    0H
+         PR                        Return to caller.
+ZQRESUME DC    X'20'
+ZALERTPC DC    X'30'
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+*  DEACT - Deactivate MCS console.                                   -*
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+DEACT    DS    0H
+         BAKR  R14,0               Save callers environment.
+         SAC   0                   Set primary mode.
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         ICM   R15,B'1111',CNID    Get CNID
+         BNZ   DODEACT             Non-zero, so do deact.
+         B     DACTRTN             Go return to caller.
+DODEACT  DS    0H
+         MODESET MF=(E,SUP)        Go supervisor mode.
+         MCSOPER REQUEST=DEACTIVATE,                                   X
+               NAME=CNAME,         Deactivate the console.             X
+               RTNCODE=RC,         Store return code here.             X
+               RSNCODE=RSN,        Store reason code here.             X
+               MF=(E,MCSOPPL)
+         MODESET MF=(E,PROB)       Go PROBLEM mode.
+         ICM   R15,15,RC           Get RC and set cond.
+         BNZ   DACTERR             Non zero, display error.
+         XC    CNID,CNID           Zero out cnid to indicate inactive.
+         LA    R1,DACTOK           -> deactivated message.
+         BAL   R14,MSG             Display message.
+         PR                        Return to caller.
+DACTERR  DS    0H
+         LA    R1,DACTBAD          Deactivate error.
+         BAL   R14,MSG             Show message.
+DACTRTN  DS    0H
+         MVC   BUFFER,=CL80'DEACT:::'
+         BAL   R14,PUTLINE
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* RESUME  - Resume message queuing.                                   *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+RESUMECN DS    0H
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         BAKR  R14,0               Save regs.
+         ICM   R8,B'1111',CNID     Get console ID.
+         BZ    RESUME00            Leave if CNID is zeros.
+         SAC   0                   Set primary mode for modeset.
+         LA    R1,MRESUME          -> Msg.
+         BAL   R14,MSG             Display it.
+         MODESET MF=(E,SUP)        Go supervisor mode.
+         SAC     512               Go AR mode for MCSOPMSG.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+         MCSOPMSG REQUEST=RESUME,  Get an MDB.                         X
+               NAME=CNAME,         Specify our console name.           X
+               RTNCODE=RC,         Save retncode here.                 X
+               RSNCODE=RSN,        Save rsn code here.                 X
+               MF=(E,MCSOPMPL)
+         SAC   0                   Go primary mode for modeset.
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         MODESET MF=(E,PROB)       Go problem mode.
+         SAC   512                 Back to AR mode.
+         SYSSTATE ASCENV=AR        Tell macros AR mode.
+RESUME00 DS    0H
+         PR
+*---------------------------------------------------------------------*
+* MACRO Models.  All models in this section are copied to working     *
+* storage in the section called: Macro Working Storage.  This is to   *
+* enable this program to be reentrant.  The model section is copied   *
+* to working storage by the SETUP subroutine at the startup of this   *
+* program.                                                            *
+*---------------------------------------------------------------------*
+         CNOP  0,4
+MACROSM  DS    0H
+*-
+EXTRACTM EXTRACT MF=L              EXTRACT parameter list.
+EXTRACTL EQU *-EXTRACTM
+*
+SUPM     MODESET MODE=SUP,MF=L     MODESET parm list for sup state
+SUPL     EQU *-SUPM
+*
+SUP0M    MODESET MODE=SUP,                                             X
+               KEY=ZERO,MF=L       MODESET parm list for sup, key 0
+SUP0L    EQU *-SUP0M
+PROBM    MODESET MODE=PROB,                                            X
+               KEY=NZERO,MF=L      MODESET parm list for problem state
+PROBL    EQU *-PROBM
+*-
+WTOPLM   WTO TEXT=,DESC=(7),MF=L   WTO parm list.
+WTOPLL   EQU *-WTOPLM
+*-
+MACROSL  EQU *-MACROSM             Length of all macro models.
+*
+*---------------------------------------------------------------------*
+* Messages (for WTO).
+*---------------------------------------------------------------------*
+SHUTTING DC  AL2(L'MSG0)
+MSG0     DC  C'RLG000I RMTLOG Starting shutdown.'
+NOTACT   DC  AL2(L'MSG2)
+MSG2     DC  C'RLG002I Console not deactivated, was not active.'
+ACTOK    DC  AL2(L'MSG3)
+MSG3     DC  C'RLG003I MCS console activated.'
+ACTBAD   DC  AL2(L'MSG4)
+MSG4     DC  C'RLG004I MCS Console failed to activate.'
+DACTOK   DC  AL2(L'MSG5)
+MSG5     DC  C'RLG005I MCS Console deactivated.'
+DACTBAD  DC  AL2(L'MSG6)
+MSG6     DC  C'RLG006I MCS Console deactivate failed.'
+MRETRYC  DC  AL2(L'MSG9)
+MSG9     DC  C'RLG009I Waiting for connection to syslog server.'
+MGETERR  DC  AL2(L'MSG10)
+MSG10    DC  C'RLG010I Error processing MDB.'
+RECRDING DC  AL2(L'MSG11)
+MSG11    DC  C'RLG011I RMTLOG is active.'
+MRESUME  DC  AL2(L'MSG12)
+MSG12    DC  C'RLG012I Issuing MCSOPMSG RESUME.'
+MALERT   DC  AL2(L'MSG15)
+MSG15    DC  C'RLG015I                                  '
+ZCSCMLIM DC  AL2(L'MSG16)
+MSG16    DC  C'RLG016I Message queueing stopped, memory limit.'
+ZCSCDLIM DC  AL2(L'MSG17)
+MSG17    DC  C'RLG017I Message queueing stopped, queue depth reached.'
+ZCSCINTR DC  AL2(L'MSG18)
+MSG18    DC  C'RLG018I Message queueing stopped, internal error.'
+ZCSCALRT DC  AL2(L'MSG18)
+MSG19    DC  C'RLG019I Message queueing stopped, alert percentage reachX
+               ed.'
+STARTIN2 DC     AL2(L'MSG20)
+MSG20    DC     C'RLG020I RMTLOG Starting initialization phase 2.'
+*
+         RLCOMM CONST
+*
+*---------------------------------------------------------------------*
+*   Private working storage.
+*---------------------------------------------------------------------*
+DATD     DSECT                     Dynamic area.
+SAVE     DS    18F                 Register save area.  Must be first
+*---
+TIMEDATE DS    4F
+DWORK    DS    D
+WRK      DS    CL8
+* BUFFERL  DS    F                Moved to common DSECT.
+BUFFER2  DS    CL255
+RRR      DS    18F
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+*--- ECB List - This is a list of pointers to ECBs. The WAIT macro ---*
+*--- works with all ECBs in this list.                             ---*
+*---------------------------------------------------------------------*
+*---v---v---v---v---v---v---v---v---v---v---v---v---v---v---v---v---v-*
+         CNOP  0,4
+ECBS     DS    0CL(ECBLEN)
+AECBMSG  DS    A                   -> ECB for console messages.
+AECBALRT DS    A                   -> ECB for ALERT.
+AECBMOD  DS    A                   -> ECB for MODIFY (STOP,etc).
+ECBLEN   EQU   *-AECBMOD
+*---
+*--- ECBs - These are the actual ECBs.
+*---
+ECBMSG   DS    F                   ECB for console message.
+ECBALRT  DS    F                   ECB for alert.
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+*--- End of ECB List and ECBs.                                        *
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+MCSPL    MCSOPER MF=(L,MCSOPPL)   MCSOPER parameter list
+MCSMPL   MCSOPMSG MF=(L,MCSOPMPL),PLISTVER=2 MCSOPMSG Parm List
+RC       DS    F                  Return code.
+RSN      DS    F                  Reason code.
+DONE     DS    C                  Flag - Set to '1' to signify exit.
+CSAALET  DS    F                  ALET (mcscsa)
+CSA      DS    A                  Addr (mcscsa)
+OPERPRM  DS    CL(MCSOPLEN)       OPERPARMs area
+TXTOFF   DS    F                  Offset to text area.
+MDBFLAG  DS    C                  MDB processing flags.
+MDBFGO   EQU   X'01'              Processed MDB general object.
+MDBFCO   EQU   X'02'              Processed MDB control prog object.
+COMADDR  DS    F                  Addr (comarea) from extract macro.
+XCSCQSTA DS    CL4                Status bytes for ALERTECB
+         ORG   XCSCQSTA
+XCSCMLIM DS    X                  Queuing Stopped by Memory Limit
+XCSCDLIM DS    X                  Queuing Stopped by Queue Depth Lim
+XCSCINTR DS    X                  Queuing Stopped by Internal Error
+XCSCALRT DS    X                  Queuing Reached Alert percentage
+*
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* MACRO working storage.  Each macro in this section should have a
+* corresponding model in the constants section.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         CNOP  0,4
+MACROS   DS    0H
+EXTRACT  DS    CL(EXTRACTL)        EXTRACT parameter list
+SUP      DS    CL(SUPL)            MODESET parm list.
+SUP0     DS    CL(SUP0L)           MODESET parm list.
+PROB     DS    CL(PROBL)           MODESET parm list.
+WTOPL    DS    CL(WTOPLL)          WTO parm list.
+* For dynamically built message.
+MSG15H   DS    AL2                 Fullword work area.
+MSG15W   DS    CL(L'MSG15+30)      Fullword work area.
+MSG15L   EQU   *-MSG15W
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* End of MACROS working storage
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+*---------------------------------------------------------------------*
+*   End on doubleword boundary.                                       *
+*---------------------------------------------------------------------*
+         DS    0D
+ENDDATD  EQU   *
+DYNL     EQU    *-DATD
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* DSECT mapping macros.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+*        DCBD    DSORG=QS
+         RLCOMM DSECT              Our common area, mapped by R11.
+         IEAVG132 ,                MDB prefix area.
+         IEAVM105 ,                MDB.
+         IEAVG131 ,                Console status area.
+         IEZVG111 ,                OPERPARM parameter area.
+COM      DSECT
+         IEZCOM   ,                COM area
+CIB      DSECT
+         IEZCIB   ,                CIB and CIBX
+         END   RMTLOG
+*---------------------------------------------------------------------*
+*   PUNCH the linkedit control statements here.                       *
+*---------------------------------------------------------------------*
+         PUNCH ' SETCODE  AC(1)        '
+         PUNCH ' ENTRY    RMTLOG       '
+         PUNCH ' NAME     RMTLOG(R)    '
+         END

@@ -1,0 +1,433 @@
+//SOMITCWT JOB (????????,????,1439,9999,9999),TAPESAVE-SOMITCW,
+//             CLASS=?,MSGCLASS=?,
+//             NOTIFY=SOMITCW,COND=(0,NE)
+//HLASMCL  EXEC HLASMCL,PARM.C=(RENT,OBJECT,NODECK,TERM),
+//             PARM.L='RENT,AC=1'
+//SYSLIB   DD  DISP=SHR,DSN=SYS1.MACLIB
+//         DD  DISP=SHR,DSN=????.SORC????
+PASS TITLE 'TAPESAVE - - - Load and saves scratch tape bit pattern'
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*     This program reads a binary bit pattern record
+*  that indicates which tape volumes are available
+*  scratch tapes.  If the record is already in the SQA
+*  for the volume range, the copy in the SQA is used.
+*  If no record is in the SQA for the volume range,
+*  this program will copy the record to the SQA and
+*  eventually delete any old records.
+*
+*  The record is kept in the SQA for other JOBs to pick
+*  scratch tapes or mark inuse tapes as scratch tapes.
+*  Exit IGXMSGEX picks scratch tapes and marks the SQA
+*  tape indicator as "tape in use" and program TAPESYNC
+*  marks SQA tape indicators as scratch again.
+*  To change from one scratch pool to another, just
+*  change the JCL to the new data set name, stop this
+*  program, and restart it.  The new tape bits will be
+*  read into SQA and the old one will be FREEMAINed in
+*  a minute or longer.  DDNAME is TAPEDATA.
+*
+*  This program then wakes up every minute and if the SQA
+*  record has been updated, it is written out to disk to
+*  overlay the disk copy.
+*
+*  Blame: somitcw@yahoo.com
+*
+*  Sample JCL:
+*
+* //TAPESAVE EXEC PGM=TAPESAVE,TIME=1439
+* //TAPEDATA DD  DISP=OLD,DSN=SYS1.TAPES.C00000.C99999
+* //* For testing, run as a JOB or STC with a
+* //* //SYSUDUMP DD SYSOUT=* DD statement.
+* //* SUBSYS of MSTR cannot have SYSOUT=anything
+*
+*  Sample start command:
+*
+* START TAPESAVE,SUB=MSTR
+* For SUB=MSTR, the data set must be in the master catalog.
+*
+*  Sample stop command:
+*
+* STOP TAPESAVE
+* STOP TAPESAVE may take a minute.
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE 1
+TAPESAVE CSECT ,
+TAPESAVE AMODE 24                 Addressing mode of 24 for EXCP
+TAPESAVE RMODE 24                 Residency mode of 24 because of AMODE
+         USING *,R15              Set temporary base register
+         SAVE  (14,12),,'TAPESAVE.&SYSDATE..&SYSTIME' Save Registers
+         DROP  R15                Drop the temporary base register
+         LR    R12,R15            Load the program's base register
+         USING TAPESAVE,R12       Give the assembler the new base
+         LA    R0,SAVESIZE        Load work area size for GETMAIN
+         GETMAIN RU,LV=(0)        Get storage for work space
+         XC    0(CLEARSIZ,R1),0(R1)  Clear SAVEAREA in DSECT
+         ST    R1,8(,R13)         Connect old and new save areas
+         ST    R13,4(,R1)         Connect old and new save areas
+         LR    R13,R1             Connect old and new save areas
+         USING SAVEAREA,R13
+*    GETMAIN memory to read block.
+         GETMAIN RU,LOC=BELOW,LV=TAPELEN   Get 12524 byte TAPEBITS area
+         LR    R11,R1             Save address to read into
+*        USING TAPEBITS,R11       Indicate address of temp. TAPEBITS
+*    Fill in EXTRACT, DCB, IOB, and CCW fields
+         MVC   EXTRACT(DUMLEN),DUMEXT  Move EXTRACT MACRO list
+         EXTRACT COMM,'S',FIELDS=(COMM),MF=(E,EXTRACT)  Get COMM
+         MVC   TAPEDATA(DUMMYLEN),DUMMY   Copy DCB/IOB/SEEK template
+         LA    R1,ECB             Load address of the Event Control Blk
+         ST    R1,IOBECBA         Store ECB address in Input/Output Blk
+         LA    R1,CCWIN           Load address of Channel Command Words
+         ST    R1,IOBCCWA         Store read CCW address in IOB
+         STCM  R1,B'0111',INTIC   Store input TIC to address
+         LA    R1,SEARCH          Load Search-id-equal disk address
+         STCM  R1,B'0111',INSEARCH Store input CCHHR search address
+         STCM  R1,B'0111',OUTSRCH Store output CCHHR search address
+         STCM  R11,B'0111',INDATA Store input buffer address
+*    Open TAPEDATA DCB
+         MVI   OPENLIST,X'80'     Set OPEN/CLOSE parm to open one DCB
+         OPEN  (TAPEDATA,UPDAT),MF=(E,OPENLIST)  Open TAPEDATA DCB
+*    Fill in SEEK fields
+         LA    R1,TAPEDATA        Load address of the TAPEDATA DCB
+         ST    R1,IOBDCBA         Store addr of the TAPEDATA DCB in IOB
+         USING IHADCB,R1          Tie DCB with DCB DSECT with R1
+         L     R1,DCBDEBAD        Load address of Data Extent Block
+         DROP  R1                 R1 has IEZDEB address now
+         MVC   CCHH,38(R1)        Move Cylinder-Head from DEBSTRCC&HH
+         MVI   R,X'1'             Set record number to search and read
+*    Read block
+         EXCP  IOB                Read a block
+         WAIT  ECB=ECB            Wait for read to complete
+*    See if CVTUSER create needed
+NEWSQA   DS    0H
+         MODESET KEY=ZERO         Need KEY zero to replace CVTUSER
+         L     R10,16             Load the address of the CVT
+         USING CVT,R10            Give assembler the CVT address
+         ICM   R9,B'1111',CVTUSER   Address CVTUSER points to
+         BNZ   GOTUSER            If CVTUSER, skip getting a new one
+*    Create CVTUSER if needed ( GETMAIN, init, chain )
+   GETMAIN RU,LV=XCVTUSIZ,LOC=BELOW,SP=245 Get 48 byte CVTUSER SQA area
+*                                 CSA would make more sense than SQA,
+*                                 but someday I may need fixed storage
+         LR    R9,R1              Save address of storage gotten
+         USING XCVTUSER,R9        Tell assembler about dsect
+         XC    XCVTUSER(XCVTUSIZ),XCVTUSER  Clear CVTUSER pointed area
+         MVC   XCVTUEYE,CCVTUSER  Move 'CVTUSERn' to CVTUSER area
+         SLR   R8,R8              Clear a register for the 'CS' inst.
+* CS - If R8 and CVTUSER are equal, then R9 is stored in CVTUSER
+* CS - If R8 and CVTUSER are not equal, then CVTUSER is loaded to R8
+         CS    R8,R9,CVTUSER      Set CVTUSER address in CVT
+         DROP  R10                Don't need pointer to CVT anymore
+         BE    GOTUSER            Got CVTUSER now, go back to main line
+* Some other program put CVTUSER in CVT first, free the new one
+         FREEMAIN RU,LV=XCVTUSIZ,A=(R9),SP=245   Free extra SQA storage
+         LR    R9,R8              Use the first CVTUSER area address
+*        B     GOTUSER            Got CVTUSER now, now check it
+GOTUSER  DS    0H
+         MODESET KEY=NZERO        Go back to key 8
+         CLC   XCVTUEYE,CCVTUSER  See if the CVTUSER area is mine
+         BNE   BADUSER            If someone else has CVTUSER, go tell
+         L     R9,XCVTTAPE        Load address of the tape bits
+         USING TAPEBITS,R9        Indicate memory TAPEBITS pointer
+*
+* R11=block-read-from-disk
+* R9=TAPEBITS-in-memory or zero
+*
+         CLI   ECB,X'7F'          See if a good read
+         BNE   CHECKSQA           Not good, go see if memory data okay
+         CLC   CTAPEBIT,0(R11)    See if a valid input record
+         BNE   CHECKSQA           Disk copy not valid, go check SQA
+* disk copy was read okay and appears valid
+         CLC   CTAPEBIT,TAPEEYE   See if SQA memory copy okay
+         BNE   REPLSQA            SQA BITS bad, go replace with disk
+         CLC   TAPECHAR,TAPECHAR-TAPEEYE(R11)  See is disk/SQA same?
+         BNE   REPLSQA            New scratch pool, go replace SQA
+         B     FREEDISK           Go to free disk input buffer
+*
+CHECKSQA DS    0H
+* Disk copy had read error, can memory copy be used?
+         CLC   CTAPEBIT,TAPEEYE   See if there is a SQA copy of bits
+         BNE   READERR            Neither copy good, go abend
+*
+REPLSQA  DS    0H
+     GETMAIN RU,LV=TAPELEN,LOC=BELOW,SP=245  Get new TAPE bits SQA area
+         LR    R8,R1              Save address of new SQA TAPEBITS
+         LR    R2,R1              Load MVCL address of new SQA TAPEBITS
+         L     R3,FTAPELEN        Load length to move to ( 12524 )
+         LR    R4,R11             Load MVCL address of disk TAPEBITS
+         L     R5,FTAPELEN        Load length to move from ( 12524 )
+         MODESET KEY=ZERO         Need KEY zero to update XCVTUSER
+         MVCL  R2,R4              Move disk copy of TAPEBITS to SQA
+CSAGAIN  DS    0H
+         L     R10,16             Load address of CVT
+         USING CVT,R10            Give assembler the CVT address
+         L     R10,CVTUSER        Load address of the CVT user area
+         USING XCVTUSER,R10       Give assembler the XCVTUSER pointer
+* CS - If R9 and XCVTTAPE are equal, then R8 is stored in XCVTTAPE
+* CS - If R9 and XCVTTAPE are not equal, then XCVTTAPE is loaded to R9
+         CS    R9,R8,XCVTTAPE     Store new SQA address
+         DROP  R10                Don't need XCVTUSER address anymore
+         BNE   CSAGAIN            CS didn't store, go try again
+         ST    R9,TAPEOLD-TAPEBITS(,R8)  Save old SQA address
+         DROP  R9                 TAPEBITS will switch to R10 later
+         MODESET KEY=NZERO        Switch back to key 8
+FREEDISK DS    0H
+         FREEMAIN RU,LV=TAPELEN,A=(R11) Free disk input buffer
+         LA    R1,CCWOUT          Load address of Channel Command Words
+         ST    R1,IOBCCWA         Store rewrite CCW address in IOB
+         STCM  R1,B'0111',OUTTIC  Store output TIC to address
+         MVI   R,X'1'             Change record number for write
+*
+*
+WAITLOOP DS    0H
+         STIMER WAIT,BINTVL=MINUTE Wait for 6000 hundredth of seconds
+         L     R10,16             Load address of CVT
+         USING CVT,R10            Give assembler the CVT address
+         L     R10,CVTUSER        Load address of the CVT user area
+         USING XCVTUSER,R10       Give assembler the XCVTUSER pointer
+         L     R10,XCVTTAPE       Load address of tape bits
+         USING TAPEBITS,R10       Tie TAPE bits DSECT to register 10
+         CLI   TAPEUPD,0          Any bits updated since last rewrite
+         BZ    FREEOLD            No update, no rewrite, check for FREE
+         STCM  R10,B'0111',OUTDATA  Store output buffer address
+         MODESET KEY=ZERO         Need KEY zero to update XCVTUSER
+         MVI   TAPEUPD,0          Clear bits updated status
+         MODESET KEY=NZERO        Switch back to normal protection key
+         EXCP  IOB                Go rewrite
+         WAIT  ECB=ECB            Wait for rewrite to complete
+         CLI   ECB,X'7F'          See if a good rewrite
+         BNE   WRITEERR           Not good, go abend
+FREEOLD  DS    0H
+         LR    R9,R10             Save TAPEBITS address
+         LR    R1,R10             Save TAPEBITS address
+FINDEND  DS    0H
+         LR    R2,R10             Save address of on back in chain
+         LR    R10,R1             Set address of place in chain
+         ICM   R1,B'1111',TAPEOLD Find end of chain
+         BNZ   FINDEND            Still more old SQA tape bits blocks
+         CLR   R9,R10             See if real SQA is the only copy
+         BE    CHKSTOP            Don't free only copy
+         ST    R1,TAPEOLD-TAPEBITS(,R2) Clear pointer to block to free
+         FREEMAIN RU,LV=TAPELEN,A=(R10),SP=245  Free old SQA bits
+CHKSTOP  DS    0H
+         L     R10,COMM            Load address of Communication Area
+* communications area (mapped by IEZCOM)
+         USING COMLIST,R10        Tie IEZCOM to R10
+         ICM   R9,B'1111',COMCIBPT Load address of Command Input Buffer
+         BZ    WAITLOOP           No CIB command, go back to wait
+         DROP  R10                Don't need COMM addressibilty anymore
+         USING CIBLIST,R9         Tie IEZCIB to R9
+CHECKCIB DS    0H
+         CLI   CIBVERB,CIBSTOP    See if operator did "STOP TAPESAVE"
+         BE    EOJ                Operator issue STOP, so end-of-job
+         ICM   R9,B'1111',CIBNEXT See if another CIB
+         DROP  R9                 Don't need CIB addressibilty anymore
+         BNZ   CHECKCIB           Go check the next Command Input Buff
+         B     WAITLOOP           No STOP command, go back to wait
+*
+*
+EOJ      DS    0H
+         MVI   OPENLIST,X'80'     Set only one DCB to OPEN or CLOSE
+         CLOSE TAPEDATA,MF=(E,OPENLIST) Close a TAPEDATA DCB
+         LA    R0,SAVESIZE        Load work area size for FREEMAIN
+         LR    R1,R13             Save work area location for FREEMAIN
+         L     R13,4(,R13)        Restore caller's save area address
+         FREEMAIN RU,LV=(0),A=(1) Free work area's storage
+         RETURN (14,12),RC=(15)   Return to caller with FREEMAIN retcde
+*
+         SPACE 3
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*      Error routines
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+BADUSER  DS    0H
+         WTO   'Sub-System TAPESAVE found a bad CVTUSER area',         C
+               ROUTCDE=11
+         ABEND 1111,DUMP          Abend with a dump
+*
+READERR  DS    0H
+         WTO   'Sub-System TAPESAVE had a read error on TAPEDATA',     C
+               ROUTCDE=11
+         ABEND 1112,DUMP          Abend with a dump
+*
+WRITEERR DS    0H
+         MODESET KEY=ZERO         Need KEY zero to update XCVTUSER
+         OI    TAPEUPD-TAPEBITS(R10),1  Record didn't get written
+         MODESET KEY=NZERO        Switch back to normal protection key
+         WTO   'Sub-System TAPESAVE had a write error on TAPEDATA',    C
+               ROUTCDE=11
+         LM    R2,R3,IOBCSW       For debug
+         L     R4,ECB             For debug
+         ABEND 1113,DUMP          Abend with a dump
+*
+*
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*      Constants and model control blocks
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE 1
+* The X'1' is the DSECT version number
+CCVTUSER DC    CL7'CVTUSER',XL1'1' Constant to init and check CVTUSER
+CTAPEBIT DC    CL7'TAPEBIT',XL1'1' Constant to init and check TAPEBIT
+*
+MINUTE   DC    F'6000'            Wait time: 6000 hundredth of seconds
+FTAPELEN DC    AL4(TAPELEN)       Length of TAPEBITS DSECT in memory
+*
+*
+DUMEXT   EXTRACT *-*,'S',FIELDS=(COMM),MF=L  Model EXTRACT for COMM
+DUMLEN   EQU     *-DUMEXT         Calculate length of EXTRACT
+*
+*
+DUMMY    DS    0D                 I/O Template
+DUMDCB   DCB   DDNAME=TAPEDATA,   DDNAME of TAPEDATA                   C
+               MACRF=E,           MACRO reference                      C
+               DSORG=PS           Data Set Organization
+DCBLEN   EQU   *-DUMDCB           Length of the DCB
+DUMIOB   DS    0D                 IOB TO READ A COUNT FIELD
+         DC    XL4'40000000'      Command Chaining used
+         DC    A(*-*)             Address of the ECB
+         DC    D'0'               Channel Status Word
+         DC    A(*-*)             Address of the Channel Command Words
+         DC    A(*-*)             Address of the Data Control Block
+         DC    A(0)               IOB Restart
+         DC    XL4'0'             Flags and counters
+         DC    D'0'               Seek address MBBCCHHR (will fill in)
+DUMCCWI  CCW   X'31',*-*,X'40',5  Search for record to read
+         CCW   8,*-8,0,0          TIC back until search complete
+         CCW   X'06',*-*,0,12524  Read the DATA portion of the record
+DUMCCWO  CCW   X'31',*-*,X'40',5  Find record before one to rewrite
+         CCW   8,*-8,0,0          TIC back until search complete
+         CCW   X'05',*-*,0,12524  Rewrite the DATA of next record
+DUMMYLEN EQU   *-DUMMY            Size of I/O template
+*
+         SPACE 3
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*      DSECTs Follow
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE 1
+SAVEAREA DSECT ,
+         DS    9D                 Register save area
+*
+TIOT     DS    F                  Address of the Task I/O Table
+COMM     DS    F                  Address of the Communication area
+OPENLIST DS    F                  OPEN/CLOSE parameter list
+ECB      DS    F                  Event Control Block for DCB
+*
+CLEARSIZ EQU   *-SAVEAREA
+*
+*
+EXTRACT  DS    XL(DUMLEN)         EXTRACT list to get COMM
+*
+*
+* Do not insert code between here and SAVESIZE
+* A template will be copied on the following fields
+         DS    0D                 Align the following DCB, IOB, etc.
+TAPEDATA DS    XL(DCBLEN)         TAPEDATA DCB
+         DS    0D                 Align IOB to double word boundary
+IOB      DS    0XL32              Input and Output Block
+         DS    XL4                XL4'40000000' Command Chaining used
+IOBECBA  DS    A                  Address of Event Control Block
+IOBCSW   DS    D                  Channel Status Word
+IOBCCWA  DS    A                  Address of Channel Command Words
+IOBDCBA  DS    A                  Address of Data Control Block
+         DS    A                  IOB Restart
+         DS    XL4                Flags and counters
+IOBSEEK  DS    D                  Seek address
+SEARCH   EQU   IOBSEEK+3,5        Cylinder, head, and record to search
+CCHH     EQU   IOBSEEK+3,4        Cylinder and head to seek to
+CC       EQU   IOBSEEK+3,2        Cylinder to seek
+HHR      EQU   IOBSEEK+5,3        Track and record to search for
+HH       EQU   IOBSEEK+5,2        Track to seek to
+R        EQU   IOBSEEK+7,1        Record to search for
+CCWIN    DS    3D                 Input Channel Command Words
+INSEARCH EQU   CCWIN+01,3         Address of the search address
+INTIC    EQU   CCWIN+09,3         Address to TIC back to
+INDATA   EQU   CCWIN+17,3         Address to read DATA into
+CCWOUT   DS    3D                 Output Channel Command Words
+OUTSRCH  EQU   CCWOUT+01,3        Address of the search address
+OUTTIC   EQU   CCWOUT+09,3        Address to TIC back to
+OUTDATA  EQU   CCWOUT+17,3        Address to rewrite DATA from
+         SPACE 1
+SAVESIZE EQU   *-SAVEAREA
+*
+*
+         COPY  CVTUSER            User DSECT from ????.SORC????
+* XCVTUSER DSECT ,
+* XCVTUEYE DS    CL8              7 bytes of 'CVTUSER' and 1 byte X'01'
+* XCVTUVOL DS    XL6              VOLSER from message used by IEC507D
+*          DS    XL2              Space available for expansion
+* XCVTUTIM DS    XL6              CYYDDDHHMMSS Century, Year,Day, Hour,
+* *                               Minute, and Second, used by IOS000I
+*          DS    XL2              Space available for expansion
+* XCVTPSWD DS    F                ACF2 LGNIXIT anchor, used by SAVEPSWD
+* XCVTJOUR DS    F                DFHJC4508 Journal PRIM or SECO
+* XCVTTAPE DS    XL4              TAPE, TAPESAVE, TAPESYNC, & IGXMSGEX
+*          DS    XL12             Space available for expansion
+* XCVTUSIZ EQU   *-XCVTUSER       Length of area pointed to by CVTUSER
+*
+*
+TAPEBITS DSECT ,
+         COPY  TAPEBITS           Copy TAPEBITS DSECT
+* TAPEEYE  DS    D                DSECT eye-catcher CL7'TAPEBIT',XL1'1'
+* TAPEOLD  DS    A                Addr of old TAPEBITS record to delete
+* TAPESKIP DS    CL6              IEC512I tape vol ser to ignore
+* TAPEDISP DS    XL2              Last TAPES byte that had a free bit
+* TAPEHIGH DS    XL2              Displacement to return to zero
+* TAPEUPD  DS    XL1              Tape bits updated, need writing
+* TAPECHAR DS    CL1              First byte of tapes described next
+* TAPES    DS    XL12500          Bits for 100,000 tapes ?00000-?99999
+* TAPEBIT0 EQU   X'80'            First tape within a byte
+* TAPEBIT1 EQU   X'40'            Second tape within a byte
+* TAPEBIT2 EQU   X'20'            Third tape within a byte
+* TAPEBIT3 EQU   X'10'            Fourth tape within a byte
+* TAPEBIT4 EQU   X'08'            Fifth tape within a byte
+* TAPEBIT5 EQU   X'04'            Sixth tape within a byte
+* TAPEBIT6 EQU   X'02'            Seventh tape within a byte
+* TAPEBIT7 EQU   X'01'            Eighth tape within a byte
+* TAPELEN  EQU   *-TAPEEYE        Length of TAPEBITS data record
+*
+         DCBD  DSORG=PS,DEVD=DA   Data Control Block DSECT IHADCB
+*
+         CVT   DSECT=YES,LIST=YES Communication Vector Table
+*
+IEZCOM   DSECT ,
+         IEZCOM ,                 Communications area
+*
+CIBLIST  DSECT ,
+         IEZCIB ,                 Command Input Buffer
+*
+TAPESAVE CSECT ,
+         EJECT ,
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*     REGISTER EQUATES
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE
+R0       EQU   0                  Register equate for register 0
+R1       EQU   1                  Register equate for register 1
+R2       EQU   2                  Register equate for register 2
+R3       EQU   3                  Register equate for register 3
+R4       EQU   4                  Register equate for register 4
+R5       EQU   5                  Register equate for register 5
+R6       EQU   6                  Register equate for register 6
+R7       EQU   7                  Register equate for register 7
+R8       EQU   8                  Register equate for register 8
+R9       EQU   9                  Register equate for register 9
+R10      EQU   10                 Register equate for register 10
+R11      EQU   11                 Register equate for register 11
+R12      EQU   12                 Register equate for register 12
+R13      EQU   13                 Register equate for register 13
+R14      EQU   14                 Register equate for register 14
+R15      EQU   15                 Register equate for register 15
+         END   ,                  The end of the program
+//L.SYSLMOD DD DISP=SHR,DSN=????.LOAD????,SPACE=   ,
+//*          UNIT=3390,VOL=SER=------
+   NAME TSPESAVE

@@ -1,0 +1,657 @@
+/* REXX/370 */
+/*
+
+Function:
+       Builds a job to allocate data set(s) and VSAM objects definitions
+       for an exising data sets and objects.
+       This allocation job is useful to reallocate data set on the
+       target system when those transferred via ftp.
+
+Syntax:
+       DDL hlq ¢DCB(YES¦NO)! ¢SMS(YES¦NO¦ONLY)! ¢AMS(ALL¦VSAM)!
+
+(C) 2006-2015 Gregori Bliznets gbliznets@iba.by
+
+*/
+trace off
+address ISPEXEC
+'VGET (ZUSER ZENVIR ZAPPLID ZGUI ZTEMPF ZTEMPN BJC1 BJC2 BJC3 BJC4)'
+parse var zenvir 17 runmode 25
+if zgui <> ''
+then runmode = zgui
+keys = 'DCB SMS AMS'
+do i = 1 to words(keys)
+  call value word(keys,i), ''
+end i
+parse upper arg hlq parms
+do while parms <> ''
+  parse var parms parm parms
+  parse var parm key '(' val ')'
+  found = 0
+  do i = 1 to words(keys) while found = 0
+    if abbrev(key, word(keys,i))
+    then found = i
+  end i
+  if found = 0
+  then do
+    say '002T Invalid parameter: 'parm
+    rc = 16
+    signal quit
+    end
+  call value word(keys,found), val
+end
+
+if left(hlq,1) = "'" & right(hlq,1) = "'"
+then hlq = substr(hlq,2,length(hlq)-2)
+if hlq = ''
+then do
+  say '002T HLQ is missed'
+  rc = 16
+  signal quit
+  end
+if dcb = ''
+then dcb = 'YES'
+if wordpos(dcb, 'YES NO') = 0
+then do
+  say '002T Invalid parameter: DCB('dcb')'
+  rc = 16
+  signal quit
+  end
+if sms = ''
+then sms = 'YES'
+if wordpos(sms, 'YES NO ONLY') = 0
+then do
+  say '002T Invalid parameter: SMS('sms')'
+  rc = 16
+  signal quit
+  end
+if ams = ''
+then ams = 'ALL'
+if wordpos(ams, 'ALL VSAM') = 0
+then do
+  say '002T Invalid parameter: AMS('ams')'
+  rc = 16
+  signal quit
+  end
+
+/* Device constants: z/OS supports 3380, 3390, 9345 only */
+devtypes.1  = '3390 0F 15 56664'
+devtypes.2  = '3380 0E 15 47476'
+devtypes.3  = '3330 0D 19 13030' /* 3330-11, 3333-11 */
+devtypes.4  = '3375 0C 12 35616'
+devtypes.5  = '3350 0B 30 19069'
+devtypes.6  = '3340 0A 12  8368'
+devtypes.7  = '3330 09 19 13030' /* 3390-1, 3390-2, 3333 */
+devtypes.8  = '2314 08 20  7294'
+devtypes.9  = '2305 07  8 14136' /* 2305-2 */
+devtypes.10 = '2305 06  8 14136' /* 2305-1 */
+devtypes.11 = '2301 05  8 14136'
+devtypes.12 = '9345 04 15 46456'
+devtypes.13 = '2311 01 10  3625'
+devtypes.0 = 13
+
+/* Check if output DD present */
+if runmode = 'BATCH'
+then do
+  ddname = 'DDL'
+  found = 0
+  numeric digits 20
+  CVT = '10'
+  TCB = c2d(storage(c2x(storage(c2x(storage(CVT,4)),4)),4))
+  TIOT = c2d(storage(d2x(TCB+12),4))
+  TIOTPTR = TIOT+24
+  TIOELNGH = c2d(storage(d2x(TIOTPTR),1))
+  do until TIOELNGH = 0
+    TIOEDDNM = strip(storage(d2x(TIOTPTR+4),8))
+    if substr(TIOEDDNM,1,1) <> '00'x & TIOEDDNM <> '' & TIOEDDNM = ddname
+    then found = 1
+    TIOTPTR = TIOTPTR + TIOELNGH
+    TIOELNGH = c2d(storage(d2x(TIOTPTR),1))
+  end
+  if found = 0
+  then ddname = ztempn
+  end
+else ddname = ztempn
+'LMDINIT LISTID(listid) LEVEL('hlq')'
+if rc <> 0
+then do
+  say '003T LMDINIT failed, return code 'rc
+  rc = 16
+  signal quit
+  end
+dsn = ''
+total = 0
+jcl.0 = 2
+do i = 1 to jcl.0
+  jcl.i.0 = 0
+end i
+do i = 1 to 4
+  if value('BJC'i) <> ''
+  then rc = jcl(value('BJC'i))
+end i
+rc = jcl('//         EXEC PGM=IDCAMS,DYNAMNBR=1000')
+rc = jcl('//SYSPRINT DD SYSOUT=*')
+do n = 1
+  tracks = 0
+  zdsdevt = '3390'
+  'LMDLIST LISTID('listid') DATASET(DSN) STATS(YES)'
+  if rc <> 0
+  then leave n
+  "DSINFO DATASET('"dsn"')"
+  call outtrap 'AMS.'
+  address TSO "LISTCAT ENTRIES('"dsn"') ALL"
+  call outtrap 'OFF'
+  parse var ams.1 w1 w2 .
+  if rc <> 0
+  then do
+    say '004W Unknown object 'dsn
+    iterate n
+    end
+
+  if zdsorg = 'VS' & hlq = dsn & (w1 = 'INDEX' | w1 = 'DATA')
+  then do /* VSAM component specified, handle associated cluster */
+    rc = jcl('  /* WARNING: 'w1' COMPONENT SPECIFIED, HANDLE CLUSTER */')
+    do i = 1 to ams.0
+      parse var ams.i w1 w2 w3 w4 w5 w6 w7 w8 .
+      if w1 = 'ASSOCIATIONS'
+      then leave i
+    end i
+    i = i+1
+    if i > ams.0
+    then do
+      say '004W Unknown object 'dsn
+      iterate n
+      end
+    parse var ams.i w1 w2 w3 w4 w5 w6 w7 w8 .
+    if left(w1,9) = 'CLUSTER--'
+    then dsn = substr(w1,10)
+    else do
+      say '004W Unknown object 'dsn
+      iterate n
+      end
+    drop ams.
+    call outtrap 'AMS.'
+    address TSO "LISTCAT ENTRIES('"dsn"') ALL"
+    call outtrap 'OFF'
+    parse var ams.1 w1 w2 .
+    if rc <> 0
+    then do
+      say '004W Unknown object 'dsn
+      iterate n
+      end
+    end
+
+  select
+  when w1' 'w2 = 'GDG BASE'
+  then do
+    parse var ams.7 w1 w2 w3 .
+    limit = word(translate(w1,' ','-'),2)
+    rc = jcl('  DEFINE -')
+    rc = jcl('   GENERATIONDATAGROUP -')
+    rc = jcl('    NAME('dsn') -')
+    rc = jcl('    LIMIT('limit') -')
+    rc = jcl('    'w2' -')
+    rc = jcl('    'w3' -')
+    rc = jcl('    ) ')
+    end
+  when w1 = 'ALIAS'
+  then do
+    parse var ams.6 w1 w2 w3 .
+    relate = word(translate(w1,' ','-'),2)
+    rc = jcl('  DEFINE -')
+    rc = jcl('   ALIAS -')
+    rc = jcl('    NAME('dsn') -')
+    rc = jcl('    RELATE('relate') -')
+    rc = jcl('    ) ')
+    end
+  when zdsorg = 'VS'
+  then do /* VSAM */
+    select
+    when w1 = 'CLUSTER'
+    then object = w1
+    when w1 = 'INDEX'
+    then iterate n
+    when w1 = 'DATA'
+    then iterate n
+    when w1 = 'AIX'
+    then object = w1
+    when w1 = 'PATH'
+    then object = w1
+    when w1 = 'PAGESPACE'
+    then object = w1
+    otherwise nop
+    end
+    dname = ''
+    iname = ''
+    dtracks = 0
+    itracks = 0
+    dunit = ''
+    iunit = ''
+    quote = "'"
+    storclas = ''
+    mgmtclas = ''
+    dataclas = ''
+    do i = 1 to ams.0
+      parse var ams.i w1 w2 w3 w4 w5 w6 w7 w8 .
+      select
+      when w1 = 'DATA' & w2 = '-------'
+      then dname = w3
+      when w1 = 'INDEX' & w2 = '------'
+      then iname = w3
+      when left(w1,8) = 'KEYLEN--' & iname = ''
+      then do
+        keylen = word(translate(w1,' ','-'),2)
+        avglrecl = word(translate(w2,' ','-'),2)
+        end
+      when left(w1,5) = 'RKP--' & iname = ''
+      then do
+        rkp = word(translate(w1,' ','-'),2)
+        maxlrecl = word(translate(w2,' ','-'),2)
+        end
+      when left(w1,8) = 'SHROPTNS' & iname = ''
+      then do
+        parse var w1 . '(' shropt ')' .
+        amorg = w5 /* INDEXED NONINDEXED NUMBERED LINEAR */
+        k = i+1
+        parse var ams.k w10 w11 .
+        if object = 'CLUSTER'
+        then amattr = w4 w6 w8 w10 /* ¢NO!ERASE ¢NO!WRITECHK ¢NO!REUSE */
+        if object = 'AIX'
+        then amattr = w4 w6 w8 w11 /* ¢NO!ERASE ¢NO!WRITECHK ¢NON!UNIQKEY */
+        if object = 'PAGESPACE'
+        then amattr = ''
+        end
+      when w1 = 'STORAGECLASS '
+      then do
+        storclas = strip(translate(w2,' ','-'))
+        mgmtclas = word(translate(w3,' ','-'),2)
+        end
+      when w1 = 'DATACLASS '
+      then do
+        dataclas = strip(translate(w2,' ','-'))
+        end
+      when left(w1,12) = 'SPACE-TYPE--'
+      then do
+        if iname <> ''
+        then isptype = word(translate(w1,' ','-'),3)
+        else dsptype = word(translate(w1,' ','-'),3)
+        end
+      when left(w1,11) = 'SPACE-PRI--'
+      then do
+        if iname <> ''
+        then isppri = word(translate(w1,' ','-'),3)
+        else dsppri = word(translate(w1,' ','-'),3)
+        end
+      when left(w1,11) = 'SPACE-SEC--'
+      then do
+        if iname <> ''
+        then ispsec = word(translate(w1,' ','-'),3)
+        else dspsec = word(translate(w1,' ','-'),3)
+        end
+      when left(w1,13) = 'LOW-CCHH-----'
+      then do
+        parse var ams.i . (quote) +1 lowcc +4 lowhh (quote) .
+        k = i+1
+        parse var ams.k . (quote) +1 highcc +4 highhh (quote) .
+        tracks = (x2d(highcc)-x2d(lowcc))*trkpercyl+(x2d(highhh)-x2d(lowhh))+1
+        if iname <> ''
+        then itracks = itracks+tracks
+        else dtracks = dtracks+tracks
+        end
+      when left(w1,18) = 'VOLSER------------'
+      then do
+        if iname <> ''
+        then ivolser = word(translate(w1,' ','-'),2)
+        else dvolser = word(translate(w1,' ','-'),2)
+        end
+      when left(w1,13) = 'DEVTYPE------'
+      then do
+        parse var ams.i . (quote) +1 ucbtyp (quote) .
+        parse var ucbtyp ucbtbyt1 +1 ucbtbyt2 +1 ucbtbyt3 +1 ucbtbyt4 +1
+        found = 0
+        do k = 1 to devtypes.0
+          parse var devtypes.k name type trkpercyl bytepertrk
+          if '20'type == ucbtbyt3''ucbtbyt4
+          then do
+            found = 1
+            leave k
+            end
+        end k
+        if found = 0 /* assume 3390 when not found */
+        then parse var devtypes.1 name type trkpercyl bytepertrk
+        if iname <> ''
+        then iunit = name
+        else dunit = name
+        end
+      when left(w1,13) = 'REC-INSERTED-'
+      then freeci = word(translate(w2,' ','-'),3)
+      when left(w1,13) = 'REC-UPDATED--'
+      then freeca = word(translate(w2,' ','-'),3)
+      when left(w1,13) = 'RELEASE------'
+      then expire = substr(w2,17,4) || substr(w2,22,3)
+      when object = 'AIX' & left(w1,9) = 'CLUSTER--'
+      then relate = word(translate(w1,' ','-'),2)
+      when object = 'AIX' & left(w1,7) = 'UPGRADE'
+      then upgrade = w1
+      when object = 'AIX' & left(w1,7) = 'NOUPGRADE'
+      then upgrade = w1
+      when object = 'AIX' & left(w1,7) = 'AXRKP--'
+      then axrkp = word(translate(w1,' ','-'),2)
+      when object = 'PATH' & left(w1,9) = 'AIX------'
+      then pathentry = word(translate(w1,' ','-'),2)
+      when object = 'PATH' & left(w1,9) = 'CLUSTER--'
+      then pathentry = word(translate(w1,' ','-'),2)
+      when object = 'PATH' & left(w1,7) = 'UPDATE'
+      then update = w1
+      when object = 'PATH' & left(w1,7) = 'NOUPDATE'
+      then update = w1
+      otherwise nop
+      end
+    end i
+    tracks = itracks+dtracks
+    select
+    when object = 'PATH'
+    then do
+      rc = jcl('  DEFINE -')
+      rc = jcl('   PATH( -')
+      rc = jcl('    NAME('dsn') -')
+      rc = jcl('    PATHENTRY('pathentry') -')
+      rc = jcl('    'update' -')
+      rc = jcl('    ) ')
+      end
+    when object = 'AIX'
+    then do
+      rc = jcl('  DEFINE -')
+      rc = jcl('   AIX( -')
+      rc = jcl('    NAME('dsn') -')
+      rc = jcl('    RELATE('relate') -')
+      rc = jcl('    'upgrade' -')
+      do while amattr <> ''
+        parse var amattr w1 amattr
+        p = wordpos(w1, 'NOWRITECHK WRITECHK NONUNIQKEY UNIQKEY')
+        if p > 0
+        then w1 = word('NOWRITECHECK WRITECHECK NONUNIQUEKEY UNIQUEKEY', p)
+        rc = jcl('    'w1' -')
+      end
+      rc = jcl('    KEYS('keylen' 'axrkp') -')
+      rc = jcl('    RECORDSIZE('avglrecl' 'maxlrecl') -')
+      if freeci+freeca <> 0
+      then rc = jcl('    FREESPACE('freeci' 'freeca') -')
+      rc = jcl('    SHAREOPTIONS('shropt') -')
+      rc = jcl('    ) -')
+      rc = jcl('   DATA ( -')
+      rc = jcl('    NAME('dname') -')
+      rc = jcl('    'dsptype'('dsppri' 'dspsec') -')
+      rc = jcl('    ) -')
+      rc = jcl('   INDEX ( -')
+      rc = jcl('    NAME('iname') -')
+      rc = jcl('    'isptype'('isppri' 'ispsec') -')
+      rc = jcl('    ) ')
+      end
+    when object = 'CLUSTER'
+    then do
+      rc = jcl('  DEFINE -')
+      rc = jcl('   CLUSTER( -')
+      rc = jcl('    NAME('dsn') -')
+      rc = jcl('    'amorg' -')
+      do while amattr <> ''
+        parse var amattr w1 amattr
+        p = wordpos(w1, 'NOWRITECHK WRITECHK NONUNIQKEY UNIQKEY')
+        if p > 0
+        then w1 = word('NOWRITECHECK WRITECHECK NONUNIQUEKEY UNIQUEKEY', p)
+        rc = jcl('    'w1' -')
+      end
+      if expire <> '0000000'
+      then rc = jcl('    TO('expire') -')
+      if amorg = 'INDEXED'
+      then rc = jcl('    KEYS('keylen' 'rkp') -')
+      if amorg <> 'LINEAR'
+      then rc = jcl('    RECORDSIZE('avglrecl' 'maxlrecl') -')
+      if freeci+freeca <> 0
+      then rc = jcl('    FREESPACE('freeci' 'freeca') -')
+      if sms <> 'NO'
+      then do
+        if storclas <> '(NULL)' & storclass <> ''
+        then rc = jcl('    STORAGECLASS('storclas') -')
+        if mgmtclas <> '(NULL)' & mgmtclass <> ''
+        then rc = jcl('    MANAGEMENTCLASS('mgmtclas') -')
+        if dataclas <> '(NULL)' & dataclass <> ''
+        then rc = jcl('    DATACLASS('dataclas') -')
+        end
+      rc = jcl('    SHAREOPTIONS('shropt') -')
+      rc = jcl('    ) -')
+      rc = jcl('   DATA ( -')
+      rc = jcl('    NAME('dname') -')
+      rc = jcl('    'dsptype'S('dsppri' 'dspsec') -')
+      if sms <> 'ONLY'
+      then rc = jcl('    VOLUMES('strip(dvolser)') -')
+      if amorg = 'INDEXED'
+      then do
+        rc = jcl('    ) -')
+        rc = jcl('   INDEX ( -')
+        rc = jcl('    NAME('iname') -')
+        rc = jcl('    'isptype'S('isppri' 'ispsec') -')
+        if sms <> 'ONLY'
+        then rc = jcl('    VOLUMES('strip(ivolser)') -')
+        end
+      rc = jcl('    ) ')
+      end
+    when object = 'PAGESPACE'
+    then do
+      rc = jcl('  DEFINE -')
+      rc = jcl('   PAGESPACE( -')
+      rc = jcl('    NAME('dsn') -')
+      rc = jcl('    'dsptype'S('dsppri' 'dspsec') -')
+      if expire <> '0000000'
+      then rc = jcl('    TO('expire') -')
+      if sms <> 'NO'
+      then do
+        if storclas <> '(NULL)' & storclas <> ''
+        then rc = jcl('    STORAGECLASS('storclas') -')
+        if mgmtclas <> '(NULL)' & mgmtclas <> ''
+        then rc = jcl('    MANAGEMENTCLASS('mgmtclas') -')
+        if dataclas <> '(NULL)' & dataclas <> ''
+        then rc = jcl('    DATACLASS('dataclas') -')
+        end
+      else rc = jcl('    VOLUME('strip(dvolser)') -')
+      rc = jcl('    ) ')
+      end
+    end
+    end
+  otherwise /* NONVSAM */
+    space = space(translate(zdstota,' ',','),0)
+    found = 0
+    do k = 1 to devtypes.0
+      parse var devtypes.k name type trkpercyl bytepertrk
+      if zdsdevt = name
+      then do
+        found = 1
+        leave k
+        end
+    end k
+    if found = 0 /* assume 3390 is not found */
+    then parse var devtypes.1 name type trkpercyl bytepertrk
+    if ams = 'ALL'
+    then do
+      rc = jcl('  ALLOCATE -')
+      rc = jcl("   DSNAME('"dsn"') -")
+      end
+    else do
+      rc = jcl('//DD'right(n,6,'0')' DD DSN='dsn',')
+      rc = jcl('//            DISP=(NEW,CATLG),')
+      end
+    expdt = ''
+    if zdsxdate <> '***None***'
+    then do
+      parse var zdsxdate yyyy '/' mm '/' dd
+      expdt = yyyy''right(date('D',yyyy''mm''dd,'S'),3,'0')
+      end
+    /* Calculate request in tracks */
+    select
+    when zdsspc = 'CYLINDER'
+    then tracks = space*trkpercyl
+    when zdsspc = 'TRACK'
+    then tracks = space
+    when zdsspc = 'BLOCK'
+    then tracks = format(zdsblk*space/bytepertrk,,0)
+    when zdsspc = 'BYTE'
+    then tracks = format(space/bytepertrk,,0)
+    end
+    if ams = 'ALL'
+    then do
+      select
+      when zdsspc = 'CYLINDER'
+      then rc = jcl('   CYLINDERS -')
+      when zdsspc = 'TRACK'
+      then rc = jcl('   TRACKS -')
+      when zdsspc = 'BLOCK'
+      then rc = jcl('   BLOCK('strip(zdsblk)') -')
+      when zdsspc = 'BYTE'
+      then rc = jcl('   TRACKS -')
+      end
+      dsppri = strip(zds1ex)
+      dspsec = strip(zds2ex)
+      if zdsspc = 'BYTE'
+      then do
+        dsppri = format(dsppri/bytepertrk,,0)
+        dspsec = format(dspsec/bytepertrk,,0)
+        end
+      rc = jcl('   SPACE('dsppri' 'dspsec') -')
+      if zdsorg = 'PO'
+      then rc = jcl('   DIR('strip(zdsdira)') -')
+      if zdsdsnt = 'HFS' | zdsdsnt = 'LIBRARY'
+      then rc = jcl('   DSNTYPE('strip(zdsdsnt)') -')
+      if expdt <> ''
+      then rc = jcl('   EXPDT('expdt') -')
+      end
+    else do
+      select
+      when zdsspc = 'CYLINDER'
+      then space = 'CYL'
+      when zdsspc = 'TRACK'
+      then space = 'TRK'
+      when zdsspc = 'BLOCK'
+      then space = strip(zdsblk)
+      when zdsspc = 'BYTE'
+      then space = 'TRK'
+      end
+      dsppri = strip(zds1ex)
+      dspsec = strip(zds2ex)
+      if zdsspc = 'BYTE'
+      then do
+        dsppri = format(dsppri/bytepertrk,,0)
+        dspsec = format(dspsec/bytepertrk,,0)
+        end
+      space = space',('dsppri','dspsec')'
+      if zdsorg = 'PO'
+      then space = space','strip(zdsdira)')'
+      else space = space')'
+      rc = jcl('//            SPACE=('space'),')
+      if zdsdsnt = 'HFS' | zdsdsnt = 'LIBRARY'
+      then rc = jcl('//            DSNTYPE='strip(zdsdsnt)',')
+      if expdt <> ''
+      then rc = jcl('//            DCB=EXPDT='expdt',')
+      end
+    if dcb = 'YES'
+    then do
+      recfm = ''
+      do i = 1 to length(zdlrecfm)
+        recfm=recfm' 'substr(zdlrecfm,i,1)
+      end i
+      if ams = 'ALL'
+      then do
+        rc = jcl('   DSORG('strip(zdsorg)') -')
+        rc = jcl('   RECFM('strip(recfm)') -')
+        rc = jcl('   LRECL('strip(zdslrec)') -')
+        rc = jcl('   BLKSIZE('strip(zdsblk)') -')
+        end
+      else do
+        rc = jcl('//            DSORG='strip(zdsorg)',')
+        rc = jcl('//            RECFM='strip(zdlrecfm)',')
+        rc = jcl('//            LRECL='strip(zdslrec)',')
+        rc = jcl('//            BLKSIZE='strip(zdsblk)',')
+        end
+      end
+    if sms <> 'NO'
+    then do
+      smsattr = ''
+      if ams = 'ALL'
+      then do
+        if zdsmc <> '**None**'
+        then smsattr = smsattr' MANAGEMENTCLASS('strip(zdsmc)')'
+        if zdssc <> '**None**'
+        then smsattr = smsattr' STORAGECLASS('strip(zdssc)')'
+        if zdsdc <> '**None**'
+        then smsattr = smsattr' DATACLASS('strip(zdsdc)')'
+        do k = 1 to words(smsattr)
+          c = ''
+          if k < words(smsattr)
+          then c = '-'
+          rc = jcl('   'word(smsattr,k)' 'c)
+        end k
+        end
+      else do
+        if zdsmc <> '**None**'
+        then smsattr = smsattr' MGMTCLAS='strip(zdsmc)
+        if zdssc <> '**None**'
+        then smsattr = smsattr' STORCLAS='strip(zdssc)
+        if zdsdc <> '**None**'
+        then smsattr = smsattr' DATACLAS='strip(zdsdc)
+        do k = 1 to words(smsattr)
+          c = ''
+          if k < words(smsattr)
+          then c = ','
+          rc = jcl('//            'word(smsattr,k)''c)
+        end k
+        end
+      end
+    if sms <> 'ONLY'
+    then do
+      if ams = 'ALL'
+      then rc = jcl('   UNIT('strip(zdsdevt)') -')
+      else rc = jcl('//            UNIT='strip(zdsdevt)',')
+      if zds#vols = 1
+      then volser = strip(zdsvol)
+      else volser = strip(zdsvtab)
+      if ams = 'ALL'
+      then rc = jcl('   VOLUME('volser') ')
+      else rc = jcl('//            VOL=SER='volser' ')
+      end
+  end
+  if zdsapf = 'YES'
+  then do
+    if ams = 'ALL'
+    then rc = jcl('  /* APF-authorized data set */')
+    else rc = jcl('//* APF-authorized data set ***')
+    end
+  /* Allocation summary */
+  if ams = 'ALL'
+  then rc = jcl('  /* 'tracks' 'strip(zdsdevt)' TRACK(S) ALLOCATED */')
+  else rc = jcl('//* 'tracks' 'strip(zdsdevt)' TRACK(S) ALLOCATED ***')
+  if datatype(tracks,'W')
+  then total = total + tracks
+end n
+rc = jcl('//SYSIN    DD *')
+rc = jcl('  /* TOTAL 'total' 'strip(zdsdevt)' TRACK(S) ALLOCATED */')
+rc = jcl('//')
+do i = 1 to jcl.0
+  address TSO 'EXECIO 'jcl.i.0' DISKW 'ddname' (STEM JCL.'i'.'
+end i
+address TSO 'EXECIO 0 DISKW 'ddname' (FINIS'
+'LMDFREE LISTID('listid')'
+if runmode <> 'BATCH'
+then "EDIT DATASET('"ztempf"')"
+rc = 0
+
+quit:
+  zispfrc = rc
+  address ISPEXEC 'VPUT ZISPFRC'
+  exit rc
+
+jcl: procedure expose jcl.
+  parse arg c
+  i = 2 - ((left(c,2)='//') & (c<>'//'))
+  j = jcl.i.0+1
+  jcl.i.j = c
+  jcl.i.0 = j
+  return 0

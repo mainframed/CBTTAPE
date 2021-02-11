@@ -1,0 +1,424 @@
+/* Rexx program to save a datasetÝ(member)¨ from ISPF edit with
+*  version control.
+*  Usage: Install using #CONFIG.
+*  When you SAVE from ISPF edit, this will check to see if a control
+*  dataset exists.  See a#Init for a description.
+*  If this data set exists, a session comparison will be done and the
+*  changes stored in the archive dataset, along with history information
+*  obtained via an ISPF panel.
+*.
+*. 2005/06/23 Created by bsquare
+*. 2005/07/08 Decided not to allow sequential datasets.
+*. 2005/07/12 Rescinded the above decision.
+*. 2005/07/21 Changed format of archive datasets.
+*. 2005/08/17 Handle odd terminal types for LMMFind bug.
+*. 2006/01/13 Fix cancelled save of existing unarchived member. (v1.1)
+*/
+address ISREdit
+"Macro (parms)"
+
+/* Get information about the dataset being edited (the target). */
+"(DID)     = DATAID"        /* Data ID for target dataset */
+"(Vol)     = VOLUME"
+"(DSN)     = DATASET"       /* Target dataset */
+"(Mem)     = MEMBER"        /*        member */
+ArcKey = Vol':'DSN'('Mem')' /* Key for archive table */
+if Mem = '' then Target = DSN
+else Target = DSN'('Mem')'
+"(Changed) = DATA_CHANGED"
+"(State)   = USER_STATE"
+
+/* Get information about the control dataset (the archive). */
+address ISPExec
+"TbGet archive"             /* ArcDSN ArcTbl dl Desc1-6 */
+"TbQuery" ArcTbl "ROWNUM(Versions)"
+address ISREdit
+IsArc = (Versions > 0)
+
+Stats = GetStats(DID,Mem)
+/* Treat previously deleted member as "Stats don't match" */
+if Stats = 'NEW' & IsArc then Stats = ''
+if Stats = 'NEW' then do
+   if Changed = 'NO' then call Done 0   /* nothing to save or archive */
+   dl = GetDesc(Target)            /* Get a description for this data */
+   address ISPExec "TbMod archive" /* Save the description */
+
+   /* SAVE */
+   if Mem <> '' then "STATS ON"  /* Make sure STATS are ON */
+   "BuiltIn SAVE"
+   if RC > 4 then call Fail 'SAVE Failed RC' RC
+   if Mem <> '' then Stats = GetStats(DID,Mem)
+   else do
+      Mod = Translate('Year/Mm/Dd',Date('S'),'YearMmDd') Time()
+      Stats = 'Version('IncRev()') User('UserID()') Modified('Mod')'
+   end
+   sLines = (Stats <> '')          /* should ALWAYS be 1 */
+   if sLines = 0 then Vers = '00.00'
+   else do
+      parse UPPER VAR Stats,
+         'VERSION('Vers')' 1 'USER('User')' 1 'MODIFIED('Mod')'
+   end
+   address ISPExec "TbTop" ArcTbl
+   address ISPExec "TbAdd" ArcTbl
+
+   "(Lines)   = LINENUM .ZLAST"
+   Lines = Lines+0               /* reformat as number */
+   parse VALUE a#Open('OUT',ArcKey,'WRITE') WITH Archive VolInfo
+   /* Copy the member to the archive PDS if required. */
+   if ArcDSN <> DSN & Archive <> ArcDSN then do
+      Copy = "'"ArcDSN"'"
+      address ISPExec
+      "LMInit DataID(ToID) DataSet(&Copy)" VolInfo
+      "LMCopy FromID(&DID) FromMem(&Mem) ToDataID(&ToID) REPLACE"
+      "LMFree DataID(&ToID)"
+   end
+   address TSO
+   if Mem <> '' then
+      queue ')Current Header('sLines+dl') Member('Mem')'
+   else
+      queue ')Current Header('sLines+dl') Data('Lines')'
+   if sLines > 0 then queue '-Stats' Stats
+   do i=1 to dl
+      queue '-Desc' '('Value('DESC'i)')'
+   end
+   "ExecIO" 1+sLines+dl "DiskW out"
+
+   /* Put the data inline if required. */
+   if Archive = ArcDSN then do i=0 to Lines-1 by 100
+      do j=1 until j=min(100,Lines-i)
+         address ISREdit "(Cur) = LINE" i+j
+         Line.j = Strip(Cur,'T')  /* small savings for VB */
+      end
+      "ExecIO" j "DiskW out (STEM Line."
+   end
+   "ExecIO 0 DiskW out (FINIS"
+   "Free f(out)"
+   address ISREdit
+end; else do
+   OldArc.0 = 0
+   ArcStats = ''; CompDS = ''
+   if IsArc then do
+      address ISPExec
+      "TbTop" ArcTbl
+      "TbSkip" ArcTbl
+      if Vers = '00.00' then Vers = ''
+      if Vers <> '' then ArcStats = 'Version('Vers')'
+      if User <> '' then ArcStats = ArcStats 'User('User')'
+      if Mod  <> '' then ArcStats = ArcStats 'Modified('Mod')'
+      if Mem = '' then Stats = ArcStats
+      if Changed = 'NO' then do
+         /* no need to archive or save if Stats match Archive */
+         if Stats = ArcStats then call Done 0
+         /* Oops. Data changed outside of Archive. */
+         if DSN = ArcDSN then
+            call Fail 'Inconsistent versions cannot be reconciled'
+         /* Oh, good.  The old version should be in the archive. */
+         /* reconcile with old version */
+      end
+      if Stats = '' then dl = GetDesc(Target)
+      parse VALUE a#Open('IN',ArcKey,'READ') WITH Archive VolInfo
+      if Archive = '' then do   /* previously cancelled save. */
+         Header = 0; Data = ''
+         CompDS = 'SESSION'
+      end; else do
+         address TSO
+         "ExecIO 1 DiskR in"
+         pull 'HEADER('Header')' 1 'DATA('Data')'
+         if Header = '' then Header = 0
+         /* Obtain old data for deleted or munged members */
+         if Data <> '' then do
+            "ExecIO" Data "DiskR in" Header+2 "(STEM Old."
+            if Old.0 = 0 then CompDS = 'NONE'
+            else do
+               CompDS = 'ARCHIVE.TEMP.S'Time('S')
+               "Alloc f(tmp) dsn("CompDS") NEW CATALOG DSORG(PS) LIKE('"DSN"')"
+               "ExecIO" Data "DiskW tmp (STEM Old. FINIS"
+               "Free f(tmp)"
+            end
+         end
+         if Data <> '' then Header = Header+Data
+         /* Read archive, skipping )Current data */
+         "ExecIO * DiskR in" Header+2 "(STEM OldArc. FINIS"
+         "Free f(in)"
+      end
+      address ISREdit
+   end; else do
+      dl = GetDesc(Target)            /* get data description */
+      address ISPExec "TbMod archive" /* save the description */
+      parse UPPER VAR Stats,
+         'VERSION('Vers')' 1 'USER('User')' 1 'MODIFIED('Mod')'
+      parse VALUE '' WITH Hist1 Hist2 Hist3 Hist4 Hist5 Hist6
+      if Vers = '' then Vers = '00.00'
+      address ISPExec "TbAdd" ArcTbl  /* save the old version */
+      ArcStats = Stats
+      CompDS = 'SESSION'              /* no archive yet       */
+   end
+   if Changed = 'YES' | Stats <> ArcStats then do
+      /* complete replacement or difference? */
+      if CompDS = 'NONE' then do
+         "(Lines) = LINENUM .ZLAST"
+         Lines = Lines+0               /* reformat as number */
+         if Lines > 0 then queue '-Del Count('Lines') Start(1)'
+      end; else do
+         /* Save the old compare options for later restoration */
+         address ISPExec "VGet (ZEDUPDOP ZUPXSIZ)"
+         OldOpts = ZEdUpdOp; OldXSize = ZUpXSiz
+         ZEdUpdOp = '0000000000'; ZUpXSiz = 0
+         address ISPExec "VPut (ZEDUPDOP ZUPXSIZ) ASIS"
+
+         /* Compare to the disk copy of this dataset */
+         if CompDS = '' then
+            if ArcDSN = DSN then CompDS = 'SESSION'
+            else CompDS = "'"ArcDSN"("Mem")'"
+         "BuiltIn Compare" CompDS "SAVE"
+         RV = RC
+
+         /* restore old compare options */
+         ZEdUpdOp = OldOpts; ZUpXSiz = OldXSize
+         address ISPExec "VPut (ZEDUPDOP ZUPXSIZ) ASIS"
+         "Reset LABEL SPECIAL"
+
+         if RV <> 0 then do
+            if CompDS <> 'SESSION' & Pos('(',CompDS) = 0 then do
+               prev = Msg('OFF')
+               "Delete" CompDS
+               call Msg prev
+            end
+            call Fail 'Unexpected error from Compare, RC' RV
+         end
+         address TSO
+         "Alloc f(in) dsn(ISPFEDIT.COMPARE.LIST) SHR REUSE"
+         "ExecIO * DiskR in (STEM Compare. FINIS"
+         "Free f(in)"
+         prev = Msg('OFF')
+         "Delete ISPFEDIT.COMPARE.LIST"
+         call Msg prev
+
+         /* Process the comparison output */
+         if CompDS = 'SESSION' then
+            "Alloc f(from) dsn('"Target"') SHR REUSE"   /* disk copy */
+         else
+            "Alloc f(from) dsn("CompDS") SHR REUSE"     /* disk copy */
+         mark = 122
+         do i=1 to Compare.0
+            if Left(Compare.i,2) = 'ID' then
+               mark = pos('TYPE',Compare.i)
+            if SubStr(Compare.i,3,1) <> '-' then iterate
+            parse VAR Compare.i,
+               Op 3 =(mark) Type +3 +1 Len +5 +1 nLine +5 +1 oLine +5
+            Len = Strip(Len)
+            /* reformat as number */
+            nLine = ('0'nLine)+0
+            oLine = ('0'oLine)+0
+            Len   = ('0'Len)+0
+            Select
+            When Len = 0 then say Compare.i  /* ERROR! */
+            When Type = 'INS' then do    /* From lines */
+               queue '-Ins Lines('Len') Start('nLine')'
+               "ExecIO" Len "DiskR from" nLine "(STEM Temp."
+               do t=1 to Len; queue Strip(Temp.t,'T'); end
+               i = i + Len - 1
+               end
+            When Type = 'DEL' then do    /* To lines */
+               queue '-Del Count('Len') Start('oLine')'
+               i = i + Len - 1
+               end
+            When Type = 'RPL' | Type = 'RFM' then do
+               queue '-Ins Lines('Len') Start('nLine')'
+               "ExecIO" Len "DiskR from" nLine "(STEM Temp."
+               do t=1 to Len; queue Strip(Temp.t,'T'); end
+               queue '-Del Count('Len') Start('oLine')'
+               i = i + (Len*2) - 1
+               end
+            Otherwise say Compare.i          /* ERROR! */
+            End
+         end
+         "ExecIO 0 DiskR from (FINIS"
+         "Free f(from)"
+         if CompDS <> 'SESSION' & Pos('(',CompDS) = 0 then do
+            prev = Msg('OFF')
+            "Delete" CompDS
+            call Msg prev
+         end
+      end
+      address ISREdit
+      Lines = Queued()
+      if Changed <> 'YES' then do
+         hl = GetHist(Target,Vers)
+         do i=hl to 1 by -1
+            push '-Hist' '('Value('HIST'i)')'
+         end
+         if ArcStats <> '' then push '-Stats' ArcStats
+         push ')Archive Header('Queued()-Lines') Data('Lines')'
+      end; else do
+         NewRev = IncRev(Vers)
+         hl = GetHist(Target,NewRev) /* get history entry */
+         do i=hl to 1 by -1
+            push '-Hist' '('Value('HIST'i)')'
+         end
+         if Stats = '' & ArcStats <> '' then Stats = ArcStats
+         if Stats <> '' then push '-Stats' Stats
+         push ')Archive Header('Queued()-Lines') Data('Lines')'
+
+         /* SAVE */
+         if Mem <> '' then "STATS ON"  /* Make sure STATS are ON */
+         "BuiltIn SAVE"
+         if RC > 4 then call Fail 'SAVE Failed RC' RC
+         if RC = 4 & ArcStats <> '' then do
+            "VERSION =" Left(NewRev,2)
+            "LEVEL   =" Right(NewRev,2)
+         end
+         if Mem <> '' then Stats = GetStats(DID,Mem)
+         else do
+            Mod = Translate('Year/Mm/Dd',Date('S'),'YearMmDd') Time()
+            Stats = 'Version('NewRev') User('UserID()') Modified('Mod')    '
+         end
+      end
+      parse UPPER VAR Stats,
+         'VERSION('Vers')' 1 'USER('User')' 1 'MODIFIED('Mod')'
+      address ISPExec "TbTop" ArcTbl
+      if Vers = '' then Vers = '00.00'
+      address ISPExec "TbAdd" ArcTbl
+   end
+   "(Lines)   = LINENUM .ZLAST"
+   Lines = Lines+0               /* reformat as number */
+   parse VALUE a#Open('OUT',ArcKey,'WRITE') WITH Archive VolInfo
+   /* Copy the member to the archive PDS if required. */
+   if ArcDSN <> DSN & Archive <> ArcDSN then do
+      address ISPExec
+      Copy = "'"ArcDSN"'"
+      "LMInit DataID(ToID) DataSet(&Copy)"VolInfo
+      "LMCopy FromID(&DID) FromMem(&Mem) ToDataID(&ToID) REPLACE"
+      "LMFree DataID(&ToID)"
+   end
+   address TSO
+   "NEWSTACK"
+      parse VAR Opts Default '00'x Global '00'x Local
+      if Stats <> '' then queue '-Stats' Stats
+      if Mem = '' then
+         do while Global <> ''
+            parse VAR Global cl '00'x Global
+            queue '-Opts' Strip(cl)
+         end
+      else
+         do while Local <> ''
+            parse VAR Local cl '00'x Local
+            queue '-Opts' Strip(cl)
+         end
+      do i=1 to dl
+         queue '-Desc' '('Value('DESC'i)')'
+      end
+      if Mem <> '' then
+         push ')Current Header('Queued()') Member('Mem')'
+      else
+         push ')Current Header('Queued()') Data('Lines')'
+      "ExecIO" Queued() "DiskW out"
+
+      /* Put the data inline if required. */
+      if Archive = ArcDSN then do i=0 to Lines-1 by 100
+         do j=1 until j=min(100,Lines-i)
+            address ISREdit "(Cur) = LINE" i+j
+            Line.j = Strip(Cur,'T')  /* small savings for VB */
+         end
+         "ExecIO" j "DiskW out (STEM Line."
+      end
+   "DELSTACK"
+   if Queued() > 0 then "ExecIO" Queued() "DiskW out"
+   if OldArc.0 > 0 then
+      "ExecIO" OldArc.0 "DiskW out (STEM OldArc."
+   "ExecIO 0 DiskW out (FINIS"
+   "Free f(out)"
+end
+call Done 0
+
+Done:
+   arg ret
+   address TSO "DelStack"        /* eliminate old garbage */
+   address ISREdit "USER_STATE = (State)"
+exit ret
+
+/* Get statistics for a member. */
+GetStats: PROCEDURE
+   arg DataID,Member
+   if Member = '' then return '' /* no stats for sequential dataset */
+   address ISPExec
+   "VGet (ZTerm)"                /* deal with strange term types */
+   if ZTerm <> '3278' & ZTerm <> '3278A' then
+      "Select Pgm(ISPTTDef) Parm(3278)"
+   "LMOpen DataID("DataID")"
+   "LMMFind DataID("DataID") Member("Member") STATS(YES)"
+   Exists = (RC = 0)           /* this member already exists. */
+   "LMClose DataID("DataID")"
+   if ZTerm <> '3278' & ZTerm <> '3278A' then
+      "Select Pgm(ISPTTDef) Parm("ZTerm")"
+   if Exists = 0 then return 'NEW'
+
+   parse VALUE '' WITH Vers User Mod
+   if ZLVers <> '' then Vers = 'Version('ZLVers'.'ZLMod')'
+   if ZLM4Date <> '' then
+      Mod  = 'Modified('ZLM4Date ZLMTime':'ZLMSec')'
+   if ZLUser <> '' then User = 'User('Strip(ZLUser)')'
+   return Vers User Mod
+
+/* Get a description of this data from the User. */
+GetDesc: PROCEDURE EXPOSE State Desc1 Desc2 Desc3 Desc4 Desc5 Desc6
+   arg DSN
+   address ISPExec
+   if Desc1 = '' then Desc1 = 'Original' DSN 'by' UserID()
+   "Display Panel(a#DescP)"
+   if RC = 8 then do
+      "VGet (ZVERB)"
+      if ZVERB = 'END' then call Done 8
+   end
+   do i=6 to 1 by -1 until Value('DESC'i) <> ''; end
+   return i
+
+/* Get a description of these changes from the User. */
+GetHist: PROCEDURE EXPOSE State,
+   Hist1 Hist2 Hist3 Hist4 Hist5 Hist6,
+   Desc1 Desc2 Desc3 Desc4 Desc5 Desc6
+   arg DSN,Vers        /* Vers,Desc are displayed in ArcHist */
+   parse VALUE '' WITH Hist1 Hist2 Hist3 Hist4 Hist5 Hist6
+   address ISPExec
+   "Display Panel(a#HistP)"
+   if RC = 8 then do
+      "VGet (ZVERB)"
+      if ZVERB = 'END' then call Done 8
+   end
+   do i=6 to 1 by -1 until Value('HIST'i) <> ''; end
+   return i
+
+/* Increment the revision (Version.Level). */
+IncRev: PROCEDURE
+   arg OldRev
+   address ISREdit
+   "(Mem)   = MEMBER"
+   if Mem = '' then NewRev = OldRev
+   else do
+      "(Vers)  = VERSION"       /* version and */
+      "(Level) = LEVEL"         /* modification level */
+      if RC <> 0 then NewRev = ''
+      else NewRev = Right(Vers,2,0)'.'Right(Level,2,0)
+   end
+   if OldRev <> '' then do
+      if OldRev < 1 then NewRev = 1
+      if NewRev = '' then NewRev = OldRev
+      if NewRev = OldRev then NewRev = NewRev + 0.01
+   end; else if NewRev = '' then NewRev = 1
+   parse VAR NewRev Vers '.' Level
+   Vers = Right(Vers,2,0)
+   Level = Right(Level,2,0)
+   if Mem <> '' then do
+      "VERSION =" Vers
+      "LEVEL   =" Level
+   end
+   return Vers'.'Level
+
+/* Fail with a message. */
+Fail: PROCEDURE EXPOSE State
+   parse ARG ZEdLMsg
+   ZEdSMsg = "Archive Failure"
+   address ISPExec "SetMsg Msg(ISRZ000)"
+   address TSO "DelStack"          /* kill old garbage */
+   address ISREdit "USER_STATE = (State)"
+   exit 8

@@ -1,0 +1,16 @@
+//GCCGEN   JOB CLASS=C,REGION=0K
+//*
+//* Delete temporary datasets
+//*
+//CLEAN    PROC GCCPREF='GCC'
+//DELETE   EXEC PGM=IEFBR14
+//DD1      DD DSN=&GCCPREF..GCC.SEQ.XMIT,DISP=(MOD,DELETE),
+//       UNIT=SYSALLDA,SPACE=(TRK,(0))
+//DD2      DD DSN=&GCCPREF..GCC.PDS.XMIT,DISP=(MOD,DELETE),
+//       UNIT=SYSALLDA,SPACE=(TRK,(0))
+//*
+//         PEND
+//*
+//S1 EXEC CLEAN
+//*
+//

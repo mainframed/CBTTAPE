@@ -1,0 +1,12 @@
+
+## $$DOC.txt
+```
+Member     Description
+-------- - ------------------------------------------------------------
+$$ASM    - High level assembly and linkedit JCL
+$$DOC    - What you are reading
+$$JCL    - Batch JCL to execute VTOCLIST
+VTOCLIST - Current version (3390-27/32 large DASD support)
+VT0CLIST - Prior version
+```
+

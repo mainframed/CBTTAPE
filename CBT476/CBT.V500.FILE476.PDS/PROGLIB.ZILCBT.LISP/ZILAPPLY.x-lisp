@@ -1,0 +1,690 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;; ZILAPPLY
+;;;
+;;; The guts of APPLY.  This routine was separated from the APPLY
+;;; visible to the user in order to be able to specify the third and
+;;; fourth arguments listed below, as well as permitting the full
+;;; Common LISP syntax of APPLY.
+;;;
+;;; Argument 1 (required) - the function name or expression to apply.
+;;; Argument 2 (required) - the list of (evaluated) arguments.
+;;; Argument 3 (optional) - the lexical (fluid) evaluation environment.
+;;; Argument 4 (optional) - the name originally used on EVAL for errors.
+;;;
+;
+;         The pseudolexical "environment" arg that gets passed around
+;         is not merely an alist, but now a more complex object.
+;
+;         Implementation notes:
+;
+;         When a FEXPR is evaluated, the second arg is just the alist,
+;         not the entire environment.  However, ZILEVAL and ZILAPPLY
+;         take full environment objects.
+;
+;         Since the PROG and ARG environments are passed
+;         to interpretive lexical closures via FUNCTION, non-local
+;         GO's and ARG's are possible even across closures.
+;
+; See MKNEWENV for description of what the environment looks like.
+;
+; Note: This module contains code for processing &OPTIONAL and &KEY args
+;       that depends on the CAR of NIL being NIL.  ZCAR is used in
+;       other locations where fast CAR is desired and it is known that
+;       the argument won't be NIL.
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 06/01/88 - Changes to support multiple values, BLOCK and TAGBODY    *
+;*            even before they're implemented.  ZEVMACS changed.       *
+;*                                                                     *
+;* 06/27/88 - Uses PARSE-BODY.                                         *
+;*                                                                     *
+;***********************************************************************
+;
+
+(eval-when (compile)
+ (let ((sample-env (funenv #'foo)))
+      (unless (listp sample-env)
+              (zerror "Environment is not a list! Recode ZILAPPLY!!!")
+      )))
+
+(include #.(zil-source-member zevmacs)) ; Include evaluator macros.
+
+(defstruct keychain
+     keyword         ; the keyword name (:foo)
+     variable        ; the keyword variable
+     initform        ; the keyword initial value
+     suppliedp       ; the keyword "supplied-p" argument
+     value           ; the keyword value to be assigned
+)
+
+
+;
+; Note that arg 3 may be specified as NIL, so that callers of
+; ZILAPPLY can tell it to make a new environment without having
+; to actually contain the call to MKNEWENV.
+;
+
+(defun zilapply (f ; the function to apply
+                 l ; the argument list
+        &optional
+                 (a nil)  ; the evaluation environment
+                 (q f)    ; function name for error messages
+             &aux
+                 m        ; Temporary local variable.
+                )
+
+;;; Start up the big dispatch.
+
+ (cond
+
+;;;;(null f)              nil  ; What is this nonsense?  Deep-six it.
+
+;;; Assuming that subrs and closures are the only valid code objects...
+;;; e.g. (apply (subr foo) ...args...) - this is sort of irregular,
+;;; but placed up front in case of efficiency hacks in the interpreter
+;;; which replace symbols with their compiled functions or something.
+
+  ( (codep f)             (zilxsub f l)                               )
+
+;;; Interpreted lexical closures (funargs)...
+
+  ( (funargp f)           (zilapply (funfun f) l (funenv f) q)        )
+
+;;; Apply of a symbol - get the function associated with the name
+
+; (note - if dynamic scoping, we'd have had to do
+;         (unless a (setq a (mknewenv nil))) up here.)
+
+  ( (symbolp f)           (zilapply-symbol-function)                  )
+
+;;; Apply of a structure...
+;;; if the structure has a property that allows it to be invoked as a
+;;; function, then use that.  If that is the case, the associated
+;;; function gets invoked with arg1 being the instance of the structure
+;;; and the other args being the args passed to apply.
+;;;
+
+  ( (and (structp f)
+         (setq m (get (vref f 0) 'defstruct-funcall-method)))
+
+                          (zilapply m (cons f l) a q)                 )
+
+;;; All other kinds of atoms (numbers, etc.) cannot be functions.
+
+  ( (atom f)              (zerror "Invalid form in functional position"
+                                  f)                                  )
+
+;;; Lists - must be LAMBDA or LABEL expression...
+
+  ( t
+
+;;; If no environment specified, make a fresh one, lexically speaking.
+
+    (unless a (setq a (mknewenv nil)))
+
+    (case (zcar f)
+
+          ((lambda)       (unless (and (consp (cdr f))
+                                       (consp (cddr f)))
+                                  (zerror "Invalid LAMBDA list" f))
+                          (zilapply-lambda)                           )
+
+          ((label)        (unless (and (consp (cdr f))
+                                       (consp (cddr f)))
+                                  (zerror "Invalid LABEL list" f))
+                          (zilapply-label)                            )
+
+          (t              (zerror "Invalid form in functional position"
+                                  f))))))
+
+
+;
+; ZILAPPLY-SYMBOL-FUNCTION
+;
+; Defined as a macro to keep local variables all together.
+;
+;
+; MACRO, FEXPR, FSUBR and special forms are invalid - not functions.
+;
+
+(defun zilapply-symbol-function macro (x)
+'(let ((s (getl f '(expr subr))))
+   (cond
+    ((null s)
+     (if (setq s (getl f '(macro |SPECIAL FORM| fexpr)))
+      then
+         (zerror "Invalid to APPLY" (zcar s) f)
+      else
+         (zevauto f t)
+         (zilapply f l a q)
+      endif
+     ))
+    ((eq (zcar s) 'subr)      (zilxsub (zcadr s) l)                    )
+    ( t    #| expr |#         (zilapply (zcadr s)
+                                        l
+                                        (mknewenv nil) ; lexical scoping
+;;;;; if dynamic scoping, would be......(mknewenv (bindenv a))
+                                        f)                             )
+
+)))
+
+;
+; ZILAPPLY-LAMBDA
+;
+; Defined as a macro to keep local variables together.
+;
+; Note that since lambdas are assumed to exist lexically, as in
+; ((lambda ...) ...), the PROG and ARG environments are retained.
+;
+; Compare the way an EXPR is applied - the PROG and ARG environments
+; are reset to NIL.  Lexical closures pass the environments through,
+; creating the potential for strange Common-LISPy results.
+;
+
+(defun zilapply-lambda macro (x)
+'(let* (((nil lambvl . lambody) f)
+        (lexprp (and lambvl (atom lambvl)))
+       )
+       ;
+       ; If the bvl is a non-NIL atom, this is a "lexpr".
+       ; In which case we bind *ARG* to the list of args (for (ARG x))
+       ; and add it to the LEXPR arg environment
+       ; and bind bvl to the number of args.
+       ;
+       ; Otherwise, this is a normal "expr".
+       ; In which case we do normal binding.
+       ;
+       (prog (newenv savespec locspecs lamspecs)
+             (setq newenv (copyenv a))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Search the body of the LAMBDA for declarations, and extract the     *
+;* special variable declarations therefrom.                            *
+;*                                                                     *
+;***********************************************************************
+;
+  ;; Get current env's pervasive specials (copy lest local shadowing)
+             (setq lamspecs (append (specenv a) nil))
+
+  (multiple-value-bind (docstring decls nbody mxform mxvalidp)
+                       (parse-body lambody nil t)
+   (setq lambody (if mxvalidp (cons mxform (cdr nbody)) nbody))
+   ;;...process local declarations...
+   (dolist (dcl decls)
+           (if (atom dcl)
+               (warn "Invalid declaration" dcl)
+               (case (car dcl)
+                     ((special)
+                     (dolist (dclarg (cdr dcl))
+                             ;; Remember this when we bind...
+                             (push dclarg locspecs)
+                             ;; It's pervasively special for references
+                             (push dclarg lamspecs)))))))
+;;;
+;;; End of declaration hacking.
+;;;
+             (when lexprp (push l (argenv newenv)))
+             ;
+             ; Save current special binding environment before the
+             ; binding process adds new specials to it.
+             ;
+             (setq savespec (special-alist))
+
+             ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+             ;
+             ; Establish pervasively special declarations here
+             ; rather than before bind.  In this way they don't
+             ; affect the initialization forms.  This is the way
+             ; CL will probably be modified by 1988, even though
+             ; CLtL (first edition) says otherwise.
+             ;
+             ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+             ;
+             ; For each variable mentioned in a local SPECIAL
+             ; declaration, delete it from the list of local bindings.
+             ;
+             ; If it was also in the lambda list, we don't care,
+             ; because DESTRUCTURING-BIND would have done the same
+             ; thing and it won't be in the binding list.
+             ;
+             ; To avoid needless consing, we do this only if
+             ; there is a variable of the same name already there.
+             ;
+
+             (dolist (var locspecs)
+               (when (assq var (bindenv newenv))
+                     (setf (bindenv newenv)
+                           (loop for binding in (bindenv newenv)
+                                 unless (eq var (car binding))
+                                 collect binding))))
+
+             ;
+             ; Set the special variables for the environment.
+             ;
+
+             (setf (specenv newenv) lamspecs)
+
+             ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+             ;
+             ; While binding, make LAMSPECS side-effectable so that
+             ; DESTRUCTURING-BIND can DELQ locally bound variables
+             ; out of the pervasively declared specials without
+             ; having to pass LAMSPECS non-locally.
+             ;
+             (push nil lamspecs)
+             (zilapply-bind lambvl (if lexprp (length l) l)
+                                   q newenv locspecs lamspecs nil)
+             (setq lamspecs (cdr lamspecs))
+
+        loop
+             (when (null lambody)
+                   (setf (special-alist) savespec)
+                   (return nil))
+             (when (null (cdr lambody))
+                   (return
+                    (multiple-value-prog1
+                     (zileval (zcar lambody) newenv nil)
+                     (setf (special-alist) savespec))))
+             (zileval (zcar lambody) newenv nil)
+             (setq lambody (cdr lambody))
+             (go loop))))
+
+;
+; ZILAPPLY-LABEL
+;
+; Defined as a macro to keep local variables together.
+;
+;;;         A temporary corruption of the label's property list is
+;;;         effected to enable the label.
+;;;         Note how the PLIST is restored in a way that preserves
+;;;         any changes to the "real" property list of the label.
+;;;
+;;; Yuk.  Can't wait until local function definitions a la FLET are
+;;;       added to the "environment" so we can use that instead of
+;;;       this cruft.
+;;;
+
+(defmacro zilapply-label ()
+ '(let* (((nil lfun llam) f)
+         (save-expr (get lfun 'expr)))
+        (unwind-protect
+         (progn (putprop lfun llam 'expr)
+                (zilapply llam l a q)    ; This is what gets returned.
+         )
+         (if save-expr
+             (putprop lfun save-expr 'expr)
+             (remprop lfun 'expr))
+        )))
+
+;
+; BIND
+;
+; BIND takes an environment and updates its binding component with
+; the variable bindings stuck on the front of it from the lists
+; provided.  (Unless the variable is special, in which case the
+; run-time special binding alist is updated instead.)
+;
+
+(defun zilapply-bind (bvl l q a locspecs lamspecs destructuring-p)
+ (prog (mode restarg c c1 c2 c3 aux-args-to-be-evaluated
+        keyspec allow-other-keys-p keylist)
+  loop
+       (or bvl (go cleanup))
+       (cond ((atom bvl)         ; CDR of a dotted pair.
+              (and restarg
+                   (bind-error q
+                    "&REST arg conflicts with dotted pair syntax"))
+              (setq restarg bvl)
+              (go cleanup)))
+       (setq c (zcar bvl))    ; An argument spec from the lambda-list.
+       (if (llkeywdp c)       ; If it's a lambda list keyword
+        then
+         (case c
+               ((&optional)    (go process-&optional))
+               ((&rest &body)  (go process-&rest))
+               ((&aux)         (go process-&aux))
+               ((&key)         (go process-&key))
+               ((&allow-other-keys)
+                               (go process-&allow-other-keys))
+               (t (bind-error q "Unsupported lambda list keyword" c)))
+        else
+         (case mode
+               ((nil)          (go required-arg))
+               ((&optional)    (go optional-arg))
+               ((&rest)        (go rest-arg))
+               ((&aux)         (go aux-arg))
+               ((&key)         (go key-arg))
+               (t (bind-error q "Misplaced lambda list keyword" mode)))
+       )
+
+ required-arg
+       (when (null l)
+             (if destructuring-p
+              then
+                 (bindarg c nil)
+                 (setq bvl (cdr bvl))
+                 (go loop)
+              else
+                 (zerror "Too few arguments" q)
+             ))
+       (bindarg c (zcar l))
+       (setq l (cdr l))
+       (setq bvl (cdr bvl))
+       (go loop)
+ optional-arg
+       (setq c2 nil c3 nil)
+       (cond
+            ((atom c) (setq c1 c))
+            (t        (setq c1 (car c)
+                            c2 (cadr c)
+                            c3 (caddr c))))
+;
+; Note: when binding ... &optional (foo bar ...) ...,
+; bar gets evaluated in the environment built SO FAR by the BINDARG
+; macro, and the evaluated value is bound to foo.
+;
+       (cond
+            ((null l) (bindarg c1 (zileval c2 a nil))
+                      (bindarg c3 nil))
+            (t        (bindarg c1 (zcar l))
+                      (bindarg c3 t)
+                      (setq l (cdr l))))
+       (setq bvl (cdr bvl))
+       (go loop)
+ aux-arg
+       (cond
+            ((atom c) (setq c1 c
+                            c2 nil))
+            (t        (setq c1 (car c)
+                            c2 (cadr c))))
+       (push `(,c1 . ,c2) aux-args-to-be-evaluated)
+       (setq bvl (cdr bvl))
+       (go loop)
+ rest-arg
+       (and restarg (bind-error q "Too many &REST args"))
+       (setq restarg c)
+       (setq bvl (cdr bvl))
+       (go loop)
+ key-arg
+
+ ;
+ ; Format of a &key entry:
+ ;
+ ; var
+ ; (var)
+ ; (var initform)
+ ; (var initform suppliedp)
+ ; ((:var var))
+ ; ((:var var) initform)
+ ; ((:var var) initform suppliedp)
+ ;
+
+       (let (
+             (var)
+             (variable)
+             (initform)
+             (suppliedp)
+             (keyword)
+            )
+            (cond
+             ((atom c)
+              (setq variable c
+                    initform nil
+                    suppliedp nil
+                    keyword (keywordify c)))
+             ((atom (setq var (car c)))
+              (setq variable var
+                    initform (cadr c)
+                    suppliedp (caddr c)
+                    keyword (keywordify var)))
+             ((or (null (cdr var))
+                  (cddr var))
+              (bind-error q "Invalid &KEY arg syntax" c))
+             (t
+              (setq variable (cadr var)
+                    initform (cadr c)
+                    suppliedp (caddr c)
+                    keyword (car var)))
+            )
+;;;
+;;; The following check removed to allow destructuring of &KEY vars.
+;;;
+;;;;;;;;;;;;(unless (and (symbolp variable)
+;;;;;;;;;;;;             (not (keywordp variable)))
+;;;;;;;;;;;; (bind-error q "Invalid &KEY variable name" variable))
+            (unless (and (symbolp suppliedp)
+                         (not (keywordp suppliedp)))
+             (bind-error q "Invalid &KEY suppliedp name" suppliedp))
+            (push (make-keychain
+                        keyword    keyword
+                        variable   variable
+                        initform   initform
+                        suppliedp  suppliedp
+                        value      keyspec
+                  ) keylist))
+       (setq bvl (cdr bvl))
+       (go loop)
+ process-&optional
+       (setq mode '&optional)
+       (setq bvl (cdr bvl))
+       (go loop)
+ process-&aux
+       (setq mode '&aux)
+       (setq bvl (cdr bvl))
+       (go loop)
+ process-&rest
+       (and restarg (bind-error q "Duplicate &REST arg" q))
+       (setq mode '&rest)
+       (setq bvl (cdr bvl))
+       (go loop)
+ process-&key
+       (setq mode '&key)
+       (setq keyspec (ncons nil)) ;Unique arg to represent "unbound" key
+       (setq bvl (cdr bvl))
+       (go loop)
+ process-&allow-other-keys
+       (setq mode '&allow-other-keys)
+       (setq allow-other-keys-p t)
+       (setq bvl (cdr bvl))
+       (go loop)
+ cleanup
+;
+; If neither &REST nor &KEY was specified, then if there are any
+; leftover args this may be an error.
+;
+       (and l
+            (null restarg)
+            (null keyspec)
+            (if destructuring-p
+             then
+                 ; nothing - just ignore the extra subargs
+             else
+                 (zerror "Too many arguments" q)))
+;
+; Bind the &REST arg if any.
+;
+       (when restarg
+             (bindarg restarg l))
+;
+; Bind the &KEY keywords if any.
+;
+       (when keyspec
+             (setq keylist (nreverse keylist))
+             ;
+             ; See if either &allow-other-keys was specified or
+             ; the :allow-other-keys keyword was passed and is not NIL.
+             ;
+             ; Note: This code depends on the CAR of NIL being NIL.
+             ;
+             (unless allow-other-keys-p
+                     (setq allow-other-keys-p
+                           (car (getk l ':allow-other-keys t))))
+             (prog (p k e f)
+                   (setq p l)
+               loop
+                   (or p (go done))
+                   (setq k (zcar p)
+                         p (cdr p))
+                   (unless p
+                         (zerror "Odd number of keyword arguments" q l))
+                   (when (eq k ':allow-other-keys)
+                         (setq p (cdr p))
+                         (go loop))
+                   (setq e (loop for x in keylist
+                                 when (eq k (keychain-keyword x))
+                                 return x))
+                   (unless e
+                           (if allow-other-keys-p
+                            then
+                               (setq p (cdr p))
+                               (go loop)
+                            else
+                               (zerror "Key not defined" q k)
+                            endif
+                           ))
+                   (when (eq (keychain-value e) keyspec)
+                         (setf (keychain-value e) (zcar p)))
+                   (setq p (cdr p))
+                   (go loop)
+               done
+                   (loop for x in keylist
+                         with sup
+                         when (eq (keychain-value x) keyspec)
+                              (setf (keychain-value x)
+                                    (zileval (keychain-initform x)
+                                             a nil))
+                              (setq sup nil)
+                         else
+                              (setq sup t)
+                         do
+                              (bindarg (keychain-variable x)
+                                       (keychain-value x))
+                         when (keychain-suppliedp x)
+                              (bindarg (keychain-suppliedp x) sup)
+                   )))
+
+;
+; Bind the &AUX args if any.
+;
+;
+; Note: when binding ... &aux (foo bar ...) ...,
+; bar gets evaluated in the environment built SO FAR by the BINDARG
+; macro (which includes all other bindings plus those established
+; for previously occurring &AUX args),
+; and the evaluated value is bound to foo.
+;
+       (loop for (c1 . c2) in (nreverse aux-args-to-be-evaluated)
+             (bindarg c1 (zileval c2 a nil)))
+       (return)))
+
+(defmacro bindarg (var val)
+ `(destructuring-bind ,var ,val q a locspecs lamspecs)
+)
+
+(defun destructuring-bind (var val q a locspecs lamspecs)
+ (cond
+  ((null var)     nil)
+  ((symbolp var)  (cond
+                   ;
+                   ; A symbol that is self-evaluating cannot be used
+                   ; as a lambda list variable.
+                   ; e.g. T, keywords
+                   ;
+                   ((eq (pbind var) var)
+                    (bind-error q "Cannot use as lambda list arg" var))
+                   ((or (memq var locspecs)      ; Locally special?
+                        (specialp var))          ; Globally special?
+                  ;
+                  ; If the variable is locally or globally declared
+                  ; SPECIAL, delete it from the list of local bindings
+                  ;
+                  ; (Note: If the variable is globally proclaimed
+                  ;        SPECIAL, it would never have ended up on
+                  ;        the list of local bindings, so we could
+                  ;        conceivably skip that, and do this only for
+                  ;        members of LOCSPECS.)
+                  ;
+                  ; To avoid needless consing, we do this only if
+                  ; there is a variable of the same name already there.
+                  ;
+                    (when (assq var (bindenv a))
+                          (setf (bindenv a)
+                                (loop for binding in (bindenv a)
+                                      unless (eq var (car binding))
+                                      collect binding)))
+                    (push (cons var val) (special-alist)))
+                   (t
+                    ;; Make "unspecial" by de-pervasive-specialing it.
+                    (delq var lamspecs) ; Must be side-effectable!!!
+                    (push (cons var val) (bindenv a)))))
+  ((atom var)     (bind-error q "Arg not a list or symbol" var))
+  ((and val (atom val))
+                  (when (< (msglevel) 3)
+                        (princ "Destructuring error in function ")
+                        (prin1 q)
+                        (terpri)
+                        (princ "Unable to destructure into arg(s) ")
+                        (prin1 var)
+                        (terpri))
+                  (zerror "Cannot destructure value" val))
+  (t
+                  (zilapply-bind var val q a locspecs lamspecs t))))
+
+(defun bind-error (q msg &optional (arg1 nil arg1?))
+ (let ((msg
+            `("Syntax error in lambda list for "
+              ,q
+              #.(tostring (ebcdic #\nl))
+              ,msg)))
+      (cond
+       (arg1? (zerror msg arg1))
+       (t     (zerror msg)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+; Obsolete code...
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; If not a LAMBDA or LABEL expression, maybe the list is a macro
+;;; call that expands into one.  Let's try it out.
+;
+; ( (and (symbolp (zcar f))
+;        (get (zcar f) 'macro))
+;                         (zilapply-warning f)
+;                         (zilapply (macroexpand f) l a q)            )
+;
+;;; Otherwise, not recognized.  Do non-CL evaluation of CAR and try it.
+;
+; ( t                     (zilapply-warning f)
+;                         (zilapply (zileval f
+;                                            (list (bindenv a) nil nil))
+;                                            l a q)                   )
+;
+; ZILAPPLY-WARNING
+;
+;
+;(defun zilapply-warning (form)
+; (when (lessp (msglevel) 2)
+;       (cterpri)
+;       (princ "Warning: Invalid function name ")
+;       (prin1 form)
+;       (princ " in CAR of form.  ")
+;       (princ "Evaluating it for value to reapply.")
+;       (terpri)))
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

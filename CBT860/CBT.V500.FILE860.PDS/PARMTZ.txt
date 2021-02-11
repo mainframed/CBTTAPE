@@ -1,0 +1,830 @@
+PARMTZ   TITLE 'P A R M T Z  ***  SET SYSTEM TIME ZONE FROM START JOB'
+***********************************************************************
+**                                                                   **
+**   PARMTZ is a quick and dirty little program that has two uses:   **
+**                                                                   **
+**   0) With a null PARM, displays current settings only.            **
+**                                                                   **
+**   1) Set the system time zone in CVTTZ.                           **
+**      a) This may mess up running jobs                             **
+**      b) This does not affect modern systems that use CVTLDTO and  **
+**         CVTLSO, i.e., z/OS and OS/390                             **
+**      c) Does not take effect until the next time the system looks **
+**         at CVTTZ (midnight or eight hour period end ?)            **
+**                                                                   **
+**   2) Create or update SYS1.PARMLIB member PARMTZ with the desired **
+**      value.                                                       **
+**                                                                   **
+**   In order to make life interesting, this program has the same    **
+**   name as one written by Jan Jaeger to transfer the time zone     **
+**   value from z/OS to z/USS.                                       **
+**                                                                   **
+**   The maximum valid hourly offset is 12, in agreement with the    **
+**   check in module IEAVNP13. Value is in variable MAXHOUR.         **
+**                                                                   **
+**   To use, add procedure PARMTZ to a procedure library for start   **
+**   jobs, generally SYS1.PROCLIB or SYS2.PROCLIB (turnkey-MVS, etc) **
+**                                                                   **
+**   Issue:   START PARMTZ,PARM='d,hh' or PARM='d,hh.mm'             **
+**     where "d" is either E or W for direction from Greenwich       **
+**     "hh" is a two digit offset from GMT (may be zero)             **
+**     "hh.mm" specifies an hour and minute offset, usually used     **
+**       for fractional offsets, e.g., PARM='E,05.30' for Mumbai.    **
+**                                                                   **
+**   To update the PARMTZ member in SYS1.PARMLIB specify MEM= with   **
+**   the member name (usually PARMTZ).                               **
+**                                                                   **
+**   Load module PARMTZ must reside in an authorized library, either **
+**   specified in the procedure, or present in a linklist library    **
+**   (e.g., SYS2.LINKLIB for turnkey-MVS) if CVTTZ is to be changed. **
+**   Code is re-entrant for easier debugging.                        **
+**                                                                   **
+**  =====> Note that this program should ENQ to protect PARMLIB,     **
+**         but an enqueue on SYSDSN would fail, and MVS has no       **
+**         other major name available.                               **
+**                                                                   **
+**                  Gerhard Postpischil  gerhard@postpischil.com     **
+**                                                January 2012       **
+**   All rights reserved. Program may be used freely by members of   **
+**   the Hercules community, providing attribution is kept intact.   **
+**                                                                   **
+***********************************************************************
+**                                                                   **
+**   Sample procedure:                                               **
+**                                                                   **
+**   //PARMTZ  PROC TZ=,MEM=DUMMY                                    **
+**   //*                                                             **
+**   //*  PROC to set Time Zone                                      **
+**   //*    e.g.,     TZ=W,06.00     or  TZ=E,05.30                  **
+**   //*    use mem to update PARMLIB:   MEM=PARMTZ                  **
+**   //*    append ,CVT to TZ to update CVTTZ: PARM='W,0500,CVT'     **
+**   //*                                                             **
+**   //IEFPROC EXEC  PGM=PARMTZ,PARM='&TZ'                           **
+**   //*                                                             **
+**   //SYSPARM  DD  DISP=SHR,DSN=SYS1.PARMLIB(&MEM)                  **
+**   //*    above may have (PARMTZ) as member to update always.      **
+**    optional:                                                      **
+**   //STEPLIB  DD  DISP=SHR,DSN= authorized library                 **
+**                                                                   **
+***********************************************************************
+**                                                                   **
+**   To assemble under MVS 3.8j: (lower case is your choice)         **
+**                                                                   **
+**   //parmtz JOB (acct,suba),'user id',MSGCLASS=C,MSGLEVEL=(1,1)    **
+**   //       EXEC ASMFCL,MAC1='SYS1.AMODGEN',                       **
+**   //            PARM.LKED='RENT,REUS,REFR,LIST,NCAL'              **
+**   //SYSIN  DD (* if inline, or DISP=SHR,DSN=pdsname(member)       **
+**   //LKED.SYSLMOD DD DISP=(SHR,KEEP,KEEP),DSN=SYS2.LINKLIB(PARMTZ) **
+**   //                                                              **
+**                                                                   **
+***********************************************************************
+**                                                                   **
+**   SOME REGISTERS ARE USED (NEARLY) GLOBALLY:                      **
+**     R6 - SYSPARM DCB                                              **
+**     R8/R9 - PARM PARSING                                          **
+**                                                                   **
+***********************************************************************
+         SPACE 1
+         MACRO ,
+&NM      MYDATA &PFX=OMITTED
+         LCLC  &P                 MAKE STUFF SHORTER
+&P       SETC  '&PFX'
+&NM      DS    0D                 FORCE ALIGNMENT
+.*   EXPAND DATA ONCE AS A PATTERN, AND ONCE IN THE DYNAMIC AREA
+&P.DCB   DCB   DDNAME=SYSPARM,DSORG=PO,MACRF=(R,W),EODAD=EODAD,        *
+               EXLST=&P.EXLST
+&P.EXLST DC    0A(0),X'07',AL3(1-1),X'85',AL3(OCEXIT)
+&P.OCLST OPEN  (&P.DCB,(UPDAT)),TYPE=J,MF=L
+         READ  &P.DECB,SF,&P.DCB,3-3,4-4,MF=L
+         MEND  ,
+         SPACE 1
+         MACRO ,
+&NM      MDEF  &TEXT
+.*   LAZY MESSAGE DEFINITION - NO COUNT OF AMPERSANDS OR QUOTES
+         LCLA  &I
+&I       SETA  K'&TEXT-2
+&NM      DC    AL1(&I-1),CL(&I)&TEXT
+&NM.L    EQU   *-&NM
+         MEND  ,
+         SPACE 1
+         MACRO ,
+&NM      MSG   &MSG
+.*   PRODUCE A MESSAGE
+         LCLA  &I
+         LCLC  &LABEL
+&LABEL   SETC  '&NM'
+&I       SETA  K'&MSG
+         AIF   (&I LT 3).ADDR
+         AIF   ('&MSG'(1,1) NE '(').ADDR
+         AIF   ('&MSG'(&I,1) NE ')').ADDR
+         AIF   ('&MSG'(2,1) EQ '(').ADDR
+         AIF   ('&MSG'(&I-1,1) EQ ')').ADDR
+         AIF   ('&MSG' EQ '(1)' OR '&MSG' EQ '(R1)').BAL
+&LABEL   LR    R1,&MSG(1)         LOAD MESSAGE ADDRESS
+&LABEL   SETC  ''
+         AGO   .BAL
+.ADDR    ANOP  ,
+&LABEL   LA    R1,&MSG            LOAD MESSAGE ADDRESS
+&LABEL   SETC  ''
+.BAL     ANOP  ,
+&LABEL   BAL   R14,PUTMSG
+         MEND  ,
+         SPACE 1
+         MACRO
+         YREGS ,
+         GBLA  &REGS
+         AIF   (&REGS EQ 1).MEND  ONLY EXPAND ONCE
+&REGS    SETA  1             MAINTAIN IBM COMPATIBILITY
+         LCLA  &I
+.LOUPE   AIF   (&I GT 15).MEND
+R&I      EQU   &I
+&I       SETA  &I+1
+         AGO   .LOUPE
+.MEND    MEND
+         SPACE 1
+*DEBUG*  PUNCH ' ORDER PARMTZ(P) '   EASIER DEBUG
+         PUNCH ' SETCODE AC(1)'   REQUIRED FOR CVT UPDATE
+         SPACE 2
+         PRINT ON,NOGEN           SAVE A TREE
+PARMTZ   START 0
+         B     BEGIN-*(,R15)      SKIP ID
+         DC    AL1(17),CL17'PARMTZ   &SYSDATE '
+BEGIN    STM   R14,R12,12(R13)
+         LR    R12,R15
+         USING PARMTZ,R12
+         SPACE 1
+*---------------------------------------------------------------------*
+*   GET PARM ADDRESS INTO R8, LENGTH INTO R9                          *
+*---------------------------------------------------------------------*
+         L     R8,0(,R1)
+         LH    1+R8,0(,R8)        GET LENGTH
+         CLI   2(R8),0            TSO CP CALL?
+         BH    *+16                 NO, USE OS FORM
+         SH    1+R8,=H'4'         ALLOW FOR LENGTH LENGTH
+         SH    1+R8,2(,R8)        ALLOW FOR PARSED COMMAND NAME
+         LA    R8,2(,R8)          SKIP SECOND LENGTH
+         LA    R8,2(,R8)          SKIP FIRST LENGTH
+         SPACE 1
+*---------------------------------------------------------------------*
+*   GET DYNAMIC STRORAGE, COPY PATTERN DATA, INITIALIZE               *
+*---------------------------------------------------------------------*
+         L     R3,=A(SAVEEND-SAVE)
+         GETMAIN R,LV=(R3)        GET STORAGE
+         LR    R2,R1              COPY START ADDRESS
+         LR    R7,R1              SAVE FOR LATER
+         SR    R15,R15
+         MVCL  R2,R14             CLEAR GOTTEN STORAGE
+         ST    R7,8(,R13)         LINK SAVE AREAS
+         ST    R13,4(,R7)
+         LR    R13,R7             ESTABLISH NEW SAVE AREA
+         USING SAVE,R13             AND DECLARE IT
+         LA    R14,DYNDATA
+         LH    R15,=AL2(PATSIZE)  IN CASE LA ISN'T ENOUGH
+         LA    R0,PATTERN
+         LR    R1,R15
+         MVCL  R14,R0             COPY DATA
+         LA    R6,DYNDCB          GET BPAM DCB ADDRESS
+         USING IHADCB,R6          MAKE REST OF CODE EASIER
+         LA    R0,DYNEXLST        POINT TO EXIT LIST
+         STCM  R0,7,DCBEXLSA      STASH IN DCB
+         LA    R0,DYNJFCB
+         STCM  R0,7,DYNEXLST+1    JFCB ADDRESS TO EXIT LIST
+         LA    R0,OCEXIT
+         STCM  R0,7,DYNEXLST+5    OPEN EXIT ADDRESS TO EXIT LIST
+         STCM  R6,7,DYNOCLST+1    OPEN/CLOSE LIST
+         LA    R0,80              CURRENT BLOCK LENGTH (IF NOT READ)
+         ST    R0,BLKLEN            THIS IS WRITE SIZE
+         SPACE 1
+*---------------------------------------------------------------------*
+*   FOR START JOB, GET THE ISSUING CONSOLE ID AND SEND ALL MESSAGES   *
+*     BACK TO IT. THEN TEST FOR FOREGROUND TSO AND SET FLAG,          *
+*---------------------------------------------------------------------*
+         XC    DB2(12),DB2          (FAKE LIST FORM)
+         EXTRACT DB,FIELDS=(COMM,TSO),MF=(E,DB2)
+         L     R3,DB              GET BLOCK
+         ICM   R4,15,4(R3)        GET CIB ADDRESS
+         BZ    NOCIB
+         MVC   CONSID+L'CONSID-L'CIBCONID(L'CIBCONID),CIBCONID-CIB(R4)
+         B     SKIPCIB
+NOCIB    L     R3,PSATOLD-PSA     GET MY TCB
+         L     R3,TCBJSCB-TCB(,R3)
+         L     R3,JSCBCSCB-IEZJSCB(,R3)
+         MVC   CONSID+L'CONSID-L'CHUCMP(L'CHUCMP),CHUCMP-CHAIN(R3)
+SKIPCIB  L     R3,DB+4            LOAD TSO FLAG POINTER
+         TM    0(R3),X'80'        FOREGROUND TSO ?
+         BZ    *+8                  NO
+         OI    ERRFLAGS,EFTSO       YES; USE TPUT FOR MESSAGES
+         SPACE 1
+*---------------------------------------------------------------------*
+*   EXAMINE PARM FIELD, EXTRACT TIME ZONE INFORMATION.                *
+*---------------------------------------------------------------------*
+         LTR   R9,R9              ANY PARM AT ALL?
+         BP    LOOKPARM             YES; EXAMINE IT
+         OI    ERRFLAGS,EFSHOW    SHOW CURRENT, ONLY
+         B     DONEPARM             SKIP PARM TESTING
+         SPACE 1
+LOOKPARM CH    R9,=H'3'           AT LEAST d,HH ?
+         BL    BDPRMLEN             NO; TOO SHORT
+         BH    HAVEFOUR
+         CLI   1(R8),C'0'         IS IS +nn OR -nn FORM?
+         BNE   BDPRMLEN             NO; FAIL
+HAVEFOUR MVI   TRTABLE,255
+         MVC   TRTABLE+1(L'TRTABLE-1),TRTABLE    SET ALL INVALID
+         MVI   TRTABLE+C' ',0     SKIP LEADING BLANKS
+         LA    R1,0(R9,R8)        STOP ADDRESS IF ALL BLANK
+         SR    R2,R2              SET FOR DEBUGGING
+         LR    R15,R9
+         BCTR  R15,0
+         EX    R15,EXTRTPRM       FIND FIRST SIGNIFICAN DIGIT
+         AR    R9,R8              ADD START TO LENGTH
+         SR    R9,R1              LESS END = NEW LENGTH
+         LR    R8,R1              NEW START
+PRMLOOP  CH    R9,=H'3'           AT LEAST d,HH ?
+         BL    BDPRMLEN             NO; TOO SHORT
+         BH    HAVEMORE
+         CLI   1(R8),C'0'         IS IS +nn OR -nn FORM?
+         BNE   BDPRMLEN             NO; FAIL
+HAVEMORE CLC   =C'TZ=',0(R8)
+         BNE   PRMNOTZ
+         LA    R8,3(,R8)          SKIP OVER PREFIX
+         SH    R9,=H'3'
+         B     PRMLOOP
+PRMNOTZ  XC    TRTABLE,TRTABLE
+         MVI   TRTABLE+C'W',C'W'  SET VALUE FOR WEST
+         MVI   TRTABLE+C'w',C'W'  SET VALUE FOR west
+         MVI   TRTABLE+C'-',C'W'  SET VALUE FOR MINUS
+         MVI   TRTABLE+C'E',C'E'  SET VALUE FOR EAST
+         MVI   TRTABLE+C'e',C'E'  SET VALUE FOR east
+         MVI   TRTABLE+C'+',C'E'  SET VALUE FOR PLUS
+         SR    R2,R2
+         TRT   0(1,R8),TRTABLE
+         LTR   R2,R2              TEST IF VALID
+         BZ    BDNODIR              NO; FAIL
+         STC   R2,NEWTZ           SET NEW VALUE
+         MVI   NEWTZ+1,C','       SPEARATE
+         LA    R0,1               BUMP ONE CHARACTER
+         CLI   1(R8),C'0'         MISSING COMMA?
+         BNL   DIRBUMP              YES; ADVANCE 1
+         CLI   1(R8),C','         HAVE A COMMA?
+         BNE   BDNODIR              NO; ERROR IN PARM SYNTAX
+         LA    R0,2
+DIRBUMP  AR    R8,R0              ADVANCE
+         SR    R9,R0
+         MVI   TRTABLE,12
+         MVC   TRTABLE+1(L'TRTABLE-1),TRTABLE    SET ALL INVALID
+         MVI   TRTABLE+C' ',8     STOP ON BLANK
+         MVI   TRTABLE+C',',4     STOP ON COMMA
+         XC    TRTABLE+C'0'(10),TRTABLE+C'0'     PASS DIGITS
+         MVI   TRTABLE+C'.',0     ALLOW PERIOD
+         MVI   TRTABLE+C':',0     ALLOW COLON
+         CH    R9,=H'2'           AT LEAST HOUR ?
+         BL    BDNOTIM              NO; FAIL
+         LR    R15,R9
+         BCTR  R15,0
+         SR    R2,R2
+         LA    R1,0(R9,R8)        STOPPER IF NO MATCH
+         EX    R15,EXTRTPRM       LOOK FOR STOPPER
+         CH    R2,MAXHOUR         ANY ERROR ?
+         BNL   BDNOTIM              YES; ERROR IN TIME FIELD
+         LR    R14,R1             GET STOP ADDRESS
+         BCTR  R14,0              ADJUST FOR EXECUTE
+         SR    R14,R8             LESS START = LENGTH -1
+         BM    BDNOTIM              ERROR IN TIME FIELD
+         CH    R14,=H'7'          TOO LONG ?
+         BH    BDNOTIM              YES; ERROR IN TIME FIELD
+         MVI   TRTABLE+C':',4     ALLOW COLON
+         LA    R3,2               CHECK TWICE
+LOOPCOLS SR    R2,R2
+         EX    R14,EXTRTPRM       COLON ?
+         LTR   R2,R2
+         BZ    DONECOLR
+         MVI   0(R1),C'.'         REPLACE COLON BY PERIOD
+         BCT   R3,LOOPCOLS
+DONECOLR EX    R14,EXMVCVAL
+         MVC   DB+8(2),=C'.0'
+         LR    R1,R14
+         SLL   R1,3               CONVERT LENGTH TO OFFSET
+         LA    R1,PATTAB(R1)      GET ENTRY ADDRESS
+         CLI   0(R1),X'FF'        INVALID ENTRY ?
+         BE    BDNOTIM              YES; BAD FORMAT
+         MVC   DB2,0(R1)          COPY ENTRY
+         TR    DB2,DB             MERGE PARM VALUE
+         MVC   NEWTZ+2(8),DB2     COPY IN CASE IT'S VALID
+         NC    DB2,=C'00.00.00'   ELIMINATE NYBBLES
+         CLC   DB2,=C'00.00.00'   MATCHES PATTERN ?
+         BNE   BDNOTIM              NO; INVALID
+         MVC   DB2(6),=AL1(2,3,5,6,8,9)
+         TR    DB2,NEWTZ          EXTRACT DIGITS ONLY
+         PACK  DB,DB2(6)          CONVERT TO PACKED
+         CVB   R1,DB              CONVERT TO BINARY
+         SR    R0,R0
+         D     R0,=F'100'         SPLIT OUT SECONDS
+         C     R0,=F'60'          LEGAL ?
+         BNL   BDTIM2BD
+         LR    R15,R0             SAVE SECS
+         SR    R0,R0              CLEAR REMAINDER
+         D     R0,=F'100'         SPLIT OUT MINUTES
+         C     R0,=F'60'          LEGAL ?
+         BNL   BDTIM2BD
+         C     R1,=F'12'          LEGAL (PER IEAVNP13 CHECK) ?
+         BH    BDTIM2BD
+         MH    R1,=H'60'          SCALE HOURS
+         AR    R1,R0              ADD MINUTES
+         MH    R1,=H'60'          SCALE HOURS.MINUTES
+         AR    R1,R15             ADD SECONDS
+         M     R0,=F'15625'
+         D     R0,=F'16384'       CONVERT TO TIMER UNITS
+         LTR   R1,R1              ALL ZERO ?
+         BNZ   *+8                  NO
+         MVI   NEWTZ,C'E'
+         CLI   NEWTZ,C'W'         WEST ?
+         BNE   HAVETZ               NO
+         LNR   R1,R1
+HAVETZ   ST    R1,BINTZNEW        SAVE FOR LATER
+         LA    R8,1(R14,R8)       SKIP
+         BCTR  R9,0
+         SR    R9,R14             RESIDUAL LENGTH
+         B     DONETIME
+EXTRTPRM TRT   0(0,R8),TRTABLE
+EXMVCVAL MVC   DB(0),0(R8)        MOVE TO WORK AREA
+PATTAB   DC    8AL1(255)          LENGTH 1 - INVALID
+         DC    AL1(0,1,8,9,9,8,9,9)  LEN 2 - hh
+         DC    8AL1(255)          LENGTH 3 - INVALID
+         DC    AL1(0,1,8,2,3,8,9,9)  LEN 4 - hhmm
+         DC    AL1(0,1,2,3,4,8,9,9)  LEN 5 - hh.mm
+         DC    AL1(0,1,8,2,3,8,4,5)  LEN 6 - hhmmss
+         DC    8AL1(255)          LENGTH 7 - INVALID
+         DC    AL1(0,1,2,3,4,5,6,7)  LEN 8 - hh.mm.ss
+         SPACE 1
+DONETIME CH    R9,=H'4'           ROOM FOR ,CVT ??
+         BL    DONEPARM             NO; IGNORE POSSIBLE ERROR
+         ICM   R0,15,0(R8)        LOAD RESIDUAL PARM
+         O     R0,=CL4' '         UPPER CASE
+         C     R0,=C',CVT'        UPDATE CVT ?
+         BNE   DONEPARM
+         OI    ERRFLAGS,EFCVTUP   INDICATE CVTTZ UPDATE REQUESTED
+         SPACE 1
+*---------------------------------------------------------------------*
+*   CONVERT SYSTEM'S TIME ZONE TO DISPLAY FORMAT                      *
+*---------------------------------------------------------------------*
+DONEPARM DS    0H
+         L     R1,CVTPTR          GET CVT
+         L     R1,CVTTZ-CVTMAP(R1)  GET OLD VALUE
+         ST    R1,BINTZOLD        SAVE OLD VALUE
+         LPR   R1,R1              GET MAGNITUDE
+         M     R0,=F'16384'
+         D     R0,=F'15625'       CONVERT FROM TIMER UNITS TO SECONDS
+         SR    R0,R0              CLEAR FOR DIVIDE
+         AL    R1,=A(5*60-1)      PREPARE TO RUN TO 5 MINUTES
+         BC    12,*+8               NO CARRY
+         A     R0,=F'1'           PROPAGATE CARRY (SHOULDN'T BE ONE)
+         D     R0,=A(5*60)
+         M     R0,=A(5*60)        ROUNDED TO 5 MINUTES
+*                                 EXTRACT HOURS, MINUTES, SECONDS
+         D     R0,=F'60'          SPLIT OUT SECONDS
+         LR    R15,R0             SAVE SECS
+         SR    R0,R0              CLEAR REMAINDER
+         D     R0,=F'60'          SPLIT OUT MINUTES
+         MH    R1,=H'100'         SCALE HOURS
+         AR    R1,R0              ADD MINUTES
+         MH    R1,=H'100'         SCALE HOURS.MINUTES
+         AR    R1,R15             ADD SECONDS
+         MVC   OLDTZ+0(10),=X'F02120204B20204B2020'  HH.MM.SS MASK
+         CVD   R1,DB              CONVERT TO PACKED
+         ED    OLDTZ+0(10),DB+4   PRETTIFY
+         MVC   OLDTZ(2),=C'E,'    SET EAST
+         TM    BINTZOLD,X'80'     TEST OLD SIGN
+         BNO   DONEOLD            POSITIVE - EAST
+         MVI   OLDTZ,C'W'         SET WEST
+DONEOLD  MVC   DYNBUFF(MSG041L),MSG041
+         MVC   MSG041T+DYNBUFF(L'MSG041T),OLDTZ
+         MSG   DYNBUFF            SHOW CURRENT CVTTZ
+         SPACE 1
+*---------------------------------------------------------------------*
+*   VERIFY SYSPARM DD CARD; GET JFCB; EXTRACT MEMBER NAME             *
+*     THE SPECIAL MEMBER NAME 'DUMMY' INHIBITS PARMLIB UPDATING       *
+*---------------------------------------------------------------------*
+         DEVTYPE DCBDDNAM,DB      SEE WHETHER USER SUPPLIED DD
+         LTR   R15,R15            DD PRESENT ?
+         BNZ   DONEPDS              NO; CONTINUE WITHOUT PDS
+         C     R15,DB             DD DUMMY ?
+         BE    DONEPDS              YES; CONTINUE WITHOUT PDS
+         CLI   DB+2,UCB3DACC      DASD ?
+         BNE   BDNODASD             NO; FAIL
+         RDJFCB MF=(E,DYNOCLST)   GET THE JFCB (NO R15 IN MVS)
+         TM    JFCBIND1,JFCPDS    DID USER SPECIFY A MEMBER NAME?
+         BZ    MISSMEM              NO
+         MVC   MEMBER,JFCBELNM    SAVE IT
+         XC    JFCBELNM,JFCBELNM  WIPE IT OUT
+         NI    JFCBIND1,255-JFCPDS   SET NO MEMBER PRESENT
+         CLC   =C'DUMMY ',MEMBER  DEFAULT MEMBER ?
+         BNE   READDSCB             NO; ELSE TREAT DUMMY AS MISSING
+MISSMEM  OI    ERRFLAGS,EFNOMEM   SHOW MEMBER NAME MISSING
+         MVC   MEMBER,=CL8'PARMTZ '    SET FOR DEFAULT
+         SPACE 1
+*---------------------------------------------------------------------*
+*   OBTAIN AND CHECK THE FORMAT 1 DSCB                                *
+*---------------------------------------------------------------------*
+READDSCB L     R14,PATCAM         BUILD SEARCH REQUEST
+         LA    R15,JFCBDSNM
+         LA    R0,JFCBVOLS
+         LA    R1,DYNBUFF         USE BUFFER FOR JFCB
+         STM   R14,R1,DB          BUILD CAMLST
+         OBTAIN DB                GET THE FORMAT 1 DSCB
+         BXH   R15,R15,BDNOFMT1   SHOW FORMAT 1 NOT FOUND
+         LA    R2,DYNBUFF
+         USING DS1FMTID,R2        MAP DSCB WITHOUT DSN
+         CLI   DS1DSORG+1,0       NOT VSAM OR STUFF?
+         BNE   BDNODASD             CAN'T BE PDS
+         CLI   DS1DSORG,DS1DSGPO  PLAIN PDS ?
+         BE    HAVEPDS              YES
+         CLI   DS1DSORG,DS1DSGPO+DS1DSGU  ANTEDILUVIAN PDS ?
+         BNE   BDNODASD             NO; REJECT
+HAVEPDS  TM    DS1RECFM,255-(DCBRECF+DCBRECBR)   OTHER THAN FB?
+         BNZ   BDDCBPRM
+         TM    DS1RECFM,DCBRECF   AT LEAST F?
+         BZ    BDDCBPRM
+         CLC   =H'80',DS1LRECL    VALID RECORD LENGTH?
+         BNE   BDDCBPRM             YES; RETURN
+         DROP  R2
+         SPACE 1
+*---------------------------------------------------------------------*
+*   OPEN DCB FOR UPDAT                                                *
+*---------------------------------------------------------------------*
+OPENBPAM OPEN  MF=(E,DYNOCLST),TYPE=J  OPEN SYSPARM
+         TM    DCBOFLGS,DCBOFOPN  DID IT OPEN ?
+         BZ    BDOPEN               NO; QUIT AFTER MESSAGE
+         TM    ERRFLAGS,EFBADCB   GOOD DCB PARAMETERS?
+         BNZ   BDDCBPRM             NO; QUIT NOW
+         NOTE  (R6)               GET AVAILABLE POSITION
+         ST    R1,MEMTTR          SAVE TTR OF NEW MEMBER TO BE
+         SPACE 1
+*---------------------------------------------------------------------*
+*   FIND THE OLD PARMTZ MEMBER; ON ERROR, SET TO REPLACE              *
+*---------------------------------------------------------------------*
+         MVC   BLDLLIST(4),=AL2(1,12+2*31)  MAKE MAXIMAL LIST
+         MVC   BLDLLIST+4(8),MEMBER    LOOK FOR EXISTING MEMBER
+         BLDL  (R6),BLDLLIST      IS OLD MEMBER PRESENT ?
+         LTR   R15,R15
+         BZ    GDBLDL               YES
+         OI    ERRFLAGS,EFNEW     NO OLD MEMBER PRESENT
+         B     DONEREAD
+GDBLDL   FIND  (R6),BLDLLIST+4+8,C  POINT TO BY TTR
+         LTR   R15,R15
+         BZ    GDFIND               GOOD FIND
+         OI    ERRFLAGS,EFREP     FIND FAILED ???
+         B     DONEREAD
+         SPACE 1
+*---------------------------------------------------------------------*
+*   READ FIRST BLOCK INTO DYNBUFF; SAVE LENGTH; (PARTIAL) VALIDATE    *
+*---------------------------------------------------------------------*
+         PUSH  USING
+         USING IHADCB,R6
+GDFIND   READ  DYNDECB,SF,(R6),DYNBUFF,MF=E      READ THE MEMBER
+         CHECK DYNDECB            WAIT FOR COMPLETION
+         LA    R1,DYNDECB
+         USING DECB,R1
+         L     R3,DECIOBPT        Load address of Input/Output Block
+         USING IOBSTDRD,R3        Give assembler IOB base
+         SLR   R2,R2              Clear residual amount work register
+         ICM   R2,B'0011',IOBCSW+5  Load residual count
+         DROP  R3                 Don't need IOB address base anymore
+         LH    R3,DYNDCB+DCBBLKSI-IHADCB
+         SLR   R3,R2              Find block size read in
+         C     R3,BLKLEN          AT LEAST 80 ?
+         BL    BDDCBPRM             NO; WHAT AM I LOOKING AT?
+         LR    R4,R3              SAVE IT
+         SR    R2,R2
+         D     R2,BLKLEN          DIVIDE BY EIGHTY
+         LTR   R2,R2              ANY REMAINDER?
+         BNZ   BDDCBPRM             YES; NOT CARD FORMAT
+         ST    R4,BLKLEN          SAVE LENGTH OF THIS BLOCK
+         OI    ERRFLAGS,EFBLOCK   HAVE USER BLOCK IN DYNBUFF
+         MVC   OLDCARD,DYNBUFF    SAVE OLD CARD IMAGE
+         MVC   DYN042,MSG042      COMPLETE MESSAGE
+         MVC   DYN042+MSG042M(L'MEMBER),MEMBER   SHOW MEMBER
+         LA    R0,L'DYN042+L'OLDCARD
+         LA    R15,OLDCARD+L'OLDCARD-1
+LAZYLOOP BCTR  R15,0
+         CLI   0(R15),C' '        TRAILING BLANK?
+         BNE   LAZYBONE
+         BCT   R0,LAZYLOOP
+LAZYBONE BCTR  R0,0
+         BCTR  R0,0
+         STC   R0,DYN042          SET TEXT LENGTH
+         MSG   DYN042             SHOW CURRENT VALUE
+*WANT??  CLI   DYNBUFF+1,C','     VALID ?
+***** CHECK CONTENTS ??
+         POP   USING
+         B     DONEREAD
+         SPACE 1
+EODAD    OI    ERRFLAGS,EFREP     MEMBER IS EMPTY (REPLACE)
+         SPACE 1
+*---------------------------------------------------------------------*
+*   IF REQUESTED, UPDATE THE EXISTING MEMBER, OR ADD/REPLACE IT       *
+*---------------------------------------------------------------------*
+DONEREAD TM    ERRFLAGS,EFNOMEM+EFSHOW  NEED TO UPDATE ?
+         BNZ   DONEPDS              NO; SKIP PDS UPDATING
+         MVI   DYNBUFF,C' '
+         MVC   DYNBUFF+1(71),DYNBUFF   KEEP CONT.COL. AND SEQUENCE
+         MVC   DYNBUFF(L'NEWTZ),NEWTZ  SET NEW TZ PARAMETER
+         TIME  DEC                GET CURRENT TIME AND DATE
+         MVC   DYNBUFF+16(MSG088L-1),MSG088+1
+         MVC   DYNBUFF+16+MSG088T-1(L'MSG088T),=X'4021204B202020'
+         ST    R1,DB
+         ED    MSG088T-1+DYNBUFF+16(L'MSG088T),DB+1  AND DATE
+         TM    ERRFLAGS,EFBLOCK   HAVE OLD BLOCK ?
+         BNZ   MERGETZ              YES; LEAVE SEQUENCE ALONE
+         MVC   DYNBUFF+71(9),=C' 00010000'  MAKE MY PREFERRED SEQ
+         B     TESTOUT
+MERGETZ  B     TESTOUT            NOP FOR (FAULTY) PARTIAL REPLACE
+*---------------------------------------------------------------------*
+*   I HAD THIS BRIGHT IDEA OF UPDATED ONLY THE OFFSET, AND KEEPING    *
+*   THE COMMENTS AS IS (MERGLOOP, ETC.)                               *
+*   ON REFLECTION THIS IS PRETTY STUPID, BECAUSE IT CAN RESULT IN     *
+*   MISLEADING TEXT, SO I CHANGED IT TO BRANCH AROUND.                *
+*   TO PUT IT BACK, MOVE THE TM EFBLOCK/B TESTOUT CODE AFTER DONEREAD *
+*   AND NOP THE MERGETZ B TESTOUT                                     *
+*---------------------------------------------------------------------*
+         LA    R2,DYNBUFF
+         LA    R3,NEWTZ
+         LA    R0,L'NEWTZ
+         LA    R1,1
+MERGLOOP CLC   0(1,R2),0(R3)      OLD=NEW BYTE ?
+         BE    MERGBUMP             YES; SKIP TO NEXT
+         CLI   0(R2),C' '         END OF OLD ?
+         BE    MERGBLNK             YES; CHECK LENGTH
+         MVC   0(1,R2),0(R3)      REPLACE OLD WITH NEW
+MERGBUMP AR    R2,R1
+         AR    R3,R1
+         BCT   R0,MERGLOOP        KEEP IT UP
+MERGBLNK LA    R1,L'NEWTZ
+         SR    R1,R0              BYTES MOVED
+         CH    R1,=H'4'           AT LEAST MINIMUM ?
+         BNL   TESTOUT              YES; DONE
+         MVC   DYNBUFF(L'NEWTZ),NEWTZ
+         MVI   DYNBUFF+L'NEWTZ,C' '    REPLACE UNCONDITIONALLY
+*---------------------------------------------------------------------*
+         SPACE 1
+TESTOUT  L     R5,BLKLEN
+         LA    R4,DYNBUFF
+         TM    ERRFLAGS,EFNEW+EFREP    NEED TO OUTPUT A MEMBER?
+         BZ    TESTUPD            NO; SEE WHETHER UPDATE REQUESTED
+         CLOSE MF=(E,DYNOCLST)    CLOSE UPDAT MODE
+         OPEN  ((R6),OUTPUT),MF=(E,DYNOCLST),TYPE=J
+         NOTE  (R6)               GET FIRST POSITION
+         AL    R1,=X'00000100'    NEXT AFTER EOF
+         ST    R1,MEMTTR          SAVE TTR OF NEW MEMBER TO BE
+         STH   R5,DCBBLKSI        SET WRITE LENGTH (!)
+         WRITE DYNDECB,SF,(R6),(R4),MF=E    WRITE NEW MEMBER
+         CHECK DYNDECB
+         STOW  (R6),MEMBER,R      ADD/REPLACE THE MEMBER
+         CH    R15,=H'8'          ADDED ?
+         BE    GOODSTOW
+         LTR   R15,R15            REPLACED ?
+         BE    GOODSTOW
+         LA    R1,MSG021
+         B     ERRMSG             QUIT WITH ERROR
+         SPACE 1
+TESTUPD  TM    ERRFLAGS,EFNOMEM   UPDATE MEMBER ?
+         BNZ   DONEPDS              YES; BYPASS
+         WRITE DYNDECB,SF,(R6),(R4),MF=E    WRITE NEW MEMBER
+         CHECK DYNDECB
+GOODSTOW MVC   DYNBUFF(MSG022L),MSG022      MEMBER ADDED
+         MVC   DYNBUFF+MSG022T(L'MSG022T),NEWTZ
+         MSG   DYNBUFF            MEMBER ADDED
+         MSG   MSG043     1/2     NO LIVE UPDATE - EXPLAIN WHY
+         SPACE 1
+*---------------------------------------------------------------------*
+*   SYSPARM UPDATE COMPLETE; CHECK FOR CVT UPDATE                     *
+*---------------------------------------------------------------------*
+         PUSH  USING
+DONEPDS  TM    ERRFLAGS,EFCVTUP   UPDATE CVT ?
+         BZ    PGMEXIT
+         LA    R9,MSG047          PRESET
+         TESTAUTH FCTN=1
+         LTR   R15,R15            ARE WE AUTHORIZED ?
+         BNZ   ERRMSG9              NO; FAIL WITH MESSAGE
+         MODESET KEY=ZERO
+         LA    R0,16              LOOP A LITTLE
+         L     R3,CVTPTR
+         USING CVTMAP,R3
+         L     R4,BINTZNEW        GET NEW VALUE
+         L     R5,CVTTZ           START UP
+UPCVT    CS    R5,R4,CVTTZ        REPLACE
+         BZ    MSGCVT               GOOD
+         BCT   R0,UPCVT           DON'T GIVE UP TOO EASILY
+         B     ERRKEY9            SHOW FAILURE
+MSGCVT   MODESET KEY=NZERO
+         MVC   DYNBUFF(MSG048L),MSG048      MEMBER ADDED
+         MVC   DYNBUFF+MSG048T(L'MSG048T),NEWTZ
+         MSG   DYNBUFF            MEMBER ADDED
+         POP   USING
+         SPACE 1
+*---------------------------------------------------------------------*
+*   TERMINATION - SHOW TIME AND DATE, CLOSE AND FREE                  *
+*---------------------------------------------------------------------*
+PGMEXIT  CLOSE MF=(E,DYNOCLST)    CLOSE SYSPARM
+         L     R9,RETCODE         LOAD RETURN CODE
+         TIME  DEC                GET CURRENT TIME AND DATE
+         MVC   DYNBUFF(MSG999L+L'MSG999E),MSG999
+         MVC   MSG999T+DYNBUFF,=X'4021204B20204B2020'
+         MVC   MSG999D+DYNBUFF,=X'4021204B202020'
+         STM   R0,R1,DB
+         OI    DB+3,X'0F'         SET SIGN
+         ED    MSG999T+DYNBUFF,DB  MAKE TIME PRINTABLE
+         ED    MSG999D+DYNBUFF,DB+5  AND DATE
+         LTR   R9,R9              CHECK RETURN CODE
+         BZ    LASTRITE
+         IC    R15,DYNBUFF        GET GOOD MSG LENGTH
+         LA    R15,L'MSG999E(,R15)  APPEND ERROR
+         STC   R15,DYNBUFF
+LASTRITE MSG   DYNBUFF
+         L     R0,=A(SAVEEND-SAVE)
+         LR    R1,R13             DYNAMIC STORAGE START
+         L     R13,4(,R13)        USER'S SAVE AREA
+         FREEMAIN R,LV=(0),A=(1)  FREE STORAGE
+         LR    R15,R9             LOAD RETURN CODE
+         LM    R0,R12,20(R13)     RESTORE MOST REGISTERS
+         L     R14,12(,R13)       RESTORE RETURN
+         BR    R14                  AND RETURN
+         SPACE 2
+*---------------------------------------------------------------------*
+*   handle terminal conditions                                        *
+*---------------------------------------------------------------------*
+BDOPEN   LA    R1,MSG013          OPEN FAILED
+         B     ERRMSG
+         SPACE 1
+BDNODASD LA    R1,MSG012          INVALID DD
+         B     ERRMSG
+         SPACE 1
+BDDCBPRM LA    R1,MSG001          INVALID DCB PARMS (WANT FB,80)
+         B     ERRMSG
+         SPACE 1
+BDNOFMT1 LA    R1,MSG027          NO FMT1 FOUND
+         B     ERRMSG
+         SPACE 1
+BDPRMLEN LA    R1,MSG101          INVALID PARM LENGTH (OR ITEM LEN)
+         B     ERRMSG
+         SPACE 1
+BDNODIR  LA    R1,MSG102          INVALID DIRECTION (E, W, + -)
+         B     ERRMSG
+         SPACE 1
+BDNOTIM  LA    R1,MSG103          INVALID SYNTAX IN TIME FIELD
+         B     ERRMSG
+         SPACE 1
+BDTIM2BD LA    R1,MSG104          VALUE TOO LARGE
+         B     ERRMSG
+         SPACE 1
+ERRKEY9  MODESET KEY=NZERO        RESTORE
+ERRMSG9  LR    R1,R9              LOAD MESSWAGE ADDRESS
+ERRMSG   MSG   (R1)               ISSUE THE ERROR MESSAGE
+ERREXIT  OI    RETCODE+L'RETCODE-1,8   SET ERROR RETURN
+         B     PGMEXIT
+         SPACE 1
+*---------------------------------------------------------------------*
+*   Message writer                                                    *
+*---------------------------------------------------------------------*
+PUTMSG   MVI   WTOTEXT,C' '
+         MVC   WTOTEXT+1(L'WTOTEXT-1),WTOTEXT    BLANK UNPROCESSED TEXT
+         STM   R2,R5,DB           SAVE A FEW REGISTERS
+         SR    R2,R2
+         IC    R2,0(,R1)          GET MESSAGE LENGTH - 1
+         EX    R2,EXMVCMSG        MOVE IT
+         TM    ERRFLAGS,EFTSO     RUNNING UNDER TSO?
+         BNZ   PUTTSO
+         LA    R2,5(,R2)          WTO LENGTH
+         STH   R2,WTOLIST         SET LENGTH
+         STCM  R2,12,WTOLIST+2    CLEAR FLAGS
+         ICM   R0,15,CONSID       SPECIFIC CONSOLE ?
+         BZ    PUTMSGW              NO; JUST WTO
+         OI    WTOLIST+2,X'40'    SET MCSFLAG = QREG0
+PUTMSGW  WTO   MF=(E,WTOLIST)
+PUTMSGX  LM    R2,R5,DB           RESTORE
+         BR    R14                  AND RETURN
+PUTTSO   LA    R2,1(,R2)          MESSAGE LENGTH
+         TPUT  WTOTEXT,(R2)       TOO LAZY FOR PUTLINE
+         B     PUTMSGX              AND RETURN
+EXMVCMSG MVC   WTOTEXT(0),1(R1)   MOVE MESSAGE TEXT
+         SPACE 1
+         PUSH  USING
+         DROP  ,
+         USING OCEXIT,R15
+         USING IHADCB,R1
+OCEXIT   SLL   R1,8
+         SRL   R1,8               CLEAN DCB ADDRESS FOR AM31
+         TM    DCBRECFM,255-(DCBRECF+DCBRECBR)   OTHER THAN FB?
+         BNZ   OCDCBBAD
+         TM    DCBRECFM,DCBRECF   AT LEAST F?
+         BZ    OCDCBBAD
+         CLC   =H'80',DCBLRECL    VALID RECORD LENGTH?
+         BER   R14                  YES; RETURN
+         USING DYNDCB,R1          ADDRESS WORK AREA
+OCDCBBAD OI    ERRFLAGS,EFBADCB   CAN'T USE DCB
+         BR    R14                  RETURN
+         POP   USING
+         SPACE 1
+         LTORG ,
+         SPACE 1
+MAXHOUR  DC    H'12'              HIGHEST VALID E/W HOURLY OFFSET
+         SPACE 1
+MSG001   MDEF  'SYSPARM DCB PARAMETERS NOT FB,80'
+MSG012   MDEF  'SYSPARM DD NOT DASD/PDS'
+MSG013   MDEF  'SYSPARM DD FAILED TO OPEN'
+MSG021   MDEF  'STOW FAILED FOR MEMBER'
+MSG022   MDEF  'SYSPARM DD UPDATED TO XXXXXXXXXX'
+MSG022T  EQU   MSG022+23-MSG022,10,C'C'
+MSG023   MDEF  'UPDATE BYPASSED BY REQUEST'
+MSG027   MDEF  'SYSPARM FORMAT 1 DSCB NOT FOUND'
+MSG041   MDEF  'CURRENT    CVTTZ IS XXXXXXXXXX'
+MSG041T  EQU   MSG041+21-MSG041,10,C'C'
+MSG042   MDEF  'CURRENT XXXXXXXX IS '  COMPLETE IN DYN042
+MSG042M  EQU   MSG042+9-MSG042,8,C'C'
+MSG043   MDEF  'YOU NEED TO IPL THE SYSTEM TO MAKE NEW TIME EFFECTIVE'
+MSG047   MDEF  'PROGRAM UNAUTHORIZED - CVTTZ UPDATE SKIPPED'
+MSG048   MDEF  'CVTTZ UPDATED TO XXXXXXXXXX'
+MSG048T  EQU   MSG048+18-MSG048,10,C'C'
+MSG049   MDEF  'CVTTZ UPDATE FAILED'
+MSG088   MDEF  'ADDED yy.ddd BY PROGRAM PARMTZ'
+MSG088T  EQU   MSG088+6-MSG088,7,C'C'
+MSG101   MDEF  'PARM HAS INVALID LENGTH'
+MSG102   MDEF  'PARM HAS INVALID DIRECTION (USE E, OR W,)'
+MSG103   MDEF  'PARM HAS INVALID TIME FIELD (USE hh OR hh.mm)'
+MSG104   MDEF  'PARM HAS EXCESSIVE VALUE (HOUR>12; MIN/SEC>60)'
+MSG999   MDEF  'PARMTZ ENDED ON yy.ddd AT hh.mm.ss'
+MSG999D  EQU   MSG999+16-MSG999,7,C'C'   DATE MASK
+MSG999T  EQU   MSG999+26-MSG999,9,C'C'   TIME MASK
+MSG999E  DC    C' WITH ERRORS'
+         SPACE 1
+PATCAM   CAMLST SEARCH,2-2,3-3,4-4     WANT ONLY FIRST 4 BYTES
+         ORG   PATCAM+4           SAVE A LITTLE
+         SPACE 1
+PATTERN  MYDATA PFX=PAT
+PATSIZE  EQU   *-PATTERN
+         SPACE 1
+         PRINT ON,GEN
+SAVE     DSECT ,                  DYNAMIC STORAGE
+         DS    18A                PRIMARY SAVE AREA
+DB       DS    2D                 WORK AREA
+DB2      DS    2D                 ANOTHER WORK AREA
+RETCODE  DS    F                  RETURN CODE
+@CIB     DS    A                  START CIB ADDRESS
+CONSID   DS    F                  CONSOLE ID
+BLKLEN   DS    F                  SIZE OF CURRENT PARMTZ BLOCK
+MEMBER   DS    CL8     1/2        MEMBER NAME FROM JFCB OR PARM
+MEMTTR   DS    AL4     2/2        MEMBER TTR0 FROM NOTE
+BINTZOLD DS    F
+BINTZNEW DS    F
+OLDTZ    DS    CL10               OLD    d,hh.mm.ss
+NEWTZ    DS    CL10               NEW    d,hh.mm.ss
+DYNDATA  MYDATA PFX=DYN           EXPAND MACROS, DATA, ETC.
+         SPACE 1
+ERRFLAGS DS    X                  ERROR CONDITIONS
+EFNEW    EQU   X'80'              NO OLD MEMBER READ
+EFREP    EQU   X'40'              MEMBER FOUND, BUT EMPTY
+EFBLOCK  EQU   X'20'              TEXT BLOCK IN DYNBUFF
+EFNOMEM  EQU   X'10'              DON'T TOUCH DD
+EFSHOW   EQU   X'08'              PARM OMITTED
+EFTSO    EQU   X'04'              RUNNING UNDER TSO
+EFCVTUP  EQU   X'02'              UPDATE CVTTZ
+EFBADCB  EQU   X'01'              DCB PARAMETERS UNACCEPTABLE
+         SPACE 1
+DYNJFCB  DS    0F
+         IEFJFCBN ,
+         SPACE 1
+DYN042   DS    CL(MSG042L)  1/2
+OLDCARD  DS    CL71         2/2   USER'S OLD CARD IMAGE (NO SEQ,CONT)
+         SPACE 1
+WTOLIST  DS    H,H
+WTOTEXT  DS    CL128
+         SPACE 1
+BLDLLIST DS    0H                 USE BUFFER FOR BLDL LIST
+TRTABLE  DS    0CL256             USE BUFFER FOR TRT TABLE
+DYNBUFF  DS    128CL256           READ/WRITE BUFFER (FOR BLOCKED DS)
+SAVEEND  EQU   *
+         SPACE 2
+         PRINT NOGEN
+         DCBD  DSORG=PO,DEVD=DA
+         SPACE 1
+         IHADECB ,
+         SPACE 1
+         IEZIOB  ,
+         SPACE 1
+         IHAPSA ,
+         SPACE 1
+         CVT   DSECT=YES
+         SPACE 1
+         IKJTCB ,
+         SPACE 1
+         IEZJSCB ,
+         SPACE 1
+         IEECHAIN ,
+         SPACE 1
+CIB      IEZCIB ,
+         SPACE 1
+         IEFUCBOB ,
+         SPACE 1
+         IECSDSL1 1
+         SPACE 1
+         YREGS ,
+         END   ,

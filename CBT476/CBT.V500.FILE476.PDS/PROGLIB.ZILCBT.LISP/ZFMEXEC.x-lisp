@@ -1,0 +1,1819 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;; Reference: Steele, pp. 385-407.
+
+;;;
+;;; The FORMAT executor, part of the new implementation of FORMAT.
+;;; This routine receives a FORMAT specification, output of the
+;;; ZFMPARS function (i.e. a parsed form of the FORMAT string),
+;;; and processes it, dispatching on the various directives.
+;;;
+
+(defstruct format
+  (dest             nil)
+  (stream           nil)
+  (spec             nil)
+  (subspec          nil)
+  (args             nil)
+  (subargs          nil)
+  (modifiers        nil)
+  (colon            nil)
+  (atsign           nil)
+  (suppress         nil)
+  (abort            nil)
+)
+
+(eval-when (compile load eval)
+ (defmacro |:| (&optional (f 'f)) `(format-colon ,f))
+ (defmacro |@| (&optional (f 'f)) `(format-atsign ,f))
+)
+
+(eval-when (compile) ; But will be READ in all cases.
+ #.(defvar format-radix-string "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+ #.(defvar format-char-reps
+           '(
+             (#X00 NULL   NULL     )
+             (#X05 HT     TAB      )
+             (#X07 DEL    RUBOUT   )
+             (#X0B VT     VT       )
+             (#X0D CR     RETURN   )
+             (#X15 NL     NEWLINE  )
+             (#X16 BS     BACKSPACE)
+             (#X25 LF     LINEFEED )
+             (#X2C FF     FORM     )
+             (#X40 SP     SPACE    )
+            ))
+ #.(defvar format-non-alphabetics
+           (loop for i from 0 to 255
+                 unless (alpha-char-p i)
+                 collect i into z
+                 finally (return (tostring (implode z)))))
+)
+
+(defmacro nl () (string #\nl))
+(defmacro cr () (string #\cr))
+(defmacro ff () (string #\ff))
+
+(defmacro format-call (char)
+ `(,(concat "FORMAT-%-" char) f))
+
+(defmacro spec-char (x) `(car ,x))
+(defmacro spec-colon (x) `(cadr ,x))
+(defmacro spec-atsign (x) `(caddr ,x))
+(defmacro spec-modifiers (x) `(cadddr ,x))
+
+(eval-when (compile load eval)
+ (defmacro format-stream-offset (f) `(car (format-stream ,f)))
+ (defmacro format-stream-string (f) `(cdr (format-stream ,f)))
+)
+
+(defmacro stream-to-string (f)
+ `(string-appendl (nreverse (format-stream-string ,f))))
+
+(defun zfmexec (dest spec args)
+ (let ((f (make-format :dest     (if (stringp dest) nil dest)
+                       :stream   (cond
+                                  ((null dest)    (cons 0 nil))
+                                  ((stringp dest) (cons 0 (list dest)))
+                                  (t              nil))
+                       :spec     spec
+                       :subspec  spec
+                       :args     args
+                       :subargs  args)))
+      (zfmexec1 f)
+
+;;;;;; CL says it is "not an error" to have leftover args.
+;;;;;; (when (format-subargs f)
+;;;;;;  (warn "Leftover FORMAT args" (format-string f) (format-args f)))
+
+      (format-return f)))
+
+(defun zfmexec1 (f)                   ; Process each element of spec.
+ (do ()
+     ((or (null (format-subspec f))   ; until we hit end of specs
+          (format-abort f)))          ; or ~¬ has been processed
+     (format-process f)
+     (setf (format-subspec f)
+           (cdr (format-subspec f)))))
+
+(defun format-process (f)
+ (let ((s (car (format-subspec f))))         ; Get each element of spec.
+       (if (stringp s)                       ; If it is a string
+           (unless (format-suppress f)       ; and not suppressing
+                   (format-princ s f))       ; then process it.
+           (format-dispatch f s))))          ; Else process directive.
+
+(defun format-dispatch (f s) ; Process directive S
+ (setf (format-colon f) (spec-colon s))
+ (setf (format-atsign f) (spec-atsign s))
+ (setf (format-modifiers f)
+       (mapcar #'(lambda (x)
+                         (case x
+                               (v   (unless (format-suppress f)
+                                            (format-read-arg f)))
+                               (|#| (length (format-subargs f)))
+                               (t   x)))
+               (spec-modifiers s)))
+
+ (case (spec-char s)
+;;;;;;;((#\nl #\cr)  (format-call newline)) Optimized out by ZFMPARS.
+       ((#\&)        (format-call &))
+       ((#\%)        (format-call %))
+       ((#\A)        (format-call a))
+       ((#\B)        (format-call b))
+       ((#\C)        (format-call c))
+       ((#\D)        (format-call d))
+       ((#\E)        (format-call e))
+       ((#\F)        (format-call f))
+       ((#\G)        (format-call g))
+       ((#\O)        (format-call o))
+       ((#\P)        (format-call p))
+       ((#\R)        (format-call r))
+       ((#\S)        (format-call s))
+       ((#\T)        (format-call t))
+       ((#\X)        (format-call x))
+
+       ((#\~)        (format-call ~))
+       ((#\|)        (format-call formfeed))
+
+       ((#\$)        (format-call $))
+       ((#\*)        (format-call *))
+       ((#\?)        (format-call ?))
+       ((#\¬)        (format-call ¬))
+
+       ((#\()  #|)|# (format-call left-paren))
+       ((#\{)        (format-call left-brace))
+       ((#\<)        (format-call <))
+
+       ((#xAD        ; left bracket
+         #x4A        ; cent sign
+        )            (format-call left-bracket))
+
+       ((#\Z)        (format-call z)) ; For ZIL debugging only.
+
+       ((#xBD        ; right bracket
+         #x6A        ; broken vertical bar
+        )            (format-call right-bracket))
+
+       ((#\})        (format-call right-brace))
+       ((#\;)        (format-call semicolon))
+       ((#\>)        (format-call >))
+ ((#|(|# #\))        (format-call right-parenthesis))
+
+       (t            (zerror "Unsupported FORMAT directive"
+                             (format-string f)
+                             (string (spec-char s))))))
+
+;======================================================================
+
+(defun format-string (f)
+ (do ((s (format-spec f) (cdr s))
+      (z "" (string-append z (format-string-from (car s))))
+     )
+     ((null s) z)))
+
+(defun format-string-from (x)
+ (cond
+  ((stringp x) x)
+  (t
+   (string-append "~" (reconstruct-format-modifiers (spec-modifiers x))
+                      (if (spec-colon x)  ":" "")
+                      (if (spec-atsign x) "@" "")
+                      (string (spec-char x))))))
+
+(defun reconstruct-format-modifiers (x)
+ (do ((x x (cdr x))
+      (z "")
+     )
+     ((null x) z)
+     (cond
+      ((null (car x)) nil)
+      ((stringp (car x))
+       (setq z (reconstruct-append z (string-append "'" (car x)))))
+      (t
+       (setq z (reconstruct-append z (tostring (car x))))))))
+
+(defun reconstruct-append (a b)
+ (cond
+  ((zerop (string-length a)) b)
+  (t (string-append a "," b))))
+
+;======================================================================
+
+(defun format-read-arg (f)
+ (or (format-subargs f)
+     (zerror "Too few FORMAT args" (format-string f) (format-args f)))
+ (pop (format-subargs f))
+)
+
+(defun format-peek-arg (f)
+ (or (format-subargs f)
+     (zerror "Too few FORMAT args" (format-string f) (format-args f)))
+ (car (format-subargs f))
+)
+
+(defun format-back-arg (f)
+ (loop for a on (format-args f)
+       until (eq (cdr a) (format-subargs f))
+       unless a do (zerror "Unable to back up in FORMAT args"
+                           (format-string f) (format-args f))
+       finally (setf (format-subargs f) a)
+               (return (car a)))
+)
+
+;======================================================================
+
+(defun format-ouch (times char f) ; Output a char some number of times.
+                                  ; Note: char is a 1-character string.
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (push (zilspad char (if (minusp times) 0 times)
+                                     char t 1)
+                       (format-stream-string f)))
+   ((eq dest t)  (dotimes (i times) (princ char nil)))
+   (t            (dotimes (i times) (princ char dest))))))
+
+(defun format-princ (object f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (push (prints object nil) (format-stream-string f)))
+   ((eq dest t)  (princ object nil))
+   (t            (princ object dest)))))
+
+(defun format-prin1 (object f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (push (prints object t) (format-stream-string f)))
+   ((eq dest t)  (prin1 object nil))
+   (t            (prin1 object dest)))))
+
+(defun format-terpri (f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (push (nl) (format-stream-string f)))
+   ((eq dest t)  (terpri nil))
+   (t            (terpri dest)))))
+
+(defun format-cterpri (f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (unless (and (fixnump (format-stream-offset f))
+                              (eql 1 (format-compute-column f)))
+                         (push (nl) (format-stream-string f))))
+   ((eq dest t)  (cterpri nil))
+   (t            (cterpri dest)))))
+
+(defun format-return (f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest)  (stream-to-string f))
+   (t            nil))))
+
+;======================================================================
+
+(defun format-compute-column (f)
+ (let ((dest (format-dest f)))
+  (cond
+   ((null dest) (format-compute-column-from-stream f))
+   ((eq dest t) (zgetfpo nil))
+   (t           (zgetfpo dest)))))
+
+(defun format-compute-column-from-stream (f)
+ (let ((s (stream-to-string f)))
+      ;;; Memoize stream string for efficiency
+      (setf (format-stream-string f) (list s))
+      (unless (fixnump (format-stream-offset f))
+              (zerror
+"FORMAT column position cannot be determined inside this directive"
+               (format-string f) (format-stream-offset f)))
+      (let ((s1 (string-append (string-reverse s) (nl) (cr))))
+           (+  (min (string-index s1 (nl))
+                    (string-index s1 (cr)))
+              (format-stream-offset f)))))
+
+;======================================================================
+
+;
+; OK, here are the FORMAT directives.
+;
+
+(defmacro format-%-a (f)
+ `(format-a-or-s nil ,f))
+
+(defmacro format-%-s (f)
+ `(format-a-or-s t ,f))
+
+;
+; This processes the A and S directives, the only difference between
+; which is that A does a PRINC and S does a PRIN1.
+;
+; Modifiers:
+;
+; : - if the arg is NIL, will be printed as (); otherwise as NIL.
+;     This is not recursive, so the (w)implementor need not sweat it.
+;
+; @ - causes spaces to be inserted on the left; otherwise on the right.
+;
+; (mincol,colinc,minpad,padchar) ...
+;
+; mincol - inserts spaces on the right, if necessary, to make the
+;          width at least MINCOL columns.  The @ modifier causes the
+;          spaces to be inserted on the left rather than the right.
+;
+;          Default is 0.
+;
+; colinc - padding characters are inserted COLINC characters at a time
+;          until the total width is at least MINCOL.  This applies only
+;          after padding has been done up to MINPAD.
+;
+;          Default is 1.
+;
+; minpad - the string is padded on the right (or on the left if the @
+;          modifier is used) with at least MINPAD copies of PADCHAR.
+;
+;          Default is 0.
+;
+; padchar - the padding character (must be a string).
+;
+;          Default is space " ".
+;
+(defun format-a-or-s (slashifyp f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f)))
+       (if  (format-modifiers f)
+            (let* (
+                   ((mincol colinc minpad padchar) (format-modifiers f))
+                  )
+                  (format-a-or-s-full arg f (|@|) (|:|) slashifyp
+                                      mincol colinc minpad padchar))
+            (format-a-or-s-simple arg f (|:|) slashifyp)))))
+
+(defun format-a-or-s-full (arg f atsignp colonp slashifyp
+                           mincol colinc minpad padchar)
+ (let* (
+        (string     (if (and (null arg) colonp)
+                        "()"
+                        (prints arg slashifyp)))
+        (size       (string-length string))
+        (fmincol    (if (fixnump mincol)  mincol  0))
+        (fcolinc    (if (fixnump colinc)  colinc  1))
+        (fminpad    (if (fixnump minpad)  minpad  0))
+        (fpadchar   (if (stringp padchar) padchar " "))
+       )
+       (unless atsignp (format-princ string f))
+       (format-ouch fminpad fpadchar f)
+       (setq size (+ size fminpad))
+       (loop while (< size fmincol) do
+             (format-ouch fcolinc fpadchar f)
+             (setq size (+ size fcolinc)))
+       (when atsignp (format-princ string f))))
+
+(defun format-a-or-s-simple (arg f colonp slashifyp)
+ (cond
+  ((and (null arg) colonp)                (format-princ "()" f))
+  (slashifyp                              (format-prin1 arg f))
+  (t                                      (format-princ arg f))))
+
+;
+; This processes the D, B, O and X directives, which format integers.
+;
+; Modifiers:
+;
+; : - causes commas to be printed between groups of 3 digits.
+;
+; @ - causes the sign to always be printed.
+;
+; (mincol,padchar,commachar) ...
+;
+; mincol - inserts spaces on the left, if necessary, to make the
+;          width at least MINCOL columns.  If the number doesn't fit
+;          in MINCOL columns, additional columns are used as needed.
+;
+;          Default is 0.
+;
+; padchar - the padding character (must be a string).
+;
+;          Default is space " ".
+;
+; commachar - the character to be used as a comma (must be a string).
+;
+;          Default is comma ",".
+;
+
+(defmacro format-%-d (f) `(format-integer 10 ,f))
+(defmacro format-%-b (f) `(format-integer 2  ,f))
+(defmacro format-%-o (f) `(format-integer 8  ,f))
+(defmacro format-%-x (f) `(format-integer 16 ,f))
+
+(defun format-integer (radix f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f))
+        ((mincol padchar commachar) (format-modifiers f))
+       )
+       (cond
+        ((not (integerp arg))
+         (format-a-or-s-full arg f nil nil nil mincol nil nil padchar))
+        (t
+         (let* (
+                (string     (format-integer-string (abs arg) radix f))
+                (fmincol    (if (fixnump mincol)    mincol    0  ))
+                (fpadchar   (if (stringp padchar)   padchar   " "))
+                (fcommachar (if (stringp commachar) commachar ","))
+               )
+               (when (|:|)
+                (setq string
+                     (prog (e z)
+                           (setq e (nreverse (zilexpl string t nil)))
+                      loop (or e (go end))
+                           (push (car e) z)
+                           (or (setq e (cdr e)) (go end))
+                           (push (car e) z)
+                           (or (setq e (cdr e)) (go end))
+                           (push (car e) z)
+                           (or (setq e (cdr e)) (go end))
+                           (push fcommachar z)
+                           (go loop)
+                      end  (return (string-appendl z)))))
+               (cond
+                ((minusp arg)
+                 (setq string (string-append "-" string)))
+                ((|@|)
+                 (setq string (string-append "+" string))))
+
+               (format-ouch (- fmincol (string-length string))
+                            fpadchar f)
+
+               (format-princ string f)))))))
+
+
+(defun format-integer-string (arg radix f)
+ (if (zerop arg)
+  then
+     "0"
+  else
+  if (eql radix 10)
+  then
+     (tostring arg)
+  else
+  if (not (and (fixnump radix)
+               (> radix 1)
+               (< radix #.(1+ (string-length format-radix-string)))
+          ))
+  then
+     (zerror "Invalid FORMAT radix value" (format-string f) radix)
+  else
+     (do (
+          (z nil)
+          (quotient arg)
+          (remainder arg)
+         )
+         ((zerop quotient) (string-appendl z))
+         (psetq quotient (quotient quotient radix)
+                remainder (remainder quotient radix))
+         (push (substr #.format-radix-string (1+ remainder) 1) z)
+     )
+ )
+)
+
+;
+; This processes the R directive, which formats integers.
+;
+; Modifiers:
+;
+; If there are no modifier arguments to the R directive, the modifier
+; flags are processed as follows:
+;
+; ~R    prints arg as a cardinal English number.
+; ~:R   prints arg as an ordinal English number.
+; ~@R   prints arg as a Roman numeral.
+; ~:@R  prints arg as an old Roman numeral.
+;
+; Otherwise...
+;
+; (radix,mincol,padchar,commachar) ...
+;
+; radix  - the radix (base) to be used.
+;
+; Everything else is as for the D, B, O and X formats.
+;
+
+(defun format-%-r (f)
+ (unless (format-suppress f)
+  (if (format-modifiers f)
+      (format-integer (pop (format-modifiers f)) f)
+      (let ((arg (format-read-arg f)))
+           (format-princ (if (|@|)
+                             (zfmnrom arg (|:|))
+                             (zfmneng arg (|:|)))
+                         f)))))
+
+;
+; This processes the C directive, which formats characters.
+;
+; Modifiers:
+;
+; : - spells out the names of the control bits and represents
+;     non-printing characters by their names.  This is a "pretty"
+;     format for printing characters.
+;
+;     When : is present, @ specifies slightly more descriptive names.
+;
+;     (Otherwise, the character is printed as a single byte of data
+;     in this implementation.)
+;
+; @ - prints the character using #\ syntax.
+;
+;
+; No modifier values are defined.
+;
+
+(defun format-%-c (f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f)))
+       (if (|:|)
+        then
+             (let* ((a (assoc arg '#.format-char-reps))
+                    (b (if (|@|) (caddr a) (cadr a)))
+                   )
+                   (format-princ (or b (string arg)) f))
+        else
+             (when (|@|)
+                   (format-princ "#\\" f))
+             (format-princ (string arg) f)
+        endif))))
+
+;
+; This processes the P directive, which handles pluralization.
+;
+; ~P prints "s" if the arg is a fixnum 1, otherwise prints nothing,
+; subject to...
+;
+; Modifiers:
+;
+; : - backs up one argument and bases the output on the last arg.
+;
+; @ - prints "y" if the argument is 1, and "ies" if it isn't.
+;
+; No modifier values are defined.
+;
+
+(defun format-%-p (f)
+ (unless (format-suppress f)
+  (let ((arg))
+       (when (|:|) (format-back-arg f))
+       (setq arg (format-read-arg f))
+       (cond
+        ((|@|)       (format-princ (if (eql arg 1) "y" "ies") f))
+        ((eql arg 1) nil)
+        (t           (format-princ "s" f))))))
+
+;
+; This processes the F directive, which prints flonums in
+; fixed-format floating-point format.
+;
+; Format:  ~w,d,k,overflowchar,padcharF
+;
+;  where   w is the width of the field to be printed
+;          d is the number of digits to print after the decimal point
+;          k is a scale factor that defaults to zero
+;
+; Exactly w characters will be output.
+;
+
+(defun format-%-f (f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f))
+        ((w d k overflowchar padchar) (format-modifiers f))
+       )
+   (when (integerp arg)
+         (setq arg (catch nil (float arg))))
+   (cond
+    ((not (floatp arg))
+     (format-a-or-s-full arg f nil nil nil w nil nil padchar))
+    (t
+     (format-fixed arg f (|@|) w d k overflowchar padchar))))))
+
+(defun format-fixed (arg f atsignp w d k overflowchar padchar)
+ (let* (
+        (fpadchar      (if (stringp padchar) padchar " "))
+        (abs           (abs arg))
+        (scaled-arg    (cond
+                        ((not (fixnump k))  abs)
+                        ((minusp k)     (/ abs (format-expt-10 (- k))))
+                        (t              (* abs (format-expt-10 k)))))
+        (trimzerop     (not (fixnump d)))
+        (supzerointp   (and (fixnump w) (fixnump d) (eql w (1+ d))))
+        ((istr . fstr) (format-float-pair scaled-arg
+                                          arg
+                                          atsignp
+                                          w
+                                          d
+                                          nil
+                                          trimzerop
+                                          supzerointp))
+        (ilength       (string-length istr))
+        (flength       (string-length fstr))
+        (width         (+ ilength flength 1))
+       )
+
+       (cond
+        ((and (fixnump w) (stringp overflowchar) (> width w))
+         (format-ouch w overflowchar f))
+        (t
+         (when (fixnump w)
+               (format-ouch (- w width) fpadchar f))
+         (format-princ (string-append istr "." fstr) f)))))
+
+; This takes a flonum and returns a dotted pair of strings,
+; representing the integer part and the fractional part.
+
+(defun format-float-pair (sarg arg signp w d
+                          lzlen trim-zeroes-p sup-zero-i-p)
+ (let*
+  ((integer (truncate sarg))
+   (decprec (cond
+             ((fixnump d) d)
+             ((fixnump w) (format-guess-d integer arg signp w))
+             (t nil)))
+   (n       (cond
+             ((fixnump decprec) (format-expt-10 (1+ decprec)))
+             ((sfloatp sarg)    #.(expt 10 7))
+             (t                 #.(expt 10 16))))
+   (fraction (tostring (+ 5 n (abs (truncate (* (- sarg integer) n))))))
+   integerstring
+   fractionstring
+  )
+  ; Check to see if rounding overflowed into integer part
+  (when (>= fraction "2") ; Note: String comparison
+        (incf integer))
+  (if (and sup-zero-i-p (zerop integer))
+      (setq integerstring "")
+      (setq integerstring (format-pad-integer integer lzlen)))
+
+  (cond
+   ((minusp arg)
+    (setq integerstring (string-append "-" integerstring)))
+   (signp
+    (setq integerstring (string-append "+" integerstring)))
+  )
+  (setq fractionstring
+        (substr fraction 2 (- (string-length fraction) 2)))
+  (when trim-zeroes-p
+        (setq fractionstring (string-right-trim "0" fractionstring))
+        (when (zerop (string-length fractionstring))
+              (setq fractionstring "0")))
+  (cons integerstring fractionstring)))
+
+(defun format-guess-d (integer arg signp w)
+ (let ((answer (- w 1 (string-length (tostring integer)))))
+      (cond
+       ((not (plusp answer)) 1)
+       ((or signp (minusp arg)) (1- answer))
+       (t answer))))
+
+; This is a quick and dirty hack for exponentiation.
+
+(defun format-expt-10 (k)
+ (or (nth k '#.(do ((i 0 (1+ i))
+                    (n 1 (* n 10))
+                    (z nil (cons n z))
+                   )
+                   ((eql i 16) (nreverse z))))
+     (do ((i 16 (1+ i))
+          (n #.(** 10 16) (* 10 n)))
+         ((eql i k) n))))
+
+;
+; This processes the E directive, which prints flonums in
+; exponential floating-point format.
+;
+; Format:  ~w,d,e,k,overflowchar,padchar,exponentcharE
+;
+;  where   w is the width of the field to be printed
+;          d is the number of digits to print after the decimal point
+;          e is the number of digits to use when printing the exponent
+;          k is a scale factor that defaults to zero
+;
+; Exactly w characters will be output.
+;
+
+(defun format-%-e (f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f))
+        ((w d e k overflowchar padchar exponentchar)
+         (format-modifiers f))
+       )
+   (when (integerp arg)
+         (setq arg (catch nil (float arg))))
+   (cond
+    ((not (floatp arg))
+     (format-a-or-s-full arg f nil nil nil w nil nil padchar))
+    (t
+     (format-exponential arg f (|@|) w d e k
+                         overflowchar padchar exponentchar))))))
+
+(defun format-exponential
+       (arg f atsignp w d e k overflowchar padchar exponentchar)
+ (let* (
+        (fpadchar      (if (stringp padchar) padchar " "))
+        (abs           (abs arg))
+        (fk            (if (fixnump k) k 1))
+        (fd            (if (fixnump d)
+                           (if (plusp fk) (1+ (- d fk)) d)
+                           nil))
+        ((aarg . aexp) (format-adjust-for-exponent abs fk))
+        (estr          (format-pad-integer (abs aexp) e))
+        (elength       (string-length estr))
+        (trimzerop     (not (fixnump fd)))
+        (supzerointp   (and (fixnump w) (fixnump fd)
+                            (< w (+ fd
+                                    elength
+                                    (if (or (minusp arg) atsignp) 5 4)))
+                       ))
+        ((istr . fstr) (format-float-pair aarg
+                                          arg
+                                          atsignp
+                                          w
+                                          fd
+                                          nil
+                                          trimzerop
+                                          supzerointp))
+        (ilength       (string-length istr))
+        (flength       (string-length fstr))
+        (width         (+ ilength flength 3 elength))
+        (echar         (cond
+                        ((stringp exponentchar) exponentchar)
+                        ((sfloatp arg) "F")
+                        ((dfloatp arg) "D")
+                        (t "?")))
+       )
+
+       (cond
+        ((and (fixnump w) (stringp overflowchar) (> width w))
+         (format-ouch w overflowchar f))
+        ((and (fixnump e) (stringp overflowchar)
+              (> (string-length estr) e))
+         (format-ouch w overflowchar f))
+        (t
+         (when (fixnump w)
+               (format-ouch (- w width) fpadchar f))
+         (format-princ (string-append istr
+                                      "."
+                                      fstr
+                                      echar
+                                      (if (minusp aexp) "-" "+")
+                                      estr)
+                       f)))))
+
+(defun format-pad-integer (i l)
+ ;
+ ; This function takes an integer I and pads it with leading zeroes
+ ; to the length specified by L.  It returns a string.
+ ;
+ (cond
+  ((not (fixnump l)) (tostring i))
+  ((minusp i)
+   (string-append "-" (format-pad-integer (- i) (1- l))))
+  (t
+   (zilspad (tostring i) l "0" nil -1))))
+
+(defun format-adjust-for-exponent (arg k)
+ ;
+ ; This function returns a flonum which is equivalent to arg scaled
+ ; up or down until the number of digits to the left of the decimal
+ ; point equals a given amount.  The return value is the flonum and
+ ; the exponent required to get it into that shape.
+ ;
+ (prog (ll ul exponent)
+       (when (zerop arg) (return '(0.0 . 0)))
+       (setq ll 1.0)
+       (when (and (fixnump k) (not (eql k 1)))
+             (if (plusp k)
+                 (dotimes (i (1- k))
+                          (setq ll (* 10.0 ll)))
+                 (dotimes (i (- 1 k))
+                          (setq ll (* 0.1 ll)))))
+
+       (setq ul (* 10.0 ll))
+       (setq exponent 0)
+      loop
+       (cond
+        ((< arg ll)    (setq arg (* arg 10.0))
+                       (decf exponent)
+                       (go loop))
+        ((< arg ul)    (return (cons arg exponent)))
+        (t             (setq arg (* arg 0.1))
+                       (incf exponent)
+                       (go loop)))))
+
+;
+; This processes the G directive, which prints flonums in
+; either fixed-point or exponential floating-point format.
+;
+; Format:  ~w,d,e,k,overflowchar,padchar,exponentcharE
+;
+;  where   w is the width of the field to be printed
+;          d is the number of digits to print after the decimal point
+;          e is the number of digits to use when printing the exponent
+;          k is a scale factor that defaults to zero
+;
+; The format depends on the magnitude (absolute value) of the arg.
+; Let n be an integer such that 10¬(n-1) <= arg < 10¬n.
+; Let ee equal e+2, or 4 if e is omitted.
+; Let ww equal w-ee, or nil if w is omitted.
+; If d is omitted, first let q be the number of digits needed to print
+; arg with no loss of information and without leading or trailing
+; zeroes; then let d equal (min q (min n 7)).
+; Let dd equal d-n.
+;
+; If 0 <= dd <= d, then arg is printed as if by the format directive
+;
+;   ~ww,dd,,overflowchar,padcharF~ee@T
+;
+; Note that the scale factor k is not passed to the ~F directive.
+; For all other values of dd, arg is printed as if by the directive
+;
+;  ~w,d,e,k,overflowchar,padchar,exponentcharE
+;
+; In either case, an @ modifier is specified to the ~F or ~E directive
+; if and only if one was specified to the ~G directive.
+;
+
+(defun format-%-g (f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f))
+        ((w d e k overflowchar padchar exponentchar)
+         (format-modifiers f))
+       )
+   (when (integerp arg)
+         (setq arg (catch nil (float arg))))
+   (cond
+    ((not (floatp arg))
+     (format-a-or-s-full arg f nil nil nil w nil nil padchar))
+    (t
+     (let* (
+            (n  (format-find-n arg))
+            (ee (if (fixnump e) (+ e 2) 4))
+            (ww (if (fixnump w) (- w ee) nil))
+            (fd (if (fixnump d)
+                    d
+                    (max (format-find-q arg) (min n 7))))
+            (dd (- fd n))
+           )
+      (cond
+       ((and (not (minusp dd)) (<= dd fd))
+        (format-fixed arg f (|@|) ww dd nil overflowchar padchar)
+        (format-ouch ee " " f))
+       (t
+        (format-exponential arg f (|@|) w fd e k
+                            overflowchar padchar exponentchar)))))))))
+
+
+(defun format-find-n (arg)
+ ;
+ ;                          n-1            n
+ ; An integer n such that 10    <= arg < 10 .
+ ; If arg is 0, let n be 0.
+ ;
+ (cond
+  ((zerop arg) 0)
+  (t
+   (setq arg (abs arg))
+   (cond
+    ((< arg 1.0)
+     (do (
+          (x arg (* x 10.0))
+          (z 1 (1- z))
+         )
+         ((> x 1.0) z)))
+    (t
+     (do (
+          (x arg (/ x 10.0))
+          (z 0 (1+ z))
+         )
+         ((<= x 1.0) z)))))))
+
+(defun format-find-q (arg)
+ ;
+ ; The number of digits needed to print arg with no loss of
+ ; information and without leading or trailing zeroes.
+ ;
+ (string-length (tostring arg)))
+
+;
+; This processes the $ directive, which prints flonums in
+; "dollars" floating-point format.
+;
+; Format:  ~d,n,w,padchar$
+;
+;  where   d is the number of digits to print after the decimal point
+;            (default value 2)
+;          n in the minimum number of digits to print before the
+;            decimal point (default value 1)
+;          w is the minimum total width of the field to be printed
+;            (default value 0)
+;
+
+(defun format-%-$ (f)
+ (unless (format-suppress f)
+  (let ((arg (format-read-arg f))
+        ((d n w padchar) (format-modifiers f))
+       )
+   (when (integerp arg)
+         (setq arg (catch nil (float arg))))
+   (cond
+    ((not (floatp arg))
+     (format-a-or-s-full arg f nil nil nil w nil nil padchar))
+    (t
+     (format-dollar arg f (|@|) (|:|) d n w padchar))))))
+
+(defun format-dollar (arg f atsignp colonp d n w padchar)
+ (let* (
+        (fd            (if (fixnump d) d 2))
+        (fn            (if (fixnump n) n 1))
+        (fw            (if (fixnump w) w 0))
+        (fpadchar      (if (stringp padchar) padchar " "))
+        (abs           (abs arg))
+        (supzerointp   (zerop fn))
+        ((istr . fstr) (format-float-pair abs
+                                          abs
+                                          nil
+                                          fw
+                                          fd
+                                          fn
+                                          nil
+                                          supzerointp))
+        (ilength       (string-length istr))
+        (flength       (string-length fstr))
+        (sign          (cond
+                        ((minusp arg) "-")
+                        (atsignp      "+")
+                        (t            nil)))
+        (width         (+ ilength flength (if sign 2 1)))
+        (m             (max fw 100))
+       )
+
+    (cond
+     ((> width m)
+      (let ((q (+ fd fn -1)))
+       (format-exponential arg f atsignp w q nil nil nil padchar nil)
+      )
+     )
+     (t
+      (and sign colonp (format-princ sign f))
+      (when (fixnump w)
+            (format-ouch (- w width) fpadchar f))
+      (and sign (not colonp) (format-princ sign f))
+      (format-princ (string-append istr "." fstr) f)))))
+
+;
+; This processes the % directive, which prints newlines.
+;
+; ~n% prints n newlines.
+;
+
+(defun format-%-% (f)
+ (unless (format-suppress f)
+  (dotimes (i (or (car (format-modifiers f)) 1))
+           (format-terpri f))))
+
+;
+; This processes the & directive, which prints conditional newlines.
+;
+; ~n& prints n conditional newlines.
+;
+
+(defun format-%-& (f)
+ (unless (format-suppress f)
+  (let ((k (or (car (format-modifiers f)) 1)))
+       (when (plusp k)
+             (format-cterpri f)
+             (dotimes (i (1- k))
+                      (format-terpri f))))))
+
+;
+; This processes the ~ directive, which prints tildes.
+;
+; ~n~ prints n tildes.
+;
+
+(defun format-%-~ (f)
+ (unless (format-suppress f)
+  (format-ouch (or (car (format-modifiers f)) 1) "~" f)))
+
+;
+; This processes the | directive, which prints formfeeds.
+;
+; ~n| prints n formfeeds.
+;
+
+(defun format-%-formfeed (f)
+ (unless (format-suppress f)
+  (format-ouch (or (car (format-modifiers f)) 1) (ff) f)))
+
+
+;
+; This processes the ? directive.
+;
+
+(defun format-%-? (f)
+ (unless (format-suppress f)
+  (let* ((fspec   (zfmpars (format-read-arg f)))
+         (flist   (if (@) (format-subargs f) (format-read-arg f)))
+         (?f (copy-format f
+                          :spec     fspec
+                          :subspec  fspec
+                          :args     flist
+                          :subargs  flist))
+       )
+       (zfmexec1 ?f)
+       (when (@)
+        (setf (format-args f) (format-args ?f))
+        (setf (format-subargs f) (format-subargs ?f))
+       )
+  )))
+
+;
+; This processes the * directive.
+;
+
+(defun format-%-* (f)
+ (unless (format-suppress f)
+  (if (|@|)
+      (setf (format-subargs f)
+            (nthcdr (or (car (format-modifiers f)) 0)
+                    (format-args f)))
+      (dotimes (i (or (car (format-modifiers f)) 1))
+               (if (|:|)
+                   (format-back-arg f)
+                   (format-read-arg f))))))
+
+;
+; This processes the ¬ directive.
+;
+
+(defun format-%-¬ (f)
+ (unless (format-suppress f)
+  (let* (
+         (modifiers (format-modifiers f))
+        )
+        (when (case (length modifiers)
+                    (0 (null (format-subargs f)))
+                    (1 (eql 0 (car modifiers)))
+                    (2 (eql (car modifiers) (cadr modifiers)))
+                    (t (and (<= (car modifiers) (cadr modifiers))
+                            (<= (cadr modifiers) (caddr modifiers)))))
+              (setf (format-abort f)
+                    (if (|:|) '|:| t))))))
+
+;
+; This processes the T directive, which does tabulation.
+;
+; ~colnum,colincT  - moves to column COLNUM.  If the "cursor" is
+;                    already at or beyond COLNUM, output spaces to
+; Default: ~1,1T     move it to column COLNUM + a multiple of COLINC
+;                    (unless COLINC is zero, in which case no spaces
+;                    are output in this case).
+;
+; @ - performs relative tabulation.
+;
+; ~colrel,colinc@T - outputs COLREL spaces and then outputs the
+;                    smallest non-negative number of additional
+; Default: ??????    spaces necessary to move to a multiple of COLINC.
+;
+; (Question:  What are the defaults for COLREL and COLINC?  It doesn't
+;             seem logical to make them 1,1 - should be 0,0?)
+;
+; (Question:  Is CLtL incorrect here?  Shouldn't it be a a column which
+;             is 1 plus a multiple of COLINC?)
+;
+
+(defun format-%-t (f)
+ (let (((colnum colinc) (format-modifiers f)))
+      (if (|@|)
+          (format-tabulate-relative f colnum colinc)
+          (format-tabulate-absolute f colnum colinc))))
+
+(defun format-tabulate-absolute (f colnum colinc)
+ (let* (
+        (fcolnum  (if (fixnump colnum) colnum 1))
+        (fcolinc  (if (fixnump colinc) colinc 1))
+        (num-cur  (- fcolnum (format-compute-column f)))
+       )
+  (if (plusp num-cur)
+      (format-ouch num-cur " " f)
+      (unless (zerop fcolinc)
+       (format-ouch (+ fcolinc (remainder num-cur fcolinc)) " " f)))))
+
+(defun format-tabulate-relative (f colrel colinc)
+ (let* (
+        (fcolrel  (if (fixnump colrel) colrel 1)) ; My guesses
+        (fcolinc  (if (fixnump colinc) colinc 1)) ; for defaults
+       )
+       (format-ouch fcolrel " " f)
+       (when (> fcolinc 1)
+             (let* ((num-cur (+ fcolrel (format-compute-column f)))
+                    (r (remainder num-cur fcolinc)))
+                  (unless (zerop r)
+                          (format-ouch (- fcolinc r) " " f))))))
+
+;
+; This processes the ( directive.        )
+;
+
+(defun format-new-stream-for-lp (f &aux o)
+ (cons (if (and (consp (format-stream f))
+                (not (fixnump (setq o (format-stream-offset f)))))
+           o
+           (1- (format-compute-column f)))
+       (list "")))
+
+(defun format-%-left-paren (f)
+ (let* ((spec (cdr (format-subspec f)))
+        (what (cond
+               ((and (:) (@)) 'upcase)
+               ((:)           'capitalize-all)
+               ((@)           'capitalize-first)
+               (t             'downcase)))
+        (newf (copy-format f :dest nil
+                             :stream (format-new-stream-for-lp f)
+                             :spec spec
+                             :subspec spec))
+       )
+       (prog (u s)
+       loop
+        (setq u (car (or (format-subspec newf)
+                      (zerror "FORMAT directive ~( specified without ~)"
+                              (format-string f)))))
+        (when (and (consp u) (eql (car u) #|(|# #\)))
+              (go finish))
+        (format-process newf)
+        (when (format-abort newf)
+              (setf (format-suppress newf) t))
+        (setf (format-subspec newf) (cdr (format-subspec newf)))
+        (go loop)
+       finish
+        (unless (format-suppress f)
+         (setq s (stream-to-string newf))
+         (setq s
+               (case what
+                (upcase
+                 (string-upcase s))
+                (downcase
+                 (string-downcase s))
+                (capitalize-all
+                 (string-capitalize s))
+                (capitalize-first
+                 (let ((i (string-verify s #.format-non-alphabetics)))
+                  (cond
+                   (i
+                    (string-append
+                     (string-substr s 1 (1- i))
+                     (string-upcase (string-substr s i 1))
+                     (string-downcase (string-substr s (1+ i)))
+                    ))
+                   (t s))))
+                (t s)))
+
+               (format-princ s f)
+               (setf (format-subargs f) (format-subargs newf))
+               (setf (format-abort f) (format-abort newf))
+        )
+        (setf (format-subspec f) (format-subspec newf)))))
+
+;
+; This processes the left bracket directive.
+;
+; Note: For EBCDIC terminal users, cent sign and broken vertical bar
+;       are permitted in place of left and right bracket.
+;
+
+(defmacro fselectif (condition)
+ `(cond
+   (,condition
+    (setf (format-suppress newf) (format-suppress f))
+    (setq selected t))
+   (t
+    (setf (format-suppress newf) t))))
+
+(defun format-%-left-bracket (f)
+ (let* (
+        (spec (cdr (format-subspec f)))
+        (newf (copy-format f :spec spec :subspec spec))
+       )
+       (prog (u select count selected)
+        (setq selected nil)
+        (cond
+         ((|:|)
+          (setq select (unless (format-suppress f)
+                               (format-read-arg newf)))
+          (fselectif (null select))
+         )
+         ((|@|)
+          (setq select (unless (format-suppress f)
+                               (format-peek-arg newf)))
+          (cond
+               ((not (null select))
+                (fselectif t)
+               )
+               (t
+                (format-read-arg newf) ; Use up the argument.
+                (fselectif nil))))
+         (t
+          (setq select (or (car (format-modifiers f))
+                           (unless (format-suppress f)
+                                   (format-read-arg newf))))
+          (setq count 0)
+          (fselectif (eql select 0))))
+       loop
+        (setq u (car (or (format-subspec newf)
+                      (zerror
+ "FORMAT directive ~LEFT_BRACKET specified without ~RIGHT_BRACKET"
+                             (format-string f)))))
+        (when (and (consp u) (or (eql (car u) #xBD)   ; right bracket
+                                 (eql (car u) #x6A))) ; broken v. bar
+              (go finish))
+        (cond
+             ((and (consp u) (eql (car u) #\;))
+              (cond
+               ((|@|)
+                (zerror
+                  "~; not allowed in FORMAT ~@LEFT_BRACKET directive"
+                  (format-string f)))
+               ((format-abort newf)
+                nil)
+               ((spec-colon u)
+                (setq count t)
+                (fselectif (not selected))
+               )
+               ((null count)
+                (setq count t)
+                (fselectif (not (null select)))
+               )
+               ((eq count t)
+                (if (|:|)
+                    (zerror "Too many subforms in FORMAT ~:LEFT_BRACKET directive"
+                            (format-string f))
+                    (zerror "Misplaced ~:; in FORMAT ~LEFT_BRACKET directive"
+                            (format-string f))))
+               (t
+                (incf count)
+                (fselectif (eql count select)))))
+             (t
+              (format-process newf)
+              (when (format-abort newf)
+                    (setf (format-suppress newf) t))
+             ))
+        (setf (format-subspec newf) (cdr (format-subspec newf)))
+        (go loop)
+       finish
+        (unless (format-suppress f)
+                (setf (format-subargs f) (format-subargs newf))
+        )
+        (setf (format-abort f) (format-abort newf))
+        (setf (format-subspec f) (format-subspec newf)))))
+
+
+;
+; This processes the { directive.
+;
+
+(defun format-%-left-brace (f)
+ ;;;
+ ;;; Check for case of ~{~}.  If so, suck up arg as format string
+ ;;;
+ (let ((s (cadr (format-subspec f))))
+      (if (and (consp s) (eql (car s) #\}))
+          (format-braces-out-of-line f (spec-colon s))
+          (format-braces-in-line f))))
+
+(defun format-braces-out-of-line (f colon2p)
+ (let ((spec (if (format-suppress f) () (zfmpars (format-read-arg f)))))
+      (format-them-braces f spec t colon2p)))
+
+(defun format-braces-in-line (f)
+ (let ((spec (cdr (format-subspec f))))
+       (format-them-braces f spec nil nil)))
+
+(defun format-them-braces (f spec out-of-line-p colon2p)
+ (let* ((arg (unless (format-suppress f)
+                     (if (@) (format-subargs f) (format-read-arg f))))
+        ((maxrep) (format-modifiers f))
+        (newf (copy-format f :args    arg
+                             :subargs arg
+                             :spec    (if out-of-line-p
+                                          spec
+                                          (format-spec f))
+                             :subspec spec
+              )))
+
+  ; begin PROG
+
+  (prog (k s)
+   (setq k 0)
+   (unless (|:|)
+           (setf (format-args newf) arg)
+           (setf (format-subargs newf) arg))
+
+  loop
+
+   (when (null (if (|:|) arg (format-subargs newf)))
+         (setf (format-suppress newf) t))
+   (unless (format-suppress newf)
+           (and maxrep (>= k maxrep) (setf (format-suppress newf) t))
+           (incf k))
+   (unless (format-suppress newf)
+      (unless (listp arg)
+              (zerror "Arg to FORMAT ~{ directive not a list" arg))
+      (and (|:|)
+           (not (listp (car arg)))
+           (zerror "Arg to FORMAT ~:{ directive not a list" (car arg)))
+      (when (|:|)
+            (setf (format-subargs newf)
+                  (setf (format-args newf) (pop arg)))))
+
+  loop-without-null-arg-check
+
+   (unless out-of-line-p
+    (setq s (car (or (format-subspec newf)
+                     (zerror "FORMAT directive ~{ specified without ~}"
+                             (format-string f))))))
+   (when (if out-of-line-p (null (format-subspec newf))
+                           (and (consp s) (eql (car s) #\})))
+         (case (format-abort newf)
+               ((|:|)
+                (return))
+               ((t)
+                (setf (format-abort newf) nil)
+                (when (format-suppress newf)
+                      (return))
+                (setf (format-subspec newf) spec)
+                (go loop))
+               (otherwise
+                (when (and (if out-of-line-p colon2p (spec-colon s))
+                           (eql k 0)
+                           (not (eql maxrep 0))
+                           (null (if (|:|) arg (format-subargs newf))))
+                      (setf (format-suppress newf) (format-suppress f)
+                            (format-args newf)     nil
+                            (format-subargs newf)  nil
+                            (format-subspec newf)  spec)
+                      (setq k 1)
+                      (go loop-without-null-arg-check))
+                (when (format-suppress newf) (return))
+                (setf (format-subspec newf) spec)
+                (go loop))))
+   (let ((save-suppress (format-suppress newf)))
+        (unwind-protect
+         (progn
+          (unless (format-suppress newf)
+                  (setf (format-suppress newf) (format-abort newf)))
+          (format-process newf)
+         )
+         (setf (format-suppress newf) save-suppress)
+        )
+   )
+   (setf (format-subspec newf)
+         (cdr (format-subspec newf)))
+   (go loop-without-null-arg-check))
+
+  ; end PROG
+
+  (unless (format-suppress f)
+          (when (@)
+                (setf (format-subargs f)
+                      (format-subargs newf))))
+  (if out-of-line-p
+     (setf (format-subspec f)
+           (cdr (format-subspec f)))
+     (setf (format-subspec f)
+           (format-subspec newf)))))
+
+;
+; This processes the ~< directive.
+;
+; None of the LISP manuals available describe this directive
+; adequately.  However, it seems that the spacing must be
+; evenly divided among either n-1, n, or n+1 pads depending
+; on the @ and : specs.
+;
+
+(defun format-%-< (f)
+ (let* (((mincol colinc minpad padchar) (format-modifiers f))
+        (fmincol  (if (fixnump mincol)  mincol  0))
+        (fcolinc  (if (fixnump colinc)  colinc  1))
+        (fminpad  (if (fixnump minpad)  minpad  0))
+        (fpadchar (if (stringp padchar) padchar " "))
+        (spec (cdr (format-subspec f)))
+        (newf (copy-format f :dest nil :stream nil
+                             :spec spec :subspec spec)))
+       (prog (u s k strings semiseen totstrlen spacing padlist padcount
+              leftpadp rightpadp spacing-between-segs spacing-left-over
+              fitstring fitmodifiers)
+        (setq totstrlen 0 k 0)
+        (unless (format-suppress newf)
+         (setf (format-stream newf) (cons "~<" (list ""))))
+         ; The "~<" is to tell ~T directives to error out.
+       process-loop
+        (setq u (car (or (format-subspec newf)
+                      (zerror "FORMAT directive ~< specified without ~>"
+                              (format-string f)))))
+        (setq s (if (consp u) (car u)))
+        (case s
+              ((#\> #\;)
+               (unless (format-suppress newf)
+                (cond
+                 ((and (eql s #\;) (spec-colon u))
+                  (when semiseen
+                        (zerror "Misplaced ~:; in FORMAT ~< directive"
+                                (format-string f)))
+                  (setq fitstring    (stream-to-string newf))
+                  (setq fitmodifiers (spec-modifiers u))
+                 )
+                 (t
+                  (let ((string (stream-to-string newf)))
+                       (incf totstrlen (string-length string))
+                       (push string strings))))
+                (setf (format-stream-string newf) (list ""))
+               )
+               (when (eql s #\;) (setq semiseen t))
+               (when (eql s #\>) (go process-loop-end))
+              )
+              (otherwise
+               (format-process newf)
+               (when (format-abort newf)
+                     (setf (format-suppress newf) t))
+              ))
+
+        (setf (format-subspec newf) (cdr (format-subspec newf)))
+        (go process-loop)
+
+       process-loop-end
+
+        (cond
+         ((format-suppress f)
+          (go finish))
+         ((null strings)
+          (format-ouch fmincol fpadchar f)
+          (go finish))
+        )
+        (cond
+         ((and (|@|) (|:|))
+          (setq padcount (1+ (length strings)))
+          (setq leftpadp t)
+          (setq rightpadp t)
+         )
+         ((|@|)
+          (setq padcount (length strings))
+          (setq leftpadp nil)
+          (setq rightpadp t)
+         )
+         ((|:|)
+          (setq padcount (length strings))
+          (setq leftpadp t)
+          (setq rightpadp nil)
+         )
+         (t
+          (setq padcount (1- (length strings)))
+          (if (plusp padcount)
+              (setq leftpadp nil rightpadp nil)
+              (setq padcount 1 leftpadp t rightpadp nil))
+         )
+        )
+        (let ((minlen (+ totstrlen (* padcount fminpad))))
+             (loop while (< fmincol minlen)
+                   do (incf fmincol fcolinc)))
+
+        (setq spacing               (- fmincol totstrlen)
+              spacing-between-segs (quotient spacing padcount)
+              spacing-left-over   (remainder spacing padcount))
+
+        (setq strings (nreverse strings))
+
+        (do ((ss strings (cdr ss))
+             (s spacing-between-segs spacing-between-segs)
+             (r spacing-left-over)
+            )
+            ((null ss)
+             (when rightpadp
+                  (push (max fminpad s) padlist)
+                  (incf k s))
+            )
+            (unless (and (not leftpadp) (eq ss strings))
+             (when (plusp r)
+                   (incf s)
+                   (decf r))
+             (push (max fminpad s) padlist)
+             (incf k s)
+            )
+            (push (car ss) padlist)
+            (incf k (string-length (car ss)))
+        )
+
+        (unless (eql k fmincol)
+         (zerror
+          "Internal FORMAT error processing ~< computing string length"
+          (format-string f) fmincol k))
+
+        (setq padlist (nreverse padlist))
+
+        (when fitstring
+         (let* (
+                ((fitextra fitlinel) fitmodifiers)
+                (ffitextra (if (fixnump fitextra) fitextra 0))
+                (ffitlinel (if (fixnump fitlinel) fitlinel 72))
+                (roomleft (- ffitlinel (1- (format-compute-column f))))
+               )
+               (when (> (+ fmincol ffitextra) roomleft)
+                     (format-princ fitstring f))
+         )
+        )
+        (dolist (p padlist)
+                (if (fixnump p)
+                    (format-ouch p fpadchar f)
+                    (format-princ p f)))
+
+       finish
+
+        (unless (format-suppress f)
+         (setf (format-subargs f) (format-subargs newf)))
+        (setf (format-subspec f) (format-subspec newf)))))
+
+;
+; This processes the Z directive, which is for ZIL debugging only.
+;
+
+(defun format-%-z (f)
+ (let ((arg (unless (format-suppress f) (format-read-arg f)))
+       (col (format-compute-column f))
+      )
+      (format t "~%")
+      (when (format-suppress f)
+       (format t
+            "Note: This directive being processed in suppress mode.~%"))
+      (format t "~&Arg is ~S~%" arg)
+      (format t "~&Format modifiers are ~S~%" (format-modifiers f))
+      (when (|:|) (format t "~&\":\" flag is on~%"))
+      (when (@) (format t "~&\"@\" flag is on~%"))
+      (format t "~&Current column is ~S~%" col)
+      (format t "~%")))
+
+;
+; The following exist only to signal errors when they are encountered
+; out of place.  They are handled correctly by code in the directive
+; handlers for (, <, etc.
+;
+
+(defun format-%-right-bracket (f)
+ (zerror "FORMAT directive error: ~RIGHT_BRACKET found but no ~LEFT_BRACKET active"
+         (format-string f)))
+
+(defun format-%-right-brace (f)
+ (zerror "FORMAT directive error: ~} found but no ~{ active"
+         (format-string f)))
+
+(defun format-%-> (f)
+ (zerror "FORMAT directive error: ~> found but no ~< active"
+         (format-string f)))
+
+(defun format-%-right-parenthesis (f)
+ (zerror "FORMAT directive error: ~) found but no ~( active"
+         (format-string f)))
+
+(defun format-%-semicolon (f)
+ (zerror "FORMAT directive error: ~; found but no ~LEFT_BRACKET or ~< active"
+         (format-string f)))
+
+;======================================================================
+
+;;;
+;;; (ZFMNENG number ordinalp)
+;;;
+;;; This function, called by the FORMAT ~R directive processor,
+;;; takes an integer and returns the English-word form of the number.
+;;; If ordinalp is true, it returns the ordinal form; otherwise it
+;;; returns the cardinal form.
+;;;
+;;; Source of really-big-number names:
+;;;  Webster's Third New International Dictionary, 1986
+;;;
+
+(defun zfmneng (number ordinalp)
+ (cond
+  ((not (integerp number))
+   (zfmneng-punt      number ordinalp))
+  ((zerop number)
+   (if ordinalp "zeroth" "zero"))
+  ((minusp number)
+   (string-append "minus " (zfmneng (minus number) ordinalp)))
+  (t
+   (zfmneng-number number ordinalp))))
+
+(defun zfmneng-number (number ordinalp)
+ (cond
+  ((< number 20)           (zfmneng-basic             number ordinalp))
+  ((< number 100)          (zfmneng-..ty              number ordinalp))
+  ((< number 1000)         (zfmneng-hundred           number ordinalp))
+  ((< number 1000000)      (zfmneng-thousand          number ordinalp))
+  ((< number 1000000000)   (zfmneng-million           number ordinalp))
+  ((< number #.(** 10 12)) (zfmneng-billion           number ordinalp))
+  ((< number #.(** 10 15)) (zfmneng-trillion          number ordinalp))
+  ((< number #.(** 10 18)) (zfmneng-quadrillion       number ordinalp))
+  ((< number #.(** 10 21)) (zfmneng-quintillion       number ordinalp))
+  ((< number #.(** 10 24)) (zfmneng-sextillion        number ordinalp))
+  ((< number #.(** 10 27)) (zfmneng-septillion        number ordinalp))
+  ((< number #.(** 10 30)) (zfmneng-octillion         number ordinalp))
+  ((< number #.(** 10 33)) (zfmneng-nonillion         number ordinalp))
+  ((< number #.(** 10 36)) (zfmneng-decillion         number ordinalp))
+  ((< number #.(** 10 39)) (zfmneng-undecillion       number ordinalp))
+  ((< number #.(** 10 42)) (zfmneng-duodecillion      number ordinalp))
+  ((< number #.(** 10 45)) (zfmneng-tredecillion      number ordinalp))
+  ((< number #.(** 10 48)) (zfmneng-quattuordecillion number ordinalp))
+  ((< number #.(** 10 51)) (zfmneng-quindecillion     number ordinalp))
+  ((< number #.(** 10 54)) (zfmneng-sexdecillion      number ordinalp))
+  ((< number #.(** 10 57)) (zfmneng-septendecillion   number ordinalp))
+  ((< number #.(** 10 60)) (zfmneng-octodecillion     number ordinalp))
+  ((< number #.(** 10 63)) (zfmneng-novemdecillion    number ordinalp))
+  ((< number #.(** 10 66)) (zfmneng-vigintillion      number ordinalp))
+  (t                       (zfmneng-punt              number ordinalp))
+))
+
+(defun zfmneng-punt (number ordinalp)
+ (let ((it (princ-to-string number)))
+      (if ordinalp (string-append it "'th") it)))
+
+(defun zfmneng-basic (number ordinalp)
+ (nth number
+      (if ordinalp
+          '(nil "first" "second" "third" "fourth" "fifth" "sixth"
+            "seventh" "eighth" "ninth" "tenth" "eleventh" "twelfth"
+            "thirteenth" "fourteenth" "fifteenth" "sixteenth"
+            "seventeenth" "eighteenth" "nineteenth")
+          '(nil "one" "two" "three" "four" "five" "six" "seven"
+            "eight" "nine" "ten" "eleven" "twelve" "thirteen"
+            "fourteen" "fifteen" "sixteen" "seventeen"
+            "eighteen" "nineteen"))))
+
+(defun zfmneng-..ty (number ordinalp)
+ (let* ((q (quotient  number 10))
+        (r (remainder number 10))
+        (s (nth q '(nil nil "twent" "thirt" "fort" "fift"
+                            "sixt" "sevent" "eight" "ninet")))
+       )
+       (if (zerop r)
+           (string-append s (if ordinalp "ieth" "y"))
+           (string-append s "y-" (zfmneng-basic r ordinalp)))))
+
+(defun zfmneng-process (number ordinalp powerof10 word)
+ (let* ((q (quotient  number powerof10))
+        (r (remainder number powerof10))
+        (k (zfmneng-number q nil))
+       )
+   (if (zerop r)
+       (string-append k (if ordinalp (string-append word "th") word))
+       (string-append k word " " (zfmneng-number r ordinalp)))))
+
+(defmacro make-power-of-10-macro (power name)
+ `(defmacro ,(concat "ZFMNENG-" (string-upcase name)) (number ordinalp)
+   `(zfmneng-process ,number ,ordinalp ,',(** 10 power)
+      ,,(string-append " " (string-downcase name)))))
+
+(make-power-of-10-macro  2 hundred)
+(make-power-of-10-macro  3 thousand)
+(make-power-of-10-macro  6 million)
+(make-power-of-10-macro  9 billion)
+(make-power-of-10-macro 12 trillion)
+(make-power-of-10-macro 15 quadrillion)
+(make-power-of-10-macro 18 quintillion)
+(make-power-of-10-macro 21 sextillion)
+(make-power-of-10-macro 24 septillion)
+(make-power-of-10-macro 27 octillion)
+(make-power-of-10-macro 30 nonillion)
+(make-power-of-10-macro 33 decillion)
+(make-power-of-10-macro 36 undecillion)
+(make-power-of-10-macro 39 duodecillion)
+(make-power-of-10-macro 42 tredecillion)
+(make-power-of-10-macro 45 quattuordecillion)
+(make-power-of-10-macro 48 quindecillion)
+(make-power-of-10-macro 51 sexdecillion)
+(make-power-of-10-macro 54 septendecillion)
+(make-power-of-10-macro 57 octodecillion)
+(make-power-of-10-macro 60 novemdecillion)
+(make-power-of-10-macro 63 vigintillion)
+
+;======================================================================
+
+;;;
+;;; (ZFMNROM number oldp)
+;;;
+;;; This function, called by the FORMAT ~R directive processor,
+;;; takes an integer and returns the Roman-numeral form of the number.
+;;; If oldp is true, it returns the "old" form
+;;; (e.g. IIII instead of IV); otherwise it returns the standard form.
+;;;
+
+(defun zfmnrom (number oldp)
+ (cond
+  ((not (integerp number))
+   (zfmnrom-punt      number oldp))
+  ((minusp number)
+   (string-append "-" (zfmnrom (minus number) oldp)))
+  ((zerop number)
+   (zfmnrom-punt      number oldp))
+  (t
+   (zfmnrom-number number oldp))))
+
+(defun zfmnrom-number (number oldp)
+ (cond
+  ((zerop number) ; Used for internal calls only
+   "")
+  ((< number 5)
+   (zfmnrom-i         number oldp))
+  ((< number 9)
+   (zfmnrom-v         number oldp))
+  ((< number 10)
+   (zfmnrom-ix        number oldp))
+  ((< number 50)
+   (zfmnrom-x         number oldp))
+  ((< number 90)
+   (zfmnrom-l         number oldp))
+  ((< number 100)
+   (zfmnrom-xc        number oldp))
+  ((< number 500)
+   (zfmnrom-c         number oldp))
+  ((< number 900)
+   (zfmnrom-d         number oldp))
+  ((< number 1000)
+   (zfmnrom-cm        number oldp))
+  ((< number 5000)
+   (zfmnrom-m         number oldp))
+  (t
+   (zfmnrom-punt      number oldp))))
+
+(defun zfmnrom-punt (number oldp)
+ (princ-to-string number))
+
+(defun zfmnrom-generate (digit1 digit2 number oldp)
+ (case number
+       (1  digit1)
+       (2  (string-append digit1 digit1))
+       (3  (string-append digit1 digit1 digit1))
+       (4  (if oldp
+               (string-append digit1 digit1 digit1 digit1)
+               (string-append digit1 digit2)))
+       (t  (zerror "Bad args passed to ZFMNROM-GENERATE"
+                   digit1 digit2 number oldp))))
+
+(defun zfmnrom-i (number oldp)
+ (zfmnrom-generate "I" "V" number oldp))
+
+(defun zfmnrom-v (number oldp)
+ (let ((r (- number 5)))
+      (string-append "V" (zfmnrom-number r oldp))))
+
+(defun zfmnrom-ix (number oldp)
+ (if oldp "VIIII" "IX"))
+
+(defun zfmnrom-x (number oldp)
+ (let ((q (quotient  number 10))
+       (r (remainder number 10))
+      )
+      (string-append (zfmnrom-generate "X" "L" q oldp)
+                     (zfmnrom-number r oldp))))
+
+(defun zfmnrom-l (number oldp)
+ (let ((r (- number 50)))
+      (string-append "L" (zfmnrom-number r oldp))))
+
+(defun zfmnrom-xc (number oldp)
+ (let ((r (- number 90)))
+      (string-append (if oldp "LXXXX" "XC") (zfmnrom-number r oldp))))
+
+(defun zfmnrom-c (number oldp)
+ (let ((q (quotient  number 100))
+       (r (remainder number 100))
+      )
+      (string-append (zfmnrom-generate "C" "D" q oldp)
+                     (zfmnrom-number r oldp))))
+
+(defun zfmnrom-d (number oldp)
+ (let ((r (- number 500)))
+      (string-append "D" (zfmnrom-number r oldp))))
+
+(defun zfmnrom-cm (number oldp)
+ (let ((r (- number 900)))
+      (string-append (if oldp "DCCCC" "CM") (zfmnrom-number r oldp))))
+
+(defun zfmnrom-m (number oldp)
+ (let ((q (quotient  number 1000))
+       (r (remainder number 1000))
+      )
+      (string-append (zfmnrom-generate "M" nil q t)
+                     (zfmnrom-number r oldp))))
+

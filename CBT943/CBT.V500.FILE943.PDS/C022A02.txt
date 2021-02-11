@@ -1,0 +1,344 @@
+ Using XPCCB macros
+
+Due to the fact that our organisation, like many other Government installations,
+has a large number of departments and users to support,  we currently let all
+users handle their individual VSE/ POWER job submissions through CICS
+transactions.  Our current setup involves VSAM files, which contain all the JCL
+that a user can submit, and transactions, which display these jobs to the user.
+These jobs are then written to a CICS intrapartition dataset defined in the DCT,
+with a trigger level of 1, which will then invoke the program that actually
+submits these jobs to the VSE/POWER reader queue.
+
+In the past, the program which handled these submissions to VSE/POWER was
+written using the old XECB macros.  This worked well, until the number of users
+submitting jobs began to grow, and the fact that the old XECB macros did not
+handle the multi-threading of jobs to the VSE/POWER reader queue, but rather
+single-threaded them through, one after the other.  As you can imagine, this had
+the potential to slow things down quite a bit.
+
+After some thought, I recoded the program using the new XPCCB macros, which do
+support the multi-threading of jobs to the VSE/POWER reader queue.  So far,
+there have been no problems with the code.
+
+To implement this program, simply define a DFHDCT TYPE=INTRA dataset in your DCT
+called PWRS, setting TRIGLEV=l and the TASKID equal to the name of the following
+program's task-id (in this case PWRS).  Then simply write whatever data you wish
+to submit to VSE/POWER to the DCT dataset, and the program will be invoked
+automatically due to the TRIGLEV value of 1.
+
+The following code accomplishes this task and is currently in use in a VSE/SP
+2.1.3 CICS 1.6 environment.
+
+PWRS     TITLE 'CICS USER SUBMIT TO POWER QUEUE'
+***********************************************************************
+* SEND BUFFER SIZE = 4401 CHARACTERS                                  *
+*                        THIS ALLOWS THE BUFFER TO BE FILLED          *
+*                        WITH 50 LINES OF JCL BEFORE IT HAS TO        *
+*                        BE SENT TO POWER.                            *
+* JCL RECORD SIZE = 88 CHARACTERS                                     *
+*                        8 CHARACTERS = PREFIX DATA                   *
+*                        80 CHARACTERS = JCL DATA                     *
+* REGISTER USAGE:                                                     *
+* R0 - USED BY DOS                                                    *
+* R1 - ADDRESS OF THE PARAMETER LIST                                  *
+* R2 - USED BY DOS                                                    *
+* R3 - BASE REGISTER                                                  *
+* R4 - OWNXPCCB DSECT ADDRESSABILITY REGISTER                         *
+* R5 - IJBXSUSR DSECT ADDRESSABILITY REGISTER                         *
+* R6 - IJBXRUST DSECT ADDRESSABILITY REGISTER                         *
+* R7 - OWNSPL DSECT ADDRESSABILITY REGISTER                           *
+* R8 - WORK REGISTER                                                  *
+* R9 - WORK REG / DATA POlNTER REG (DATAPTR)                          *
+* R10 - BUFFER POINTER REG (BUFPTR)                                   *
+* R11 - EXEC INTERFACE BLOCK (EIB)                                    *
+* R12 - SECOND BASE REGISTER                                          *
+* R13 - DYNAMIC STORAGE REGISTER                                      *
+* R14 - RETURN REGISTER                                               *
+* R15 - ENTRY POINT OF EXEC INTERFACE PROGRAM                         *
+***********************************************************************
+*** SET UP ADDRESSABILITY TO BASE REGISTERS AND DSECTS ***
+INSTRUCT DFHEIENT CODEREG=(3,12)
+EDP3P010 DS    0H                      START OF THIS PROGRAM
+         LA    R4,OWNXPCCB             GET ADD OF CROSS PART. CONTROL
+         USING IJBXPCCB,R4             SET UP ADDRESSABILITY FOR DSECT
+         LA    R5,IJBXSUSR             GET ADDR OF USER DATA TO BE SENT
+         USING PXUUSER,R5              SET UP ADDRESSABILITY FOR DSECT
+         LA    R6,IJBXRUSR             GET ADDR OF RECEIVED USER DATA
+          USING PXPUSER,R6              SET UP ADDRESSABILITY FOR DSECT
+         LA    R7,OWNSPL               GET ADDRESS OF SPL
+         USING OWNSPLDS,R7             SET UP ADDRESSABILITY FOR DSECT
+         B     ENQUEUE                 BRANCH AROUND EOF AND QBUSY
+*** END OF FILE AND QUEUE BUSY ROUTINES ***
+ENDEOF   EXEC CICS DEQ RESOURCE(PWRS) LENGTH(L4)
+         MVC   EOFFLAG,EOF             SET EOF FLAG TO INDICATE EOF
+         B     FILLBUF                 GO TO FILL BUFFER ROUTINE
+QBUSY    EXEC CICS DELAY INTERVAL(5)
+         B     ENQUEUE                 GO TRY TO ENQUEUE THE FILE AGAIN
+*** ENQUEUE THE TEMPORARY STORAGE FILE CONTAINING THE DATA CARDS ***
+ENQUEUE  EXEC CICS HANDLE CONDITION ENQBUSY(QBUSY) QZERO(ENDEOF)
+         EXEC CICS ENQ RESOURCE(PWRS) LENGTH(L4)
+*** IDENTIFY EDP3P010 AS VSE/AF XPCC USER ***
+IDENT    XPCC  XPCCB=(R4),FUNC=IDENT   IDENTIFY 'EDP3P010' TO AF-XPCC
+         CLM   R15,M1,EIGHTDC          WAS RETURN CODE X'08' RETURNED ?
+         BNO   CONCT                   ...NO, CONTINUE WITH CONNECTION
+IDENTBAD ST    R15,SAVE15              SAVE REGISTER 15
+         MVC   ABENDCD,=C'IDST'        INSERT ABEND CODE FOR DIAGNOSTIC
+         CLI   IJBXRETC,IJBXNSTO       DID IDENT FAIL DUE TO NO STORAGE
+         BE    FINDUMP                 ...YES, TERMINATE WITH "IDST"
+         MVC   ABENDCD,=C'IDEN'        FAIL WAS NOT DUE TO STORAGE...
+         B     FINDUMP                 ..INSERT ABEND CODE AND DUMP
+*** ESTABLISH THE XPCC CONNECTION TO VSE/POWER ***
+CONCT    XPCC  XPCCB=(R4),FUNC=CONNECT CONNECT TO VSE/POWER
+         LTR   R15,R15                 IS CONNECTION ALREADY AVAILABLE?
+         BZ    CONNOK                  ...YES, BYPASS WAIT FOR CONNECT
+         CLM   R15,M1,EIGHTDC          WAS RETURN CODE X'08' RETURNED ?
+         BL    WAITCECB                ...NO, MUST BE '04', SO WAIT
+         CLI   IJBXRETC,IJBXQSCE       DID POWER GIVE XPCC TERMQSCE
+         BE    TERMQSCE                ...YES, GO TO HANDLE THAT STATE
+CONCTBAD ST    R15,SAVE15              SAVE REGISTER 15
+         MVC   ABENDCD,=C'CNST'        INSERT ABEND CODE FOR DIAGNOSTIC
+         CLI   IJBXRETC,IJBXNSTO       DID CONNECT FAIL DUE TO NO STOR?
+         BE    FINDUMP                 ...YES, GO DUMP WITH "CNST"
+         MVC   ABENDCD,=C'CONN'        CONN DIDN'T FAIL DUE TO STORAGE
+         B     FINDUMP                 ...GO DUMP WITH "CONN"
+TERMQSCE MVC   ABENDCD,=C'TQSC'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         B     FINDUMP                 GO DUMP
+WAITCECB ZAP   LOOPCNT,=P'0'           ZERO LOOP COUNTER
+LOOPC    EXEC CICS DELAY INTERVAL(1)
+         TM    IJBXCECB+2,POSTBIT      CONNECTION COMPLETE ?
+         BO    CONNOK                  ...YES, CONTINUE WITH CONNECT OK
+         AP    LOOPCNT,=P'1'           ADD 1 TO LOOP COUNTER
+         CP    LOOPCNT,=P'20'          HAVE WE WAITED 20 SECONDS ?
+         BL    LOOPC                   ...NO, GO WAIT ANOTHER SECOND
+         MVC   ABENDCD,=C'WATC'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         B     FINDUMP                 GO DUMP
+CONNOK   MVC   ABENDCD,=C'    '        CLEAR ABEND CODE, SUCCESSFUL
+         ST    R15,SAVE15              CLEAR REG 15, SUCCESSFUL
+*** GENERATED SPL IS UPDATED INDICATING PUT TO POWER RDR QUEUE ***
+PUTA1    PWRSPL TYPE=UPD,SPL=OWNSPL,REQ=PUT,QUEUE=RDR
+         MVI   PXUBTYP,PXUBTSPL        INDICATE BUFFER TYPE = SPL
+         MVI   PXUACT1,0               CLEAR ALL OTHER BYTES IN PXUSSER
+         MVI   PXUSIGNL,0              ...WHICH MAY BE CHANGED BY USER
+         STCM  R7,M7,IJBXADR           INSERT SPL ADDRESS AS BUF. ADDR.
+         LA    R8,SPLGLEN              LOAD LENGTH OF SPL
+         ST    R8,IJBXBLN              INSERT BUFFER LENGTH INTO XPCCB
+         ST    R9,SAVE9                SAVE REGISTER 9
+         BAL   R9,SENDR                GO TO SENDR ROUTINE
+         L     R9,SAVE9                RESTORE REGISTER 9
+         MVC   ABENDCD,=C'PUT1'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REG 15
+         CLI   PXPRETCD,PXPRCOK        WAS POWER RETURN CODE ZERO ?
+          BNE   REQFAIL                 NO, GO TO HANDLE REQUEST FAILURE
+         MVI   PXUBTYP,PXUBTNDB        BUFFER = NORMAL DATA BUFFER
+         MVI   PXUACT1,0               CLEAR ACTION BYTE
+         LA    BUFPTR,SENDBUF          GET ADDRESS OF SEND BUFFER
+         STCM  BUFPTR,M7,IJBXADR       INSERT BUFFER ADDRESS INTO XPCCB
+         LA    DATAPTR,HOLDCARD        GET ADDRESS OF INPUT CARD
+         MVC   EOFFLAG,NOTEOF          SET EOF FLAG TO INDICATE NOT EOF
+         MVC   ABENDCD,=C'    '        CLEAR ABEND CODE, SUCCESSFUL
+         ST    R15,SAVE15              CLEAR REG 15, SUCCESSFUL
+*** FILL THE BUFFER WITH INPUT CARDS FROM TRANSIENT DATA ***
+FILLBUF  CLC   EOFFLAG,EOF             END OF FILE REACHED ?
+         BE    PUTA3                   ...YES, GO TO SEND FINAL BUFFER
+         EXEC CICS READQ TD QUEUE('PWRS') INTO(HOLDCARD) LENGTH(H80)
+         CL    BUFPTR,LASTPREC         ENOUGH SPACE FOR ONE MORE RECORD
+         BH    PUTA2                   ...NO, GO TO SEND NORMAL BUFFER
+MOVEIN   USING RECPRFIX,BUFPTR         GET DSECT FOR RECORD LAYOUT
+         XC    0(RECPRFXL,BUFPTR),0(BUFPTR) CLEAR BYTES FOR PREFIX
+         MVI   RECTYPE,RECTNORM INSERT REC. TYPE IN REC. PREFIX
+         LA    R8,L'HOLDCARD           LOAD LENGTH OF DATA CARD
+         STH   R8,RECLNGTH             INSERT LEN. OF DATA CARD IN PREF
+         LA    BUFPTR,RECPRFXL(,BUFPTR) SKIP PREFIX IN BUFFER
+         DROP  BUFPTR                  DROP REGISTER
+         MVC   0(L'HOLDCARD,BUFPTR),0(DATAPTR) MOVE DATA INTO BUFFER
+         LA    BUFPTR,L'HOLDCARD(,BUFPTR) POINT TO NEXT FREE B. SPACE
+         LA    DATAPTR,HOLDCARD        GET ADDRESS OF INPUT CARD
+         B     FILLBUF
+*** BUFFER IS FULL, SEND IT TO VSE/POWER QUEUE ***
+PUTA2    LA    R8,SENDBUF              GET AGAIN START ADDR OF SEND BUF
+         SR    BUFPTR,R8               CALC. ACTUALLY USED BUFFER LGTH
+         ST    BUFPTR,IJBXBLN          INSERT BUFFER LENGTH INTO XPCCB
+         ST    R9,SAVE9                SAVE REGISTER 9
+         BAL   R9,SENDR                GO TO SENDR ROUTINE
+         L     R9,SAVE9                RESTORE REGISTER 9
+         MVC   ABENDCD,=C'PUT2'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REG 15
+         CLI   PXPRETCD,PXPRCOK        WAS POWER RETURN CODE ZERO ?
+         BNE   REQFAIL                 NO, GO TO HANDLE REQUEST FAILURE
+         LA    BUFPTR,SENDBUF          GET AGAIN ADDRESS OF SEND BUFFER
+         MVC   ABENDCD,=C'    '        CLEAR ABEND CODE, SUCCESSFUL
+         ST    R15,SAVE15              CLEAR REG 15, SUCCESSFUL
+         B     MOVEIN                  CONTINUE TO MOVE IN NEXT CARDS
+*** END OF FILE HAS BEEN REACHED, SEND LAST BUFFER ***
+PUTA3    MVI   PXUACT1,PXUATEOD        INDICATE END OF DATA
+         LA    R8,SENDBUF              GET AGAIN START ADDR OF SEND BUF
+         SR    BUFPTR,R8               CALC. ACTUALLY USED BUF. LENGTH
+         ST    BUFPTR,IJBXBLN          INSERT BUFFER LENGTH INTO XPCCB
+         ST    R9,SAVE9                SAVE REGISTER 9
+         BAL   R9,SENDR                GO TO SENDR ROUTINE
+         L     R9,SAVE9                RESTORE REGISTER 9
+         MVC   ABENDCD,=C'PT3R'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REG 15
+         CLI   PXPRETCD,PXPRCOK        WAS POWER RETURN CODE ZERO ?
+         BNE   REQFAIL                 NO, GO TO HANDLE REQUEST FAILURE
+         MVC   ABENDCD,=C'PT3F'        INSERT ABEND CODE FOR DIAGNOSTIC
+         CLI   PXPFBKCD,PXPOOOK        WAS POWER FEEDBACK CODE ALSO 0 ?
+         BNE   REQFAIL                 NO, GO TO HANDLE REQUEST FAILURE
+         MVC   ABENDCD,=C'     '       CLEAR ABEND CODE, SUCCESSFUL
+         ST    R15,SAVE15              CLEAR REG 15, SUCCESSFUL
+         B     DISCT                   ALL DONE...GO DISCONNECT
+*** ROUTINE TO HANDLE SENDR REQUEST FAILURES ***
+REQFAIL  UNPK  HELP,PXPRETCD(2)        UNPACK HEX POWER RETURN CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILPWRC,HELP           INSERT PRINTABLE POWER R.C.
+         UNPK  HELP,PXPFBKCD(2)        UNPACK HEX POWER FEEDBACK CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILPWFB,HELP           INSERT POWER FEEDBACK CODE
+          B     FINDUMP                 GO TO TERMINATION WITH DUMP
+*** DISCONNECT THE XPCC COMMUNICATION LINK TO VSE/POWER ***
+DISCT    XPCC  XPCCB=(R4),FUNC=DISCONN DISCONNECT LINK TO VSE/POWER
+         LTR   R15,R15                 WAS DISCONNECT SUCCESSFUL ?
+         BZ    TERMN                   ..YES, CONTINUE WITH TERMINATION
+         CLI   IJBXRETC,IJBXNDC1       ARE WE BUSY FROM OUR OWN SEND ?
+         BNE   DISABEND                ..NO, GO DIAGNOSE IT AND ABEND
+         ZAP   LOOPCNT,=P'0'           ZERO LOOP COUNTER
+DISCLOOP EXEC CICS DELAY INTERVAL(1)
+         XPCC  XPCCB=(R4),FUNC=DISCONN TRY AGAIN TO DISC LINK TO POWER
+         LTR   R15,R15                 WAS THIS DISCONNECT SUCCESSFUL ?
+         BZ    TERMN                   ..YES, CONTINUE WITH TERMINATION
+         CLI   IJBXRETC,IJBXNDC1       ARE WE STILL BUSY FROM OWN SEND?
+         BNE   DISABEND                ..NO, GO DIAGNOSE IT AND ABEND
+         AP    LOOPCNT,=P'1'           ADD 1 TO LOOP COUNTER
+         CP    LOOPCNT,=P'20'          HAVE WE WAITED 20 SECONDS ?
+         BL    DISCLOOP                ...NO, GO WAIT ANOTHER SECOND
+DISABEND MVC   ABENDCD,=C'DISC'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGlSTER 15
+         UNPK  HELP,IJBXRETC(2)        UNPACK HEX XPCC RETURN CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILRETC,HELP           INSERT PRINTABLE XPCC RET. CODE
+         UNPK  HELP,IJBXREAS(2)        UNPACK HEX XPCC REASON CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILREAS,HELP           INSERT PRINTABLE XPCC REAS. CODE
+         B     FINDUMP                 ...NO, GO TERMINATE WITH DUMP
+*** TERMINATE INTERACTION WITH THE VSE/AF XPCC SUPPORT ***
+TERMN    XPCC  XPCCB=(R4),FUNC=TERMIN  TERMINATE CROSS PART. INTERFACE
+         LTR   R15,R15                 WAS TERMINATE SUCCESSFUL ?
+         BZ    FINEND                  ...YES, GO TO NORMAL EOJ
+         MVC   ABENDCD,=C'TERM'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         UNPK  HELP,IJBXRETC(2)        UNPACK HEX XPCC RETURN CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILRETC,HELP           INSERT PRINTABLE XPCC RET. CODE
+         UNPK  HELP,IJBXREAS(2)        UNPACK HEX XPCC REASON CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILREAS,HELP           INSERT PRINTABLE XPCC REAS. CODE
+         B     FINDUMP                 ...NO, GO TERMINATE WITH DUMP
+*** TERMINATION ROUTINES ***
+FINDUMP  EXEC CICS ABEND ABCODE(ABENDCD)
+FINEND   EXEC CICS RETURN
+*** CENTRAL XPCC SENDR ROUTINE ***
+SENDR    XPCC  XPCCB=(R4),FUNC=SENDR   SEND BUFFER TO VSE/POWER
+         LTR   R15,R15                 DID SEND WORK ?
+         BZ    WAITSECB                 ..YES, THEN WAIT FOR REPLY
+TESTRETC CLI   IJBXRETC,IJBXNOC3       DID POWER ABNORMALLY TERMINATE ?
+         BE    ABNPOW                  ..YES, THEN GO TO STOP PROGRAM
+         CLI   IJBXRETC,IJBXCBSY       IS IT A LINE A BUSY CONDITION ?
+         BNE   SENDABND                ..NO, GO DIAGNOSE IT AND ABEND
+         ZAP   LOOPCNT,=P'0'           ZERO LOOP COUNTER
+SENDLOOP EXEC CICS DELAY INTERVAL(1)
+         XPCC  XPCCB=(R4),FUNC=SENDR   TRY AGAIN TO SEND BUFFER
+         LTR   R15,R15                 DID THIS SEND WORK ?
+         BZ    WAITSECB                ..YES, THEN WAIT FOR REPLY
+         CLI   IJBXRETC,IJBXCBSY       IS IT STILL A LINE BUSY CONDIT?
+         BNE   SENDABND                ..NO, GO DIAGNOSE IT AND ABEND
+         AP    LOOPCNT,=P'1'           ADD 1 TO LOOP COUNTER
+         CP    LOOPCNT,=P'20'          HAVE WE WAITED 20 SECONDS ?
+         BL    SENDLOOP                ...NO, GO WAIT ANOTHER SECOND
+SENDABND MVC   ABENDCD,=C'SEND'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         UNPK  HELP,IJBXRETC(2)        UNPACK HEX XPCC RETURN CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILRETC,HELP           INSERT PRINTABLE XPCC RET. CODE
+         UNPK  HELP,IJBXREAS(2)        UNPACK HEX XPCC REASON CODE
+          TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILREAS,HELP           INSERT PRINTABLE XPCC REAS. CODE
+         B     FINDUMP                 GO TERMINATE WITH DUMP
+ABNPOW   MVC   ABENDCD,=C'POWR'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         B     FINDUMP                 GO DUMP
+*** SEND IS O.K. - WAIT FOR SEND ECB TO BE POSTED ***
+WAITSECB ZAP   LOOPCNT,=P'0'           ZERO LOOP COUNTER
+LOOPS    EXEC CICS DELAY INTERVAL(1)
+         CLI   IJBXREAS,REASOK         CONNECTION O.K. ?
+         BER   R9                      ...YES, RETURN TO CALLER
+         AP    LOOPCNT,=P'1'           ADD 1 TO LOOP COUNTER
+         CP    LOOPCNT,=P'20'          HAVE WE WAITED 20 SECONDS ?
+         BL    LOOPS                   ...NO, GO WAIT ANOTHER SECOND
+*** ECB WAS POSTED BAD OR NEVER POSTED ***
+BADREAS  TM    IJBXREAS,IJBXABDC       DID POWER TERMlNATE ABNORMALLY
+         BO    ABNPOW                  ..YES, SET ABEND CODE AND DUMP
+         MVC   ABENDCD,=C'WATS'        INSERT ABEND CODE FOR DIAGNOSTIC
+         ST    R15,SAVE15              SAVE REGISTER 15
+         UNPK  HELP,IJBXREAS(2)        UNPACK HEX XPCC REASON CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILREAS,HELP           INSERT PRINTABLE XPCC REAS. CODE
+         UNPK  HELP,PXPRETCD(2)        UNPACK HEX POWER RETURN CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILPWRC,HELP           INSERT PRINTABLE POWER R.C.
+         UNPK  HELP,PXPFBKCD(2)        UNPACK HEX POWER FEEDBACK CODE
+         TR    HELP(2),TRTAB           CONVERT TO PRINTABLE HEX-VALUE
+         MVC   FAILPWFB,HELP           INSERT POWER FEEDBACK CODE
+         B     FINDUMP                 GO TO TERMINATION WITH DUMP
+*** DATA AREAS AND DEFINITIONS ***
+         DC    C'START OF DATA AREAS AND DEFINITIONS'
+SAVE15   DS    F                       SAVED REGISTER 15 DURING ABEND
+SAVE9    DS    F                       SAVED REGISTER 9 DURING BAL
+FAILPWRC DC    CL2'00'                 VSE/POWER RET CODE IN IJBXRUSR
+FAILPWFB DC    CL2'00'                 VSE/POWER FDBK CODE IN IJBXRUSR
+FAILREAS DC    CL2'00'                 REASON CODE RECEIVED IN IJBXRETC
+FAILRETC DC    CL2'00'                 RETURN CODE RECEIVED IN IJBXRETC
+ABENDCD  DC    CL4'PWRS'               ABEND FIELD FOR CICS ABENDS
+EOFFLAG  DS    CL4                     END OF DATA FLAG
+EOF      DC    CL4'STOP'               INDICATES END OF DATA
+NOTEOF   DC    CL4'MORE'               INDICATES NOT END OF DATA
+HOLDCARD DS    CL80                    JCL CARD READ FROM PWRS QUEUE
+JOBNAME  DS    CL8                     JOB NAME RETURNED BY POWER
+JOBNUM   DS    CL2                     JOB NUMBER RETURNED BY POWER
+HELP     DC    CL3' '                  FIELD USED TO UNPACK RETURN CODE
+LOOPCNT  DC    P'00'                   LOOP COUNTER FOR WAIT ON ECB'S
+PWRS     DC    CL4'PWRS'               QUEUE RESOURCE ID
+TRTAB    EQU   *-240                   ENTRY POINT FOR TRANSLATE TABLE
+         DC    X'F0F1F2F3F4F5F6F7F8F9C1C2C3C4C5C6'     TRANSLATE TABLE
+EIGHTDC  DC    X'08'                   BYTE TO TEST RETURN CODE
+L4       DC    H'4'                    LENGTH FOR ENQ RESOURCE
+H80      DC    H'80'                   LENGTH OF INPUT SPOOL CARD
+M1       EQU   1                       MASK BIT SETTING
+M7       EQU   7                       MASK BIT SETTING
+REASOK   EQU   X'00'                   ZERO VSE/AF REASON CODE
+POSTBIT  EQU   X'80'                   MASK FOR A POSTED ECB
+BUFPTR   EQU   10                      USE RlO AS BUFPOINTER
+DATAPTR  EQU   9                       USE R9 AS DATA POINTER
+LASTPREC DC    A(SENDBUF+L'SENDBUF-RECPRFXL-L'HOLDCARD) LAST RECORD
+         DC    C'BEGINNING OF REPLY BUFFER'
+REPLBUF  DS    CL100                   BUFFER FOR RECEIPT OF DATA
+         DC    C'BEGINNING OF SEND BUFFER'
+SENDBUF  DS    CL4401                  BUFFER USED FOR XPCC SENDR
+         DC    C'END OF DATA AREAS AND DEFINITIONS'
+*** CROSS PARTITION CONTROL BLOCK ***
+OWNXPCCB XPCCB APPL=EDP3P010,TOAPPL=SYSPWR,                            X
+                BUFFER=(SENDBUF,4401),REPAREA=(REPLBUF,100)
+*** GENERATE THE SPL ***
+OWNSPL PWRSPL TYPE=GEN,USERID=R000,PRFX=OWN
+*** DUMMY SECTION OF VSE/POWER SPOOL PARAMETER LIST (SPL) ***
+OWNSPLDS PWRSPL TYPE=MAP
+*** DUMMY SECTION OF CROSS PARTITION CONTROL BLOCK (XPCCB) ***
+XPCCBMAP MAPXPCCB
+         END
+
+
+Kevin Potter
+Systems Programmer
+Douglas County, Oregon (USA)  ) Xephon 1987
+

@@ -1,0 +1,348 @@
+CICS print function revisited
+
+Issue 42 of CICS Update, May 1989, contained several
+programs to replace the CICS screen print function.  These
+programs enhanced the print function by providing a separator
+page (or banner) and by providing a 'you get what you see'
+image of the screen instead of the compressed version IBM
+supplies.  An additional benefit not noted by the author,
+Nivaldo Moura, is that SCS printers are supported, something
+the IBM version does not handle.
+
+In attempting to implement these programs in an MVS/XA
+CICS 1.7.0 shop I ran into two major problems.
+
+1   The program will not work with conversational-mode
+transactions.
+
+2   The program destroys the link between a transaction and its
+COMMAREA.
+
+The program listed below fixes these problems.  It is very
+similar to Mr Moura's original program, but contains code to
+save the COMMAREA (if any), and to perform slightly
+different logic based on whether or not the originating terminal
+was in pseudo-conversational or conversational mode.  I also
+eliminated the separator page and moved the banner to the top
+of the page with the screen image (to save paper).
+
+When CICS detects a print key request (via DFHZCP) from a
+conversational task, it checks the target printer device type,
+and, if it is a 3284 or 3286, it reads the terminal buffer and
+then starts a CSPP transaction to the target printer, passing the
+screen buffer as data.  The CSPP PCT entry needs to be
+changed to point to the new program in order for these
+conversational prints to work.
+
+If you want SCS printers such as the 3812 to be supported in
+conversational mode you also need to ZAP a CICS CSECT so
+that the device type is not checked.  A ZAP which works in our
+environment is included below for your use.  The ZAP is not
+necessary for the pseudo-conversational environment.
+
+When CICS detects a print key request from a task at a pseudo-
+conversational wait, it kicks off transaction CSPK.  Either the
+CSPK PCT entry must be changed to point to this new
+program, or the IBM DFHPRK program must be replaced by
+our program renamed to DFHPRK.  The SUEDS program
+listed in the original article was renamed in our shop to
+RISFMT, but was otherwise unchanged.
+
+CICS PRINT SCREEN ROUTINE
+
+*********************************************************************
+*  THIS PROGRAM IS A REPLACEMENT FOR IBM'S DFHPRK PROGRAM
+*  WHICH PRINTS THE SCREEN BUFFER TO THE CICS TCTTE DEFINED
+*  DEFAULT SCREEN HARDCOPY PRINTER.
+*  IBM'S PROGRAM HAS SEVERAL PROBLEMS
+*      1) NO TOP OF FORM BEFORE OR AFTER A PRINT REQUEST
+*      2) IT DOES NOT HANDLE 327X DATA SUCH AS BINARY ZEROES
+*        SO THE PRINT DOES NOT REALLY LOOK LIKE THE SCREEN
+*      3) SCS Printers are not supported
+*  This program fixes these problems and is adapted from a program
+*  listed in issue 42 (MAY 1989) of XEPHON CICS UPDATE MAGAZINE
+*  Note: This program will not be invoked if the task which
+*        originated the print request is in conversational mode
+*        and if the printer is an SCS mode printer such as the
+*        3812. Before CICS issues the START for tran CSPP
+*        it checks the device type in the TCTTE. If it finds
+*        an SCS printer (or any other non 3270 print device)
+*        the node error transaction gets started and a DFH2497
+*        message is issued (printer not available). The print
+*        key process is effectively halted at that point.
+*        To get around this, we have Zapped module DFHZCPS$
+*        , Csect DFHZARQ to eliminate the test for device
+*        type.
+*  Program Initiation can happen in three ways:
+*  1) As a result of a print key request from a terminal between
+*     pseudo conversational conversations.  CICS intercepts the
+*     print key request and starts a CSPK transaction.  This
+*     program starts up, reads the screen buffer, reformats
+*     it to remove control characters and pads nulls to spaces.
+*     This program then STARTS the CSPK tran to the target
+*     printer passing the formatted buffer as data.
+*  2) As a result of a print key request from a terminal in
+*     conversational mode.  CICS intercepts the print key request,
+*     and if the target device is a 3270 mode printer, CICS
+*     reads the screen buffer and starts the CSPP transaction
+*     passing the screen buffer as data.  If the printer type
+*     is not 3270, a CSNE error occurs, and the print process
+*     stops.  Once the CSPP tran starts, this program is invoked
+*     and the buffer is RECEIVED and then reformatted.  This program
+*     then STARTS the CSPK transaction to the target printer
+*     passing the reformatted buffer as data.
+*  3) As a result of a START TRAN(CSPK) command by either of the
+*     two paths described above.
+*     The program RECEIVES the data passed to it by the previous
+*     incarnation (the screen buffer).  A header with userid,
+*     time, date and system id is then printed along with the
+*     reformatted screen buffer.
+         COPY  DFHTCADS                 CICS DSECTS
+         DFHTCA CICSYST=YES
+         COPY  DFHCSADS
+         DFHTCTZE CICSYST=YES
+SAVECOM  DSECT
+         DS    CL32768
+*    SET UP ENVIRONMENT
+DFPPRK   DFHEIENT EIBREG=RB,CODEREG=(R3),DATAREG=RA
+         L     TCTTEAR,TCAFCAAA
+         LA    TCTTEAR,0(TCTTEAR)
+*   Lets see whether we are reading and formatting the buffer or
+*   getting ready to print the screen image
+         EXEC  CICS HANDLE CONDITION                                   X
+               ERROR      (SUPRT999)                                   X
+               IOERR      (SUPRT999)                                   X
+               ENDDATA    (SUPRT010)
+         EXEC  CICS RETRIEVE                                           X
+               SET    (R8)                                             X
+               LENGTH (WLENGTH)
+         LH    R7,WLENGTH
+         STH   R7,SAVELEN
+         CLC   EIBTRNID,=CL4'CSPK'      Is this second time in ?
+         BE    SUPRT500                 ...If so, write to printer
+*    Get screen buffer, format it, then restart this transaction
+*    to print the data
+SUPRT010 LA    R0,WSHAREDA
+         LH    R1,WSHAREDL
+         XR    R14,R14
+         XR    R15,R15
+         ICM   R15,B'1000',=X'40'
+         MVCL  R0,R14
+         XC    PRINTER,PRINTER
+         MVC   PRINTER,TCTEPTO
+         CLC   PRINTER,NOPRINT
+         BE    SUPRT999
+*   Conversational mode tran = CSPP
+*   Pseudo-conversational mode tran = CSPK
+         CLC   EIBTRNID,=CL4'CSPK'      Is This Pseudoconversational?
+         BE    READSCRN                 IF so, we need to read screen
+         LA    R4,WSCRBUF               OTHERWISE data is already
+         LH    R5,SAVELEN               provided by CICS
+         LR    R9,R5                    ...
+         MVCL  R4,R8                    ...
+         MVC   PRINTER,EIBTRMID         ...
+         B     SKIPREAD                 so skip around screen read
+READSCRN LA    R7,WSCRBUFL
+         STH   R7,WLENGTH
+         EXEC  CICS RECEIVE                                            X
+               INTO      (WSCRBUF)                                     X
+               MAXLENGTH (WLENGTH)                                     X
+               BUFFER                                                  X
+               NOHANDLE
+*        This program reformats buffer replacing nulls with spaces
+*        and generally makes it look like the screen image
+SKIPREAD EXEC  CICS LINK                                               X
+               PROGRAM    ('RISFMT')                                   X
+               COMMAREA   (WSCRBUF)                                    X
+               LENGTH     (EDITL)                                      X
+               NOHANDLE
+         EXEC  CICS ASSIGN                                             X
+               USERID   (WUSERID)                                      X
+               SYSID    (WSYSID)
+         MVC   TERMID,EIBTRMID
+         LH    R7,WSHAREDL
+         STH   R7,WLENGTH
+         EXEC  CICS START                                              X
+               TRANSID    ('CSPK')                                     X
+               FROM       (WSHAREDA)                                   X
+               LENGTH     (WLENGTH)                                    X
+               TERMID     (PRINTER)
+         EXEC  CICS SEND CONTROL                                       X
+               FREEKB                                                  X
+               ALARM
+         XR    R7,R7                    CLEAR OUT REG7 FOR COMPARE
+         CH    R7,EIBCALEN              DO WE HAVE A COMMAREA ?
+         BE    SKIPCOM                  IF NOT, DO NORMAL RETURN
+         L     R7,DFHEICAP              LOAD COMMAREA ADDRESS
+         USING SAVECOM,R7               ESTABLISH ADDRESSABILITY
+*        If There was a COMMAREA, we need to restart the original
+*        user transaction and pass it the saved COMMAREA
+         EXEC  CICS RETURN                                             X
+               TRANSID   (TCTTETC)                                     X
+               COMMAREA  (SAVECOM)                                     X
+               LENGTH    (EIBCALEN)
+SKIPCOM  EXEC  CICS RETURN
+*  Print Buffer Routine
+SUPRT500 LA    R4,WSHAREDA
+         LH    R5,WLENGTH
+         LR    R9,R5
+         MVCL  R4,R8
+         EXEC  CICS SEND TEXT                                          X
+               FROM     (LINECICS)                                     X
+               LENGTH   (LINECICL)                                     X
+               ERASE                                                   X
+               PRINT                                                   X
+               NLEOM
+         MVC   WLINE(WLINESL),WLINES
+         EXEC  CICS ASKTIME                                            X
+               ABSTIME    (WLTIME)
+         EXEC  CICS FORMATTIME                                         X
+               ABSTIME    (WLTIME)                                     X
+               MMDDYY     (WLDATE)                                     X
+               DATESEP    ('/')                                        X
+               TIME       (WLTIME)                                     X
+               TIMESEP    (':')
+         MVC   WLUSERID,WUSERID
+         MVC   WLTERMID(4),TERMID
+         MVC   WLSYSID(4),WSYSID
+         LH    R7,=AL2(WLINESL)
+         STH   R7,WLENGTH
+         EXEC  CICS SEND TEXT                                          X
+               FROM     (WLINE)                                        X
+               LENGTH   (WLENGTH)                                      X
+               ERASE                                                   X
+               PRINT                                                   X
+               NLEOM
+         EXEC  CICS SEND TEXT                                          X
+               FROM     (LINECICS)                                     X
+               LENGTH   (LINECICL)                                     X
+               ERASE                                                   X
+               PRINT                                                   X
+               NLEOM
+         LA    R7,2
+         STH   R7,WLENGTH
+         LA    R15,BUFFOUT
+         USING OUTLINE,R15
+         LA    R5,WSCRBUF
+         LA    R4,24
+LOOP1    MVC   OUTDATA,0(R5)
+         MVI   OUTCC,NEWLINE
+         LA    R5,80(R5)
+         LA    R15,80(R15)
+         BCT   R4,LOOP1
+         DROP  R15
+         EXEC  CICS SEND TEXT                                          X
+               FROM     (BUFFOUT)                                      X
+               LENGTH   (DATALEN)                                      X
+               ERASE PRINT NLEOM
+         MVI   WCC,FORMFEED
+         MVI   WCC+1,ENDMSG
+         LA    R7,2
+         STH   R7,WLENGTH
+         EXEC  CICS SEND TEXT                                          X
+               FROM     (WLINE)                                        X
+               LENGTH   (WLENGTH)                                      X
+               ERASE PRINT NLEOM
+*   RETURN
+SUPRT999 EXEC  CICS RETURN
+*   WORKING STORAGE
+TCTTEAR  EQU   6                        TCTTE
+WLINES   EQU   *
+WLINE1   EQU   *
+         DC    CL18'CICS PA1 PRINT KEY'
+         DC    X'15'
+         DC    CL17'SYSTEM ID:.....   '
+         DC    CL8' '
+         DC    X'15'
+         DC    CL17'DATE:..........   '
+         DC    CL8' '
+         DC    X'15'
+         DC    CL17'TIME:..........   '
+         DC    CL8' '
+         DC    X'15'
+         DC    CL17'USER ID:.......   '
+         DC    CL8' '
+         DC    X'15'
+         DC    CL17'TERMINAL ID:....  '
+         DC    CL4' '
+WLINESL  EQU   *-WLINES
+NEWLINE  EQU   X'15'
+ENDMSG   EQU   X'19'
+FORMFEED EQU   X'0C'
+NOPRINT  DC    H'0'
+PRINTERL DC    H'4'
+LINECICS DC    X'15',79C'*'
+LINECICL DC    H'080'
+EDITL    DC    H'2564'
+DATALEN  DC    AL2(BUFFOUTL)
+WSHAREDL DC    AL2(ENDSHRDA-WSHAREDA)
+DFHEISTG DSECT
+SAVELEN  DS    H
+WSHAREDA EQU   *
+WUSERID  DS    CL8
+WSYSID   DS    CL4
+WLENGTH  DS    H
+PRINTER  DS    F
+TERMID   DS    F
+WLINE    DS    0C
+WCC      DS    CL36
+WLSYSID  DS    CL4
+         DS    CL18
+WLDATE   DS    XL8
+         DS    CL18
+WLTIME   DS    XL8
+         DS    CL18
+WLUSERID DS    CL8
+         DS    CL18
+WLTERMID DS    CL04
+         DS    CL4
+WSCRBUF  DS    2560C
+WSCRBUFL EQU   *-WSCRBUF
+         DS    F
+BUFFOUT  DS    26CL80
+BUFFOUTL EQU   *-BUFFOUT
+ENDSHRDA EQU   *
+OUTLINE  DSECT
+OUTALL   DS    0CL80
+OUTCC    DS    X
+OUTDATA  DS    CL79
+         END   DFPPRK
+
+MODIFICATION
+
+//DPSUPZAP JOB 88310000,BLP,CLASS=Q                   U2 QCICSZCP
+//********************************************************************
+//*       C I C S    M O D I F I C A T I O N
+//*       MODULE: DFHZCPS$
+//*       CSECT : DFHZARQ
+//*       PURPOSE : WHEN ZCP INTERCEPTS A PRINT KEY REQUEST DURING
+//*                 A CONVERSATIONAL TASK, IT CHECKS TO SEE IF THE
+//*                 TCTTE DEVICE TYPE IS 3284 OR 3286. THE IBM CODE
+//*                 FOR PRINT KEY CAN ONLY HANDLE THESE DEVICE TYPES.
+//*                 OUR REPLACEMENT PROGRAM, DFPPRK, CAN HANDLE MOST
+//*                 ANY PRINT DEVICE, INCLUDING 3812/SCS PRINTERS.
+//*                 THIS MODIFICATION ZAPS THE FINAL CHECK OF DEVICE
+//*                 TYPE TO BASICALLY IGNORE THE CHECK.
+//*                 IT CHANGES A 'BNE TO AN ERROR ROUTINE' TO A
+//*                 'BE TO NORMAL PRINT PROCESSING'.
+//*      CICS LEVEL : 1.7.0  8804 WITH LEVELSET
+/*JOBPARM   L=30,T=1,H=0
+//ZAP     EXEC   PGM=IMASPZAP PARM=IGNIDRFULL
+//SYSPRINT DD SYSOUT=A
+//SYSLIB DD DSN=SYS1.CICSVS.LOADLIB,DISP=SHR,VOL=SER=SYBRES,UNIT=3380
+//SYSIN DD *
+ NAME DFHZCPS$ DFHZARQ
+ VER  0B4C 47705B32
+ REP  0B4C 47805B16
+/*EOF
+//*
+//*      REMEMBER TO COPY THIS INTO LPALIB AFTER TESTING
+//*      IN LOADLIB WITH THE PRVMOD=(DFHZCPS$) PARAMETER
+//*
+
+
+Brian Price
+Systems Programmer II
+Regional Information Systems (USA) ) Xephon 1989
+
+

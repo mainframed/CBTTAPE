@@ -1,0 +1,159 @@
+         TITLE 'Save Password Changes in RAKF Users Table'
+RAKFPSAV CSECT
+         PRINT NOGEN
+*
+**********************************************************************
+*                                                                    *
+* NAME: RAKFPSAV                                                     *
+*                                                                    *
+* TYPE: Assembler Source                                             *
+*                                                                    *
+* DESC: Save Password Changes in RAKF Users Table                    *
+*                                                                    *
+* FUNCTION: - read the password change queue created by RAKFPWUP     *
+*             into memory                                            *
+*           - loop through the RAKF users table and check each line  *
+*             for a password change queue entry. If an entry exists  *
+*             update that line in place                              *
+*           - clear the password change queue                        *
+*                                                                    *
+* REQUIREMENTS: - RAKF users table pointed to by ddname RAKFUSER     *
+*               - RAKF password change queue pointed to by ddname    *
+*                 RAKFPWUP, a sequential dataset with LRECL=18,      *
+*                 RECFM=F and one line per password change in the    *
+*                 following format:                                  *
+*                                                                    *
+*                 ----+----1----+---                                 *
+*                 uuuuuuuu pppppppp                                  *
+*                                                                    *
+*                 where uuuuuuuu is the username and pppppppp is     *
+*                 the new password, each padded to the right with    *
+*                 blanks to 8 characters.                            *
+*                                                                    *
+**********************************************************************
+*
+* initialize
+*
+         SAVE  (14,12),,RAKFPSAV_&SYSDATE._&SYSTIME
+         USING RAKFPSAV,R15        establish => program EP
+         ST    R13,SAVEAREA+4      save HSA
+         LA    R11,SAVEAREA        establish => savearea
+         ST    R11,8(R13)          save LSA
+         LR    R13,R11             setup => our savearea
+         USING SAVEAREA,R13        new addressability
+         DROP  R15                 program EP no longer needed
+         B     CONTINUE            branch around savearea
+SAVEAREA DS    18F                 savearea
+*
+* first read of password change queue to determine number of changes
+*
+CONTINUE XR    R5,R5               initialize changes counter
+         XR    R6,R6               initialize changes buffer size
+         OPEN  (RAKFPWUP,(INPUT))  open password change queue
+SIZELOOP GET   RAKFPWUP,PWUP       get change record
+         LA    R5,1(,R5)           increment changes counter
+         A     R6,CHGRECL          increment buffer size
+         B     SIZELOOP            read next change record
+ENDPWUP  CLOSE (RAKFPWUP)          close password change queue
+         LTR   R5,R5               no password changes queued?
+         BZ    RETURN               exit
+*
+* second read of password change queue loads all changes in storage
+*
+         ST    R5,NCHANGES         remember number of changes
+         ST    R6,CHGBSIZE         remember changes buffer size
+         GETMAIN RU,LV=CHGBSIZE    get storage for changes buffer
+         ST    R1,ACHGBUF          remember changes buffer address
+         OPEN  (RAKFPWUP,(INPUT))  reopen password change queue
+         A     R6,ACHGBUF          one byte beyond change buffer
+         USING PWUP,R6             establish changes addressability
+CHGREAD  S     R6,CHGRECL          address record for backward read
+         GET   RAKFPWUP,PWUP       get change record
+         BCT   R5,CHGREAD          read next change record
+         CLOSE (RAKFPWUP)          close password change queue
+*
+* update RAKF users table
+*
+         RDJFCB (RAKFUSER)         find out user table DSN for ENQ
+         MODESET MODE=SUP,KEY=ZERO authorize ourselves for SYSDSN ENQ
+         ENQ   (SYSDSN,JFCBDSNM,E,44,SYSTEM),RET=HAVE   serialization
+         ENQ   (SPFEDIT,JFCBDSNM,E,52,SYSTEMS),RET=HAVE serialization
+         MODESET MODE=PROB,KEY=NZERO return to problem state
+         OPEN  (RAKFUSER,(UPDAT))  open users table
+         USING USERREC,R1          addressability of users table record
+USERLOOP GET   RAKFUSER            get record from users table
+         CLI   USER,C'*'           is it a comment?
+         BE    USERLOOP             process next record
+         L     R5,NCHANGES         get number of changes
+         L     R6,ACHGBUF          get changes buffer address
+PWDLOOP  CLC   USER(8),PWUPUSER    do we have an update?
+         BE    UPDATEPW             go process it
+         A     R6,CHGRECL          address next entry
+         BCT   R5,PWDLOOP          check next password change record
+         B     USERLOOP            no update found, process next user
+UPDATEPW MVC   PASSWORD(8),PWUPPSWD update password
+         MVC   SEQNO(8),PWCHANGE   flag sequence number
+         PUTX  RAKFUSER            update users table record in place
+         B     USERLOOP            process next user
+ENDUSER  CLOSE (RAKFUSER)          close users table
+         DROP  R1                  users table record no longer needed
+         MODESET MODE=SUP,KEY=ZERO authorize ourselves for SYSDSN DEQ
+         DEQ   (SPFEDIT,JFCBDSNM,52,SYSTEMS),RET=HAVE release ENQ
+         DEQ   (SYSDSN,JFCBDSNM,44,SYSTEM),RET=HAVE   release ENQ
+         MODESET MODE=PROB,KEY=NZERO return to problem state
+         OPEN  (RAKFPWUP,(OUTPUT)) clear ..
+         CLOSE (RAKFPWUP)                 .. password change queue
+*
+* clear and free change queue buffer
+*
+         L     R5,NCHANGES         get number of changes
+         L     R6,ACHGBUF          get changes buffer address
+CLRLOOP  XC    PWUP(CHGLRECL),PWUP clear record
+         A     R6,CHGRECL          address next entry
+         BCT   R5,CLRLOOP          clear next change record
+         DROP  R6                  changes buffer no longer needed
+         FREEMAIN RU,LV=CHGBSIZE,A=ACHGBUF free changes buffer
+*
+* cleanup and return
+*
+         XC    PWUP(CHGLRECL),PWUP clear local changes queue record
+RETURN   L     R13,SAVEAREA+4      get caller's savearea
+         RETURN (14,12),,RC=0      return
+*
+* data area
+*
+CHGBSIZE DS    F                   size of changes queue buffer
+ACHGBUF  DS    F                   address of changes queue buffer
+NCHANGES DS    F                   number of changes in queue
+CHGRECL  DC    A(CHGLRECL)         record length of changes queue
+PWCHANGE DC    CL8'PWCHANGE'       flag for sequence number field
+SYSDSN   DC    CL8'SYSDSN'         resource name for enqueue
+SPFEDIT  DC    CL8'SPFEDIT'        resource name for enqueue
+RAKFPWUP DCB   DDNAME=RAKFPWUP,MACRF=(GM,PM),EODAD=ENDPWUP,DSORG=PS
+RAKFUSER DCB   DDNAME=RAKFUSER,MACRF=(GL,PM),EODAD=ENDUSER,DSORG=PS,   X
+               EXLST=JFCB          DCB with exit list for RDJFCB
+JFCB     DS    0F                  the exit list contains only ..
+         DC    X'87'                .. the target JFCB address ..
+         DC    AL3(INFMJFCB)        .. for RDJFCB
+         IEFJFCBN                  RDJFCB target
+         LTORG ,                   all literals go here
+PWUP     DS    0C                  changes queue record
+PWUPUSER DC    CL8' '              userid
+         DC    C' '                filler
+PWUPPSWD DC    CL8' '              new password
+         DC    C' '                filler
+CHGLRECL EQU   *-PWUP              record length of changes queue
+*
+* equates
+*
+         YREGS                     register equates
+*
+* RAKF users table
+*
+USERREC  DSECT                     record from users table
+USER     DS    CL8                 user
+         DS    CL10                group, filler, flag
+PASSWORD DS    CL8                 password
+         ORG   USER+72             any other stuff
+SEQNO    DS    CL8                 sequence number
+         END   RAKFPSAV            end of program

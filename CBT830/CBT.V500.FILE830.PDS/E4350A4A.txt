@@ -1,0 +1,463 @@
+REXX Host Command Environment experiences
+
+This article is an attempt to document the results from my
+investigation of REXX internals regarding the MVS/TSO
+implementation of the REXX Host Command Environment.
+For MVS/TSO REXX the environments implemented, by
+default, are:
+
+o      TSO
+o      CONSOLE
+o      MVS
+o      LINK
+o      ATTACH.
+
+In addition when running ISPF under TSO, these environments
+are implemented:
+
+o      ISPEXEC
+o      ISREDIT.
+
+These entries are put in a table called the Host Command
+Environment Table.  When a REXX is to be started, REXX
+initializes a Host Command Environment Table on top of a
+stack and it is removed from the stack when the REXX
+terminates.  In this way a REXX doesn't have to bother about
+environments for subroutine REXXs since they are all
+protected on a kind of 'run unit' basis.  When the REXX
+language processor processes an instruction that is a Host
+Command, ie one of the environment names in the above table,
+it first evaluates the expression and then passes the command to
+the Host Command Environment for execution.
+
+A specific routine is defined for each entry in the Host
+Command Environment Table.  It will get control with register
+1 pointing to the TSO Command Processor Parameter List
+(CPPL), which is mapped by the IKJCPPL macro, and
+standard linkage conventions for other registers.
+
+A REXX can direct commands to one of the above Host
+Command Environments if it refers to it on the ADDRESS
+REXX command.  For example:
+
+      Address ISPEXEC  /* To direct commands to ISPF    */
+      Address TSO      /* To direct commands to TSO/E   */
+
+If a REXX tries to refer to an unknown Host Command
+Environment, nothing happens until the REXX actually tries to
+direct a command for it.  For example:
+
+      /* To direct commands to unknown */
+      Address GARBAGE "ALLOC FI(DD1) DA(TEMP.DD1) SHR"
+
+which will give a return code of -3 indicating that the Host
+Command Environment GARBAGE does not exist.
+
+You can inquire if a given Host Command Environment exists
+or not by using the SUBCOM command.  It will return 0 if the
+environment exists, 1 if it does not.
+
+Sometimes it would be useful to have your own Host
+Command Environment for use by a specific TSO application,
+as shown by this pseudo-language application example:
+
+                /* To direct commands to MYOWN   */
+           Address MYOWN "START MYOWN SYSTEM"
+      Next_Transaction:
+           Address MYOWN "Enter Transaction or END"
+           If END Then Signal Stop
+                .
+                                                                   .
+                .
+      /* Transaction Processing */
+                .
+                                                                  .
+                .
+           Signal Next_Transaction
+      Stop:
+           Address MYOWN "STOP MYOWN SYSTEM"
+
+The REXX would look like this if it had to be implemented
+using the standard TSO Host Command Environment.  For
+example:
+
+                /* To direct commands to MYOWN   */
+           Address TSO "MYOWN START MYOWN SYSTEM"
+      Next_Transaction:
+           Address TSO "MYOWN Enter Transaction or END"
+           If END Then Signal Stop
+                .
+                                                            .
+                .
+                /* Transaction Processing */
+                .
+                                                            .
+                .
+           Signal Next_Transaction
+      Stop:
+           Address TSO "MYOWN STOP MYOWN SYSTEM"
+
+A major drawback to the last implementation is that the REXX
+is not portable between TSO and CMS without a lot of code
+changes.  The MYOWN command processor itself is probably
+not portable anyhow, but why add costs to conversions?
+
+The solution to this problem is to implement the following
+Assembler program, which can add your own entry to the
+REXX Host Command Environment Table.
+
+The program is a simple TSO interface to the Host Command
+Environment Table program, IRXSUBCM.  IRXSUBCM has
+functions to add, update, delete, and query entries in the Host
+Command Table.  The following program implements the add,
+update, and delete functions of this module on a one-to-one
+basis.
+
+You should be aware that the update/delete does not make a
+delete of the copy of the load module in storage, since the old
+routine name is not referenced on the update/delete command.
+I do not know if REXX is doing this kind of clean-up or not
+(it's not documented), so be warned.
+
+One other thing you may benefit from by looking at the
+program is a method to find the REXX Vector of External
+Entry Points.  The code shown dynamically (ie without linking
+to any REXX module at all) picks up entry point addresses to
+useful REXX routines such as:
+
+o      IRXSUBCM (used by this program)
+o      IRXEXCOM (REXX variable access routine)
+o      IRXRLT (REXX get result routine)
+o      IRXIC (REXX trace and execution control routine)
+o      and several others.
+
+To invoke the routine from TSO refer to the comments in the prologue.
+
+*======================================================================
+*     Description:                                                    *
+*           REXXCOMM is a program that can be invoked from REXX       *
+*           to ADD UPDATE DELETE entries in the current               *
+*              REXX Host Command Environment Table                    *
+*           It enables a REXX to specify his own Host Command         *
+*           Environment similar to 'TSO', 'ISPEXEC' etc.              *
+*      Example:                                                       *
+*           The next command adds an entry to the table.              *
+*           Address TSO "REXXCOMM '",                                 *
+*                           " ADD",                                   *
+*                           " MYPGM",                                 *
+*                           " MYLDMOD"                                *
+*           following can then be used in the EXEC:                   *
+*           Address MYPGM                                             *
+*           "INIT"                 /* Call MYLDMOD  with INIT parm  */*
+*           "PROCESS DATA xyz)"    /* Call MYLDMOD  with  DATA parm */*
+*======================================================================
+*     Dependencies:
+*         REXXCOMM is written as a TSO Command Processor in AMODE ANY
+*         It is assumed to be called from REXX like this:
+*            Address TSO "REXXCOMM '",
+*                        " <Function>",           /* Lth. < 9  */
+*                        " <Command Env.Name>",   /* Lth. < 9  */
+*                        " <Routine Name>",       /* Lth. < 9  */
+*                        " <Routine Token> '"     /* Lth. < 17 */
+*         Where
+*            Function is either ADD, UPDATE or DELETE
+*            Command Env. Name is the name representing the environment
+*                    e.g. GDDM. Its like ISPEXEC and TSO.
+*            Routine Name is the name of the program that shall receive
+*                    control when there is a command for it.
+*                    This routine will be loaded for the 'ADD' and
+*                    'UPDATE' function.
+*                    This parameter applies only to 'ADD','DELETE'
+*            The Routine Token parameter are optional.
+*                    This parameter applies only to 'ADD','DELETE'
+*         See REXX Reference manual for the definition of those fields.
+*======================================================================
+*         In order to find the address of the service routine
+*         that updates the table, without using LINK/CALL macros,
+*         we traverse some control blocks to get this information:
+*            At entry R1 points to CPPL
+*               CPPL_CPPLECT points to the TSO ECT
+*                  ECT_ECTENVBK points to the REXX Environment Block
+*                        ENVBLOCK_IRXEXTE points to the REXX
+*                                 External Entry Points Table
+*     Return Codes:
+*        REXXCOMM can terminate with following returncodes:
+*           0    Processing was successful
+*           4    Processing was not successful. Function unknown
+*                or parameters missing.
+*           8    Processing was not successful. The specified entry
+*                was not found in the table. This is only issued
+*                DELETE,(QUERY) and UPDATE function.
+*          20    Processing was not successful.
+*                A message is issued to explain the error.
+*          28    Processing was not successful.
+*                A language processing environment could not be
+*                located.
+REXXCOMM CSECT
+REXXCOMM AMODE 31                  Set Addressing Mode
+         B     50(,R15)            Go around Id
+           DC    CL46'REXXCOMM UPDATE HOST COMMAND ENVIRONMENT TABLE'
+         STM   R14,R12,12(R13)     SAVE REGISTERS IN CALLER'S SAVEAREA
+         LR    R12,R15             INIT 1. BASE REGISTER
+         USING REXXCOMM,R12        Tell Assembler
+*                                  Set up SA for later calls
+         ST    R13,SAVEAREA+4      Save backward reference to our SA
+         LR    R2,R13              Copy R13
+         LA    R13,SAVEAREA        R13 --> To preformatted savearea
+         ST    R13,8(,R2)          Save forward reference in caller SA
+         ST    R0,AENVBLK          Save address of REXX Env. Block
+         BAS   R10,GETPARM         Get parameters and verify Function
+         BNZ   RETURN              If error then Exit with rc
+         BAS   R10,REXXHOST        Try to tell REXX about the Command
+         B     RETURN              Just exit with returncode
+*======================================================================
+*        This routine get the parameters and verifies the function
+*        Registers at entry:
+*            R1   According to TSO/E conventions it points to CPPL
+*                      !
+*                      V
+*           CPPL   --------     -------------------------------
+*                  !  CBUF! --->!LLOOCommand Parameter data   !
+*                  --------     ------------------------------n
+*                  !  UPT ! ->
+*                  --------
+*                  !  PSCB! ->
+*                  --------    --------------
+*                  !  ECT ! -->! ECT        !
+*                  --------    !-------------
+*                                  !
+*                                  !
+*                                  V
+*                              --------------
+*                              ! ENVBLK     !
+*                              --------------
+*                                  !
+*                                  !
+*                                  V
+*                              --------------
+*                              ! IRXEXTE    !  REXX Vector
+*                              --------------
+*                                  !
+*                                  !
+*                                  V
+*                              --------------
+*                              ! IRXSUBCM   !  Module E.P.
+*                              --------------
+*            R10 Return address
+*        Registers used:
+*            R3 -- > Parameter Data
+*            R4 -- > Parameter Length
+*            R11 Subroutine linkage
+*        Registers at EXIT:
+*            R8 -- > IRXSUBCM entry point
+*            R15 to contain the returncode
+*======================================================================
+GETPARM  DS    0H
+         SR    R15,R15             Clear returncode
+         LR    R2,R1               R2  --> CPPL
+         L     R3,CPPLCBUF-CPPL(R2) R3  --> LLOOCommand parameters
+         L     R5,CPPLECT-CPPL(R2) R5  --> ECT
+         ST    R5,AECT             Save ECT address
+         LH    R4,0(R3)            R4  = Length total
+         BCTR  R4,0                Make lth executable
+         EX    R4,MVCPARM          Get hole parameter (<257 )
+         LA    R4,1(,R4)           Back again
+*        Now try to locate the 'real' parameters behind the commandname
+*        and calculate the length of the remaining string.
+         SH    R4,2(R3)            R4  = Length - Offset to parameters
+         SH    R4,=H'4'            R4  = Remaining length minus LLOO
+         AH    R3,2(R3)            R3 --> LLOO + Offset
+         AH    R3,=H'4'            R3 --> parameters succeeding command
+         L     R6,ECTENVBK-ECT(R5) R6 --> REXX Environment Block
+         ST    R6,AENVBLK          Save ENVBLK Address
+         L     R7,ENVBLOCK_IRXEXTE-ENVBLOCK(R6) R7 --> REXX Vector
+         ST    R7,AVECTOR          Save REXX Vector Address
+         L     R8,IRXSUBCM-IRXEXTE(R7) R8 --> E.P. For IRXSUBCM module
+         ST    R8,ASUBCM           Save entrypoint to IRXSUBCM
+*        R3 will now point to the parameter string
+*        R4 will now contain the length of parameter string
+GETFUNC  DS    0H
+         BAS   R11,GETWORD         Get the first word or FUNCTION
+         CLC   WORD(6),=C'UPDATE'  What type of function is requested
+         BE    FUNCOK              UPDATE is OK
+         CLC   WORD(6),=C'DELETE'  What type of function is requested
+         BE    FUNCOK              DELETE is OK
+         CLC   WORD(3),=C'ADD'     What type of function is requested
+         BE    FUNCOK              ADD    is OK
+         LA    R15,4               Set returncode
+         B     GETEXIT             Return to caller
+FUNCOK   DS    0H
+         MVC   FUNCTION,WORD       Save Function
+         BAS   R11,GETWORD         Get the next word or COMMAND NAME
+         CLI   WORD,C' '           Was it there ?
+         BNE   CMDOK               Yes:  Don't bother
+         LA    R15,4               Set returncode
+         B     GETEXIT             Return to caller
+CMDOK    DS    0H
+         MVC   CMDNAME,WORD        Save Command Name to be used
+         CLC   FUNCTION(6),=C'DELETE' If its DELETE Then we have enough
+         BE    GETEXIT             and just get out
+         BAS   R11,GETWORD         Get the next word or ROUTINENAME
+         CLI   WORD,C' '           Was it there ?
+         BNE   ROUTOK              Yes:  Don't bother
+         LA    R15,4               Set returncode
+         B     GETEXIT             Return to caller
+ROUTOK   DS    0H
+         MVC   ROUTINE,WORD        Save Routine Name to be used
+         BAS   R11,GETWORD         Get the next word or TOKEN
+         MVC   TOKEN,WORD          Save eventual token to be used
+GETEXIT  DS    0H
+         LTR   R15,R15             Set CC
+         BR    R10                 Return
+MVCPARM  MVC   PARM(*-*),0(R3)     Executed Instr.
+*        This little routine picks up the next blank delimited word
+*        in the parameter
+*        Register at entry:
+*           R3  points to the string
+*           R4  contains the residual length of string
+*           R11 to contain the return address
+*        At exit:
+*         WORD  Contains the next word if any left
+*           R6  work register
+GETWORD  DS    0H
+         MVI   WORD,C' '           Blank work area
+         MVC   WORD+1(L'WORD-1),WORD
+         LA    R6,WORD             R6 --> Work area
+BLANKSKP DS    0H
+         CLI   0(R3),C' '          Skip blanks first
+         BNE   NOBLANK             If no blank Then go ahead
+         LA    R3,1(,R3)           Position forward
+         BCTR  R4,0                Decrement counter
+         LTR   R4,R4               If more data then
+         BP    BLANKSKP               make another turn
+NOBLANK  DS    0H
+NEXTCHAR EQU   *
+         LTR   R4,R4               Are more data left ?
+         BNPR  R11                 No:  Return
+         CLI   0(R3),C' '          Are current char. blank ?
+         BER   R11                 Yes: Then we are done too
+         MVC   0(1,R6),0(R3)       Take next non blank character
+         LA    R3,1(,R3)           Position input  ptr. forward
+         LA    R6,1(,R6)           Position output ptr. forward
+         BCTR  R4,0                Decrement length
+         B     NEXTCHAR            Make another turn
+*======================================================================
+*        First try to LOAD the routine before we
+*        call the REXX routine that sets up an entry in the
+*             REXX Host Command Environment Table
+*        Locate the routine thru the ENVBLK and VECTOR.
+*        Register at entry:
+*            R10 Return address
+*        Registers at exit:
+*            R15 to contain the returncode
+*======================================================================
+REXXHOST DS    0H
+*        Try to LOAD the routine in question.
+         CLC   FUNCTION(6),=C'DELETE' Is function DELETE ?
+         BE    REXXPREP            Yes: Then just prepare for REXX
+*                                  No:  Must be ADD or UPDATE
+         LOAD  EPLOC=ROUTINE,ERRET=LOADFAIL
+REXXPREP DS    0H
+*        Set up parameters for the SUBCOM module
+         USING SUBCOMTB_ENTRY,R4   Tell Assembler
+         LA    R4,SUBCOM           R4 --> SUBCOM Table Entry to built
+         MVC   SUBCOMTB_NAME,CMDNAME
+         MVC   SUBCOMTB_ROUTINE,ROUTINE
+         MVC   SUBCOMTB_TOKEN,TOKEN
+         LA    R5,SUBCOMTB_NEXT-SUBCOMTB_ENTRY Set up length
+         CLC   FUNCTION(6),=C'DELETE' Is function DELETE ?
+         BNE   NODEL               No:  Length already set
+         SR    R5,R5               Yes: Set zero length
+         XC    ASUBCOM,ASUBCOM          And pointer too
+NODEL    DS    0H
+         LA    R1,PARMLIST
+         ST    R5,STRLTH           Save length in parmlist
+         L     R15,ASUBCM          Get E.P. from previous lookup
+         BASR  R14,R15 Call IRXSUBCM
+         LTR   R15,R15             Set CC
+         BR    R10                 Return to caller
+PARMLIST DS    0F                  Align
+         DC    A(FUNCTION)             Parm  1
+         DC    A(ASUBCOM)                    2
+         DC    A(STRLTH)                     3
+         DC    A(CMDNAME+X'80000000')        4
+LOADFAIL DS    0H
+         ST    R15,RETCODE         Save RC from LOAD
+         MVC   MSG01RTN,ROUTINE    Put name in message
+         LA    R1,MSG01            R1 --> STart of message
+         L     R2,MSG01L           R2 = Length  of message
+         TPUT  (R1),(R2)           Put message to terminal
+         LH    R15,=H'20'          Set new RC
+         BR    R10                 Return to caller
+*======================================================================
+*        Return to caller with return code in register 15
+*        Register at entry:
+*            R15 to contain the returncode
+*======================================================================
+RETURN   DS    0H
+*        Restore regs. and set returncode
+         L     R13,SAVEAREA+4      Get original SA pointer
+         ST    R15,16(,R13)        Save returncode in callers SA
+         LM    R14,R12,12(R13)     Load regs as they were, except R15
+         OI    15(R13),X'01'       Set flag in SA that we leave
+         BSM   0,R14               Return to caller in his mode.
+*======================================================================
+*        D A T A   A R E A S
+*======================================================================
+         DS    0D
+         DC    CL8'EYECATCH'       Eyecatcher
+AECT     DC    A(0)                Address of TSO  Environment Block
+AENVBLK  DC    A(0)                Address of REXX Environment Block
+AVECTOR  DC    A(0)                Address of REXX Vector Table
+ASUBCM   DC    A(0)                Address of REXX IRXSUBCM Module
+RETCODE  DC    F'0'                Final returncode
+FUNCTION DC    CL8' '              Parameter Function
+CMDNAME  DC    CL8' '              Parameter Command Name
+ROUTINE  DC    CL8' '              Parameter Routine Name
+TOKEN    DC    CL16' '             Parameter Token   Id
+STRLTH   DC    F'0'                Length of parameter to IRXSUBCM
+         DC    CL4'WORD'           Eyecatcher
+WORD     DC    CL32' '             Word work area
+         DC    CL4'PARM'           Eyecatcher
+PARM     DC    CL256' '            Original input parameter
+         DC    CL4'SUBC'           Eyecatcher
+ASUBCOM  DC    A(SUBCOM)           Pointer parameter to IRXSUBCM
+SUBCOM   DS    (SUBCOMTB_NEXT-SUBCOMTB_ENTRY)C Table entry
+         DC    CL4'SA  '           Eyecatcher
+SAVEAREA DC    18F'0'              Save area
+*        Messages
+MESSAGE  DS    0F
+MSG01    DC    C'REXXCOMM01E Error loading routine '
+MSG01RTN DS    CL8
+MSG01L   DC    A(*-MSG01)
+*=====================================================================*
+*        D S E C T S
+*=====================================================================*
+         IKJCPPL                     TSO/E CPPL Block
+         IKJECT                      TSO/E Environment Control Table
+         IRXENVB                     TSO/E Rexx Environment Block
+         IRXEXTE                     TSO/E Rexx Vector of External E.P.
+         IRXSUBCT                    TSO/E Rexx Host Command Env. Table
+         END   REXXCOMM
+
+The following manuals should be consulted:
+
+o      SC28-1883-2 TSO/E Version 2 REXX Procedures
+      Language; MVS REXX Reference.
+      -      Pages 24  to 28 (commands to external environments).
+      -      Pages 30  to 31 (the ADDRESS command).
+      -      Pages 217 to 218 (the SUBCOM command).
+      -      Page 228 (IRXSUBCM routine).
+      -      Pages 268 to 271 (IRXSUBCM routine).
+      -      Pages 345 to 346 (ENVBLOCK REXX environment block).
+      -      Pages 350 to 352 (IRXEXTE  REXX vector of
+            external entry points).
+      -      Pages 399 to 401 (Host Command Environment routine).
+
+o      SC28-1875   TSO/E V.2 Programming Services
+      -      Pages 2-8 to 2-9 (the Command Processor Parameter List: CPPL).
+
+Peter Rosenberg
+Systems Engineer
+Computer Resources International A/S (Denmark)      c Xephon 1991
+

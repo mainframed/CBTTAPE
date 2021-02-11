@@ -1,0 +1,396 @@
+ A task attach exit for transaction routing
+We are an MVS/XA shop running CICS 1.7 on 2 3090s.  We have a large 3600/4700
+network communicating with a host CICS system (NIMROD).  It became necessary to
+have a second host CICS system (HOGAN) that would also need to communicate with
+the same 3600 terminals.  Implementing a Terminal Owning Region (TOR) and using
+transaction routing seemed the ideal solution.  Unfortunately, the same
+transaction-ids could be routed to either region, the difference being a
+particular transaction sub-code and/or an account range - this was held in the
+terminalsU I/O area (TIOA).
+It was decided to write a program (TDD010) to run at the pre-task attach global
+exit (XZTATT) to examine the in-bound TIOA in the TOR and compare the relevant
+fields with look-up tables held in the global work area available to the exit.
+If the transaction was not to be routed to the new CICS system, the transaction-
+id was left unchanged and the PCT entry would route it to the existing CICS
+system.  If it was selected, the first character of the transaction-id was
+changed to TZU and the PCT entry would then route it to the new CICS system.
+The global work area is built by a program (TDD009) that is run when the TOR
+CICS system is initialised.  The following source for TDD009 and TDD010 contains
+a large amount of installation-dependent code but does serve to illustrate the
+techniques used.
+The initialisation program (TDD009) and the exit program (TDD010) must be
+defined in the PPT of the TOR and the initialisation program must also be
+defined in the PLTPI.  For each transaction that could be routed either way
+there must be a pair of PCT entries in the following format defined in the TOR:
+   DEFine Group(grpname) TRan(BSYN) REMOTESystem(NIM) REMOTEName(BSYN)
+   DEFine Group(grpname) TRan(ZSYN) REMOTESystem(HGN) REMOTEName(BSYN)
+PROGRAM SOURCE FOR INITIALISATION PROGRAM - TDD009
+*       PLTPI PROGRAM TO READ 3 ESDS FILES AND BUILD A GLOBAL WORK   *
+*       AREA FOR THE ZCP EXIT ENTERED BEFORE TASK ATTACH.            *
+*          1.  A FILE OF CICS TRANSACTION ID'S THAT COULD BE RE-     *
+*       ROUTED (TXNRTID),                                            *
+*          2.  A FILE OF INTERNAL TRANSACTION CODES TO BE CHECKED    *
+*       IF THE CICS TRANSID IS 'BSYN' (TXNRTCD),                     *
+*          3.  A FILE OF ACCOUNT RANGES TO BE CHECKED AND CORRES-    *
+*       PONDING PRODUCT/SUB-PRODUCT CODES TO BE ADDED TO THE         *
+*       TIOA (TXNRTAC).                                              *
+*       AFTER BUILDING THE GLOBAL WORK AREA, ENABLE THE EXIT,        *
+*       AND END.                                                     *
+*       REGISTER USAGE :-                                            *
+*         ON ENTRY                                                   *
+*           R1 -> PARAMETER LIST, = @EIB, @COMMAREA                  *
+*           R13-> STANDARD REGISTER SAVE AREA                        *
+*           R14-> RETURN ADDRESS                                     *
+*           R15-> ENTRY ADDRESS OF PROGRAM                           *
+*          ON EXIT                                                   *
+*           R14-> RETURN ADDRESS                                     *
+TDD009   START
+GWAAR    EQU   2                      EQUATE GLOBAL WORK AREA BASE REG
+WAAR     EQU   4                      EQUATE WORK AREA BASE REG
+T1POINT  EQU   5                      EQUATE TABLE 1 POINTER REG
+T2POINT  EQU   6                      EQUATE TABLE 2 POINTER REG
+T3POINT  EQU   7                      EQUATE TABLE 3 POINTER REG
+T1OFFSET EQU   4                      EQUATE TAB1 OFFSET INTO GWA
+T2OFFSET EQU   5                      EQUATE TAB2 OFFSET INTO GWA
+T3OFFSET EQU   6                      EQUATE TAB3 OFFSET INTO GWA
+MVCFR    EQU   8                      EQUATE MOVE LONG FROM ADDR.
+MVCFRLEN EQU   9                      EQUATE MOVE LONG FROM LENGTH
+MVCTO    EQU   14                     EQUATE MOVE LONG TO ADDR.
+MVCTOLEN EQU   15                     EQUATE MOVE LONG TO LENGTH
+TABLE1   DSECT                        TABLE OF CICS TRAN IDS
+         USING *,T1POINT                ID BASE REG
+TIDENTRY DS    CL4                    CICS TRAN ID ENTRY
+TABLE2   DSECT                        TABLE OF INT TRAN CODES
+         USING *,T2POINT                ID BASE REG
+CDENTRY  DS    XL2                    INT TRAN CODE ENT PACKED UN-SIGN
+TABLE3   DSECT                        TABLE OF ACNT RANGES + PRD CODES
+          USING *,T3POINT                ID BASE REG
+ACENTRY  DS    0XL15                  ACNT ENTRY
+ACFRMENT DS    XL5                    ACNT FROM ENTRY
+ACTOENT  DS    XL5                    ACNT TO ENTRY
+PCENT    DS    CL5                    PRODUCT+SUB-PRODUCT CODE ENTRY
+WA       DSECT                        WORK AREA DSECT
+         USING *,WAAR                   ID BASE REG
+GWA      DSECT                        GLOBAL WORK AREA DSECT
+         USING *,GWAAR                  ID BASE REG
+GATABAD  DS    3F                     TABLE ADDRESSES IN WORK AREA
+GATABS   DS    0F                     TABLES IN WORK AREA
+*        EXEC INTERFACE STORAGE DSECT WITH PROGRAM WORK              *
+*        AREAS APPENDED.                                             *
+DFHEISTG DSECT
+*        WORK FIELDS
+RECID    DS    F                       RECORD ID FIELD (RBA)
+CDENTW   DS    CL4                     INT TRAN CODE ENT WORK
+WORK1    DS    0CL9
+         DS    CL3
+WORK2    DS    0CL5
+         DS    CL3
+WORK3    DS    CL2
+         DS    CL1
+XITLEN   DS    H                       HALFWORD EXIT LENGTH
+EIRESP   DS    F                  CVDA FOR EXEC INTERFACE RESPONSE
+*        START OF PROCESSING                                         *
+TDD009   CSECT
+* *      AS PROGRAM IS CRITICAL TO CICS START UP ALL ERROR         * *
+* *                CONDITIONS CAUSE ABEND                          * *
+         EXEC  CICS HANDLE CONDITION ERROR(BADEXIT)
+*        ENABLE DATASETS                                             *
+         EXEC CICS SET DATASET('TXNRTID') ENABLED
+         EXEC CICS SET DATASET('TXNRTCD') ENABLED
+         EXEC CICS SET DATASET('TXNRTAC') ENABLED
+*        GET MAX STORE AS WORK AREA TO BUILD UNKNOWN LENGTH GLOBAL   *
+*        WORK AREA (32K - 1)                                         *
+         EXEC  CICS GETMAIN SET(WAAR) LENGTH(32767)
+*        PROCESS CICS TRANID FILE
+         LR    T1POINT,WAAR            LOAD TABLE 1 BAR FROM WA BAR
+         AH    T1POINT,CCH12           UP TABLE 1 BAR BY 12
+*        SET BROWSE POINTER TO START OF FILE                         *
+         MVC   RECID,CCF0000           SET RECID TO ZERO
+         EXEC  CICS STARTBR DATASET('TXNRTID') RIDFLD(RECID) RBA
+*        READ A RECORD FROM 'ID' FILE                                *
+RDNEXID  EXEC  CICS READNEXT DATASET('TXNRTID') RIDFLD(RECID) RBA     +
+               INTO(TIDENTRY) RESP(EIRESP)
+         CLC   EIRESP,DFHRESP(ENDFILE) END OF FILE ?
+         BE    EOFID               YES, GET OUT OF LOOP
+         CLC   EIRESP,DFHRESP(ERROR)   ANY OTHER ERROR ?
+         BE    BADEXIT             YES, ABEND PROGRAM
+         LA    T1POINT,4(T1POINT)      UP TABLE 1 BAR BY 4
+         B     RDNEXID             LOOP BACK AND READ ANOTHER
+*        END BROWSE OF FILE                                          *
+EOFID    EXEC  CICS ENDBR DATASET('TXNRTID')
+         MVC   TIDENTRY,CCENDTID       SET UP END OF TABLE MARKER
+         LA    T1POINT,4(T1POINT)      UP TABLE 1 BAR BY 4
+*        T1POINT NOW POINTS TO BEGINNING OF T2.                      *
+         LR    T2POINT,T1POINT         SET T2 POINT FROM T1
+*        SET BROWSE POINTER TO START OF FILE
+         MVC   RECID,CCF0000           SET RECID TO ZERO
+         EXEC  CICS STARTBR DATASET('TXNRTCD') RIDFLD(RECID) RBA
+*        READ A RECORD FROM 'CD' FILE                                *
+RDNEXCD  EXEC  CICS READNEXT DATASET('TXNRTCD') RIDFLD(RECID) RBA     +
+               INTO(CDENTW) RESP(EIRESP)
+         CLC   EIRESP,DFHRESP(ENDFILE) END OF FILE ?
+         BE    EOFCD               YES, GET OUT OF LOOP
+          CLC   EIRESP,DFHRESP(ERROR)   ANY OTHER ERROR ?
+         BE    BADEXIT             YES, ABEND PROGRAM
+         PACK  WORK1,CDENTW            PACK ENTRY
+         MP    WORK1,CCP10             MULTIPLY BY 10
+         MVC   CDENTRY,WORK3           AND STORE DIGITS IN TABLE
+         LA    T2POINT,2(T2POINT)      UP TABLE 2 BAR BY 2
+         B     RDNEXCD                 LOOP BACK AND READ ANOTHER
+*        END BROWSE OF FILE                                          *
+EOFCD    EXEC  CICS ENDBR DATASET('TXNRTCD')
+         MVC   CDENTRY,CCENDCD         SET UP END OF TABLE MARKER
+         LA    T2POINT,2(T2POINT)      BUMP UP T2 POINTER BY 2
+*        T2POINT NOW POINTS TO BEGINNING OF T3.                      *
+         LR    T3POINT,T2POINT         SET T3 POINT FROM T2
+*        SET BROWSE POINTER TO START OF FILE                         *
+         MVC   RECID,CCF0000           SET RECID TO ZERO
+         EXEC  CICS STARTBR DATASET('TXNRTAC') RIDFLD(RECID) RBA
+*        READ LEAD RECORD FROM 'AC' FILE AND IGNORE IT - NOT USED.   *
+         EXEC  CICS READNEXT DATASET('TXNRTAC') RIDFLD(RECID) RBA     +
+               INTO(ACENTRY) RESP(EIRESP)
+         CLC   EIRESP,DFHRESP(ENDFILE) END OF FILE ?
+         BE    EOFAC               YES, GET OUT OF LOOP
+         CLC   EIRESP,DFHRESP(ERROR)   ANY OTHER ERROR ?
+         BE    BADEXIT             YES, ABEND PROGRAM
+*        READ A RECORD FROM 'AC' FILE                                *
+RDNEXAC  EXEC  CICS READNEXT DATASET('TXNRTAC') RIDFLD(RECID) RBA     +
+               INTO(ACENTRY) RESP(EIRESP)
+         CLC   EIRESP,DFHRESP(ENDFILE) END OF FILE ?
+         BE    EOFAC               YES, GET OUT OF LOOP
+         CLC   EIRESP,DFHRESP(ERROR)   ANY OTHER ERROR ?
+         BE    BADEXIT             YES, ABEND PROGRAM
+         LA    T3POINT,15(T3POINT)     UP TABLE 3 BAR BY 15
+         B     RDNEXAC                 LOOP BACK AND READ ANOTHER
+*        END BROWSE OF FILE                                          *
+EOFAC    EXEC  CICS ENDBR DATASET('TXNRTAC')
+         MVC   ACFRMENT,CCENDAC        SET UP END OF TABLE MARKER
+         MVC   ACTOENT,CCENDAC         SET UP END OF TABLE MARKER
+         LA    T3POINT,15(T3POINT)     BUMP UP T3 POINTER BY 15
+*        T3POINT NOW POINTS TO END OF WORK AREA USED, THEREFORE :-   *
+*        T3POINT - WAAR = LENGTH OF REQUIRED GLOBAL WORK AREA        *
+         SR    T3POINT,WAAR            SET GA LENGTH REQUIRED
+         STH   T3POINT,XITLEN          STORE GA LENGTH REQUIRED
+         SR    T2POINT,WAAR            NOW = OFFSET OF T3 IN WA
+         SR    T1POINT,WAAR            NOW = OFFSET OF T2 IN WA
+*        GET A GLOBAL WORK AREA                                      *
+         EXEC  CICS ENABLE PROGRAM('TDD010')                          +
+               EXIT('XZCATT') GALENGTH(XITLEN)
+*        GET GLOBAL WORK AREA ADDRESS                                *
+         EXEC  CICS EXTRACT EXIT PROGRAM('TDD010')                    +
+               GALENGTH(XITLEN) GASET(GWAAR)
+*        MOVE TABLES FROM WORK AREA TO GLOBAL WORK AREA              *
+         LR    MVCFR,WAAR          SETUP FROM ADDR.
+         LR    MVCTO,GWAAR         SETUP TO ADDR.
+         LR    MVCFRLEN,T3POINT    SETUP FROM LENGTH
+         LR    MVCTOLEN,T3POINT    SETUP TO LENGTH(SAME AS FROM)
+         MVCL  MVCTO,MVCFR         AND MOVE LONG
+*        SET UP TABLE ADDRESSES = OFFSETS + START GWA                *
+         LR    T1OFFSET,GWAAR         SET UP ADDR
+         AH    T1OFFSET,CCH12          OF TABLE 1
+         AR    T2OFFSET,GWAAR         SET UP ADDR OF TABLE 2
+         AR    T3OFFSET,GWAAR         SET UP ADDR OF TABLE 3
+         STM   T1OFFSET,T3OFFSET,GATABAD STORE ADDRESSES IN GWA
+*        ENABLE EXIT TDD010, CLOSE DATASETS AND END                  *
+         EXEC  CICS ENABLE PROGRAM('TDD010') START
+         EXEC  CICS SET DATASET('TXNRTID') CLOSED
+         EXEC  CICS SET DATASET('TXNRTCD') CLOSED
+         EXEC  CICS SET DATASET('TXNRTAC') CLOSED
+          EXEC  CICS RETURN
+BADEXIT  EXEC  CICS ABEND ABCODE('TXNR')
+         EXEC  CICS RETURN
+*        DEFINE CONSTANTS                                            *
+LITPOOL  LTORG                         LITERAL POOL
+CCP10    DC    P'10'                   PACKED TEN
+CCF0000  DC    F'0'                    FULLWORD ZERO = INIT RBA ADDR
+CCH12    DC    H'12'                   HALF WORD 12
+CCENDTID DC    C'****'                 END OF TRAN ID TABLE ENTRY
+CCENDCD  DS    0XL2                    END OF TRAN CODE TAB ENT (9999)
+CCENDAC  DC    X'9999999999'           END OF ACCOUNT RANGE TABLE ENTRY
+         END
+PROGRAM SOURCE FOR THE EXIT PROGRAM - TDD010
+*        USER EXIT TO EXAMINE TIOA BEFORE TASK ATTACH AND MODIFY
+*        TRANSID IF NECESSARY TO ROUTE TO HOGAN CICS REGION INSTEAD
+*        OF NIMROD CICS REGION.
+*        IN THE GLOBAL WORK AREA AVAILABLE TO THE EXIT ARE THREE
+*        TABLES :-
+*           1.  A TABLE OF CICS TRANSACTION ID'S THAT COULD BE RE-
+*        ROUTED,
+*           2.  A TABLE OF INTERNAL TRANSACTION CODES TO BE CHECKED
+*        IF THE CICS TRANSID IS 'BSYN',
+*           3.  A TABLE OF ACCOUNT RANGES TO BE CHECKED AND CORRES-
+*        POINDING PRODUCT+SUB-PRODUCT CODES TO BE ADDED TO THE TIOA.
+*        REGISTER USAGE :-
+*          ON ENTRY
+*           R1 -> STANDARD USER EXIT PARAMETER LIST, USE MACRO
+*                 DFHUEXIT TYPE=EP TO GENERATE DSECT, INCLUDES
+*                 ADDRESS OF GLOBAL WORK AREA.
+*           R2 -> XZCATT USER EXIT PARAMETER LIST, INCUDES TRANSID
+*                 ABOUT TO BE ATTACHED, THIS IS FIELD TO BE CHANGED
+*                 IF NECESSARY.
+*           R8 -> TIOA (XZCATT USER EXIT ONLY)
+*           R10-> TCTTE (XZCATT USER EXIT ONLY)
+*           R13-> STANDARD REGISTER SAVE AREA
+*           R14-> RETURN ADDRESS
+*           R15-> ENTRY ADDRESS OF EXIT PROGRAM
+*          ON EXIT
+*           R14-> RETURN ADDRESS
+*           R15-> RETURN CODE (NOT CHECKED BY DFHZCP) SET TO ZERO
+TDD010   START
+XITPRMAR EQU   1                       EQUATE STD EXIT PARM BASE REG
+XZCPRMAR EQU   2                       EQUATE XZCATT PARM BASE REG
+GWAAR    EQU   3                       EQUATE GLOBAL WORK AREA BASE REG
+T1POINT  EQU   5                       EQUATE TABLE 1 POINTER REG
+T2POINT  EQU   6                       EQUATE TABLE 2 POINTER REG
+T3POINT  EQU   7                       EQUATE TABLE 3 POINTER REG
+TIOABAR  EQU   8                       EQUATE TIOA BASE REG
+TCTTEAR  EQU   10                      EQUATE TCTTE BASE REG
+PROGAR   EQU   12                      EQUATE PROGRAM BASE REG
+*        DATA DEFINITIONS
+TABLE1   DSECT                         TABLE OF CICS TRAN IDS
+         USING *,T1POINT                 ID BASE REG
+TIDENTRY DS    CL4                     CICS TRAN ID ENTRY
+TABLE2   DSECT                         TABLE OF INT TRAN CODES
+         USING *,T2POINT                 ID BASE REG
+CDENTRY  DS    XL2                     INT TRAN CODE ENTRY
+TABLE3   DSECT                         TABLE OF ACNT RANGES + PRD CODES
+         USING *,T3POINT                 ID BASE REG
+ACRANGE  DS    0XL10                   ACNT RANGE ENTRY
+ACFRMENT DS    XL5                     ACNT FROM ENTRY
+ACTOENT  DS    XL5                     ACNT TO ENTRY
+PCENT    DS    CL5                     PRODUCT+SUB-PRODUCT CODE ENTRY
+GWA      DSECT                         GLOBAL WORK AREA DSECT
+         USING *,GWAAR                   ID BASE REG
+GWATABAD DS    3F                      TABLE ADDRESSES IN GWA
+ GWATABS  DS    0F                      TABLES ARE REST OF GWA
+XZCPRM   DSECT                         XZCATT EXIT PARM DSECT
+         USING *,XZCPRMAR                ID BASE REG
+         DS    F                       UNUSED ADDR. OF LU6.2 TPN
+         DS    X                       UNUSED LENGTH OF LU6.2 TPN
+XZCTRNID DS    0CL4                    TRANSID ABOUT TO BE ATTACHED
+XZCTID1  DS    C                       1ST. CHAR OF TRANSID
+         DS    CL2                     REST OF TRANSID
+XZCTID4  DS    C                       LAST CHAR OF TRANSID
+         DFHUEXIT TYPE=EP              STD USER EXIT R1 PARM DSECT
+         COPY  DFHTCTTE                TCTTE DSECT
+         COPY  DFHTIOA                 TIOA DSECT
+*        TIOA DATA AREA
+         DS    CL6                     FILLER
+* INTERNAL TRANSACTION CODE - UNSIGNED PACKED                        *
+TIOACD7  DS    0XL2                    EXISTING OFFSET 7
+         DS    C                       FILLER
+TIOACD8  DS    0XL2                    NEW OFFSET 8 FOR C.P.B.
+         DS    C                       FILLER
+* OFFSETS IN TIOA OF UNSIGNED PACKED A/C NO'S FOR DIFFERENT TRANIDS
+TIOAAC8  DS    0XL5                    OFFSET 8 FOR REST
+         DS    C                       FILLER
+TIOAAC9  DS    0XL5                    OFFSET 9 FOR B**2 OR E***
+         DS    C                       FILLER
+TIOAAC10 DS    XL5                     OFFSET 10 FOR E**2
+         DS    CL10                    FILLER
+TIOAAC25 DS    0XL5                    OFFSET 25 FOR BSYN
+         DS    C                       FILLER
+TIOAAC26 DS    XL5                     OFFSET 26 FOR ESYN
+         DS    CL220                   FILLER
+TIOAPC   DS    CL5                     PRODUCT+SUB-PRODUCT CODE
+*        START OF PROCESSING
+TDD010   CSECT
+         USING *,PROGAR                ESTABLISH ADDRESSABILITY
+         SAVE  (14,12)                 SAVE CALLING REGS
+         LR    PROGAR,R15              LOAD PROGRAM BASE REG
+         CLI   TCTTETT,TCTE3601        TRAN FROM 3600 ?
+         BNE   RETURN                    NO, EXIT FROM EXIT
+         USING DFHUEPAR,XITPRMAR       ESTABLISH ADDR. FOR PARMS
+         L     GWAAR,UEPGAA            LOAD ADDRESS GLOBAL WORK AREA
+         LM    T1POINT,T3POINT,GWATABAD LOAD TABLE POINTERS
+         CLC   XZCTRNID,CCESYN         TRANSID = 'ESYN' ?
+         BNE   CHKBSYN                   NO, GO CHECK IF ITS 'BSYN'
+         MVC   WKCD,TIOACD8            MOVE INT TRANID TO WORK
+         MVO   WKACNO6,TIOAAC26        MOVE AC.NO. TO WORK AREA
+         BE    CHKCD                   GO CHECK INT TRAN CODE
+CHKBSYN  CLC   XZCTRNID,CCBSYN         TRANSID = 'BSYN' ?
+         BNE   CHKTID                    NO, GO CHECK IF TRANIDS.
+         MVC   WKCD,TIOACD7            MOVE INT TRANID TO WORK
+         MVO   WKACNO6,TIOAAC25        MOVE AC.NO. TO WORK AREA.
+         BE    CHKCD                   GO CHECK INT TRAN CODE
+CHKTID   CLC   CCENDTID,TIDENTRY       END OF TRAN ID TAB ?
+         BE    RETURN                    YES, EXIT FROM EXIT
+         CLC   XZCTRNID,TIDENTRY       TRAN ID = ENTRY IN TRAN ID TAB ?
+         BE    CHKAC                     YES, GO CHECK ACCOUNT RANGE
+         LA    T1POINT,4(T1POINT)      BUMP UP TAB ENTRY POINTER
+         B     CHKTID                    AND BACK ROUND LOOP
+CHKCD    CLC   CCENDCD,CDENTRY         END OF TRAN CODE TAB ?
+         BE    RETURN                    YES, EXIT FROM EXIT
+         CLC   WKCD,CDENTRY            TRAN CODE = ENTRY IN TAB ?
+         BE    CHKACNT                   YES, GO CHECK ACCOUNT RANGE
+         LA    T2POINT,2(T2POINT)      BUMP UP TAB ENTRY POINTER
+         B     CHKCD                     AND BACK ROUND LOOP
+*     FOR TXNS. ENA2,ENM2,ENP2,ESG2,EIM2,EAE2 (I.E. E**2)
+*     THE ACNO IS AT OFFSET 10 IN THE TIOA.
+CHKAC    CLI   XZCTID1,C'E'            1ST. CHAR TRANID = 'E'?
+          BNE   CHKAC1                    NO, THIS IS NOT ONE.
+         CLI   XZCTID4,C'2'            LAST CHAR TRANID = '2'?
+         BNE   CHKAC1                    NO, THIS IS NOT ONE.
+         MVO   WKACNO6,TIOAAC10        MOVE AC.NO. TO WORK AREA.
+         B     CHKACNT                 GO AND CHECK ACNO TABLE.
+*     FOR TXNS. BNA2,BNM2,BNP2,BSG2,BIM2,BAE2 (I.E. B**2)
+*     THE ACNO IS AT OFFSET 9 IN THE TIOA.
+CHKAC1   CLI   XZCTID1,C'B'            1ST. CHAR TRANID = 'B'?
+         BNE   CHKAC2                    NO, THIS IS NOT ONE.
+         CLI   XZCTID4,C'2'            LAST CHAR TRANID = '2'?
+         BNE   CHKAC2                    NO, THIS IS NOT ONE.
+         MVO   WKACNO6,TIOAAC9         MOVE AC.NO. TO WORK AREA.
+         B     CHKACNT                 GO AND CHECK ACNO TABLE.
+*     FOR TXNS. E***
+*     THE ACNO IS AT OFFSET 9 IN THE TIOA.
+CHKAC2   CLI   XZCTID1,C'E'            1ST. CHAR TRANID = 'E'?
+         BNE   CHKAC3                    NO, THIS IS NOT ONE.
+         MVO   WKACNO6,TIOAAC9         MOVE AC.NO. TO WORK AREA.
+         B     CHKACNT                 GO AND CHECK ACNO TABLE.
+* MOVE ACNO IN NORMAL POSITION AT OFFSET 8 IN TIOA (TIOAAC8) TO WORK
+CHKAC3   MVO   WKACNO6,TIOAAC8         MOVE AC.NO. TO WORK AREA.
+CHKACNT  CLC   CCENDAC,ACRANGE         END OF ACCOUNT RANGE TAB ?
+         BE    RETURN                    YES, EXIT FROM EXIT
+         CLC   WKACNO5,ACFRMENT        AC NO < FROM ENTRY IN TAB ?
+         BL    RETURN                    YES, EXIT FROM EXIT
+         CLC   WKACNO5,ACTOENT         AC NO <= TO ENTRY IN TAB ?
+         BNH   DOMODS                    YES, GO AND MAKE CHANGES
+         LA    T3POINT,15(T3POINT)     BUMP UP TAB ENTRY POINTER
+         B     CHKACNT                   AND BACK ROUND LOOP
+DOMODS   MVI   XZCTID1,C'Z'            MOD 1ST CHAR TRAN ID = Z
+         MVC   TIOAPC,PCENT            MOVE TAB ENT PRD CODE TO TIOA
+         MVC   TIOATDL,CCH256          MOVE NEW TIOA DATA LEN TO TIOA
+RETURN   RETURN (14,12),RC=0           RESTORE REGS,ZERO RC, RETURN
+*  AC. NO. WORK AREA TO REMOVE CHECK DIGIT 'C'
+WKACNO6  DS    0XL6                    0N.NN.NN.NN.NN.CX
+WKACNO5  DS    XL5                     0N.NN.NN.NN.NN
+         DS    X                       CX
+* WORK INTERNAL TRANSACTION CODE
+WKCD     DS    XL2                     NN.NN
+LITPOOL  LTORG                         LITERAL POOL
+CCESYN   DC    C'ESYN'                 'ESYN' CICS TRANSACTION ID
+CCBSYN   DC    C'BSYN'                 'BSYN' CICS TRANSACTION ID
+CCENDTID DC    C'****'                 END OF TRAN ID TABLE ENTRY
+CCENDCD  DS    0XL2                    END OF TRAN CODE TAB ENT (9999)
+CCENDAC  DC    X'9999999999'          END OF ACCOUNT RANGE TABLE ENTRY
+CCH256   DC    X'0100'                 NEW TIOA DATA LEN = 256 BYTES
+         END
+
+
+Garry Barker
+Senior Systems Programmer
+Woolwich Equitable Building Society (UK)     ) Wae88
+
+
+
+
+
+
+
+
+
+
+
+
+
+

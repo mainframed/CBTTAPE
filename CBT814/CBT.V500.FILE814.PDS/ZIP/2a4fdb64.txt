@@ -1,0 +1,324 @@
+Automatically monitoring disk space
+
+For some time now, I have been required to manually monitor our
+disk packs which are mounted with the STORAGE attribute on a
+semi-continuous basis.  Inevitably, we get caught with too little
+space on our disk packs at the wrong time, with the result that our
+production work fails.  To combat this, I created a monitor
+program which can periodically check the available free space on
+selected disk volumes.  Volumes which are below a certain
+threshold are mounted PRIVATE, while volumes previously
+mounted PRIVATE will be mounted STORAGE again if they
+now exceed the threshold.  Additional requirements are that a
+minimum number of volumes are mounted STORAGE at all times
+and that these required volumes have a minimum amount of free
+space between them.  If these two conditions are not met, the
+program ends with a return code of 4.
+
+Normally, I let the program run all week.  It's started at every
+IPL, and cancelled at the beginning of our system back-ups at the
+weekend.  It would be possible to give the operator a WTOR
+(issued via a subtask) to allow him to end the program gracefully,
+but I deemed this unnecessary.
+
+This program could be modified to look at disk packs for other
+situations, such as the automatic monitoring of space on
+PRIVATE packs.  If a particular pack were to fall below a certain
+threshold, the program could issue through an internal reader a
+command like this:
+/*$VS'SE ''DISK VOLUME PROD01 has less than 50 CYLS'',USER=(X,Y)'
+If it was after 5 pm, a WTO could be issued instead if the disk
+volume warranted such action.
+
+This code was created in an MVS/XA 2.2.0 environment, but
+should run with no problems under MVS/370.
+
+STORMON  CSECT
+         STM   R14,R12,12(R13)         SAVE REGISTERS
+         LR    R3,R15                    AND ESTABLISH
+         USING STORMON,R3                  ADDRESSABILITY
+         LA    R4,SAVE
+         ST    R4,8(R13)
+         ST    R13,4(R4)
+         LR    R13,R4
+*  GET INPUT PARAMETERS;  PARAMETERS MUST BE IN THE FORM:
+*                                    PARM='XXXX,NN,NN,NNNN,NNNN'
+*  THESE PARMS CORRESPOND TO
+*                          GENERIC CANDIDATE VOLUME ID
+*                          WAIT TIME IN MINUTES BETWEEN CHK OF PKS
+*                          NUMBER OF REQUIRED STORAGE PACKS
+*                          MINIMUM # OF FREE CYLS ACROSS ALL REQ PACKS
+*                          THRESHOLD LIMIT FOR PACK TO CHANGE FROM
+*                             STORAGE TO PRIVATE STATUS
+*  FOR EXAMPLE,
+*        PARM='STOR,10,03,0300,0100'
+*        WOULD SPECIFY
+*                      CANDIDATE VOLUMES WOULD BEGIN WITH "STOR"
+*                      A 10 MINUTE WAIT TIME
+*                      3 PACKS ALWAYS REQUIRED TO BE MOUNTED STORAGE
+*                      A MINIMUM OF 300 FREE CYLINDERS ON THOSE 3 PACKS
+*                      A SWITCH TO PRIVATE STATUS FOR OTHER PACKS
+*                         HAVING LESS THAT 100 FREE CYLINDERS ON THEM
+*  NOTE:
+*        A PACK WILL BE MOUNTED STORAGE EVEN IF IT HAS LESS THAN THE
+*        THRESHOLD VALUE, IF IT IS ONE OF THE FIRST N (REQUIRED) PACKS
+*        AFTER THE PACKS ARE SORTED BY FREE SPACE.
+*        IF THE NUMBER OF REQUIRED PACKS IS GREATER THAT THE NUMBER
+*        OF PACKS CURRENTLY ONLINE, ALL PACKS WILL BE MOUNTED STORAGE
+*        AND THE PROGRAM WILL END WITH A NON-ZERO RETURN CODE.
+*        IF THE TOTAL NUMBER OF FREE CYLINDERS ON THE FIRST N
+*        (REQUIRED) PACKS IS LESS THAN THE AMOUNT SPECIFIED, THE
+*        PROGRAM WILL END WITH A NON-ZERO RETURN CODE.
+*        IF YOU SPECIFY "00" FOR THE WAIT TIME, THE PROGRAM WILL
+*        CONTINUOUSLY CHECK THE ONLINE CANDIDATE VOLUMES.
+GETPARM  L     R1,0(R1)                GET PARAMETERS ADDRESS
+         MVC   STORFLAG(4),2(R1)       SAVE GENERIC VOLUME NAME
+         PACK  TEMPHOLD(8),7(2,R1)     PACK WAIT TIME
+         CVB   R2,TEMPHOLD             CHANGE TO BINARY
+         MH    R2,=H'60'               CONVERT TIME FROM MIN TO SECONDS
+         MH    R2,=H'100'              CONVERT TIME FROM SEC TO HUNDRDS
+         ST    R2,WAITTIME             SAVE WAIT TIME
+         PACK  TEMPHOLD(8),10(2,R1)    PACK # OF REQUIRED STOR PKS
+         CVB   R2,TEMPHOLD             CHANGE TO BINARY
+         ST    R2,REQSTOR              SAVE # OF REQUIRED STOR PKS
+         PACK  TEMPHOLD(8),13(4,R1)    PACK MINIMUM FREE CYLS
+         CVB   R2,TEMPHOLD             CHANGE TO BINARY
+         ST    R2,LOWLIMIT             SAVE MINIMUM FREE CYLS
+         MVC   THRSHOLD(4),18(R1)      SAVE LOWER THRESHOLD FOR SWITCH
+*                                        FROM STORAGE TO PRIVATE STATUS
+*  SETUP FOR UCB SCAN OF ONLINE DASD HERE
+SCAN     L     R4,CVTPTR               GET CVT POINTER (X'10')
+         USING CVTMAP,R4               ESTABLISH CVT ADDRESSABILITY
+         MVI   DASDDEV,UCB3DACC        DEVICE TYPE TO SCAN FOR
+         OI    PARMLIST,X'80'          INDICATE LAST PARMLIST FOR UCBSC
+         XC    WORKAREA,WORKAREA       CLEAR UCB SCAN WORKAREA
+         LA    R5,STORTABL             LOAD TABLE ADDRESS
+         SR    R6,R6                   ZERO STORE PACK COUNTER
+SCANUCBS LA    R1,PARMLIST             POINT AT PARMLIST
+         L     R15,CVTUCBSC            GET UCB SCAN ROUTINE ADDRESS
+         BALR  R14,R15                 CALL SCAN ROUTINE
+         LTR   R15,R15                 TEST RESULT
+         BNZ   SETUP                   IF RC Â=0, NO MORE UCBS
+         L     R7,STORUCB              GET UCB ADDRESS
+         USING UCBOB,R7                ESTABLISH ADDRESSABILITY
+         CLC   UCBVOLI(4),STORFLAG     IS THIS A PACK A CANDIDATE
+         BNE   SCANUCBS                IF NOT, KEEP SCANNING UCBS
+         MVC   0(4,R5),STORUCB         IF SO, SAVE UCB ADDRESS
+         MVC   4(6,R5),UCBVOLI         SAVE VOLUME SERIAL NUMBER
+         MVC   10(2,R5),UCBCHAN        SAVE VOLUME CHANNEL ADDRESS
+         TM    UCBSTAB,X'10'           TEST FOR PACK MOUNTED PRIVATE
+         BO    PRIVATE                 BRANCH IF PACK MOUNTED PRIVATE
+         TM    UCBSTAB,X'08'           TEST FOR PACK MOUNTED PUBLIC
+         BO    PUBLIC                  BRANCH IF PACK IS MOUNTED PUBLIC
+         MVI   12(R5),C'S'             PACK IS MOUNTED STORAGE
+         B     CONTSCAN                GO INCREMENT POINTERS
+PRIVATE  MVI   12(R5),C'P'             PACK IS MOUNTED PRIVATE
+         B     CONTSCAN                GO INCREMENT POINTERS
+PUBLIC   MVI   12(R5),C'U'             PACK IS MOUNTED PUBLIC
+CONTSCAN LA    R5,14(R5)               POINT PAST INFO JUST SAVED
+         LA    R6,1(R6)                INCREMENT STORXX PACK UCB COUNT
+         B     SCANUCBS                GO GET NEXT UCB ADDRESS
+SETUP    ST    R6,UCBCOUNT             SAVE COUNT OF UCBS
+         L     R7,REQSTOR              GET # OF REQUIRED STOR PACKS
+         SR    R6,R7                   SUB # OF REQ STOR FROM # ONLINE
+         BNM   ENOUGH
+NOTENUF  ST    R6,OTHERSTR             SAVE NUMBER OF (NON-EXISTENT)
+*                                        OTHER STORAGE PACKS
+         MVC   REQSTOR(4),UCBCOUNT     REDUCE # OF REQUIRED STOR PACKS
+*                                      ISSUE HIGHLIGHTED MESSAGE
+         WTO   '# OF STORAGE PACKS IS LESS THAN SPECIFIED', ROUTCDE=1
+         B     OPENRDR                 OPEN INTRDR AND MOUNT ALL AVAIL
+*                                        STOR PACKS STORAGE, THEN QUIT
+ENOUGH   ST    R6,OTHERSTR             SAVE NUMBER OF OTHER STOR PACKS
+*  GET FREE SPACE AVAILABLE ON CANDIDATE PACKS FOUND IN UCB SCAN
+GETSPACE LA    R4,STORTABL             POINT AT STOR PACK TABLE
+         LA    R5,SVC78RES             POINT AT SVC 78 RESULT AREA
+         L     R6,UCBCOUNT             GET COUNT OF UCBS
+SVC78LOP L     R0,0(R4)                GET UCB ADDRESS
+         LA    R1,0(R5)                GET CURRENT RESULT AREA ADDRESS
+         SVC   78                      GO GET FREE SPACE INFO
+         LA    R4,14(R4)               POINT TO NEXT STOR TABLE ENTRY
+         LA    R5,30(R5)               POINT TO NEXT SVC 78 RES AREA
+         BCT   R6,SVC78LOP             GET INFO FOR ALL STOR PACKS
+         L     R7,UCBCOUNT             GET COUNT OF STOR PACKS
+SORT1    LA    R4,STORTABL             POINT AT STOR PACK TABLE
+         LA    R5,SVC78RES             POINT AT SVC 78 RESULT AREA
+         L     R6,UCBCOUNT             GET COUNT OF STOR PACKS
+         S     R6,=F'1'                DECREMENT FOR INNER LOOP OF SORT
+SORT2    CLC   6(4,R5),36(R5)          COMPARE FREE SPACE
+         BNL   NEXTCOMP                BRANCH IF ALREADY IN DEC SEQUEN
+         MVC   TEMPHOLD(30),0(R5)      SWITCH ENTRIES: SAVE 1ST ENTRY
+         MVC   0(30,R5),30(R5)                         MOVE 2ND TO 1ST
+         MVC   30(30,R5),TEMPHOLD                      MOVE 1ST TO 2ND
+         MVC   TEMPHOLD(14),0(R4)      SWITCH ENTRIES: SAVE 1ST ENTRY
+         MVC   0(14,R4),14(R4)                         MOVE 2ND TO 1ST
+         MVC   14(14,R4),TEMPHOLD                      MOVE 1ST TO 2ND
+NEXTCOMP LA    R4,14(R4)               POINT AT NEXT STORPACK ENTRY
+         LA    R5,30(R5)               POINT AT NEXT SVC 78 RESLT ENTRY
+         BCT   R6,SORT2                CONTINUE INNER SORT
+         BCT   R7,SORT1                CONTINUE OUTER SORT
+*  OPEN THE INTERNAL READER, MOUNT THE REQUIRED NUMBER OF PACKS STORAGE
+*  AND MOUNT THE LAST N CANDIDATE VOLUMES STORAGE OR PRIVATE
+OPENRDR  OPEN  (INTERRDR,OUTPUT)       OPEN INTERNAL READER
+REQUIRED LA    R4,STORTABL             GET STOR PACK TABLE ADDRESS
+         L     R5,REQSTOR              GET # OF "MUST HAVE" STOR PACKS
+         LTR   R5,R5                   ANY VOLUMES REQUIRED?
+         BZ    LASTPAKS                IF NOT, GO LOOK AT "REST" OF PKS
+CHKREQS  CLI   12(R4),C'S'             IS PAK CURRENTLY MOUNTED STORAGE
+         BE    NEXTREQS                IF SO, GO LOOK AT NEXT PACK
+         MVI   12(R4),C'S'             ELSE, MARK PACK AS STORAGE
+         BAL   R7,MOUNTVOL               AND GO ISSUE MOUNT FOR IT
+NEXTREQS LA    R4,14(R4)               POINT AT NEXT STOR TABLE ENTRY
+         BCT   R5,CHKREQS              CHECK UNTIL # OF REQUIRED PACKS
+*                                        IS SATISFIED
+LASTPAKS L     R5,OTHERSTR             GET BALANCE OF STORAGE PACKS
+         LTR   R5,R5                   CHECK IF POSITIVE
+         BP    CHKLASTN                IF POSITIVE, CHK LAST N PACKS
+         BZ    CLOSERDR                IF ZERO, CLOSE THE INTRDR
+         CLOSE (INTERRDR)              CLOSE THE INTRDR
+         B     EXITPGM                 TOO FEW PACKS ONLINE--EXIT PGM
+CHKLASTN L     R5,REQSTOR              GET NUM PACKS ALREADY PROCESSED
+         MH    R5,=H'30'               MULTIPLY BY SVC 78 RES ENTRY LEN
+         A     R5,=A(SVC78RES)         PNT AT SVC 78 RES AREA FOR PK #N
+         L     R6,OTHERSTR             GET COUNT OF OTHER STOR PACKS
+CHKLN    CLC   6(4,R5),THRSHOLD        COMPARE # FREE CYLS TO THRESHOLD
+         BL    MOUNTP                  IF < THAN THRES, MOUNT PRIVATE
+MOUNTS   CLI   12(R4),C'S'             IS PACK ALREADY MOUNTED STORAGE?
+         BE    NEXTLN                  IF SO, GO INCREMENT POINTERS
+         MVI   12(R4),C'S'             ELSE SET PACK TO STORAGE
+         BAL   R7,MOUNTVOL             AND ISSUE MOUNT COMMAND
+         B     NEXTLN                  INCREMENT POINTERS
+MOUNTP   CLI   12(R4),C'P'             IS PACK ALREADY MOUNTED PRIVATE?
+         BE    NEXTLN                  IF SO, GO INCREMENT POINTERS
+         MVI   12(R4),C'P'             ELSE SET PACK TO PRIVATE
+         BAL   R7,MOUNTVOL             AND ISSUE MOUNT COMMAND
+NEXTLN   LA    R4,14(R4)               POINT AT NEXT STOR PACK ENTRY
+         LA    R5,30(R5)               POINT AT NEXT SVC 78 RESLT ENTRY
+         BCT   R6,CHKLN                CONTINUE TO CHECK LAST N PACKS
+CLOSERDR CLOSE (INTERRDR)              CLOSE INTERNAL READER
+*  CHECK THE REQUIRED VOLUMES TO INSURE THAT THEY HAVE MORE THAN
+*  THE SPECIFIED MINIMUM AMOUNT OF FREE SPACE BETWEEN THEM
+CHKSPACE LA    R4,SVC78RES             POINT AT STOR PACK TABLE
+         L     R5,REQSTOR              GET # OF REQUIRED STORAGE PACKS
+         SR    R6,R6                   CLEAR ACCUMULATOR
+CHKSLOOP PACK  TEMPHOLD(8),6(4,R4)     GET NUMBER OF
+         CVB   R7,TEMPHOLD               FREE CYLS FOR THIS PACK
+         AR    R6,R7                   ADD TO ACCUMULATOR
+         LA    R4,30(R4)               POINT AT NEXT SVC 78 RESLT AREA
+         BCT   R5,CHKSLOOP             CONTINUE SPACE CHECK LOOP
+         S     R6,LOWLIMIT             COMPARE TO MINIMUM ALLOWED VALUE
+         BM    TOOLOW                  BRANCH IF VALUE IS LESS THAN MIN
+         STIMER WAIT,BINTVL=WAITTIME   ELSE WAIT FOR ONE TIME INTERVAL
+         B     SCAN                    GO BEGIN PROCESS AGAIN
+TOOLOW   WTO   '# OF FREE CYLS ON REQUIRD PACKS LESS THAN SPECIFIED',  X
+               ROUTCDE=1
+EXITPGM  L     R13,4(R13)              GET OLD SAVE AREA
+         LM    R14,R12,12(R13)         RESTORE REGISTERS
+         LA    R15,4                   SET BAD RETURN CODE
+         BR    R14                     EXIT PROGRAM
+*  MOUNT VOLUME SUBROUTINE
+MOUNTVOL LH    R8,10(R4)               GET CHANNEL ADDRESS
+         SRL   R8,8                    GET RID OF LOW BYTE
+         A     R8,=A(CONVTABL)         ADD TABLE START ADDRESS
+         MVC   CCU(1),0(R8)            MOVE PROPER CHAR INTO 1ST POS
+         LH    R8,10(R4)               GET CHANNEL ADDRESS
+         SRL   R8,4                    GET RID OF LOW NIBBLE
+         N     R8,=F'15'               GET RID OF HIGH NIBBLE
+         A     R8,=A(CONVTABL)         ADD TABLE START ADDRESS
+         MVC   CCU+1(1),0(R8)          MOVE PROPER CHAR INTO 2ND POS
+         LH    R8,10(R4)               GET CHANNEL ADDRESS
+         N     R8,=F'15'               GET RID OF MIDDLE AND HI NIBBLES
+         A     R8,=A(CONVTABL)         ADD TABLE START ADDRESS
+         MVC   CCU+2(1),0(R8)          MOVE PROPER CHAR INTO 3RD POS
+         MVC   VOLSER(6),4(R4)              MOVE VOLSER INTO COMMAND
+         CLI   12(R4),C'S'                  IS PACK TO BE MOUNTED STOR?
+         BNE   MOUNTPRI                     IF NOT, GO MOUNT PRIVATE
+MOUNTSTR MVC   ATTRIBUT(7),=CL7'STORAGE'    MOVE ATTRIBUTE TO COMMAND
+         B     ISSUECMD                     GO ISSUE COMMAND
+MOUNTPRI MVC   ATTRIBUT(7),=CL7'PRIVATE'    MOVE ATTRIBUTE TO COMMAND
+ISSUECMD PUT   INTERRDR,COMMAND             WRITE COMMAND TO INTRDR
+         BR    R7
+*  DATA AREAS
+INTERRDR DCB   DSORG=PS,RECFM=FB,BLKSIZE=80,LRECL=80,MACRF=(PM),       X
+               DDNAME=INTERRDR
+PARMLIST DS   0F                       PARMLIST FOR UCB SCAN SERVICE
+AREA     DC    A(WORKAREA)             SCAN WORKAREA ADDRESS
+DEVICET  DC    A(DASDDEV)              DEVICE TYPE ADDRESS
+UCBRES   DC    A(STORUCB)              ADDRESS OF UCB FOUND BY SCAN
+WORKAREA DS    CL100                   SCAN WORK AREA
+DASDDEV  DS    CL1                     DEVICE TYPE TO SCAN FOR
+STORUCB  DS    F                       UCB FOUND BY SCAN
+STORTABL DS    CL70                    STOR PACK TABLE
+UCBCOUNT DS    F                       TOTAL NUMBER OF STOR PACKS FOUND
+SVC78RES DS    CL150                   SVC 78 RESULT AREA
+         DS   0D                       TEMPHOLD MUST BE D-WORD ALGNED
+TEMPHOLD DS    CL30                    TEMPORARY HOLDING AREA/CVB AREA
+SAVE     DS    18F                     REGISTER SAVE AREA
+CONVTABL DC    CL16'0123456789ABCDEF'  CONVERSION TABLE FOR CHAN ADDRES
+*  INPUT PARAMETERS:
+STORFLAG DS    CL4                     GENERIC CANDIDATE VOLUME ID
+WAITTIME DS    F                       WAIT TIME CONSTANT
+REQSTOR  DS    F                       # OF REQUIRED STORAGE PACKS
+OTHERSTR DS    F                       # OF PACKS NOT REQUIRED AS STR
+LOWLIMIT DS    F                       LOWER LIMIT OF AVAIL SPACE ON
+*                                        REQUIRED PACKS
+THRSHOLD DS    CL4                     THRESHOLD SPACE AVAIL FOR
+*                                        SWITCH FROM STORG TO PRIVATE
+*        OUTPUT RECORD TO THE INTRDR HAS THE FOLLOWING FORMAT:
+*               /*$VS,'M CCU,VOL=(SL,VOLSER),USE=STORAGE'
+COMMAND  DS    0CL80
+         DC     CL9'/*$VS,''M '
+CCU      DS     CL3
+         DC     CL9',VOL=(SL,'
+VOLSER   DS     CL6
+         DC     CL6'),USE='
+ATTRIBUT DS     CL7
+         DC     CL1''''
+         DC     CL43' '
+         LTORG
+         CVT    DSECT=YES
+UCBOB    DSECT
+         IEFUCBOB
+         END
+
+The following procedure is used to run STORMON as a started
+task:
+
+//STORMN  PROC
+//*  PARMLIST EXPLANATION:
+//*               ONLY PACKS BEGINNING WITH "STOR' WILL BE CONSIDERED
+//*               CHECK SPACE ON STORAGE PACKS EVERY 10 MINUTES
+//*               3 STORAGE PACKS MUST BE AVAILABLE AT ALL TIMES
+//*               300 CYLINDERS MUST BE AVAILABLE ON THE FIRST 3 PACKS
+//*               PACKS WITH LESS THAN 100 CYLINDERS WILL BE MOUNTED
+//*                  PRIVATE (UNLESS THEY ARE ONE OF THE FIRST 3 PACKS)
+//STORMON  EXEC  PGM=STORMON,PARM='STOR,10,03,0300,0100'
+//STEPLIB   DD   DSN=Z03AF.LOADLIB,DISP=SHR
+//SYSPRINT  DD   SYSOUT=*
+//INTERRDR  DD   SYSOUT=(A,INTRDR)
+//SYSUDUMP  DD   SYSOUT=Q
+//*
+//ERROR    EXEC  PGM=WTO,COND=(4,NE)
+//SYSIN     DD   DDNAME=IEFRDER
+//IEFRDER   DD   DSN=Z03AF.STORMON.CTLCARDS(ERRORMSG),DISP=SHR
+//SYSPRINT  DD   SYSOUT=*,DCB=(LRECL=80,BLKSIZE=800,RECFM=FB)
+The following error message is issued when STORMON quits
+with a return code of 4.
+************************************************************
+*                                                          *
+*  OPERATORS:                                              *
+*                                                          *
+*  STORMON HAS ENDED WITH A RETURN CODE OF 4.  THE STORAGE *
+*  PACKS HAVE LESS THAN 300 FREE CYLINDERS, OR THERE ARE   *
+*  LESS THAN THREE STORAGE PACKS ONLINE.                   *
+*                                                          *
+*  PLEASE CALL TECHNICAL SERVICES AT ONCE.                 *
+*                                                          *
+************************************************************
+
+
+David R Saunders
+Senior Systems Engineer
+University of Virginia (USA) © University of Virginia 1989
+
+

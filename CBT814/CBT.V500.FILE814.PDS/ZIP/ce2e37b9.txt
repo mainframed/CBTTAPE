@@ -1,0 +1,471 @@
+A TSO log-on pre-prompt exit
+
+When we were selecting an application selection monitor to sit
+between the user and our VTAM applications, two important
+requirements were:
+
+1      The user must only sign on once to the application
+      selection monitor.
+
+2      Each user sees only the applications he or she is authorized
+      to use and nothing more than that (for example, a
+      development user gets only CICS-TEST, IDMS-TEST,
+      and TSO; whereas someone from the sales department gets
+      to see CICS-PROD1, CICS-PROD2 etc).
+
+This meant that the application monitor had to be able to
+interface with RACF to verify the user-id and password and to
+pass CINIT data to the various VTAM applications.  We chose
+NCI from Westinghouse, although I am certain that other
+products could also have fulfilled at least the above
+requirements.  To pass user-id/password CINIT data to CICS
+was not a great problem; however, TSO/E was a little more
+complicated, because the password in the CINIT data field was
+not picked up by the standard IBM TSO log-on screen.
+Although the password was in the CINIT data record the user
+was still prompted to re-enter it, before proceeding to TSO.
+
+I started to look at the TSO pre-prompt exit, IKJEFLD.  In
+order to bypass the standard IBM log-on screen this exit must
+supply at least the following items to the log-on processor:
+
+1      User-id
+
+2      Password
+
+3      TSO account number
+
+4      TSO region size
+
+5      TSO log-on procedure.
+
+In our MVS system all these items are stored in the RACF
+database (SYS1.UADS is not used).  So the exit must either
+interface with RACF (via the RACINIT and RACXTRT
+macros) or get this data from the application selection monitor
+as CINIT data.  Items three, four, and five are automatically
+filled in by the log-on processor when using the standard log-
+on.  We had to choose the latter method because to use the
+RACXTRT macro, the exit must be APF-authorized, while
+IKJEFLA receives control in the problem state, key 8, ie  not
+authorized.  (In Version 2 of TSO/E the exit will receive
+control in the authorized state, IBM assured me.)
+
+Therefore the design consists of two pieces of code:
+
+1      The TSO pre-prompt exit IKJEFLD
+
+2      The RACF TSO data extraction routine.
+
+THE TSO PRE-PROMPT EXIT IKJEFLD
+
+The TSO pre-prompt exit IKJEFLD must be link-edited
+together with IKJELFA into SYS1.LPALIB.  It picks up the
+user-id, password, account number, region size, log-on
+procedure, and optionally (in our case) the RACF user group
+name from the input buffer.  These items are moved into the
+parameter list pointed to by register 1 upon entry to IKJEFLD.
+The NO_PROMPT_BIT is set, so that the standard log-on
+screen is no longer displayed.  If the user is already logged on
+(indicated by the USER_ENQ_FAILED bit, the exit also sets
+the RECONNECT bit on so that a re-connection is done
+automatically.
+
+         TITLE 'IKJEFLD - TSO LOGON PREPROMPT EXIT'
+*  DESCRIPTION: THE EXIT IS DESIGNED TO PREVENT THE DISPLAY OF THE    *
+*               THE DEFAULT IBM TSO LOGON SCREEN AND THUS AUTOMATE    *
+*               THE TSO SIGNON PROCESS SELECTED FROM THE VTAM         *
+*               APPLICATION SELECTION MENU (NCI).                     *
+*               THE MOST COMMON EXECUTION OF THE EXIT WILL BE:        *
+*               - NCI SUPPLIES THE LOGON PROCESSOR WITH USERID &      *
+*                 PASSWORD & LOGON PROC & REGION SIZE & ACCOUNT NO.   *
+*                 AND MAY SUPPLY A RACF GROUP NAME                    *
+*               - IF THE USERID IS ALREADY LOGGED ON IT SETS THE      *
+*                 "RECONNECT_BIT" ON                                  *
+*               - THE EXIT MOVES THE FIELDS FROM THE INPUT BUFFER     *
+*                 TO THE COMMON PARMETERLIST                          *
+*               - SETS THE "DON'T_PROMPT_BIT" ON AND RETURNS TO THE   *
+*                 LOGON PROCESSOR                                     *
+*               - IF THE USER WAS ALREADY LOGGED ON (BECAUSE THE USER *
+*                 ENQ. FAILED) THE EXIT ALSO SETS THE RECONNECT BIT   *
+*                 ON. SO THAT AUTOMATICALLY THE USER IS RECONNECTED   *
+*               THUS THE LOGON COMMAND MUST BE:                       *
+* LOGON USERID/PSW PROC(PNAME) ACCT(ANAME) SIZE(SVALUE)               *
+* <--POSITIONAL--> <-KEYWORD-> <-KEYWORD-> <-KEYWORD-->               *
+*                  -  OR - OR - OR - OR -                             *
+* LOGON USERID/PSW PROC(PNAME) ACCT(ANAME) SIZE(SVALUE) GROUP(GNAME)  *
+* <--POSITIONAL--> <-KEYWORD-> <-KEYWORD-> <-KEYWORD--> <-KEYWORD-->  *
+*                  ALL OTHER POSSIBLE OPTIONS OF THE LOGON COMMAND    *
+*                  ARE IGNORED.                                       *
+*               IF THE LOGON COMMAND IS NOT ENTERED AS ABOVE          *
+*               THIS EXIT WILL IGNORE ALL AND MAKE THE LOGON          *
+*               PROCESSOR PROMPT WITH THE DEFAULT IBM TSO LOGON SCREEN*
+*               ALL OTHER POSSIBLE OPTIONS OF THE LOGON COMMAND ARE   *
+*               IGNORED.                                              *
+*  OPERATION: THE OPERATION OF THE MODULE IS CONTROLLED BY THE        *
+*             DATA AREA'S POINTED TO BY REGISTER 1 UPON ENTRY:        *
+*             SEE ALSO DSECT PARMLIST.                                *
+*    ATTRIBUTES:                                                      *
+*      LOCATION:      SYS1.LPALIB, LKEDIT TO IKJEFLA                  *
+*      STATE:         PROBLEM STATE, UPON ENTRY                       *
+*      AMODE:         24 BIT                                          *
+*      RMODE:         24 BIT                                          *
+*      KEY:           KEY 8                                           *
+*      TYPE:          REENTRANT,REUSEABLE,REFRESHABLE                 *
+IKJEFLD CSECT , REENTRANT          CSECT NAME DECLARED
+*  CONSTANT EQUATES
+*  BYTE 0 OF CNTL SWITCHES
+UENQFAIL EQU   B'10000000'          USER ENQ FAILED
+RSRCFAIL EQU   B'00100000'          OTHER THAN USERID RESOURCE FAILURE
+DISCON   EQU   B'00010000'          DISCONNECT BIT ON
+DONTPRMP EQU   B'00001000'          DON'T PROMPT BIT ON
+*  BYTE 1 OF CNTL SWITCHES
+DONTUENQ EQU   B'00001000'          DON'T ENQ USER ID
+RECONECT EQU   B'00000001'          RECONNECT BIT ON
+*  BYTE 2 OF CNTL SWITCHES
+MAIL     EQU   B'10000000'          MAIL BIT ON
+NOTICES  EQU   B'01000000'          NOTICES BIT ON
+ON       EQU   X'FF'                FLAG VALUE ON
+OFF      EQU   X'00'                FLAG VALUE OFF
+*   REASON CODE USED IN THE MSG'S
+REASON01 EQU   X'01'
+REASON02 EQU   X'02'
+REASON03 EQU   X'03'
+REASON04 EQU   X'04'
+REASON05 EQU   X'05'
+REASON06 EQU   X'06'
+REASON07 EQU   X'07'
+REASON08 EQU   X'08'
+REASON09 EQU   X'09'
+REASON10 EQU   X'10'
+REASON11 EQU   X'11'
+REASON12 EQU   X'12'
+REASON13 EQU   X'13'
+REASON14 EQU   X'14'
+REASON15 EQU   X'15'
+BEGIN    SAVE  (14,12),,IKJEFLD_&SYSDATE._&SYSTIME
+         LR    R12,R15               COPY ENTRY POINT
+         USING IKJEFLD,R12           SET UP BASE ADDRESSABILITY
+         LR    R10,R1                USER EXIT PARM IN R1 AND R10
+*  GET WORKING STORAGE
+         GETMAIN RU,LV=LWORKA,SP=21
+         ST    R13,4(R1)             SAVE R13 IN PROG SAVEAREA
+         ST    R1,8(R13)             SAVE R1 IN MAINPROG SAVEAREA
+         LR    R13,R1                R13 POINTER TO EXITS SAVE AREA
+         USING WORKA,R13             USE R13 = BASE INTO EXIT STORAGE
+         ST    R10,PLSTPTR            SAVE ADDRESS OF PARMLIST
+*  REG 15 SHALL CONTAIN AN UNIQUE REASON CODE WHEN AN ERROR IS DETECTED
+         MVI   TSOUIDNM,C' '         CLEAR TSOUIDNM FIELD
+         MVC   TSOUIDNM+1(L'TSOUIDNM-1),TSOUIDNM
+         MVC   TSOUIDNM(L'TSONONM),TSONONM PRESET USERID FIELD
+         USING PARMLIST,R10          SETUP ADDRESSABILITY INTO PARMLIST
+         USING PARMLDES,R9           SETUP ADDRESSABILITY INTO BUFF DES
+         L     R9,CNTLSW             R9 = ADDRESS OF CNTLSW DES
+         L     R2,DATAPTR            R2 = ADDRESS OF CNTLSW DES
+         NI    0(R2),X'FF'-DISCON    PRESET DISCONNECT BIT TO OFF
+         NI    1(R2),X'FF'-DONTUENQ  MAKE SURE THAT LOGON PROCESSOR
+         OI    2(R2),MAIL+NOTICES    SET MAIL AND NOTICES BITS
+*  TEST "RESOURCE-OTHER-THAN-USERID-FAILURE"
+         TM    0(R2),RSRCFAIL        IF RESOURCE FAILED  THEN
+         BO    ERRRSRC               GOTO ERROR HANDLING
+*  TEST USERID ENQ FAILED
+         TM    0(R2),UENQFAIL        IF USER ENQ FAILED BIT = OFF
+         BNO   CONPROC                  CONTINUE THERE
+RELOGON  DS    0H                    ELSE, IE USER WAS LOGGED ON
+         OI    1(R2),RECONECT        SET RECONNECT BIT ON
+CONPROC  DS    0H
+         L     R9,INBUF              R9 = ADDRESS OF INPUT BUFF DES
+         L     R2,DATAPTR            R2 = ADDRESS OF INPUT BUFFER
+         LH    R3,CURLN              R3 = CURRENT LENGTH OF INPUT BUFF
+         C     R3,LLOGONU            IF LENGTH < L'LOGON UUUU/PPPP
+         LA    R15,REASON01          SET R15 TO REASON CODE
+         BL    ERRINBF1              ISSUE MSG & SHOW LOGON SRCEEN
+         DROP  R10                   NOT REQUIRED ANY MORE
+         DROP  R9                    NOT REQUIRED ANY MORE
+*  TRANSLATE TO UPPERCASE
+         LR    R5,R3                 R5 CURENT LENGTH OF IN BUFFER
+         BCTR  R5,0                  DECREMENT R5 FOR EX
+         EX    R5,TRANUPPC
+         B     SRCHLOGN              BRANCH AROUND
+TRANUPPC OC    0(0,R2),SPACES        R2 = PTR TO INBUFF
+SRCHLOGN DS    0H                    SEARCH FOR TEXT: "LOGON "
+         CLC   0(L'LOGNTXT,R2),LOGNTXT
+         BE    SRCHUID
+         LA    R2,1(R2)              POINT TO NEXT CHARACTER IN BUFF
+         BCT   R3,SRCHLOGN           COMPARE NEXT, IF NOT LAST
+         LA    R15,REASON02          SET R15 TO REASON CODE
+         B     ERRINBF1              NO LOGON TEXT FOUND, SO ISSUE MSG
+*  SEARCH FOR USERID :
+*  R2 POINTS TO THE BEGINNING OF THE TEXT: "LOGON ", MUST BE
+*  ADVANCED TO END OF THIS TEXT
+*  R3 MUST CONTAIN THE REMAING LENGTH OF TEXT FOLLOWING: "LOGON "
+SRCHUID  DS    0H                    SEARCH FOR USERID
+         A     R2,LLOGNTXT           R2 POINTS TO EXPECTED BEGIN OF UID
+         S     R3,LLOGNTXT           R3 = REMAING LENGTH
+SRCHUID1 DS    0H
+         CLI   0(R2),C' '            IS THIS A SPACE
+         BNE   STARTUID              NO SO HERE IS WHERE USERID STARTS
+         LA    R2,1(R2)              INCREMENT R2
+         BCT   R3,SRCHUID1           COMPARE NEXT CHAR., IF NOT LAST
+         LA    R15,REASON03          SET R15 TO REASON CODE
+         B     ERRINBF1              NO USERID FOUND, SO ERROR
+STARTUID DS    0H                    START OF USERID FOUND NOW SEARCH
+         LR    R4,R2                 R4 IS START OF USERID
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF USERID
+LOOPUID  DS    0H
+         CLI   0(R2),C'/'            IS THIS A / ?
+         BE    PROCUID               END OF USERID FOUND LETS PROCESS
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT USERID LENGTH
+         BCT   R3,LOOPUID            COMPARE NEXT CHAR., IF NOT LAST
+         LA    R15,REASON04          SET R15 TO REASON CODE
+         B     ERRINBF1              NO USERID FOUND, SO ERROR
+*  USERID FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCUID  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO USERID, SO
+         LA    R15,REASON05          SET R15 TO REASON CODE
+         BZ    ERRINBF1              ISSUE MSG AND SHOW LOGON
+         C     R5,LTSOUIDN           IF LENGTH>8 THEN INVALID USERID
+         LA    R15,REASON06          SET R15 TO REASON CODE
+         BZ    ERRINBF1              SO ISSUE MSG & SHOW LOGON
+         MVI   TSOUIDNM,C' '         CLEAR TSOUIDNM FIELD
+         MVC   TSOUIDNM+1(L'TSOUIDNM-1),TSOUIDNM
+         STC   R5,TSOUIDLN           FILLIN LENGTH BYTE
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,MOVEUID            EXECUTE MOVEWRDS INSTRUCTION
+         B     SRCHPSW               BRANCH OVER MOVEUID INSTR.
+MOVEUID  MVC   TSOUIDNM(0),0(R4)     MOVE INSTR FROM EX
+*  SEARCH FOR PASSWORD :
+*  R2 POINTS TO THE / PREFIXING THE PASSWORD
+*  R3 CONTAINS THE REMAINING LENGTH IN THE BUFFER
+SRCHPSW  DS    0H
+         LA    R2,1(R2)              P2 POINT TO PSW (PAST /)
+         BCTR  R3,0                  DECREMENT REMAINING LENGTH TOO.
+         LR    R4,R2                 R4 IS START OF PSW
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF PSW
+LOOPPSW  DS    0H
+         CLI   0(R2),C' '            IS THIS A SPACE
+         BE    PROCPSW               END OF PSW FOUND LETS PROCESS
+         CLI   0(R2),C'/'            A / MEANS THERE IS A NEWPSW
+*                                    WHICH WILL NOT BE HANDLED BY EXIT
+         LA    R15,REASON07          SET R15 TO REASON CODE
+         BE    ERRINBF1              ISSUE MSG AND SHOW LOGON
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT PSW LENGTH
+         BCT   R3,LOOPPSW            COMPARE NEXT CHAR, IF NOT LAST
+*                                    ELSE NOMORE DATA IN BUFF AND
+*                                    PSW IS FOUND
+*    PSW FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCPSW  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO PSW, SO
+         LA    R15,REASON08          SET R15 TO REASON CODE
+         BZ    ERRINBF1              AND ISSUE MSG AND SHOW LOGON
+         C     R5,LRCFPSWN           IF LENGTH>8 THEN INVALID PSW
+         LA    R15,REASON09          SET R15 TO REASON CODE
+         BZ    ERRINBF1              ISSUE MSG AND SHOW LOGON
+         MVI   RCFPSWNM,C' '         CLEAR RCFPSWNM FIELD
+         MVC   RCFPSWNM+1(L'RCFPSWNM-1),RCFPSWNM
+         STC   R5,RCFPSWLN           FILLIN LENGTH BYTE
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,MOVEPSW            EXECUTE MOVEWRDS INSTRUCTION
+         B     SRCHOPTN              BRANCH OVER MOVEPSW INSTR.
+MOVEPSW  MVC   RCFPSWNM(0),0(R4)     MOVE INSTR FROM EX
+*  SEARCH FOR OPTIONS:
+*  R2 POINTS TO SPACE FOLLOWING PSW
+*  R3 IS REMAINING LENGTH IN BUFFER
+SRCHOPTN DS    0H
+         MVI   ACCTFLG,OFF           SET ACCTFLAG TO OFF
+         MVI   PROCFLG,OFF           SET PROCFLAG TO OFF
+         MVI   SIZEFLG,OFF           SET SIZEFLAG TO OFF
+         MVI   RGRPFLG,OFF           SET RGRPFLAG TO OFF
+         C     R3,LOPTION            IF LENGTH < L' SMALLEST OPTION
+         LA    R15,REASON01          SET R15 TO REASON CODE
+         BL    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         LR    R6,R2                 SAVE R6 (START OF OPTIONS)
+         LR    R7,R3                 SAVE R7 (LENGTH REMAINING)
+*  SEARCH FOR STRING: ACCT(
+SRCHACCT DS    0H                    SEARCH FOR TEXT: "ACCT("
+         CLC   0(L'ACCTTXT,R2),ACCTTXT
+         BE    STARTACC
+         LA    R2,1(R2)              POINT TO NEXT CHARACTER IN BUFF
+         BCT   R3,SRCHACCT           COMPARE NEXT, IF NOT LAST
+         LA    R15,REASON02          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*  ACCOUNT NUMBER FOUND R2 POINTS TO START OF TEXT ACCT(
+*  AND R3 IS LENGTH REMAINING IN BUFFER
+STARTACC DS    0H
+         A     R2,LACCTTXT           R2 POINTS TO BEGIN OF ACCT #
+         S     R3,LACCTTXT           R3 = REMAING LENGTH
+         LR    R4,R2                 R4 IS START OF ACCT #
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF ACCT #
+LOOPACC  DS    0H
+         CLI   0(R2),C')'            IS THIS A ) ?
+         BE    PROCACC               END OF ACCT FOUND LETS PROCESS
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT ACCT LENGTH
+         BCT   R3,LOOPACC            COMPARE NEXT CHAR., IF NOT LAST
+         LA    R15,REASON03          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*  ACCT FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCACC  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO ACCT, SO
+         LA    R15,REASON04          SET R15 TO REASON CODE
+         BZ    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         C     R5,LACCTFLD           IF LENGTH>40 THEN INVALID ACC
+         LA    R15,REASON05          SET R15 TO REASON CODE
+         BH    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         MVI   ACCTFLD,C' '          CLEAR ACCOUNT FIELD
+         MVC   ACCTFLD+1(L'ACCTFLD-1),ACCTFLD
+         STC   R5,ACCTFLN            FILLIN LENGTH BYTE
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,MOVEACC            EXECUTE MOVEACC INSTRUCTION
+         MVI   ACCTFLG,ON            SET ACCTFLAG TO ON
+         B     SRCHPROC              BRANCH OVER MOVEACC INSTR.
+MOVEACC  MVC   ACCTFLD(0),0(R4)      MOVE INSTR FROM EX
+*  SEARCH FOR STRING: PROC(
+SRCHPROC DS    0H                    SEARCH FOR TEXT: "PROC("
+         LR    R2,R6                 RESET R2 TO START OF OPTIONS
+         LR    R3,R7                 RESET R3 TO LENGTH REMAINING
+SRCHPRO  DS    0H                    SEARCH FOR TEXT: "PROC("
+         CLC   0(L'PROCTXT,R2),PROCTXT
+         BE    STARTPRO
+         LA    R2,1(R2)              POINT TO NEXT CHARACTER IN BUFF
+         BCT   R3,SRCHPRO            COMPARE NEXT, IF NOT LAST
+         LA    R15,REASON06          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*    LOGON PROC FOUND R2 POINTS TO START OF TEXT PROC(
+*    AND R3 IS LENGTH REMAINING IN BUFFER
+STARTPRO DS    0H
+         A     R2,LPROCTXT           R2 POINTS TO BEGIN OF PROC NAME
+         S     R3,LPROCTXT           R3 = REMAINING LENGTH
+         LR    R4,R2                 R4 IS START OF PROC NAME
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF PROC NAME
+LOOPPRO  DS    0H
+         CLI   0(R2),C')'            IS THIS A ) ?
+         BE    PROCPRO               END OF PROC FOUND LETS PROCESS
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT PROC LENGTH
+         BCT   R3,LOOPPRO            COMPARE NEXT CHAR., IF NOT LAST
+         LA    R15,REASON07          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*  PROC FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCPRO  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO PROC, SO
+         LA    R15,REASON08          SET R15 TO REASON CODE
+         BZ    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         C     R5,LPROCFLD           IF LENGTH>8  THEN INVALID PROC
+         LA    R15,REASON09          SET R15 TO REASON CODE
+         BH    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         MVI   PROCFLD,C' '          CLEAR LOGON PROC FLD
+         MVC   PROCFLD+1(L'PROCFLD-1),PROCFLD
+         STC   R5,PROCFLN            FILLIN LENGTH BYTE
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,MOVEPRO            EXECUTE MOVEPRO INSTRUCTION
+         MVI   PROCFLG,ON            SET PROCFLAG TO ON
+         B     SRCHSIZE              BRANCH OVER MOVEPRO INSTR.
+MOVEPRO  MVC   PROCFLD(0),0(R4)      MOVE INSTR FROM EX
+*  SEARCH FOR STRING: SIZE(
+SRCHSIZE DS    0H                    SEARCH FOR TEXT: "SIZE("
+         LR    R2,R6                 RESET R2 TO START OF OPTIONS
+         LR    R3,R7                 RESET R3 TO LENGTH REMAINING
+SRCHSIZ  DS    0H                    SEARCH FOR TEXT: "SIZE("
+         CLC   0(L'SIZETXT,R2),SIZETXT
+         BE    STARTSIZ
+         LA    R2,1(R2)              POINT TO NEXT CHARACTER IN BUFF
+         BCT   R3,SRCHSIZ            COMPARE NEXT, IF NOT LAST
+         LA    R15,REASON10          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*    SIZE FOUND R2 POINTS TO START OF TEXT SIZE(
+*    AND R3 IS LENGTH REMAINING IN BUFFER
+STARTSIZ DS    0H
+         A     R2,LSIZETXT           R2 POINTS TO BEGIN OF SIZE NAME
+         S     R3,LSIZETXT           R3 = REMAING LENGTH
+         LR    R4,R2                 R4 IS START OF SIZE NAME
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF SIZE NAME
+LOOPSIZ  DS    0H
+         CLI   0(R2),C')'            IS THIS A ) ?
+         BE    PROCSIZ               END OF SIZE FOUND LET'S PROCESS
+         CLI   0(R2),C'0'            CHARACTER: 0123456789  ?
+         LA    R15,REASON11          SET R15 TO REASON CODE
+         BL    ERRINBF2              NO, ISSUE MSG AND SHOW LOGON
+         CLI   0(R2),C'9'            CHARACTER: 0123456789 ?
+         LA    R15,REASON12          SET R15 TO REASON CODE
+         BH    ERRINBF2              NO, ISSUE MSG AND SHOW LOGON
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT SIZE LENGTH
+         BCT   R3,LOOPSIZ            COMPARE NEXT CHAR, IF NOT LAST
+         LA    R15,REASON13          SET R15 TO REASON CODE
+         B     ERRINBF2              ISSUE MSG AND SHOW LOGON
+*  SIZE FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCSIZ  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO SIZE, SO
+         LA    R15,REASON14          SET R15 TO REASON CODE
+         BZ    ERRINBF2              ISSUE MSG AND SHOW LOGON
+         C     R5,LSIZEEBC           IF LENGTH>7 THEN INVALID SIZE
+         LA    R15,REASON15          SET R15 TO REASON CODE
+         BH    ERRINBF2              ISSUE MSG AND SHOW LOGON
+*   CONVERT SIZE TO HEX.
+         MVI   SIZEEBC,C'0'          CLEAR EBCDIC SIZE FIELD
+         MVC   SIZEEBC+1(L'SIZEEBC-1),SIZEEBC
+         LA    R3,SIZEEBC+L'SIZEEBC
+         SR    R3,R5                 SUBTRACT LENGTH
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,EBCMSIZ            EXECUTE EBCMSIZ INSTRUCTION
+         B     GOPACK                BRANCH OVER
+EBCMSIZ  MVC   0(0,R3),0(R4)         MOVE INSTR FROM EX
+GOPACK   DS    0H
+         PACK  SIZEPACK(L'SIZEPACK),SIZEEBC(L'SIZEEBC)
+         CVB   R3,SIZEPACK           CONVERT TO BINARY
+         ST    R3,SIZEFLD            AND STORE IN SIZEFLD
+         L     R5,LSIZEFLD           FILLIN LENGTH TO BE COMPATIBLE
+         STC   R5,SIZEFLN            WITH ACCT AND PROC
+         MVI   SIZEFLG,ON            SET SIZEFLAG TO ON
+*  SEARCH FOR STRING: GROUP(
+SRCHRGRP DS    0H                    SEARCH FOR TEXT: "GROUP("
+         LR    R2,R6                 RESET R2 TO START OF OPTIONS
+         LR    R3,R7                 RESET R3 TO LENGTH REMAINING
+SRCHRGR  DS    0H                    SEARCH FOR TEXT: "GROUP("
+         CLC   0(L'RGRPTXT,R2),RGRPTXT
+         BE    STARTRGR
+         LA    R2,1(R2)              POINT TO NEXT CHARACTER IN BUFF
+         BCT   R3,SRCHRGR            COMPARE NEXT, IF NOT LAST
+         B     FILLPARM              ALL OPTIONS FOUND
+*    RACF GROUP NAME FOUND R2 POINTS TO START OF TEXT GROUP(
+*    AND R3 IS LENGTH REMAINING IN BUFFER
+STARTRGR DS    0H
+         A     R2,LRGRPTXT           R2 POINTS TO BEGIN OF RGRP #
+         S     R3,LRGRPTXT           R3 = REMAINING LENGTH
+         LR    R4,R2                 R4 IS START OF RGRP #
+         XR    R5,R5                 R5 WILL BECOME LENGTH OF RGRP #
+LOOPRGR  DS    0H
+         CLI   0(R2),C')'            IS THIS A ) ?
+         BE    PROCRGR               END OF RGRP FOUND LETS PROCESS
+         LA    R2,1(R2)              INCREMENT R2
+         LA    R5,1(R5)              INCREMENT RGRP LENGTH
+         BCT   R3,LOOPRGR            COMPARE NEXT CHAR., IF NOT LAST
+         B     FILLPARM              ALL OPTIONS FOUND
+*  GROUP FOUND, BEGIN POINTED TO BY R4, LENGTH IN R5
+PROCRGR  DS    0H
+         LTR   R5,R5                 IF LENGTH=0 THEN NO RGRP, SO
+         BZ    FILLPARM              ALL OPTIONS FOUND
+         C     R5,LRGRPFLD           IF LENGTH>8 THEN INVALID RACF GRP
+         BH    FILLPARM              ALL OPTIONS FOUND
+         MVI   RGRPFLD,C' '          CLEAR RACF GROUP FIELD
+         MVC   RGRPFLD+1(L'RGRPFLD-1),RGRPFLD
+         STC   R5,RGRPFLN            FILLIN LENGTH BYTE
+         BCTR  R5,0                  DECREMENT LENGTH, FOR EX INSTR.
+         EX    R5,MOVERGR            EXECUTE MOVERGR INSTRUCTION
+         MVI   RGRPFLG,ON            SET RGRPFLAG TO ON
+         B     FILLPARM              ALL OPTIONS FOUND
+MOVERGR  MVC   RGRPFLD(0),0(R4)      MOVE INSTR FROM EX
+
+This article will be continued next month when we shall be
+publishing the remaining source code for the TSO pre-prompt
+exit IKJEFLD.
+
+
+Karel Bastiaansen
+Systems Programmer
+IFF Nederland BV (The Netherlands)                  c Xephon 1990
+
+

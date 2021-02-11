@@ -1,0 +1,499 @@
+CEMT from batch for VSE
+
+In previous issues of CICS Update, I have read several articles
+on issuing CEMT commands from a batch job.  Unfortunately,
+all these articles were for MVS and not VSE users.  Recently
+we had a need for this function, so I decided to write the
+following VSE programs to do it.  All programs were tested on
+VSE 2.1.6 with CICS 1.6 and VSE 3.2.1 with CICS 1.7
+systems.  Both VM-mode and 370-mode (VAE and non-VAE)
+supervisors were used with no problems.
+
+To communicate between the batch program and CICS, XPCC
+support was used.  This facility is documented in the VSE/AF
+Diagnosis Reference: Supervisor manual.  The documentation
+is ambiguous and requires some trial-and-error programming to
+clear it up.  The code in my programs is well documented and
+should be of some assistance to anyone who needs to user
+XPCC.
+
+XPCC is actually an extension of XECB support. XECB
+support allows synchronization of tasks in different partitions in
+the same address space.  This was available in VSE Version 1.
+XPCC support, introduced in VSE Version 2, extends XECB
+to allow synchronization and direct communication between
+tasks in different partitions in the same or different address
+spaces. Basically, with XPCC, each task identifies itself, says
+with whom it wishes to communicate, and then waits for the
+XPCC service routines to set up the connection.  Once this is
+established, the tasks can communicate until either task issues a
+disconnect or terminate.  The programming is simply a matter
+of following the XPCC protocol and checking return codes and
+ECBs.
+
+There are four pieces to this system:
+
+1      A batch job to request CEMT commands.
+
+2      A subtask in the CICS partition that accepts commands
+      from a batch job, passes them to the CICS task, and returns
+      CEMT command output to the batch job.
+
+3      A CICS task that issues the CEMT commands.
+
+4      A CICS program to start up and shutdown the system.
+
+
+THE BATCH PROGRAM
+
+The batch program reads control cards from SYSIPT that
+contain a CICS partition-id and a CEMT command.  An
+XPCCB is constructed using the partition-id, and a connection
+between this program and a subtask in the CICS partition is
+attempted.  If the connection is successful, the CICS subtask is
+passed the CEMT command.  This subtask, in turn, passes the
+CEMT command to a CICS task that calls the enhanced master
+terminal programs, which actually process the command.  A
+return code is passed backward through the chain of programs
+and is displayed on the report from this program.  The control
+card layout for this program is:
+
+o      Columns 1-3 - the constant 'CFB'
+
+o      Columns 4-5 - the CICS partition id
+
+o      Columns 6-80 - the CEMT command.
+
+
+JCL for executing the batch program
+
+* $$ JOB JNM=CFB,CLASS=T,DISP=D
+* $$ LST CLASS=T,DEST=(,XXXX)
+// JOB CFB
+// LIBDEF PHASE,SEARCH=(LIB.SUBLIB),TEMP
+// EXEC CFB,SIZE=16K
+CFBF2 S DAT(VENINSF) CLO
+/*
+/&
+* $$ EOJ
+
+
+Source code for the batch program
+
+         TITLE 'CFB - PASS CEMT COMMANDS TO CICS SUBTASK'
+*     COMMUNICATE WITH CICS SUBTASK                               *
+CFB      CSECT
+         BALR  R3,R0                       load base 1
+         USING *,R3,R4                     and tell assembler
+         LA    R4,4095(,R3)                load...
+         LA    R4,1(,R4)                     ...base 2
+         LA    R5,BATXPCCB                 load XPCCB base
+         USING XPCCBLAY,R5                 and tell assembler
+         OPEN  REPORT,CARDS,CONSOLE        open files
+         COMRG                             get COMREG address
+         MVC   H1DATE,0(R1)                save date in heading line
+         BAL   R9,HEADINGS                 go print headings
+         STXIT AB,ABERROR,ABSAVE,OPTION=NODUMP    arm our
+         STXIT PC,PCERROR,PCSAVE                    exits
+* Here we read each input card and make some rudimentary checks.
+* The first three characters of the card must be CFB and the next
+* two characters must not be blank.
+READIT   DS    0H
+         GET   CARDS                       read a card
+         CLC   CID,=CL3'CFB'               is this for us ?
+         BNE   CARDERR                     no
+         CLC   CPART,=CL2' '               is there a partition id ?
+         BE    PARTERR                     no
+* Now we lock on a resource name based on the CICS partition id.
+* The subtask in CICS can only be called by one partition at a time,
+* so we will use the VSE LOCK mechanism to serialize calls to the
+* subtask.
+         MVC   CFBLOCK+7,CPART             insert partition id
+         LOCK  CFBLOCK,FAIL=WAITC          attempt a lock
+         LTR   R15,R15                     any errors ?
+         BNZ   LOCKERR                     lock unsuccessful
+* Now we identify ourselves to the XPCC service routines. Our
+* application name is CFBBATCH. The application name of the task with
+* which we wish to link (i.e., the CICS subtask) is CFBxx, where the
+* xx is replaced by the partition id assigned to the partition in
+* which the subtask is running.
+         MVC   IJBXCECB,=F'0'              reset
+         MVC   IJBXSECB,=F'0'               the
+         MVC   IJBXRECB,=F'0'                ECBs
+         MVC   IJBXTOAP+3(2),CPART         insert partition id into
+*                                          XPCCB TOAPPL (for multiple
+*                                          CICS's)
+         XPCC  XPCCB=BATXPCCB,FUNC=IDENT   tell VSE who we are
+         C     R15,=F'4'                   serious error ?
+         BH    IDERR                       yes
+* Now we try to connect with the CICS subtask. If he's not there,
+* we'll give him 15 seconds to connect with us.
+         XPCC  XPCCB=BATXPCCB,FUNC=CONNECT Try to CONNECT to CICS tsk
+         C     R15,=F'4'                   serious error ?
+         BH    CONNERR                     yes
+         LA    R2,3                        number of times to loop
+RETRYCON DS    0H
+         TM    IJBXCECB+2,X'80'            connection complete ?
+         BO    CONNOK                      yes
+         MVC   XTECB,=XL4'00'              reset timer ECB
+         SETIME 5,XTECB                    set interval timer
+         WAIT  XTECB                       wait for time to elapse
+         BCT   R2,RETRYCON                 if any more, try again
+         B     CONNERR                     connection error
+CONNOK   DS    0H
+* Now data is placed in the buffer and sent to the CICS subtask.
+* A reply is requested (by using the SENDR function). After we
+* send the data, we wait on the IJBXSECB (SEND ECB). This ECB will
+* not be posted until we have been sent a reply or an error occurs.
+         MVI   CFBDATA,C' '                clear data area
+         MVC   CFBDATA+1(L'CFBDATA-1),CFBDATA
+         MVC   CFBDATA(74),CCMD            insert command
+         XPCC  XPCCB=BATXPCCB,FUNC=SENDR   send a command
+         LTR   R15,R15                     send ok ?
+         BNZ   SENDRERR                    no - issue error message
+* Here we loop and check the appropriate ECB to see if a reply has
+* been sent. We'll check for two minutes; if it takes any longer,
+* we'll assume something choked and just forget about this card.
+* Change this wait time if it is not appropriate for your system.
+         LA    R2,12                       number of times to loop
+RETRYRPL DS    0H
+         TM    IJBXSECB+2,X'80'            has reply been sent ?
+         BO    REPLYOK                     yes
+         MVC   XTECB,=XL4'00'              reset timer ECB
+         SETIME 10,XTECB                   set timer interval
+         WAIT  XTECB                       wait for time to elapse
+         BCT   R2,RETRYRPL                 if any more, try again
+         LA    R15,X'EE'                   indicate wait error
+         MVI   IJBXRETC,X'EE'              indicate wait error
+         B     REPLYERR                    REPLY error
+REPLYOK  DS    0H
+* Here we loop and check the appropriate ECB to see if a DISCONNECT has
+* been sent. We'll check for two minutes; if it takes any longer,
+* we'll assume something choked and just forget about this card.
+* Change this wait time if it is not appropriate for your system.
+         LA    R2,12                       number of times to loop
+RETRYDIS DS    0H
+         TM    IJBXCECB+2,X'80'            disconnected ?
+         BO    DISCOK                      yes - continue
+         MVC   XTECB,=XL4'00'              reset timer ECB
+         SETIME 10,XTECB                   set interval timer
+         WAIT  XTECB                       wait for time to elapse
+         BCT   R2,RETRYDIS                 if any more, try again
+         LA    R15,X'EE'                   indicate wait error
+         MVI   IJBXRETC,X'EE'              indicate wait error
+         B     DISCERR                     REPLY error
+DISCOK   DS    0H
+* It is necessary to terminate the XPCC session here if we do not
+* want to have the silly restriction that a single job may only
+* communicate with one CICS per run.
+RESET    DS    0H
+         XPCC  XPCCB=BATXPCCB,FUNC=DISCONN disconnect session
+         LTR   R15,R15                     DISCONNECT ok ?
+         BNZ   DISCERR                     no - issue error message
+         XPCC  XPCCB=BATXPCCB,FUNC=TERMIN  terminate XPCC services
+         LTR   R15,R15                     terminate ok ?
+         BNZ   TERMERR                     no - issue error message
+         UNLOCK CFBLOCK                    unlock CICS subtask
+         LTR   R15,R15                     unlock ok ?
+         BNZ   UNLKERR                     no
+* Now print a line with the input card and the reply. (The reply
+* is a displayed return code from the CEMT processor).
+         MVC   D1PART,CPART                set
+         MVC   D1CMD,CCMD                    up
+         MVC   D1CMT,=CL20'RETURN CODE = X''  ''' reply
+         LA    R13,1                       number of bytes to process
+         LA    R14,CFBREPLY                input area
+         LA    R15,D1CMT+16                output area
+         BAL   R10,HX2CHAR                 go convert to character
+         MVC   WOP,D1                      move to work area
+         PUT   REPORT                      print a line
+         CNTRL REPORT,SP,2                 and space it out
+         AP    LINECTR,=PL1'3'             bump line counter
+         CP    LINECTR,=PL2'60'            need another page ?
+         BL    NOHEAD1                     no headings necessary
+         BAL   R9,HEADINGS                 go print headings
+NOHEAD1  DS    0H
+         SR    R15,R15                     clear reg 15
+         IC    R15,CFBREPLY                load cemt return code
+         LTR   R15,R15                     any errors ?
+         BZ    CALLOK                      no
+         OI    RC,CEMTZAP                  indicate errors
+CALLOK   DS    0H
+         B     READIT                      go get another card
+* Here we close our files and load the highest return code encountered
+* during the run. Change the return code assigned to each error class
+* if it does not suit your installation.
+GOBACK   DS    0H
+         CLOSE REPORT,CARDS,CONSOLE        close files
+         SR    R15,R15                     clear register 15
+         TM    RC,DOSZAP                   DOS error ?
+         BZ    RC1                         no - go check next
+         LA    R15,20                      yes - load return code
+         B     EOJ                         and go back
+RC1      DS    0H
+         TM    RC,XPCCZAP                  XPCC error ?
+         BZ    RC2                         no - go check next
+         LA    R15,16                      yes - load return code
+         B     EOJ                         and go back
+RC2      DS    0H
+         TM    RC,CHECKZAP                 program check ?
+         BZ    RC3                         no - go check next
+         LA    R15,12                      yes - load return code
+         B     EOJ                         and go back
+RC3      DS    0H
+         TM    RC,CEMTZAP                  error from CEMT ?
+         BZ    RC4                         do I have to repeat it again
+         LA    R15,8
+         B     EOJ
+RC4      DS    0H
+         TM    RC,CARDZAP                  control card error ?
+         BZ    RC5
+         LA    R15,4
+         B     EOJ
+RC5      DS    0H
+EOJ      DS    0H
+         EOJ   RC=(R15)                    back to job control
+*               H E A D I N G S                                   *
+HEADINGS DS    0H
+         ZAP   LINECTR,=PL1'6'             reset line counter
+         AP    PAGECTR,=PL1'1'             increment page counter
+         CNTRL REPORT,SK,1                 skip to channel 1
+         MVC   H1PAGE,EDPAGE               ready edit for page number
+         ED    H1PAGE,PAGECTR              insert new page number
+         MVC   WOP,H1                      place heading in work area
+         PUT   REPORT                      print it
+         CNTRL REPORT,SP,2                 space 2 lines
+         MVC   WOP,H2                      second heading to work area
+         PUT   REPORT                      print that too
+         CNTRL REPORT,SP,2                 space an extra line and
+         BR    R9                          goback to caller
+*               E R R O R S                                       *
+CARDERR  DS    0H                          error on input card
+         OI    RC,X'04'                    indicate error
+         MVC   D1(80),CARD                 place card in work area
+         MVC   D1CMT,=CL20'INVALID CONTROL CARD'  tell 'em what's wrong
+         MVC   WOP,D1                      move to work area
+         PUT   REPORT                      print a line
+         CNTRL REPORT,SP,1                 and space one too
+         AP    LINECTR,=PL1'2'             bump page line counter
+         CP    LINECTR,=PL2'60'            need another page ?
+         BL    NOHEAD2                     no
+         BAL   R9,HEADINGS                 yes - go print headings
+NOHEAD2  DS    0H
+         B     READIT                      go get next card
+PARTERR  DS    0H                          error on part id parameter
+         OI    RC,CARDZAP                  indicate error
+         MVC   D1PART,CPART                insert erroneous part id
+         MVC   D1CMD,CCMD                  and rest of card
+         MVC   D1CMT,=CL20'INVALID PARTITION ID'  tell 'em what's wrong
+         MVC   WOP,D1                      move to work area
+         PUT   REPORT                      print a line
+         CNTRL REPORT,SP,1                 I like double spacing
+         AP    LINECTR,=PL1'2'             bump line ctr
+         CP    LINECTR,=PL2'60'            another page ?
+         BL    NOHEAD3                     no
+         BAL   R9,HEADINGS                 yes - top it off
+NOHEAD3  DS    0H
+         B     READIT                      go get next card
+* These routines are entered when an XPCC error is encountered.
+IDERR    DS    0H                          XPCC IDENT error
+         MVC   XPCCERR+12(8),=CL8'IDENT'   insert function code
+         B     DISPERR                     common XPCC err rtns
+CONNERR  DS    0H                          XPCC CONNECT error
+         MVC   XPCCERR+12(8),=CL8'CONNECT' insert function code
+         B     DISPERR                     common XPCC err rtns
+SENDRERR DS    0H                          XPCC SENDR error
+         MVC   XPCCERR+12(8),=CL8'SENDR'   insert function code
+         B     DISPERR                     common XPCC err rtns
+REPLYERR DS    0H                          XPCC REPLY error
+         MVC   XPCCERR+12(8),=CL8'REPLY'   insert function code
+         B     DISPERR                     common XPCC err rtns
+DISCERR  DS    0H                          XPCC DISCONN error
+         MVC   XPCCERR+12(8),=CL8'DISCONN' insert function code
+         B     DISPERR                     common XPCC err rtns
+TERMERR  DS    0H                          XPCC IDENT error
+         MVC   XPCCERR+12(8),=CL8'TERMIN'  insert function code
+         B     DISPERR                     common XPCC err rtns
+DISPERR  DS    0H
+         OI    RC,XPCCZAP                  indicate error
+         MVC   LOG,XPCCERR                 insert msg
+         ST    R15,FWORK                   save error code
+         LA    R13,1                       number of bytes to process
+         LA    R14,FWORK+3                 input is last byte of r15
+         LA    R15,LOG+36                  output address
+         BAL   R10,HX2CHAR                 make it displayable
+         LA    R13,1                       number of bytes to process
+         LA    R14,IJBXRETC                input is return code
+         LA    R15,LOG+53                  output address
+         BAL   R10,HX2CHAR                 convert
+         PUT   CONSOLE                     display error message
+         MVC   D1PART,CPART                insert partition id
+         MVC   D1CMD,CCMD                  and rest of card
+         MVC   D1CMT,=CL20'** XPCC ERROR **'  tell em' what's wrong
+         MVC   WOP,D1                      move to work area
+         PUT   REPORT                      and print it
+         CNTRL REPORT,SP,2                 don't forget a blank line
+         AP    LINECTR,=PL1'3'             bump page counter and
+         CP    LINECTR,=PL2'60'            print the
+         BL    NOHEAD4                     headings if we
+         BAL   R9,HEADINGS                 need them
+NOHEAD4  DS    0H
+         XPCC  XPCCB=BATXPCCB,FUNC=TERMPRG TERMINATE XPCC services
+         UNLOCK CFBLOCK                    unlock subtask
+         B     READIT                      and check for more
+* Abnormal termination exit
+ABERROR  DS    0H
+         OI    RC,CHECKZAP                 indicate error
+         LM    R2,R15,16(R1)               reload our registers
+         STC   R0,ABERR                    save abend code
+         LA    R13,1                       and
+         LA    R14,ABERR                     make
+         LA    R15,ABENDERR+37                 it
+         BAL   R10,HX2CHAR                       displayable
+         MVC   LOG,ABENDERR                console work area
+         PUT   CONSOLE                     display error
+         UNLOCK ALL                        release all locks and
+         XPCC  XPCCB=BATXPCCB,FUNC=TERMPRG TERMINATE XPCC services
+         B     GOBACK                      eoj
+* Program check exit
+PCERROR  DS    0H
+         OI    RC,CHECKZAP                 indicate error
+         LM    R2,R15,16(R1)               reload registers
+         LR    R5,R1                       save savearea address
+         LA    R13,2                       display
+         LA    R14,2(,R5)                    type of
+         LA    R15,PCMSG+26                    program
+         BAL   R10,HX2CHAR                       check
+         L     R5,4(,R5)                   calculate
+         SR    R5,R3                        the
+         ST    R5,OFFSET                     offset of
+         LA    R13,3                          the program check
+         LA    R14,OFFSET+1                and
+         LA    R15,PCMSG+45                   make it
+         BAL   R10,HX2CHAR                      readable
+         MVC   LOG,PCMSG                   insert message
+         PUT   CONSOLE                     and display it
+         UNLOCK ALL                        release all locks
+         XPCC  XPCCB=BATXPCCB,FUNC=TERMPRG TERMINATE XPCC services
+         B     GOBACK                      eoj
+* DOS errors
+LOCKERR  DS    0H
+         MVC   LOCKMSG+14(8),=CL8'LOCK'    insert functions
+         B     DOSCOM                      go to common routines
+UNLKERR  DS    0H
+         MVC   LOCKMSG+14(8),=CL8'UNLOCK'  insert function
+         B     DOSCOM                      go to common routines
+DOSCOM   DS    0H
+         OI    RC,DOSZAP                   indicate error
+         MVC   LOG,LOCKMSG                 load message
+         ST    R15,FWORK                   save return code
+         LA    R13,1                       and
+         LA    R14,FWORK+3                  make
+         LA    R15,LOG+35                    it
+         BAL   R10,HX2CHAR                    readable
+         PUT   CONSOLE                     display on console
+         MVC   D1PART,CPART                insert partition an
+         MVC   D1CMD,CCMD                  remainder of card
+         MVC   D1CMT,=CL20'** LOCK ERROR **'  tell em' what's wrong
+         MVC   WOP,D1                      move to work area
+         PUT   REPORT                      print it
+         CNTRL REPORT,SP,2                 and a couple others
+         AP    LINECTR,=PL1'3'             bump line ctr
+         CP    LINECTR,=PL2'60'            go print
+         BL    NOHEAD5                       headings if
+         BAL   R9,HEADINGS                     we need them
+NOHEAD5  DS    0H
+         B     READIT                      go get next card
+*                  HEX TO CHARACTER ROUTINE                       *
+*        R10 = return address
+*        R13 = number of bytes to process
+*        R14 = input field
+*        R15 = output field
+HX2CHAR  DS    0H
+         TRT   0(0,R14),ZONETBL             translate zone and
+         STC   R2,0(R0,R15)                   store in output area
+         TRT   0(0,R14),NUMTBL              translate numerics and
+         STC   R2,1(R0,R15)                   store in output area
+         LA    R14,1(R0,R14)                reset for next arg byte
+         LA    R15,2(R0,R15)                reset to next byte out
+         BCT   R13,HX2CHAR                  go do it
+         BR    R10                          return to caller
+ZONETBL  DC    16X'F0',16X'F1',16X'F2',16X'F3',16X'F4',16X'F5',16X'F6'
+         DC    16X'F7',16X'F8',16X'F9',16X'C1',16X'C2',16X'C3',16X'C4'
+         DC    16X'C5',16X'C6'
+NUMTBL   DC    16X'F0F1F2F3F4F5F6F7F8F9C1C2C3C4C5C6'
+*                  W O R K   A R E A S                            *
+ABSAVE   DC    9D'0'
+PCSAVE   DC    9D'0'
+OFFSET   DC    F'0'
+FWORK    DC    F'0'
+ABERR    DC    XL1'00'
+LINECTR  DC    PL2'0'
+PAGECTR  DC    PL2'0'
+EDPAGE   DC    XL4'40202021'
+WOP      DC    CL132' '
+CARD     DS    0CL80
+CID      DC    CL3' '
+CPART    DC    CL2' '
+         DC    CL1' '
+CCMD     DC    CL74' '
+LOG      DC    CL72' '
+CFBDATA  DC    CL80' '
+CFBREPLY DC    CL80' '
+XTECB    TECB
+RC       DC    XL1'00'
+CARDZAP  EQU   X'01'
+CEMTZAP  EQU   X'02'
+CHECKZAP EQU   X'04'
+XPCCZAP  EQU   X'08'
+DOSZAP   EQU   X'10'
+BATXPCCB XPCCB APPL=CFBBATCH,TOAPPL=CFBXX,BUFFER=(CFBDATA,80),
+               REPAREA=(CFBREPLY,80)
+*                  R E P O R T   L A Y O U T                      *
+H1       DS    0CL132
+         DC    CL40' CFB'
+         DC    CL40'CEMT FROM BATCH'
+         DC    CL5'DATE'
+H1DATE   DC    CL8' '
+         DC    CL12'        PAGE'
+H1PAGE   DC    CL4' '
+         DC    CL23' '
+H2       DS    0CL132
+         DC    CL132' CICS   COMMENTS              COMMAND'
+D1       DS    0CL132
+         DC    CL2' '
+D1PART   DC    CL2' '
+         DC    CL4' '
+D1CMT    DC    CL20' '
+         DC    CL2' '
+D1CMD    DC    CL74' '
+         DC    CL30' '
+*                  M E S S A G E S                                *
+XPCCERR  DC    CL72'CFB-1  XPCC XXXXXXXX error. R15 = X''XX'' IJBXRETC
+               = X''XX'''
+XPCCOK   DC    CL72'CFB-2  XPCC XXXXXXXX successful'
+ABENDERR DC    CL72'CFB-3  Abnormal termination. Code=X''XX''.'
+PCMSG    DC    CL72'CFB-4  Program check X''XXXX'' at offset +X''XXXXXX
+               ''.'
+LOCKMSG  DC    CL72'CFB-5  VSE XXXXXXXX error. R15 = X''XX''.'
+         LTORG
+*                  D T F S                                        *
+REPORT   DTFPR DEVADDR=SYS018,DEVICE=1403,IOAREA1=WOP,
+               BLKSIZE=132,CONTROL=YES
+CARDS    DTFCD DEVADDR=SYSIPT,IOAREA1=CARD,EOFADDR=GOBACK
+CONSOLE  DTFCN DEVADDR=SYSLOG,IOAREA1=LOG,TYPEFLE=CMBND,BLKSIZE=72,
+               INPSIZE=72
+*         L O C K A B L E   R E S O U R C E S                     *
+CFBLOCK  DTL   NAME=CFBXX,CONTROL=E,LOCKOPT=1,KEEP=NO,OWNER=TASK,
+               SCOPE=INT
+*                  D S E C T S                                    *
+XPCCBLAY MAPXPCCB
+         END   CFB
+
+We shall continue this article about issuing CEMT commands
+from batch under VSE next month.
+
+Michael P Kilroy
+Systems Programming Supervisor
+Progress Lighting Inc (USA)
+

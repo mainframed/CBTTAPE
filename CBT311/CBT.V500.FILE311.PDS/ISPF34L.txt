@@ -1,0 +1,1917 @@
+/* REXX
+ | bug: 17sep1998 - fdr move for CSI gets *VSAM for volume
+ |
+ |
+ | Name: ISPF34L
+ |
+ | Author: David Alcock
+ |         dave@planetmvs.com
+ |
+ | Purpose: Read the dataset list from the ISPF 3.4 SPFx.LIST and
+ |          create utility control cards and other functions.
+ |
+ |          This is a "Quick and dirty" utility designed to quickly
+ |          create control cards and perform other functions on
+ |          datasets found in a ISPF 3.4 listing.  It doesn't look
+ |          pretty but it is handy.
+ |
+ | Note: Some of the oldest code uses "PUSH" and does things backwards.
+ |       Please do all new code with "QUEUE" so we have clear logic.
+ |
+ |
+ | Disclaimer: This REXX exec is FREEWARE.  Use at your own risk.  It
+ |             is provided for your enjoyment and neither David
+ |             Alcock or his employer provides any warranty for it's
+ |             use.  I'd like to hear how it works on your system.
+ |
+ |             This software is not in the public domain but is
+ |             available free of charge and with source code provided.
+ |             It is copyright 1998-2002+ by David Alcock.  All rights
+ |             reserved.
+ */
+
+vrm = '1.9'
+
+/**********************************************************************
+***
+**           M o d i f i c a t i o n   H i s t o r y
+**
+** Person     Date        Description
+** ---------- ----------- ------------------------------------------
+** DGAlcock   2001-09-21  1.9 - If no volser given, don't generate
+**                        a JCL line with UNIT=,VOL=SER= (fileaid srch)
+** DGAlcock   2001-05-17  1.8 - Add VTS volume insert thingy;
+** DGAlcock   2000-10-05  1.7
+**                        - Add symbolics to IDCAMS_catalogs_SYSRES;
+**                        - Prompt for catalog and noscratch for
+**                          IDCAMS_delete;
+** DGAlcock   2000-08-06  1.6
+**                        - Add Generate_FTPGET function;
+**                        - Allow different LRECL/BLKSIZE/RECFM for CC;
+**                        - Prompt for new dsname creation method in
+**                          XMIT function;
+** DGAlcock   2000-07-27  1.5
+**                        - Add NOVERIFY to FDR_Move function
+**                        - Add IDCAMS_LISTCAT function
+**                        - Add delete and catalog prompts to idc_cat
+** DGAlcock   2000-03-11  1.4
+**                        - HLQ analysis
+**                        - Handle the extra volume lines if invoked
+**                          for a volser instead of "Dsname Level"
+** DGAlcock   2000-03-01  1.3 - Add creation of XMIT job;
+** DGAlcock   1999-11-22  1.2 - IEBCOPY with replace
+** DGAlcock   16-MAY-1998 1.1 - Two of the IDCAMS functions were NOT
+**                        generating the IDCAMS step JCL;
+** DGAlcock   21-APR-1998 1.0 - released on the Internet;
+** DGAlcock   15-MAR-1998 Added IEHPROGM deletes (scratches);
+**                        Made IEHPROGM renames use queue; Redesign
+**                        of main menu;
+** DGAlcock   04-MAR-1998 Added SYSLIBxx DDNAME create;
+** DGAlcock   05-FEB-1998 Added JOBINFO on comment after jobcard;
+**                        Added creating DSAT output command
+** DGAlcock   21-JAN-1998 Strip out non-dataset lines from input;
+**                        Add better checking for FDR move and copy;
+**                        Add edit of sysut2 file at the end;
+** DGAlcock   28-OCT-1997 Add jobstep for IEHPROGM_rename;
+** DGAlcock   10-OCT-1997 Enhanced FDR_RENAMEs and added jobcard;
+**                        Generate_IDCAMS_step was added;
+** DGAlcock   26-SEP-1997 Added Write_out_Volser function and
+**                        enhanced the DSAT function; Added sysut2_>
+**                        _dsn on the command line;
+** DGAlcock   25-SEP-1997 Added FDR Copy function;
+** DGAlcock   03-JUL-1995 Initial exec created;
+***
+**********************************************************************/
+
+arg sysut1_dsn sysut2_dsn
+
+user = sysvar(sysuid)
+
+if sysut2_dsn == "" then sysut2_dsn = "@CNTLCRD"
+jobinfo = ""
+jctype = "q"
+userid = sysvar(sysuid)
+
+mtype = address()
+
+if mtype == "TSO" | mtype == "MVS" then ,
+   if sysvar(systsoe) > "2040" then smfid = mvsvar(syssmfid)
+   else do
+        cvt    = storage(10,4)
+        dcvt   = c2d(cvt)
+        smca   = storage(c2x(d2c(dcvt+x2d(c5))),3)
+        dsmca  = c2d(smca)
+        smfid = storage(c2x(d2c(dsmca+x2d(10))),4)
+        end
+else do
+     say "This exec is intended for use on an IBM mainframe running "
+         "MVS (but OS/390 is okay)"
+     exit 12
+     end
+
+/***********************************************************************
+* Installation dependant code:
+*
+* 1) Set the comand to clear screen: Use the command for your site!!!!!
+*
+* 2) Generate a job card.  This code uses the SHOWTSO installation
+*    command to obtain ACF2 information: "programmer name", UID
+*    string and default sysout destination.
+*
+*    There is a version of SHOWTSO on the CBT tape from Rockwell
+*    International - I think it's on the overflow tape now.
+*
+*    If you don't have a SHOWTSO or another way of getting these
+*    values, you could prompt for them.
+*
+* 3) Set the Migration volume name as set by your installation's disk
+*    management system.  In ISPF v4, the volume will have a migration
+*    level appended, but we will only check the first 6 bytes
+***********************************************************************/
+
+cmd_cls = "CLS"     /* TSO command to clear the screen */
+cmd_pds = "PDSE"    /* TSO command for PDS (or Serena's product) */
+
+acct = "?,?,?,???"
+dest = "LOCAL"
+
+jc.1 = "//"userid"I JOB  ("acct"),"
+jc.2 = "//          '"name"',"
+jc.3 = "//          NOTIFY="userid",REGION=8M,MSGCLASS=X,"
+jc.4 = "//          CLASS=U,TIME=1439"
+jc.5 = "//BANNER    OUTPUT DEFAULT=YES,JESDS=ALL,DEST="dest
+jc.0 = 5
+
+/*
+ | Set values for IBM's HSM
+ */
+migvol  = "MIGRAT"              /* migration volume name */
+migtype = "migrated"            /* migration type for this product */
+migprod = "HSM"                 /* migration product name */
+
+/*
+ | Set values for DMS (SAMS:Disk)
+ */
+migvol  = "ARCIVE"              /* migration volume name */
+migtype = "archived"            /* migration type for this product */
+migprod = "DMS (SAMS:Allocate)" /* migration product name */
+
+ /* Note: last one of the migvol/migtype/migprod will be used */
+
+/*---------------------------------------------------------------------
+ | Set misc program defaults
+ ------------------------------------------------------------------- */
+
+ccl = "80"   /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+ccb = "8800" /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+ccf = "F B"  /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+
+/***********************************************************************
+ | Verify that the input dataset exists
+ |
+ | The SPF*.LIST file is a 3.4 dataset list.
+ **********************************************************************/
+
+if sysut1_dsn == "" then do
+   say "Input SPF*.LIST dataset was not given, terminating"
+   exit 12
+   end
+
+x = LISTDSI(sysut1_dsn)
+if x <> 0 then do
+   say "Error accessing DSN:" sysut1_dsn
+   say "> "sysmsglvl1
+   say "> "sysmsglvl2
+   say "> SYSREASON: "sysreason
+   exit
+   end
+
+sysut1_pdsn = sysdsname
+parse value sysut1_dsn with . "(" member ")" .
+if member <> "" then do
+   sysut1_pdsn = sysut1_pdsn"("strip(member)")"
+   end
+sysut1_num = "*"
+
+sysut1_dd = "I34L"random()
+address TSO "ALLOCATE FILE("sysut1_dd") DA('"sysut1_pdsn"') SHR REUSE"
+arc = rc
+if arc <> 0 then do
+   say "Error allocating input file: '"sysut1_pdsn"', RC="arc
+   exit 12
+   end
+
+"EXECIO "sysut1_num" DISKR "sysut1_dd" (FINIS STEM sysut1_file."
+erc = rc
+
+if erc <> 0 then do
+   say "Error reading input file: '"sysut1_pdsn"', RC="arc
+   exit 12
+   end
+address TSO "FREE FILE("sysut1_dd")"
+
+/***********************************************************************
+* Weed out the non-dataset lines from the input file                   *
+***********************************************************************/
+
+listver = 0
+weeded = 0
+migcnt = 0
+involumestuff = 0
+
+do i = 1 to sysut1_file.0
+
+   if involumestuff == 1 then do
+      if word(sysut1_file.i,1) == "DATA" then involumestuff = 0
+      /* say "Skipping volume line:" sysut1_file.i */
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+
+   if word(sysut1_file.i,1) == "VOLUME" then do
+      /* say "Skipping volume line:" sysut1_file.i */
+      sysut1_file.i = ""
+      involumestuff = 1
+      weeded = weeded + 1
+      iterate
+      end
+
+   if substr(sysut1_file.i,1,22) == "1 LISTING OF DATA SETS" then do
+      listver = 3
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+   if substr(sysut1_file.i,1,22) == "1 Listing of Data Sets" then do
+      listver = 4
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+   if substr(sysut1_file.i,1,18) == "     DATA SET NAME" then do
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+   if substr(sysut1_file.i,1,18) == "  ----------------" then do
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+
+   if strip(sysut1_file.i) == "" then do
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+
+   if word(sysut1_file.i,1) == "PAGE:" then do
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+   if word(sysut1_file.i,1) == "TIME:" then do
+      sysut1_file.i = ""
+      weeded = weeded + 1
+      iterate
+      end
+
+   volume = word(sysut1_file.i,2)
+   if substr(volume,1,6) == migvol then migcnt = migcnt + 1
+   end
+
+/***********************************************************************
+* Show the menu
+***********************************************************************/
+
+address TSO cmd_cls
+
+say "ISPF34L - version "vrm "- Freeware - ISPF 3.4 list processor"
+/* Please keep the next line in the code but it's okay to leave it
+   commented out: */
+/* say "Copyright 1995-1998 by David Alcock. All rights reserved." */
+say " "
+
+if weeded == 0 then say "No input lines were weeded out"
+else say weeded "lines were weeded out of "sysut1_file.0" input lines"
+
+if migcnt == 0 then say "No "migtype" datasets found in input"
+else say "Found "migcnt" files "migtype" to "migprod
+
+say " "
+say "Select one of the following:               SMF ID: "smfid
+say " "
+say "I1 - IDCAMS alias             M1 - Show PDS directory info"
+say "I2 - IDCAMS catalogs_SYSRES   M2 - Invoke DSAT Command    "
+say "I3 - IDCAMS catalogs          M3 - Write out volser       "
+say "I4 - IDCAMS renames           M4 - //DDnames cards        "
+say "I5 - IDCAMS deletes           M5 - RESTORE JCL cards      "
+say "I6 - IDCAMS LISTCAT           M6 - IEBCOPY replaces       "
+say "I7 - IDCAMS VTS inserts       M7 - XMIT job               "
+say "                              M8 - XMIT commands          "
+say "D1 - DMS Archive              M9 - HLQ analysis           "
+say "                              M10 - FTPGET MS/DOS bat file"
+say "F1 - FDR Renames              M11 - PROG (APFLST entries) "
+say "F2 - FDR moves                                            "
+say "F3 - FDR Copies                                           "
+say "                              PM1 - IEHPROGM renames      "
+say "FA1- FileAid Search           PM2 - IEHPROGM deletes      "
+say " "
+pull option
+select
+  when option = "I1"  then call Generate_IDCAMS_alias
+  when option = "I2"  then call Generate_IDCAMS_catalogs_SYSRES
+  when option = "I3"  then call Generate_IDCAMS_catalogs
+  when option = "I4"  then call Generate_IDCAMS_renames
+  when option = "I5"  then call Generate_IDCAMS_deletes
+  when option = "I6"  then call Generate_IDCAMS_listcat
+  when option = "I7"  then call Generate_IDCAMS_VTS_inserts
+
+  when option = "M1"  then call Show_directory_information
+  when option = "M2"  then call Invoke_DSAT
+  when option = "M3"  then call Write_out_Volser
+  when option = "M4"  then call Generate_DDNAMES
+  when option = "M5"  then call Generate_RESTORE_JCL_cards
+  when option = "M6"  then call Generate_IEBCOPY_REPLACE
+  when option = "M7"  then call Generate_XMIT_JOB
+  when option = "M8"  then call Generate_XMIT_Commands
+  when option = "M9"  then call Do_HLQ_Analysis
+  when option = "M10" then call Generate_FTPGET
+  when option = "M11" then call Generate_APFLST
+  when option = "D1"  then call Generate_DMS_archives
+  when option = "F1"  then call Generate_FDR_Renames
+  when option = "F2"  then call Generate_FDR_MOVEs
+  when option = "F3"  then call Generate_FDR_COPIES
+  when option = "PM1" then call Generate_IEHPROGM_renames
+  when option = "PM2" then call Generate_IEHPROGM_deletes
+  when option = "FA1" then call Generate_FileAid_Search
+  otherwise
+       say "Invalid option, terminating"
+       exit
+       end
+
+exit
+
+/*********************************************************************
+* Insert the jobcard - either queue it or push it...
+*********************************************************************/
+
+Generate_jobcard:
+
+jdate = substr(date('s'),1,4)"."substr(date('j'),3,3) /* ccyy.ddd */
+isodate = substr(date('s'),1,4)"-"substr(date('o'),4,2)|| ,
+          "-"substr(date('o'),7,2) /* ccyy-mm-dd */
+if jctype == "q" then do
+   do j = 1 to jc.0
+      queue jc.j
+      end
+   queue '//*'
+   queue '//** This job was generated by the %ISPF34L exec'
+   queue '//** on 'isodate ' ('jdate' Julian) at' time()
+   queue '//**'
+   if jobinfo <> "" then do
+      queue '//**' jobinfo
+      queue '//*'
+      end
+   end
+else do
+     push '//*'
+     push '//**' jobinfo
+     if jobinfo <> "" then do
+        push '//**'
+        push '//** on 'isodate ' ('jdate' Julian) at' time()
+        push '//** This job was generated by the %ISPF34L exec'
+        end
+     push '//*'
+     do j = jc.0 to 1 by -1
+        push jc.j
+        end
+     end
+return
+
+/*********************************************************************
+* Generate IDCAMS job step
+*********************************************************************/
+
+Generate_IDCAMS_step:
+
+if jctype == "q" then do
+   queue "//JUSTDOIT EXEC PGM=IDCAMS"
+   queue "//SYSPRINT DD SYSOUT=*"
+   queue "//SYSIN    DD *"
+   end
+else do
+     push "//SYSIN    DD *"
+     push "//SYSPRINT DD SYSOUT=*"
+     push "//JUSTDOIT EXEC PGM=IDCAMS"
+     end
+return
+
+/*********************************************************************
+* Initialize for control card library output
+*********************************************************************/
+
+init_control_card:
+
+if substr(sysut2_dsn,1,1) <> "'" then ,
+   sysut2_dsn = sysvar(sysuid)"."sysut2_dsn
+
+say "Writing to DSN="sysut2_dsn
+call "OUTTRAP" "dummy.","*"
+address TSO "DELETE '"sysut2_dsn"'"
+call "OUTTRAP" "OFF"
+address TSO "ALLOCATE FILE(SYSUT2) DA('"sysut2_dsn"')",
+            "UNIT(SYSDA) NEW REUSE SPACE(5 5) TRACKS",
+            "LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")"
+
+address TSO "NEWSTACK"   /* Place to put SYSUT2 output */
+return
+
+/*********************************************************************
+* Terminate control card processing
+*********************************************************************/
+
+term_control_card:
+
+QUEUE ''      /* add null line to indicate End-Of-File */
+address TSO "EXECIO * DISKW SYSUT2 (FINIS"
+erc = rc
+if erc <> 0 then ,
+   say "%ISPF34L - Terminating, EXECIO rc="erc
+address TSO "FREE FILE(SYSUT2)"
+address TSO "DELSTACK"
+
+if sysvar(sysispf) == "ACTIVE" then do
+   sysut2_dsn = strip(sysut2_dsn)
+   address ISPEXEC
+   "CONTROL ERRORS RETURN"
+   "EDIT DATASET('"sysut2_dsn"')"
+   erc = rc
+   if erc > 4 then ,
+      say "%ISPF34L - Could not edit "sysut2_dsn "rc="erc
+   "CONTROL ERRORS CANCEL"
+   end
+return
+
+/***********************************************************************
+* FDR copy with rename
+*
+*    COPY TYPE=DSF,DSNENQ=NONE
+*    SELECT DSN=SYS3.SYS.ACF2.CLIST,
+*           NEWNAME=SYS2.SYS.ACF2.CLIST
+*
+*    MOVE TYPE=DSF
+*    SELECT DSN=SYS3.SYS.ACF2.CLIST,
+*           NEWNAME=SYS2.SYS.ACF2.CLIST
+*
+***********************************************************************/
+Generate_FDR_Renames:
+
+say "Executing: Generate_FDRDSF_Renames"
+
+say "Please enter new volume:"
+pull newvol
+if newvol == "" then newvol = "bozo01"
+newvol = translate(newvol)
+
+call init_control_card
+call generate_jobcard
+
+lastvol = ""
+num = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   if volume == newvol then do
+      say "Skipping dataset="dsname
+      say "           (already on "newvol")"
+      iterate
+      end
+
+   if volume <> lastvol then do
+
+      lastvol = volume
+      num = num + 1
+      queue '//* ==============================================='
+      queue '//COPY'num' EXEC PGM=FDRCOPY,REGION=9M,TIME=1439'
+      queue '//SYSPRINT  DD SYSOUT=*'
+      queue '//SYSPRIN1  DD SYSOUT=*'
+      queue '//SYSUDUMP  DD SYSOUT=*'
+      queue '//ABNLDUMP  DD DUMMY'
+      queue '//DISK1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='volume
+      queue '//TAPE1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='newvol
+      queue '//SYSIN     DD *'
+      queue ' COPY TYPE=DSF,DSNENQ=NONE'
+      end
+
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+   ndsname = delword(ndsname,1,1)
+   ndsname = "SYS2."ndsname             /* Change new prefix ! */
+   ndsname = translate(ndsname,'.',' ')
+
+   queue '      SELECT DSN='dsname","
+   queue '             NEWNAME='ndsname
+   end
+
+call term_control_card
+
+return /* from Generate_FDR_Renames */
+
+
+
+/*---------------------------------------------------------------------
+ | Generate FDR MOVE statements
+ |
+ | The only time you should be using NOVERIFY is when the dataset
+ | is catalogued on another system and you can't use LISTDSI.
+ ------------------------------------------------------------------- */
+Generate_FDR_MOVEs:
+
+say "Executing: Generate_FDRDSF_Moves"
+
+verdsn = ""
+
+/*
+ |  Get new volume name
+ */
+
+say "Please enter new volume:"
+pull newvolr
+newvol = word(newvolr,1)
+if newvol == "" then newvol = "bozo01"
+newvol = translate(newvol)
+if words(newvol) > 1 then do
+   say "%ISPF34L - You entered a more words than expected for volume"
+   say "%ISPF34L - Using first one: "word(newvol,1)
+   newvol = word(newvol,1)
+   end
+/* Here we allow for: 'BOZO01 NOVERIFY' for reducing prompting */
+do i = 2 to words(newvolr)
+   select
+     when translate(word(newvolr,i)) == "VERIFY"   then verdsn = "Y"
+     when translate(word(newvolr,i)) == "NOVERIFY" then verdsn = "N"
+     otherwise
+          say "Ignoring '"word(newvolr,i)"'"
+          end
+   end
+
+/*
+ |  Prompt for dataset verification via LISTDSI
+ */
+
+if verdsn == "" then do
+   say "Verify dataset exists (Y/N)"
+   pull verdsnr
+   verdsnr = translate(verdsnr)
+   select
+    when substr(verdsnr,1,1) == "Y" then verdsn = "Y"
+    when substr(verdsnr,1,1) == "N" then verdsn = "N"
+    otherwise
+         say "Invalid response, going to verify dataset"
+         verdsn = "Y"
+         end
+    end
+
+if verdsn = "Y" then say "Will verify dataset exists"
+else say "Will NOT verify dataset exists"
+
+/*
+ |  Here's where we do the dirty work
+ */
+
+call init_control_card
+call generate_jobcard
+
+lastvol = ""
+num = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   if volume == "??????" then do
+      say "Skipping DSN="left(dsname,44) "(volume=??????)"
+      iterate
+      end
+
+   if verdsn == "Y" then do
+      fq_dsname = "'"strip(dsname)"'"
+      rc = LISTDSI(fq_dsname)
+      select
+        when rc == 0 then do
+             say "Select:  DSN="left(dsname,44) "Unit="sysunit
+             end
+        when sysreason == "0008" then do
+             say "Skipping DSN="left(dsname,44) "(tape)"
+             iterate
+             end
+        when sysreason == "0012" then do
+             ndsn = translate(dsname,' ','.')
+             last_node = word(ndsn,words(ndsn))
+             if last_node == "DATA" | last_node == "INDEX" then do
+                say "Skipping DSN="left(dsname,44) "(VSAM Comp)"
+                iterate
+                end
+             say "Select:  DSN="left(dsname,44) sysdsorg
+             end
+        otherwise
+             say "Error:   DSN="dsname
+             say "           > "sysmsglvl1
+             say "           > "sysmsglvl2
+             say "           > SYSREASON: "sysreason
+             iterate
+             end
+      end
+
+   if volume == newvol then do
+      say "Skipping DSN="left(dsname,44) ,
+          "(already on "newvol")"
+      iterate
+      end
+
+   if volume <> lastvol then do
+
+      lastvol = volume
+      num = num + 1
+      queue '//* ==============================================='
+      queue '//MOVE'num' EXEC PGM=FDRCOPY,REGION=9M,TIME=1439'
+      queue '//SYSPRINT  DD SYSOUT=*'
+      queue '//SYSPRIN1  DD SYSOUT=*'
+      queue '//SYSUDUMP  DD SYSOUT=*'
+      queue '//ABNLDUMP  DD DUMMY'
+      queue '//DISK1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='volume
+      queue '//TAPE1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='newvol
+      queue '//SYSIN     DD *'
+      queue ' MOVE TYPE=DSF,DSNENQ=NONE'
+      end
+   queue '      SELECT DSN='dsname
+   end
+
+call term_control_card
+return /* from Generate_FDR_Moves */
+
+/***********************************************************************
+* Write the FDR Copy JCL and select statements
+***********************************************************************/
+Generate_FDR_COPIES:
+
+say "Executing: Generate_FDRDSF_Copies"
+
+say "Please enter new volume:"
+pull newvol
+if newvol == "" then newvol = "bozo01"
+newvol = translate(newvol)
+if words(newvol) > 1 then do
+   say "%ISPF34L - You entered a more words than expected for volume"
+   say "%ISPF34L - Using first one: "word(newvol,1)
+   newvol = word(newvol,1)
+   end
+
+call init_control_card
+call generate_jobcard
+
+lastvol = ""
+num = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   if volume == "??????" then do
+      say "Skipping DSN="left(dsname,44) "(volume=??????)"
+      iterate
+      end
+
+   fq_dsname = "'"strip(dsname)"'"
+   rc = LISTDSI(fq_dsname)
+   select
+     when rc == 0 then do
+          say "Select:  DSN="left(dsname,44) "Unit="sysunit
+          end
+     when sysreason == "0008" then do
+          say "Skipping DSN="left(dsname,44) "(tape)"
+          iterate
+          end
+
+     when sysreason == "0012" then do
+          ndsn = translate(dsname,' ','.')
+          last_node = word(ndsn,words(ndsn))
+          if last_node == "DATA" | last_node == "INDEX" then do
+             say "Skipping DSN="left(dsname,44) "(VSAM Comp)"
+             iterate
+             end
+          say "Select:  DSN="left(dsname,44) sysdsorg
+          end
+     otherwise
+          say "Error:   DSN="dsname
+          say "           > "sysmsglvl1
+          say "           > "sysmsglvl2
+          say "           > SYSREASON: "sysreason
+          iterate
+          end
+
+
+   if volume == newvol then do
+      say "Skipping DSN="left(dsname,44) ,
+          "(already on "newvol")"
+      iterate
+      end
+
+   if volume <> lastvol then do
+
+      lastvol = volume
+      num = num + 1
+      queue '//* ==============================================='
+      queue '//COPY'num' EXEC PGM=FDRCOPY,REGION=9M,TIME=1439'
+      queue '//SYSPRINT  DD SYSOUT=*'
+      queue '//SYSPRIN1  DD SYSOUT=*'
+      queue '//SYSUDUMP  DD SYSOUT=*'
+      queue '//ABNLDUMP  DD DUMMY'
+      queue '//DISK1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='volume
+      queue '//TAPE1     DD DISP=SHR,UNIT=SYSALLDA,VOL=SER='newvol
+      queue '//SYSIN     DD *'
+      queue ' COPY TYPE=DSF,DSNENQ=NONE,NOCAT'
+      end
+   queue '      SELECT DSN='dsname
+   end
+
+call term_control_card
+return /* from Generate_FDR_COPIES */
+
+/***********************************************************************
+* File Aid Search
+***********************************************************************/
+Generate_FileAid_Search:
+
+say "Executing: Generate_FileAid_Search"
+
+irc = 0
+do while irc == 0
+   say "Please enter search string"
+   pull ss
+   if strip(ss) == "" then do
+      say "I need a search string"
+      irc = 0
+      end
+   else irc = 1
+   end
+
+call init_control_card
+call generate_jobcard
+
+jobs = 1
+num = 0
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   num = num + 1
+   if num = 256 then do
+      jobs = jobs + 1
+      call generate_jobcard
+      num = 1
+      end
+
+   volume = strip(volume)
+   comma = ","
+   if volume == "" then comma = ""
+
+   queue "//* ==============================================="
+   queue "//STEP"num" EXEC PGM=FILEAID"
+   queue "//SYSPRINT DD DUMMY"
+   queue "//SYSLIST  DD SYSOUT=*"
+   queue "//SYSTOTAL DD SYSOUT=*"
+   queue "//DD01     DD DISP=SHR,DSN="strip(dsname)||comma
+   if volume <> "" then ,
+      queue "//            UNIT=SYSALLDA,VOL=SER="volume
+   queue "//SYSIN    DD *"
+   queue "$$DD01 LIST IF=(1,0,C'"ss"')"
+   end
+
+say "Number of jobs created instream:" jobs
+call term_control_card
+return /* from Generate_FileAid_Search */
+
+/***********************************************************************
+* IEHPROGM renameds
+*
+*   RENAME DSNAME=datasetname,
+*                 NEWNAME=prefix.suffix,
+*                 VOL=3390=SYSTRS
+*
+***********************************************************************/
+Generate_IEHPROGM_renames:
+
+say "Executing: Generate_IEHPROGM_renames"
+say " "
+say "Enter device type: 3380 or 3390"
+pull dtype
+dtype = strip(dtype)
+select
+  when dtype == "3380" then nop
+  when dtype == "3390" then nop
+  when dtype == ""     then do
+       dtype = "3390"
+       say "Device type not given, using 3390"
+       end
+  otherwise
+     say "Unknown device type accepted:" dtype
+  end
+
+call init_control_card
+call generate_jobcard
+
+queue "//PROGM   EXEC PGM=IEHPROGM"
+
+lvol = ""
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+   if volume == "" then iterate
+   if volume == "*VSAM*" then iterate
+   if lvol <> volume then do
+      queue "//"left(volume,8)" DD" ,
+            "DISP=SHR,VOL=SER="volume",UNIT="dtype
+      lvol = volume
+      end
+
+   end
+
+queue "//VDSBYPAS DD DUMMY"
+queue "//SYSPRINT DD SYSOUT=*"
+queue "//SYSIN    DD *"
+
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+   if volume == "" then volume == "<volume>"
+   if volume == "*VSAM*" then do
+      say "Skipping VSAM dataset: "dsname
+      iterate
+      end
+
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+   ndsname = delword(ndsname,1,1)
+   ndsname = "SYS2."ndsname","
+   ndsname = translate(ndsname,'.',' ')
+   dsname = dsname","
+
+            /*....+....1....+....2....+....3 */
+   lineout = " RENAME DSNAME=oldname,
+   lineout = overlay(dsname,lineout,16)
+   queue lineout
+
+            /*....+....1....+....2....+....3 */
+   lineout = "               NEWNAME=newname,
+   lineout = overlay(ndsname,lineout,24)
+   queue lineout
+
+   lineout = "               VOL="dtype"="volume
+   queue lineout
+
+   end
+
+
+call term_control_card
+
+return /* from Generate_IEHPROGM_renames */
+
+/***********************************************************************
+ | IEHPROGM deletes
+ |
+ | SCRATCH DSNAME=dsname,VOL=dtype=volume,PURGE
+ |
+ | SCRATCH DSNAME=BOZO.CLOWNLIB,VOL=3390=CIRCUS,PURGE
+ |
+ **********************************************************************/
+Generate_IEHPROGM_deletes:
+
+say "Executing: Generate_IEHPROGM_deletes"
+say " "
+say "Enter device type: 3380 or 3390"
+pull dtype
+dtype = strip(dtype)
+select
+  when dtype == "3380" then nop
+  when dtype == "3390" then nop
+  when dtype == ""     then do
+       dtype = "3390"
+       say "Device type not given, using 3390"
+       end
+  otherwise
+     say "Unknown device type accepted:" dtype
+  end
+
+call init_control_card
+call generate_jobcard
+
+queue "//PROGM   EXEC PGM=IEHPROGM"
+
+lvol = ""
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+   if volume == "" then iterate
+   if volume == "*VSAM*" then iterate
+   if lvol <> volume then do
+      queue "//"left(volume,8)" DD" ,
+            "DISP=SHR,VOL=SER="volume",UNIT="dtype
+      lvol = volume
+      end
+
+   end
+
+queue "//VDSBYPAS DD DUMMY"
+queue "//SYSPRINT DD SYSOUT=*"
+queue "//SYSIN    DD *"
+
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   if volume == "" then volume == "<volume>"
+   if volume == "*VSAM*" then do
+      say "Skipping VSAM dataset: "dsname
+      iterate
+      end
+
+   dsname = strip(dsname)
+   queue  " SCRATCH DSNAME="dsname",VOL="dtype"="volume",PURGE"
+
+   end
+
+
+call term_control_card
+
+return /* from Generate_IEHPROGM_deletes */
+
+/***********************************************************************
+* IDCAMS VTS Inserts                                                   *
+***********************************************************************/
+
+Generate_IDCAMS_VTS_inserts:
+
+say "Executing: Generate_IDCAMS_VTS_inserts"
+
+call init_control_card
+jctype = "q"
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with volume .
+
+   queue "CREATE VOLUMEENTRY( -"
+   queue "                    NAME(V"volume") -"
+   queue "                    LIBRARYNAME(XVTS102) -"
+   queue "                    STORAGEGROUP(SGVTS) LOCATION(LIBRARY) -"
+   queue "                    MEDIATYPE(MEDIA2) USEATTRIBUTE(PRIVATE) -"
+   queue "                  )"
+   queue " "
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_listcat */
+
+/***********************************************************************
+* IDCAMS LISTCAT                                                       *
+***********************************************************************/
+
+Generate_IDCAMS_listcat:
+
+say "Executing: Generate_IDCAMS_listcat"
+
+say "Specify Master Catalog or null for none..."
+pull scat
+scat = translate(scat)
+if strip(scat) <> "" then say "Thanks for the catalog: "scat
+
+call init_control_card
+jctype = "q"
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   if scat == "" then do
+      queue " LISTCAT ENTRY('"dsname"')"
+      end
+   else do
+        queue " LISTCAT ENTRY('"dsname"') - "
+        queue "         CATALOG('"scat"') ALL"
+        end
+
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_listcat */
+
+/***********************************************************************
+* IDCAMS deletes                                                       *
+***********************************************************************/
+
+Generate_IDCAMS_deletes:
+
+address TSO cmd_cls
+say "Executing: Generate_IDCAMS_deletes"
+
+say " "
+say "To perform NOSCRATCH hit enter (null)"
+pull scratchr
+if scratchr = "" then scratch = "NOSCRATCH"
+else scratch = ""
+
+select
+  when smfid == "XYZ1" then tocat = "CATALOG.MASTER1"
+  when smfid == "XYZ2" then tocat = "CATALOG.MASTER2"
+  when smfid == "XYZ5" then tocat = "CATALOG.MASTER5"
+  otherwise
+       tocat = "n/a"
+       end
+
+loop = 1
+do while loop = 1
+   say " "
+   say "Catalog Resolution needed, select options below:"
+   say "1 - Use default catalog" tocat
+   say "2 - I want to be prompted for new catalog name"
+   say "3 - No catalog desired"
+   say "X - exit"
+   pull tocatr
+   select
+     when tocatr == "1" then leave
+     when tocatr == "2" then do
+                             say "Enter catalog"
+                             pull tocat
+                             leave
+                             end
+     when tocatr == "3" then do
+                             tocat = ""
+                             leave
+                             end
+     when translate(tocatr) == "X" then exit
+     otherwise
+          say "Invalid option: "tocatr
+          end
+     end
+
+jobinfo = "Delete NonVSAM datasets"
+
+call init_control_card
+jctype = "q"
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   if tocat <> "" then cont = "-"
+   else cont = ""
+
+   queue " DELETE '"dsname"'" scratch cont
+   if tocat <> "" then queue "        CATALOG('"tocat"')"
+
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_deletes */
+
+/***********************************************************************
+* IDCAMS catalogs
+*
+*   DEFINE NONVSAM( -
+*                   NAME(ndsname) -
+*                   VOLUMES(volume) -
+*                   DEVICETYPES(3380) -
+*                 )
+***********************************************************************/
+
+Generate_IDCAMS_catalogs:
+
+say "Executing: Generate_IDCAMS_catalogs"
+
+
+/*
+ |  Prompt for dataset verification via LISTDSI
+ */
+
+delem = "N"
+say "UnCatalogue as well (Y OR N)"
+pull delemr
+delemr = translate(delemr)
+select
+ when substr(delemr,1,1) == "Y" then delem = "Y"
+ when substr(delemr,1,1) == "N" then delem = "N"
+ otherwise
+      say "Invalid response, not going to delete"
+      end
+
+if delem = "Y" then say "Will delete datasets prior to define"
+else say "Will NOT delete dataset prior to define"
+
+say "Specify Master Catalog or null for none..."
+pull scat
+scat = translate(scat)
+if strip(scat) <> "" then say "Thanks for the catalog: "scat
+
+call init_control_card
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   /*
+    |      dsname = strip(dsname)
+    |      ndsname = translate(dsname,' ','.')
+    |      ndsname = delword(ndsname,1,1)
+    |      ndsname = "HPS."ndsname
+    |      ndsname = translate(ndsname,'.',' ')
+    */
+
+   if delem == "Y" then do
+      if scat == "" then ,
+         QUEUE " DELETE "dsname " NOSCRATCH "
+      else do
+           QUEUE " DELETE "dsname " NOSCRATCH - "
+           QUEUE "        CATALOG("scat")"
+           end
+      end
+
+   QUEUE " DEFINE NONVSAM( - "
+   QUEUE "                 NAME("dsname") - "
+   QUEUE "                 VOLUMES("volume") - "
+   QUEUE "                 DEVICETYPES(3390) - "
+
+   if scat == "" then QUEUE "               )"
+   else do
+        QUEUE "                 ) -"
+        QUEUE "                 CATALOG("scat")"
+        end
+
+   /*
+    |  QUEUE ' DEFINE ALIAS( -               '
+    |  QUEUE '               NAME(OS390R6U.'ndsname') - '
+    |  QUEUE '               RELATE('ndsname') - '
+    |  QUEUE '             ) -'
+    |  QUEUE '             CATALOG(CATALOG.OS390R6U)'
+    */
+
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_catalogs */
+
+/***********************************************************************
+* IDCAMS catalogs for datasets on the SYSRES
+*
+*   DEFINE NONVSAM( -
+*                   NAME(ndsname) -
+*                   VOLUMES(******) -
+*                   DEVICETYPES(3380) -
+*                 )
+***********************************************************************/
+
+Generate_IDCAMS_catalogs_SYSRES:
+
+address TSO cmd_cls
+say "Executing: Generate_IDCAMS_catalogs for SYSRES/Symbolics"
+
+say " "
+say "Specify symbolic name or hit enter (null) to use ******"
+pull tovol
+if tovol = "" then tovol = "******"
+
+select
+  when smfid == "XYZ1" then tocat = "CATALOG.MASTER1"
+  when smfid == "XYZ2" then tocat = "CATALOG.MASTER2"
+  when smfid == "XYZ5" then tocat = "CATALOG.MASTER5"
+  otherwise
+       tocat = "master.catalog.name.goes.here"
+       end
+say " "
+say "Default Master Catalog:" tocat
+say " "
+say "Specify master catalog name or hit enter (null) for default"
+pull tocatr
+if tocatr <> "" then tocat = tocatr
+
+jobinfo = "NonVSAM catalogs to volume "tovol" in "tocat
+
+call init_control_card
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   queue " DEFINE NONVSAM( - "
+   queue "                 NAME("dsname") - "
+   queue "                 VOLUMES("tovol") - "
+   queue "                 DEVICETYPES(0000) - "
+   queue "               ) -"
+   queue "               CATALOG(CATALOG.MASTER5)"
+
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_catalogs_SYSRES */
+
+/***********************************************************************
+* IDCAMS dataset renames
+*
+* ALTER datasetname -
+*       NEWNAME(newdatasetname)
+***********************************************************************/
+
+Generate_IDCAMS_renames:
+
+say "Executing: Generate_IDCAMS_renames"
+
+call init_control_card
+call generate_jobcard
+call generate_IDCAMS_step
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+   ndsname = delword(ndsname,1,1)
+   ndsname = "HPS."ndsname
+   ndsname = translate(ndsname,'.',' ')
+
+   lineout = " ALTER "dsname" - "
+   QUEUE lineout
+   lineout = "       NEWNAME("ndsname")"
+
+   /*
+    | QUEUE ' IF LASTCC = 0 THEN - '
+    | QUEUE '    DEFINE ALIAS( -               '
+    | QUEUE '    NAME(OS390R6M.'ndsname') - '
+    | QUEUE '    REL('ndsname')) -          '
+    | QUEUE '    CAT(CATALOG.OS390R6M)         '
+    */
+
+   end
+
+call term_control_card
+
+return /* from Generate_IDCAMS_renames */
+
+/***********************************************************************
+ |    Create IDCAMS alias control cards
+ |
+ |    DEFINE ALIAS ( -
+ |                   NAME(newname) -
+ |                   RELATE(current.name ) -
+ |                 ) -
+ |                 CATALOG(CATALOG.MASTER5)
+ **********************************************************************/
+
+Generate_IDCAMS_alias:
+
+say "Executing: Generate_IDCAMS_alias"
+say "--> It is assumed that the input has the current name and" ,
+    "and new.names as the first and second 'words' of the file"
+
+call init_control_card
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with cname nname .
+
+   cname = translate(strip(cname)) /* uppercase + strip */
+   nname = translate(strip(nname))
+
+   push "             CATALOG(CATALOG.MASTER5)"
+   push "             ) -"
+   push "               RELATE("cname") -"
+   push "               NAME("nname") -"
+   push "DEFINE ALIAS ( -"
+
+   end
+
+jctype = "p"
+call generate_IDCAMS_step
+call generate_jobcard
+call term_control_card
+
+return /* from Generate_IDCAMS_alias */
+
+/***********************************************************************
+* Generate DMS (SAMS:DISK) archive control cards out
+*
+* ARCHIVE DSN=dsname,RETPD=700,SCRATCH
+***********************************************************************/
+
+Generate_DMS_archives:
+
+call init_control_card
+
+say "Executing: Generate_DMS_archives"
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+   ndsname = delword(ndsname,1,1)
+   ndsname = "HPS."ndsname
+   ndsname = translate(ndsname,'.',' ')
+
+   lineout = " ARCHIVE DSN="dsname",SCRATCH,RECATALOG"
+   PUSH lineout
+
+   end
+
+   lineout = "//SYSIN  DD  *"
+   PUSH lineout
+   lineout = "//           S='*'"
+   PUSH lineout
+   lineout = "//         EXEC  ARCHIVE,"
+   PUSH lineout
+   lineout = "//jobname JOB card,TIME=1439,CLASS=U"
+   PUSH lineout
+
+call term_control_card
+
+return /* from Generate_DMS_archives */
+
+/***********************************************************************
+* Generate Restore job stream
+*
+* This can be used to get all datasets recalled back on DASD
+***********************************************************************/
+
+Generate_RESTORE_JCL_cards:
+
+say "Executing: Generate_Restore-JCL-Cards"
+
+call init_control_card
+call generate_jobcard
+
+queue '//****************************************************'
+queue '//**   ACCESS A DATASET IN BATCH TO RECALL IT'
+queue '//****************************************************'
+queue '//RESTORE  PROC DSN='
+queue '//PDS      EXEC PGM=IEBGENER,COND=EVEN'
+queue '//SYSIN    DD DUMMY'
+queue '//SYSPRINT DD SYSOUT=*'
+queue '//SYSUDUMP DD SYSOUT=*'
+queue '//ABNLDUMP DD DUMMY'
+queue '//SYSUT1   DD DISP=SHR,DSN=&DSN'
+queue '//SYSUT2   DD DISP=(,DELETE),UNIT=SYSDA,SPACE=(CYL,10)'
+queue '// PEND'
+queue '//* --------------------------------------------------'
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   dsname = strip(dsname)
+
+   queue "//#"i" EXEC RESTORE,DSN='"dsname"'"
+   end
+
+call term_control_card
+
+return /* from Generate_RESTORE_JCL_cards */
+
+/***********************************************************************
+* Generate IEBCOPY with replace
+***********************************************************************/
+
+Generate_IEBCOPY_Replace:
+
+say "Executing: Generate_IEBCOPY_Replace"
+
+say " "
+say "Specify to volume or hit enter for 'bozo'"
+pull tovol
+if tovol = "" then tovol = "BOZO"
+
+call init_control_card
+call generate_jobcard
+
+n = 0
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   dsname = strip(dsname)
+   n = n + 1
+
+   queue "//*"
+   queue "//** Process library:" dsname
+   queue "//*"
+   queue "//CLR"n"  EXEC PGM=IKJEFT01,TIME=1439,DYNAMNBR=100,REGION=9M"
+   queue "//SYSUDUMP DD SYSOUT=*"
+   queue "//SYSTSPRT DD SYSOUT=*"
+   queue "//SYSTSIN  DD *"
+   queue " "cmd_pds" '"dsname"' VOLUME("tovol")"
+   queue "      DELETE  :"
+   queue "      COMPRESS SHR"
+   queue "      END"
+   queue "/*"
+   queue "//*"
+   queue "//COPY"n"  EXEC PGM=IEBCOPY,TIME=1439,REGION=9M"
+   queue "//VDSBYPAS DD DUMMY"
+   queue "//SYSPRINT DD SYSOUT=*"
+   queue "//IN1      DD DISP=SHR,DSN="dsname","
+   queue "//            UNIT=SYSALLDA,VOL=SER="volume
+   queue "//OUT1     DD DISP=SHR,DSN="dsname","
+   queue "//            UNIT=SYSALLDA,VOL=SER="tovol
+   queue "//SYSUDUMP DD SYSOUT=*"
+   queue "//SYSIN    DD *"
+   queue "  COPY INDD=((IN1,R),OUTDD=OUT1"
+   queue "/*"
+
+   end
+
+call term_control_card
+
+return /* from Generate_RESTORE_JCL_cards */
+
+/***********************************************************************
+* Show PDS directory information
+***********************************************************************/
+
+Show_directory_information:
+
+say "Directory information:"
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   fq_dsname = "'"strip(dsname)"'"
+   say "Processing dsn="fq_dsname
+
+   x = LISTDSI(fq_dsname)
+   if x <> 0 then do
+      say "> Could not find DSN:" fq_dsname
+      say "  > "sysmsglvl1
+      say "  > "sysmsglvl2
+      say "  > SYSREASON: "sysreason
+      iterate
+      end
+
+    if sysdsorg == "PO" then do
+       x = LISTDSI(fq_dsname "DIRECTORY") /* get directory bl   ks */
+       say   "> Directory used...."sysudirblk
+       say   "> Directory alloc..."sysadirblk
+       end
+    else say "> Skipping dataset, Not a PDS"
+   end /* of select */
+
+return /* from Show_Directory_information */
+
+/***********************************************************************
+* Invoke DSAT to show information on cataloged version of these datasets
+* The volume field is ignored
+*
+* In case the user wants the "DSAT" command generated for use elsewhere
+* (like to rerun in batch to get the output), we put the command out.
+***********************************************************************/
+
+Invoke_DSAT:
+
+address TSO "CLS"
+say "Showing Dataset information for cataloged versions:"
+
+call init_control_card
+jobinfo = "Invoke the DSAT command"
+call generate_jobcard
+queue '//DSATING EXEC PGM=IKJEFT01,TIME=1439,DYNAMNBR=100'
+queue '//SYSTSPRT DD SYSOUT=*'
+queue '//SYSTSIN  DD *'
+
+d = 0
+
+fdsn = ""
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   /* Here we try to get rid of a trailing comma.  This is goodnes
+      if we are processing sys1.parmlib(LPALSTxx) */
+   dsname = translate(dsname," ",",")
+
+   fdsn = fdsn ||" '"strip(dsname)"'"
+
+   d = d + 1
+   select
+     when d == 1 then queue " DSAT ('"strip(dsname)"' +"
+     when i == sysut1_file.0 then queue "       '"strip(dsname)"')"
+     otherwise
+        queue "       '"strip(dsname)"' +"
+        end
+
+   end
+
+call "OUTTRAP" "dsat.","*"
+address TSO "DSAT ("fdsn")"
+call "OUTTRAP" "OFF"
+
+queue '//'
+queue '//* Output from DSAT:'
+queue '//* '
+do i = 1 to dsat.0
+   queue left('//* 'dsat.i,71)
+   end
+
+call term_control_card
+
+return /* from Invoke_DSAT */
+
+/***********************************************************************
+* Write out volser
+***********************************************************************/
+
+Write_out_Volser:
+
+say "Writing out volser information:"
+
+call init_control_card
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   fq_dsname = "'"strip(dsname)"'"
+   say "Processing dsn="fq_dsname
+
+   x = LISTDSI(fq_dsname)
+   if x <> 0 then do
+      say "          > Could not find DSN:" fq_dsname
+      say "            > "sysmsglvl1
+      say "            > "sysmsglvl2
+      say "            > SYSREASON: "sysreason
+      sysvolume = "??????"
+      end
+   queue dsname sysvolume
+
+   end
+
+call term_control_card
+return /* from Write_out_Volser */
+
+/***********************************************************************
+* Generate DDNAMEs - good for use with the DA$PDSR utility
+***********************************************************************/
+
+Generate_DDNAMEs:
+
+say "Writing out //DDNAMEs:"
+
+call init_control_card
+
+n = 0
+jc = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volser .
+
+   dsname = translate(strip(dsname))
+   if volser == "" then comma = ""
+   else comma = ","
+
+   jc = jc + 1
+   if jc == 999 then do
+      queue '//*---> jobcard and new step jcl needed here'
+      jc = 0
+      n = 0
+      end
+
+   if n < 100 then ,
+      queue "//SYSLIB"right(n,2,'0')" DD DISP=SHR,DSN="dsname||comma
+   else queue "//SYSLI"right(n,3,'0')" DD DISP=SHR,DSN="dsname||comma
+   if comma <> "" then ,
+      queue "              UNIT=SYSALLDA,VOL=SER="volser
+
+   n = n + 1
+   end
+
+call term_control_card
+return /* from Generate_DDNAMEs */
+
+/***********************************************************************
+* Generate PROGxx style APFLST
+***********************************************************************/
+
+Generate_APFLST:
+
+say "Writing out new PROGxx APFLST"
+
+call init_control_card
+
+n = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   dsname = translate(strip(dsname))
+   volume = translate(strip(volume))
+
+   apfadd = "APF ADD DSNAME("dsname")"
+   queue left(apfadd,56)" VOLUME("volume")"
+
+   n = n + 1
+   end
+
+call term_control_card
+return /* from Generate_APFLST */
+
+/***********************************************************************
+* Generate XMIT commands or job
+***********************************************************************/
+Generate_XMIT_Commands:
+jcl = 0
+signal gxjStart
+
+Generate_XMIT_job:
+jcl = 1
+
+say "Executing: Generate_XMIT_Job"
+gxjStart:
+say " "
+
+say "Enter XMIT output dataset method"
+say "1 userid.SPFTEMP7.whatever (-1 first node) <-- Default"
+say "2 userid.SPFTEMP7.whatever (-2 first nodes)"
+say "3 userid.whatever"
+say "4 userid.B.whatever"
+say "5 SYS2.whatever"
+pull methodr
+methodr = strip(methodr)
+select
+   when methodr == ""  then method = "1"
+   when methodr == "1" then method = "1"
+   when methodr == "2" then method = "2"
+   when methodr == "3" then method = "3"
+   when methodr == "4" then method = "4"
+   when methodr == "5" then method = "5"
+   otherwise
+        say "Unrecognized method number, using option 1"
+        method = 1
+        end
+dlist.0 = 0
+
+call init_control_card
+if jcl = 1 then call generate_jobcard
+n = 0
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   dsname = strip(dsname)
+   n = n + 1
+
+   dsname = strip(dsname)
+   select
+     when method = "1" then do
+          ndsname = translate(dsname,' ','.')
+          ndsname = delword(ndsname,1,1)
+          ndsname = userid".SPFTEMP7."ndsname".XMI"
+          ndsname = translate(ndsname,'.',' ')
+          end
+     when method = "2" then do
+          ndsname = translate(dsname,' ','.')
+          ndsname = delword(ndsname,1,1)
+          ndsname = delword(ndsname,1,1)
+          ndsname = userid".SPFTEMP7."ndsname".XMI"
+          ndsname = translate(ndsname,'.',' ')
+          end
+     when method = "3" then do
+          ndsname = sysvar('sysuid')"."dsname".XMI"
+          j = dlist.0
+          j = j + 1
+          dlist.j = ndsname
+          dlist.0 = j
+          end
+     when method = "4" then do
+          ndsname = sysvar('sysuid')".B."dsname".XMI"
+          j = dlist.0
+          j = j + 1
+          dlist.j = ndsname
+          dlist.0 = j
+          end
+     when method = "5" then do
+          ndsname = "SYS2."dsname".XMI"
+          j = dlist.0
+          j = j + 1
+          dlist.j = ndsname
+          dlist.0 = j
+          end
+     otherwise
+          ndsname = "Internal.error.in.ispf34l.exec"
+          nop
+          end
+
+   if length(ndsname) > 43 then do
+      say "Warning: DSN generated over 44 characters:"
+      say "DSN="ndsname
+      end
+
+   if jcl = 1 then do
+      queue "//*"
+      queue "//** XMIT: "dsname
+      queue "//*"
+      queue "//XMIT#"n" EXEC PGM=IKJEFT01,"|| ,
+            "TIME=1439,DYNAMNBR=100,REGION=9M"
+      queue "//SYSUDUMP DD SYSOUT=*"
+      queue "//SYSTSPRT DD SYSOUT=*"
+      queue "//SYSTSIN  DD *"
+      queue " /* ==================================================" ,
+            "#" n "*/"
+
+      queue " DSAT '"dsname"'"
+      queue " "
+      end
+   queue " XMIT A.B DA('"dsname"') +"
+   queue "      OUTDATASET('"ndsname"')"
+   if length(ndsname) > 43 then do
+      g = "....+....1....+....2....+....3....+....4...."
+      queue " /* Fix via:      "g "*/"
+      end
+   if jcl = 1 then queue "/*"
+   end
+
+if jcl = 1 then ,
+   do j = 1 to dlist.0
+      queue "//* DELETE '"dlist.j"'"
+      end
+
+call term_control_card
+
+return /* from Generate_XMIT_job */
+
+/***********************************************************************
+* Do HLQ analysis
+***********************************************************************/
+
+Do_HLQ_Analysis:
+
+say "Executing: Do_HLQ_Analysis"
+say " "
+call init_control_card
+lasthlq = ""
+
+n = 0
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname .
+
+   dsname = strip(dsname)
+   n = n + 1
+
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+
+   hlq = word(ndsname,1)
+   if hlq <> lasthlq then do
+      queue hlq
+      lasthlq = hlq
+      end
+
+   end
+
+call term_control_card
+return /* from Do_HLQ_Analysis */
+
+
+/*---------------------------------------------------------------------
+ | FTP MS/DOS batch file
+ |
+ | On the PC, the syntax is "batchfile password"
+ | where "password" is the password for the userid
+ ------------------------------------------------------------------- */
+
+Generate_FTPGET:
+
+say "Writing out MS/DOS FTP GET batch file"
+
+ttype = ""
+say "Do you want a binary transfer? (Yes or No)"
+pull ttyper
+ttyper = translate(ttyper)
+select
+  when substr(ttyper,1,1) == "Y" then ttype = "binary"
+  when substr(ttyper,1,1) == "N" then ttype = "ascii"
+  otherwise
+       say "Response not Yes or No, assuming Binary"
+       ttype = "binary"
+       end
+
+mvsuser = sysvar('sysuid')
+say "Enter null to use userid="mvsuser" or enter userid"
+pull mvsuserr
+if strip(mvsuserr) <> "" then mvsuser = mvsuserr
+
+delwordr = 1
+say "How many nodes to delete at front of XMIT dataset?"
+say "> Null = 2"
+pull delwordr
+select
+   when delwordr = "1" then delword = 1
+   when delwordr = "2" then delword = 2
+   when delwordr = "3" then delword = 3
+   otherwise
+        say "Invalid node deletion value, terminating"
+        say "Using 2"
+        end
+
+ccl = "255"   /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+ccb = "32760" /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+ccf = "V B"   /* LRECL("ccl") BLKSIZE("ccb") RECFM("ccf")" */
+call init_control_card
+
+queue "@echo off"
+queue "echo open "sysvar('sysnode')">t"
+queue "echo user "mvsuser "%1>>t"
+queue "echo "ttype">>t"
+
+n = 0
+
+do i = 1 to sysut1_file.0
+   if sysut1_file.i == "" then iterate /* skip null lines */
+
+   parse value sysut1_file.i with dsname volume .
+
+   dsname = translate(strip(dsname))
+   dsname = strip(dsname)
+   ndsname = translate(dsname,' ','.')
+   do j = 1 to delword
+      ndsname = delword(ndsname,1,1)
+      end
+   ndsname = translate(ndsname,'.',' ')
+
+   queue "echo get '"dsname"' "ndsname">>t"
+
+   n = n + 1
+   end
+
+queue "echo quit>>t"
+queue "ftp -n -s:t"
+queue "del t"
+
+call term_control_card
+return /* from Generate_APFLST */
+
+/***********************************************************************
+* The end of ISPF34L exec
+***********************************************************************/
+
+/* | ---------EEEEEEEE---------NN-----NN---------DDDDDDD--------- |
+   | ---------EE---------------NNNN---NN---------DD----DD-------- |
+   | ---------EEEEE------------NN-NN--NN---------DD----DD-------- |
+   | ---------EE---------------NN---NNNN---------DD----DD-------- |
+   | ---------EEEEEEEE---------NN----NNN---------DDDDDDD--------- | */

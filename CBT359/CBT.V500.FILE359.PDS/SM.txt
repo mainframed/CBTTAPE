@@ -1,0 +1,338 @@
+SM       TITLE 'SESSION MANAGER SWITCH ROUTINE'
+***********************************************************************
+*                                                                     *
+*   MODULE NAME  =  SM                                                *
+*                                                                     *
+*   DESCRIPTIVE  =  THE SM COMMAND IS A TSO COMMAND TO TURN-OFF AND   *
+*                      SUBSEQUENTLY TURN-ON THE TSO SESSION MANAGER   *
+*                                                                     *
+*   COMMAND SYNTAX  =  SM  OFF/ON                                     *
+*                                                                     *
+*   CSECT NAME  =  SM                                                 *
+*                                                                     *
+*   COPYRIGHT  =  NONE                                                *
+*                                                                     *
+*   STATUS  =  MVS / SP 1.3                                           *
+*                                                                     *
+*   FUNCTION  =                                                       *
+*      TO PROVIDE A TSO COMMAND THAT WILL TEMPORARILY DISABLE (AND    *
+*      SUBSEQUENTLY RE-ENABLE) THE TSO SESSION MANAGER (NOTE -        *
+*      THIS COMMAND HAS NO EFFECT IF USED IN A TSO SESSION WHERE      *
+*      THE TSO SESSION MANAGER WAS NOT INITIALLY ACTIVE)              *
+*                                                                     *
+*      OPERATION  =                                                   *
+*         1.  ESTABLISH LOCAL ADDRESSIBILITY                          *
+*         2.  LOCATE THE ONLINE TSO PROTECTED-STEP-CONTROL-BLOCK      *
+*             (PSCB) AND EXIT (WITH A MESSAGE) IF NOT FOUND           *
+*         3.  TEST APF-AUTHORIZATION:                                 *
+*             3.1  IF AUTHORIZED, THEN PROCEED TO GET KEY 0           *
+*             3.2  IF NOT AUTHORIZED BUT EXECUTING FROM LPA, THEN     *
+*                  ISSUE SVC 235 TO GET APF-AUTHORIZATION AND         *
+*                  PROCEED TO GET KEY 0                               *
+*             3.3  IF NOT AUTHORIZED AND NOT EXECUTING FROM LPA,      *
+*                  THEN DISPLAY ERROR MESSAGE AND EXIT                *
+*         4.  GET KEY 0 USING MODESET MACRO                           *
+*         5.  LOCATE THE TSO TERMINAL-STATUS-BLOCK (TSB), THE TSO     *
+*             LOGON-WORK-AREA (LWA), THE TSO SESSION MANAGER MAIN     *
+*             WORK AREA (RDFBLOCK), AND THE SAVED RDFBLOCK PTR        *
+*             (LAST FOUR BYTES OF PSCB USER FIELD - PCSBU)            *
+*         6.  TEST THE ACTIVE ENVIRONMENT AND GO PERFORM ERROR EXIT   *
+*             PROCESSING IF THE TSO SESSION MANAGER IS NOT ACTIVE     *
+*             OR CAN NOT BE RESTORED                                  *
+*         7.  IF THE TSO SESSION MANAGER IS ACTIVE, THEN:             *
+*             7.1  RESET PSW KEY AND EXIT IF "SM ON" SPECIFIED        *
+*             7.2  PROCEED THROUGH THE STEPS NEEDED TO DISABLE THE    *
+*                  TSO SESSION MANAGER:                               *
+*                  7.2.1  STATUS-STOP THE SESSION MANAGER TCB         *
+*                  7.2.2  SET FLAGS SO THAT SESSION MANAGER THINKS    *
+*                         THAT A FULL-SCREEN COMMAND IS ACTIVE        *
+*                  7.2.3  SAVE RDFBLOCK PTR IN THE PSCBU+4 FIELD      *
+*                  7.2.4  ISSUE TPUT TO CLEAR THE TERMINAL SCREEN     *
+*                  7.2.5  RESET TERMINAL DISPLAY MANAGER OPTIONS      *
+*                         FLAGS IN THE TSB                            *
+*                  7.2.6  IF VTAM, DISABLE FULL-SCREEN MODE           *
+*                  7.2.7  RESET PSW KEY AND EXIT                      *
+*         8.  IF THE TSO SESSION MANAGER IS NOT ACTIVE, THEN:         *
+*             8.1  RESET PSW KEY AND EXIT IF "SM OFF" SPECIFIED       *
+*             8.2  PROCEED THROUGH THE STEPS NEEDED TO ENABLE THE     *
+*                  TSO SESSION MANAGER:                               *
+*                  8.2.1  ENABLE TERMINAL DISPLAY MANAGER OPTIONS     *
+*                         FLAGS IN THE TSB                            *
+*                  8.2.2  RESTORE RDFBLOCK PTR FROM THE PSCBU+4 FIELD *
+*                  8.2.3  STATUS-START THE SESSION MANAGER TCB        *
+*                  8.2.4  MODIFY TSB FLAGS SO THAT SESSION MANAGER    *
+*                         MAY RESUME TERMINAL DISPLAY CONTROL         *
+*                  8.2.5  IF VTAM, ENABLE FULL-SCREEN MODE            *
+*                  8.2.6  ISSUE TPUT TO CLEAR THE TERMINAL SCREEN     *
+*                  8.2.7  RESET PSW KEY AND EXIT                      *
+*                                                                     *
+*   MACROS USED  =                                                    *
+*        CVT                       SYSTEM CVT MAPPING DSECT           *
+*        EPILOG                    OXY RE-ENTRANT RESTORE SEQUENCE    *
+*        EXTRACT                   SYSTEM CONTROL-BLOCK LOCATOR       *
+*        FREEMAIN                  SYSTEM FREE MEMORY OPERATION       *
+*        GETMAIN                   SYSTEM GET MEMORY OPERATION        *
+*        IHAASCB                   SYSTEM ASCB MAPPING DSECT          *
+*        IHAASXB                   SYSTEM ASXB MAPPING DSECT          *
+*        IHAPSA                    SYSTEM PSA MAPPING DSECT           *
+*        IKJCPPL                   TSO CPPL MAPPING DSECT             *
+*        IKJPSCB                   TSO PSCB MAPPING DSECT             *
+*        IKJTSB                    TSO TSB MAPPING DSECT              *
+*        LWA                       EQUS FOR TSO LOGON-WORK-AREA       *
+*        MODESET                   SYSTEM PSW-KEY/PSW-MODE CONTROL    *
+*        PROLOG                    OXY RE-ENTRANT SAVE SEQUENCE       *
+*        RDFBLOCK                  EQUS FOR SESSION MGR RDFBLOCK AREA *
+*        STATUS                    SYSTEM TCB DISPATCH CONTROL        *
+*        STAX                      SYSTEM ATTENTION-EXIT CONTROL      *
+*        STFSMODE                  TSO SET-TERM OPTIONS OPERATION     *
+*        STTMPPMD                  TSO SET-TERM OPTIONS OPERATION     *
+*        TESTAUTH                  SYSTEM APF-AUTHORIZATION CHECKER   *
+*        TPUT                      TSO TERMINAL OUTPUT OPERATION      *
+*        XKJCBUF                   OXY TSO CMD BUFFER MAPPING DSECT   *
+*                                                                     *
+*   NOTES  =                                                          *
+*      REGISTER CONVENTIONS  =  STANDARD CONVENTIONS                  *
+*         REGISTERS 0 - 1    =  WORK REGISTERS                        *
+*         REGISTER  2        =  TEMPORARY PSCB/ASCB/CVT BASE REGISTER *
+*         REGISTER  3        =  TEMPORARY ASXB BASE REGISTER          *
+*         REGISTER  4        =  TSO LWA BASE REGISTER                 *
+*         REGISTER  5        =  TSO TSB BASE REGISTER                 *
+*         REGISTER  6        =  SESSION MANAGER RDFBLOCK BASE         *
+*         REGISTERS 7 - 9    =  UNUSED                                *
+*         REGISTER 10        =  ADDRESS OF PSCBU+4 LOCATION           *
+*         REGISTER 11        =  WORK/SAVE AREA BASE ADDRESS           *
+*         REGISTER 12        =  CSECT BASE ADDRESS                    *
+*         REGISTER 13        =  SAVE AREA BASE ADDRESS                *
+*         REGISTER 14        =  RETURN ADDRESS                        *
+*         REGISTER 15        =  ENTRY POINT ADDRESS REGISTER          *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+* UPDATED 21FEB85, WILLIAM SMITH, SYNTEX (USA), INC., PALO ALTO, CA.  *
+*                                                                     *
+* . SOURCE:  OCCIDENTAL PETROLEUM, HOUSTON, TX.; COURTESY OF SAM BASS *
+* . THIS CODE HAS BEEN TESTED AT THE 8409 PUT LEVEL OF MVS/SP 1.3.3   *
+*   JES2 WITH TSO/E RELEASE 2.0                                       *
+* . MODIFICATION HISTORY AND NOTES                                    *
+*   - AN IN-LINE DSECT FOR THE "LWA" (LOGON WORK AREA) HAS BEEN       *
+*     REPLACED WITH COMMENTS AND THE IBM MAPPING MACRO, "IKJEFLWA",   *
+*     HAS BEEN CODED IN ITS PLACE                                     *
+*   - WARNING:  IKJEFLWA IS *RESTRICTED* MATERIAL AND CANNOT BE       *
+*     DISTRIBUTED WITH THIS MODULE.  IKJEFLWA IS DISTRIBUTED ON THE   *
+*     OPTIONAL MATERIALS TAPE, FEATURE 7029 (1600 BPI) OR 7031 (6250  *
+*     BPI), VOL=SER=SYM-01, FILE 1 IN THE "AAPVT" (PRIVATE MACROS),   *
+*     FILE FOR FMID JBB1213.  IF YOU ARE NOT LICENSED FOR THE OPTION- *
+*     AL MATERIALS, SIMPLY REMOVE THE COMMENTS FROM THE IN-LINE LWA   *
+*     DSECT TO CREATE THE MAPPING DSECT FOR USE DURING ASSEMBLY.      *
+* . TO ELIMINATE NEED FOR THE AUTHORIZATION SVC, LINK SM AS AN APF    *
+*   AUTHORIZED COMMAND AND ADD THE COMMAND NAME TO THE IKJEFTE2 TSO   *
+*   AUTHORIZED COMMAND TABLE; THE SVC CALL SHOULD BE NO-OP'ED.        *
+* . IF SM IS EXECUTED FROM ISPF OPTION 4 OR 6 AND THE SM MODULE IS    *
+*   LOCATED IN THE PLPA, BE SURE TO UPDATE THE ISPF TABLE "ISPTCM" TO *
+*   ALLOW ISPF TO LOCATE THE MODULE; CONSULT THE ISPF INSTALLATION    *
+*   GUIDE FOR FURTHER DETAILS ON UPDATING THIS TABLE                  *
+*                                                                     *
+***********************************************************************
+SM       PROLOG (R14,R12),,SM_MVS/SP1.3,RENT=(R11,SMWORKA,SMWORKL), ....
+               TYPE=CSECT
+         L     R1,0(,R1)           GET CBUF ADDR
+         LH    R2,2(,R1)           GET OFFSET
+         LA    R2,4(R1,R2)         COMPUTE OPERAND ADDR
+         MVC   SMWOPRND,0(R2)      COPY OPERAND
+         OI    SMWONOFF,C' '       UPCASE OPERAND
+         MVC   SMWXTRCT(XTRACTL),XTRACT      INITIALIZE REMOTE PLIST
+         EXTRACT SMWPSCBA,,MF=(E,SMWXTRCT)   EXTRACT PSCB ADDRESS
+         L     R2,SMWPSCBA         GET PSCB ADDRESS
+         LA    R2,0(R2)            CLEAR HIGH-ORDER BYTE
+         LTR   R2,R2               IS PSCB ADDRESS VALID?
+         BZ    SMNOTSO               NO, GO PRINT NON-TSO MESSAGE
+         USING PSCB,R2               YES, USE IKJPSCB MAPPING
+         LA    R10,PSCBU+4         COMPUTE ADDRESS OF PSCB USER WORD
+         DROP  R2                  DROP PSCB
+         TESTAUTH FCTN=1,STATE=YES,RBLEVEL=1
+         LTR   R15,R15             CAN MODESET BE ISSUED?
+         BZ    SMKEY0                YES, GO ISSUE MODESET NOW
+         L     R2,CVTPTR             NO, GET CVT ADDRESS
+         USING CVT,R2              USE CVT MACRO MAPPING DSECT
+         SLR   R3,R3               ZERO REGISTER
+         ICM   R3,B'0111',CVTLPDIR GET LPA DIRECTORY ADDRESS
+         CR    R3,R12              IS "SM" MODULE IN LPA?
+         BNL   SMNOAPF               NO, GO PRINT NOT AUTH. MESSAGE
+         MVI   SMWFLAGS,SMWS235      YES, SET "SVC 235 USED" FLAG
+         STAX  DEFER=YES           DEFER ATTENTION INTERRUPTS
+         LA    R0,1                REQUEST AUTHORIZATION ON
+*        SVC   223                 SET AUTHORIZATION ON
+         DROP  R2                  DROP CVT
+SMKEY0   DS    0H
+         MODESET KEY=ZERO,MODE=SUP
+         USING PSA,R0              USE IHAPSA MAPPING
+         L     R2,PSAAOLD          GET ASCB ADDRESS
+         DROP  R0                  DROP PSA
+         USING ASCB,R2             USE IHAASCB MAPPING
+         L     R3,ASCBASXB         GET ASXB ADDRESS
+         USING ASXB,R3             USE IHAASXB MAPPING
+         L     R4,ASXBLWA          GET LOGON WORK AREA ADDRESS
+         DROP  R3                  DROP ASXB
+         L     R5,ASCBTSB          GET TSB ADDRESS
+         DROP  R2                  DROP ASCB
+         USING LWA,R4              USE LWA DSECT MAPPING
+         CLC   =C'   LWA  ',LWALWA DOES LWA CONTAIN A VALID ID?
+         BNE   SMERROR               NO, MUST BE ENVIRONMENTAL ERROR
+         USING TSB,R5              USE IKJTSB MAPPING
+         L     R6,LWAXXXX          GET SESSION MANAGER RDFBLOCK ADDR.
+         LA    R6,0(R6)            CLEAR HIGH-ORDER BYTE
+         LTR   R6,R6               IS RDFBLOCK ADDRESS VALID?
+         BZ    SMSWON                NO, GO SEE IF CAN BE RESTORED
+         CLC   =C'RDF ',RDFRDF(R6) DOES RDF CONTAIN A VALID ID?
+         BNE   SMSWON                NO, GO SEE IF RDF CAN BE RESTORED
+         TM    TSBFLG5,TSBATMP     IS SESSION MANAGER IN CONTROL?
+         BZ    SMSTART               NO, RE-START SESSION MANAGER
+         CLI   SMWONOFF,C'N'       WAS C'ON' SPECIFIED?
+         BE    SMRESET               YES, SKIP BECAUSE ALREADY ON
+         L     R7,RDFTCB(R6)       GET RDF TCB ADDRESS
+         STATUS STOP,TCB=(R7)      STOP SESSION MANAGER TASK
+         OI    RDFFLGS(R6),RDFFSCR INDICATE FULLSCREEN APPLICATION
+         ST    R6,0(R10)           SAVE RDFBLOCK ADDRESS INTO PSCB
+         MVC   LWAXXXX,=F'0'       ZERO RDFBLOCK ADDRESS
+         TPUT  CLEAR,CLEARL,FULLSCR     ERASE SCREEN
+         STTMPMD OFF,KEYS=NO       DISABLE SESSION MANAGER
+         TM    TSBFLG5,TSBVTAM     IS THIS A VTAM SESSION?
+         BZ    SMRESET               NO, GO RESET KEY AND EXIT
+         STFSMODE OFF                YES, FULLSCREEN PROTECT MODE OFF
+         B     SMRESET             GO RESET STORAGE KEY AND EXIT
+SMSWON   DS    0H
+         L     R6,0(R10)           GET SAVED RDFBLOCK ADDRESS
+         LA    R6,0(R6)            CLEAR HIGH-ORDER BYTE
+         LTR   R6,R6               WAS RDFBLOCK ADDRESS SAVED?
+         BZ    SMERROR               NO, CANNOT RESTORE SESSION MGR.
+         CLC   =C'RDF ',RDFRDF(R6) DOES RDF CONTAIN A VALID ID?
+         BNE   SMERROR               NO, CANNOT RESTORE SESSION MGR.
+         CLI   SMWONOFF,C'F'       WAS C'OFF' SPECIFIED?
+         BE    SMRESET               YES, SKIP BECAUSE ALREADY OFF
+         STTMPMD ON,KEYS=ALL         NO, ENABLE SESSION MANAGER
+         ST    R6,LWAXXXX          RESTORE RDFBLOCK ADDRESS
+         MVC   0(4,R10),=F'0'      ZERO PSCB USER WORD
+         L     R7,RDFTCB(R6)       GET RDF TCB ADDRESS
+         STATUS START,TCB=(R7)     START SESSION MANAGER TASK
+         B     SMRESET             GO RESET STORAGE KEY AND EXIT
+SMSTART  DS    0H
+         OI    TSBFLG5,TSBATMP+TSBKEYS  ENABLE SESSION MANAGER
+         NI    RDFFLG1(R6),X'FF'-(RDFFSCRA+RDFFSCRK)
+         TM    TSBFLG5,TSBVTAM          IS THIS A VTAM SESSION?
+         BZ    SMCLEAR                    NO, SKIP STFSMODE MACRO
+         STFSMODE ON,INITIAL=YES        ENABLE FULL SCREEN MODE
+SMCLEAR  TPUT  CLEAR,CLEARL,FULLSCR     ERASE SCREEN
+         B     SMRESET             GO RESET STORAGE KEY AND EXIT
+         DROP  R4,R5
+SMERROR  DS    0H
+         TPUT  ERROR,ERRORL        PRINT SM UNAVAILABLE MESSAGE
+SMRESET  DS    0H
+         MODESET KEY=NZERO,MODE=PROB
+         TM    SMWFLAGS,SMWS235    WAS SVC 235 WAS USED?
+         BZ    SMEPILOG              NO, GO EXIT
+         SLR   R0,R0                 YES, REQUEST AUTHORIZATION OFF
+*        SVC   223                 SET AUTHORIZATION OFF
+         STAX  DEFER=NO            ALLOW ATTENTION INTERRUPTS
+         B     SMEPILOG            GO EXIT
+SMNOTSO  DS    0H
+         TPUT  NOPSCB,NOPSCBL      PRINT NON-TSO SESSION MESSAGE
+         B     SMEPILOG            GO EXIT IF NOT A TSO SESSION
+SMNOAPF  DS    0H
+         TPUT  NOAUTH,NOAUTHL      PRINT NOT AUTHORIZED MESSAGE
+         B     SMEPILOG            GO EXIT IF NOT AUTHORIZED
+SMEPILOG EPILOG (14,12),RC=0,RENT=(R11,SMWORKL)
+         SPACE 2
+         LTORG
+         SPACE 2
+RDFRDF   EQU   X'00'               OFFSET WITHIN RDF OF RDF BLOCK ID
+RDFFLGS  EQU   X'90'               OFFSET WITHIN RDF OF RDFFLAG BYTE
+RDFSLEEP EQU   X'80'                 ADFMDF01 IS IN A WAIT
+RDFFSCR  EQU   X'40'                 TPUT FULLSCR BEING USED
+RDFWAITF EQU   X'20'                 ADFMDF01 TCB IS WAITING
+RDFLOCKF EQU   X'10'                 THE LOCAL LOCK IS HELD
+RDFTWAIT EQU   X'08'                 DO NOT ISSUE SYSEVENT TERMWAIT
+RDFTGET  EQU   X'04'                 OUTSTANDING TGET FLAG
+RDFEXIT  EQU   X'02'                 SESSION MANAGER IS TO QUIT
+RDFFSREF EQU   X'01'                 RETURNING TO FULL SCREEN MODE
+RDFFLG1  EQU   X'91'               OFFSET WITHIN RDF OF RDFFLG1 BYTE
+RDFTPUT  EQU   X'80'                 WINBLOCK(S) UPDATED BUT SCREEN
+*                                    * NOT YET UPDATED
+RDFTSOIN EQU   X'40'                 LINE TO THE TMP
+RDFMODAL EQU   X'20'                 MODE INDICATOR
+RDFFSCRA EQU   X'10'                 DO NOT INTERCEPT I/O
+RDFFSCRK EQU   X'08'                 LEAVE TSBKEYS=1 WHEN GOING TO
+*                                    * FULL SCREEN MODE FLAG
+RDFATTN  EQU   X'04'                 ATTN HAS BEEN ENTERED
+RDFTCB   EQU   X'94'               OFFSET WITHIN RDF OF SM. TCB ADDR.
+XTRACT   EXTRACT 0,'S',FIELDS=(PSB),MF=L
+XTRACTL  EQU   *-XTRACT
+CLEAR    DC    X'40115D7E1140401D4013' KEY STRING
+         DC    X'3CC76000'
+         DC    X'3C4F4000'
+         DC    X'3CD66000'
+         DC    X'3C404000'
+         DC    X'13'
+CLEARL   EQU   *-CLEAR
+ERROR    DC    C'SESSION MANAGER CAN NOT BE RESTORED OR IS UNAVAILABLE'
+ERRORL   EQU   *-ERROR
+NOPSCB   DC    C'UNABLE TO LOCATE TSO CONTROL BLOCKS'
+NOPSCBL  EQU   *-NOPSCB
+NOAUTH   DC    C'UNABLE TO OBTAIN MVS AUTHORIZATION'
+NOAUTHL  EQU   *-NOAUTH
+         EJECT
+SMWORKA  DSECT
+SMWSAVE  DS    18F                 REGISTER SAVE AREA
+SMWXTRCT DS    XL(XTRACTL)         REMOTE EXTRACT PARAMETER LIST
+SMWPSCBA DS    A                   PSCB ADDRESS
+SMWOPRND DS    0CL2                COMMAND OPERAND
+SMWFLAGS DS    XL1                 LOCAL ROUTINE FLAGS
+SMWS235  EQU   X'80'               SVC 235 USED FOR AUTHORIZATION
+SMWONOFF DS    CL1                 OPERAND BYTE
+SMWORKL  EQU   *-SMWORKA
+         EJECT
+*LWA     DSECT
+*********************************************************************
+*      THE LOGON WORK AREA WILL CONTAIN INFORMATION WHICH IS        *
+*      NECESSARY FOR THE LOGON/LOGOFF PROCESSING ROUTINES.  IT      *
+*      WILL CONTAIN CONTROL BLOCK POINTERS, ENTRANCE LISTS AND      *
+*      PARAMETER LISTS.                                             *
+*********************************************************************
+*LWAPPTR  DS    A
+*LWALWA   DC    CL8'   LWA  '         /*LWA CONTROL BLOCK ID      */
+*
+*         LWA AREA DELETED
+*
+*         ORG   LWA+X'94'
+*LWAXXXX  DS    A                     /*POINTER TO SESSION MANAGER*/
+*                                    /*RDFBLOCK AREA             */
+*
+*         ORG   LWA+X'9C'
+*LWATCB02 DS    A                     /*POINTER TO TCB FOR        */
+*                                    /*IKJEFT02                  */
+*
+*         ORG   LWA+X'A0'
+*LWAPIOWA DS    A                     /*POINTER TO I/O DCB        */
+*                                    /*WORK TABLES               */
+*         DS    F                     /*RESERVED                  */
+*         DS    F                     /*RESERVED                  */
+*
+*         DS    0D
+*LWALEN   EQU   *-LWA
+*         EJECT
+         PRINT NOGEN
+         CVT   DSECT=YES
+         SPACE 2
+         IHAPSA
+         SPACE 2
+         IHAASCB
+         SPACE 2
+         IHAASXB
+         SPACE 2
+         PRINT GEN
+         EJECT
+         IKJEFLWA
+         EJECT
+         IKJPSCB
+         EJECT
+         IKJTSB LIST=YES
+         END

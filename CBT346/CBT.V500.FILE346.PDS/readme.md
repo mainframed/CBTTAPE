@@ -1,0 +1,30 @@
+
+## $$DOC.txt
+```
+Bob Break's JES2 exits.
+
+
+    Here are some examples of Bob Break's JES2 exits.
+
+    The following exits are for JES2 6.0.4 (OS/390 Release 2.5):
+
+       HASPEX20,  HASPEX44,  HASP2604 -  Exits 20, 44, 2 respectively
+
+       HASP2520 is Exit 2 for JES2 5.2.0, and is provided, so you
+                can see how to convert an exit from JES2 5.2.0 to
+                JES2 6.0.4
+
+    Note $$EXIT44 points out a change that has to be made for
+       OS/390 Release 2.10.
+
+
+
+Bob Break                            Sam Golob
+St. Louis, Mo.                       P.O. Box 906
+cb7485@momail.sbc.com                Tallman, NY 10982-0906
+bbreak@swbell.net                    845-362-0190
+314-340-9301                         sbgolob@attglobal.net
+314-845-2018                         sbgolob@aol.com
+
+```
+

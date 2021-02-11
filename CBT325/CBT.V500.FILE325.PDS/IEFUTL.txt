@@ -1,0 +1,497 @@
+*
+*        This version queries an installation defined field in the ACF2
+*        logonid record to find the wait time for each user: TSOIDLE
+*
+*        It also resolves two logic problems encountered previously:
+*        1) The LU name was taken from the ACF2 in-storage record.
+*           Now the LU name is taken from the Terminal Status Block.
+*           ACF2 does not update the in-storage record during reconnect
+*           so some users were avoiding the disconnect by intentionally
+*           disconnecting and reconnecting from a different LU. Whoever
+*           happened to be on the original LU got disconnected when the
+*           wise-guy timed out.
+*        2) This code now calculates continuous elapsed time instead of
+*           only elapsed time occurances. Because SMF does not drive
+*           the exit when a wait time period ends before the time limit
+*           (user enters something), we were carrying the cumulative
+*           total instead of the current total. Now, if time of current
+*           entry minus time of last entry is greater than time limit
+*           (wait was not continuous), we reset the internal counter.
+*
+IEFUTL   TITLE 'WELLS FARGO BANK SMF TIME LIMIT EXIT'
+***********************************************************************
+         PRINT NOGEN                                                  *
+*             MODULE NAME:  IEFUTL                                    *
+*                                                                     *
+*             DESCRIPTIVE NAME:  WELLS FARGO BANK SMF TIME LIMIT EXIT *
+*                                                                     *
+*             STATUS:  MVS RELEASE XA2.1.5                            *
+*                                                                     *
+*             FUNCTION:                                               *
+*                                                                     *
+*              . VALIDATE ACF2 AUTHORIZATION (VIA LOGON RECORD)       *
+*                TO DIFFERENTIATE NORMAL TEST JOBS & USERS            *
+*                FROM 'PRIVILEGED' (I.E. SUBMITTOR HAS OPER AUTH.     *
+*                (TP01 LEVEL MODIFICATION)                            *
+*              . ALLOW TEST (Z) JOBS TO BE CANCELLED IF THE CPU       *
+*                TIME LIMIT IS EXCEEDED (UNLESS PRIVILEGED USER).     *
+*              . ALLOW TSO SESSIONS TO BE EXTENDED INDEFINETELY       *
+*                IF THE CPU TIME LIMIT IS EXCEEDED.                   *
+*              . ALLOW PRODUCTION & PRIVILEGED JOBS TO BE EXTENDED    *
+*                5 MINUTES 6 TIMES IF THE CPU TIME LIMIT              *
+*                IS EXCEEDED (I.E. 30  MINUTES)                       *
+*              . ALLOW TSO SESSIONS TO BE CANCELLED IF THE WAIT       *
+*                TIME LIMIT IS EXCEEDED. TOTAL AMOUNT OF WAIT TIME    *
+*                TAKEN FROM ACF2 RECORD (CN02 LEVEL MODIFICATION)     *
+*              . ALLOW TEST (Z) JOBS TO BE CANCELLED IF THE WAIT      *
+*                TIME LIMIT IS EXCEEDED (UNLESS PRIVILEGED USER).     *
+*              . ALLOW PRODUCTION & PRIEVLEDGED JOBS TO BE EXTENDED   *
+*                5 MINUTES UP TO 6 TIMES IF THE WAIT TIME LIMIT       *
+*                IS EXCEEDED (I.E. 3.5 HOURS).                        *
+*                                                                     *
+*             OPERATION:                                              *
+*              . ANALYZE SMF COMMON EXIT PARAMETER AREA.              *
+*              . CANCEL JOB IF WFB SMF PARAMETER LIST IS MISSING.     *
+*              . IF CPU TIME IS EXPIRED:                              *
+*                   EXTEND TIME BY 5 MINUTES IF TSO SESSION.          *
+*                   CANCEL JOB IMMEDIATELY IF Z JOB (NON-PRIVILEGED)  *
+*                   EXTEND TIME BY 5 MINUTES UP TO 6 TIMES FOR A      *
+*                      PRODUCTION OR PRIVILEGED Z JOB.                *
+*              . IF WAIT TIME IS EXPIRED:                             *
+*                   CONDITIONALLY TERMINATE SESSION IF NON-PRIVILEGED *
+*                   (I.E. NO OPER AUTHORITY) USER.                    *
+*                   EXTEND TIME BY SMF JWT UP TO ACF2 SPECIFIED       *
+*                   TIME, CONDITIONALLY TERMINATE IF WAIT PERSISTS.   *
+*                ** CONDITIONAL TERMINATION ALLOWS LOGON RECONNECT    *
+*                   CANCEL IF TEST (Z) JOB SUBMITTED BY NON-PRIVILEGED*
+*                   USER.                                             *
+*                   EXTEND TIME BY 30 MINUTES UP TO 6 TIMES IF A      *
+*                      PRODUCTION OR PRIVILEGED JOB.                  *
+*              . NUMBER OF TIMES IEFUTL IS ENTERED FOR WAIT AND CPU   *
+*                TIME IS LOGGED IN THE WFB SMF PARAMETER LIST. IT     *
+*                IS POINTED TO BY SMFUSER IN THE COMMON SMF PARAMETER *
+*                LIST (THE JMR - JOB MANAGEMENT RECORD).              *
+*                                                                     *
+*             DEPENDENCIES:  CHARACTER SET IS EBCDIC.  REASSEMBLE     *
+*                IF A DIFFERENT CHARACTER SET IS NEEDED.              *
+*                                                                     *
+*             RESTRICTIONS:  NONE                                     *
+*                                                                     *
+*             REGISTER CONVENTIONS:  STANDARD CONVENTIONS.            *
+*                   R0  - PARM/WORK REGISTER                          *
+*                   R1  - PARM/WORK REGISTER                          *
+*                   R2  - IEFUTL ENTRY TYPE INDICATOR                 *
+*                       - TEMP RETURN CODE REGISTER                   *
+*                   R3  - TEMP TIME EXTENSION IN SECONDS              *
+*                   R4  - ACF2 ACCVT & SVC34 AREA                     *
+*                   R5  - ACF2 ACUCB & LIDREC, & AUTHORIZATION CODE   *
+*                   R6  - R7  WORK REGS                               *
+*                   R8  - POINTER TO SVC34 MESSAGE AREA               *
+*                   R9  - POINTER TO WFB SMFLIST                      *
+*                   R10 - POINTER TO GETMAINED WTO AREA               *
+*                   R11 - POINTER TO COMMON EXIT PARAMETER AREA       *
+*                   R12 - BASE REGISTER                               *
+*                   R13 - UNUSED (REMAINS CALLERS SAVE AREA PTR)      *
+*                   R14 - RETURN REGISTER                             *
+*                   R15 - RETURN CODE REGISTER                        *
+*                                                                     *
+*             PATCH LABEL: NO PATCH AREA PROVIDED                     *
+*                                                                     *
+*             MODULE TYPE:  PROCEDURE                                 *
+*                                                                     *
+*                PROCESSOR:  ASM                                      *
+*                                                                     *
+*                MODULE SIZE:  600 BYTES                              *
+*                                                                     *
+*                ATTRIBUTES:  SCHEDULER KEY 0, REENTRANT,             *
+*                   SUPERVISOR STATE, ENABLED                         *
+*                                                                     *
+*             ENTRY POINTS:  IEFUTL (ONLY ENTRY POINT)                *
+*                                                                     *
+*             LINKAGE:  FROM INITIATOR VIA MODULE IEATLEXT            *
+*                                                                     *
+*             INPUT:  REGISTER 0 HAS REASON FOR ENTRY CODE            *
+*                       0 - JOB CPU TIME EXCEEDED                     *
+*                       4 - STEP CPU TIME EXCEEDED                    *
+*                       8 - JOB WAIT TIME EXCEEDED                    *
+*                     REGISTER 1 POINTS TO A LIST OF FULL WORDS       *
+*                     THE FIRST OF WHICH POINTS TO THE SMF COMMON     *
+*                     EXIT PARAMETER AREA MAPPED BY SMFCEPA DSECT     *
+*                                                                     *
+*             EXIT - NORMAL:  AT PROGRAM END VIA BRANCH REGISTER 14   *
+*                                                                     *
+*             OUTPUT: REGISTER 1 TIME LIMIT EXTENSION IN SECS (IF ANY)*
+*                     REGISTER 15 HAS EXIT CODE                       *
+*                       0 - CANCEL JOB                                *
+*                       8 - EXTEND TIME BY VALUE IN REGISTER 1        *
+*                     WFB SMFLIST HAS UPDATED EXTENTION COUNT         *
+*                                                                     *
+*             EXIT - ERROR:  NONE                                     *
+*                                                                     *
+*             EXTERNAL REFERENCES:  NONE                              *
+*                                                                     *
+*             CONTROL BLOCKS: NONE                                    *
+*                                                                     *
+*             TABLES:  NONE                                           *
+*                                                                     *
+*             MACROS & SVC'S: SAVE, GETMAIN, FREEMAIN, TPUT, WTO      *
+*                                                                     *
+*             CHANGE ACTIVITY:                                        *
+*             12/01/86 NIELSEN  OBTAIN LU FROM TSB AND TIME LIMIT FROM*
+*                               ACF2 RECORD                    (CN01) *
+*             02/11/87 NIELSEN  ADD TIME STAMP TO DISCONNECT MSG(CN02)*
+*                                                                     *
+*             MESSAGES: SEE CONSTANTS AREA                            *
+*                                                                     *
+*             ABEND CODES:  NONE                                      *
+*                                                                     *
+***********************************************************************
+         EJECT
+*
+*   E  Q  U  A  T  E  S
+*
+D0       EQU   0              USED FOR OFFSET OF ZERO
+D12      EQU   12             USED FOR OFFSET OF TWELVE
+D28      EQU   28             USED FOR OFFSET OF TWENTY EIGHT
+WTOSVC   EQU   35             WRITE TO OPERATOR SVC
+WTOAREAL EQU   144            LENGTH OF GETMAIN FOR WTO WORK AREA
+*
+*  R  E  G  I  S  T  E  R     E  Q  U  A  T  E  S
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         EJECT
+IEFUTL   CSECT
+         SAVE  (14,12),,IEFUTL.MVS.&SYSTIME_&SYSDATE SAVE REGISTERS
+         LR    R12,R15                 LOAD REGISTER 12 FROM 15
+         USING IEFUTL,R12              ESTABLISH ADDRESSABILITY
+         LR    R2,R0                   SAVE ENTRY TYPE INDICATOR
+         L     R11,D0(R1)              LOAD POINTER TO PARAMETER AREA
+         USING SMFEPLA,R11             ESTABLISH ADDRESSABILITY TO SMF
+*                                      PARAMETER AREA DSECT
+*
+*  GET AREA FOR MESSAGES FOR REENTRANTABILITY
+*
+         GETMAIN R,LV=WTOAREAL,SP=241  GET STORAGE FOR WTO WORK AREA
+         LR    R10,R1                  SAVE ADDRESS OF WTO WORK AREA
+         GETMAIN R,LV=SVC34GM,SP=241   GET SVC34 BUFFER AREA      TP01
+         LR    R8,R1                   USE R8 FOR SVC34 WORKAREA  TP01
+         USING SVC34,R8                MAP SVC34 PARM AREA      TP01
+         XC    SVC34L(4),SVC34L        CLEAR LENGTH AREA        CN02
+         LA    R1,SVC34GM              SET UP SVC34 PARM LIST     TP01
+         STH   R1,SVC34L               PLUG IN MESSAGE LENGTH     TP01
+         MVC   SVC34M,TERMMSG          COPY VTAM TERM MSG TO LIST TP01
+*
+*  INSURE WFB SMFLIST IS PRESENT
+*
+         L     R9,SMFUSER              GET WFB SMFLIST ADDR
+         LA    R9,0(R9)                CLEAR HIGH ORDER BYTE
+         LTR   R9,R9                   IS THERE AN ADDR?
+         BP    WFBSMFOK                YES - CONTINUE
+         USING SMFLIST,R9              ADDR WFB SMFLIST
+         MVC   0(ERRMSGL,R10),ERRMSG   MOVE ERROR MESSAGE TO WORK AREA
+         LR    R1,R10                  POINT TO MESSAGE
+         SVC   WTOSVC                  LET THE OPERATOR KNOW
+         B     CANCEL                  DO NOT CONTINUE
+         EJECT
+WFBSMFOK DS    0H
+         TIME  STCK,SMFWORKD           GET TOD CLOCK READING      CN02
+         L     R6,SMFWORKD             LOAD INTO WORK REG         CN02
+         SLL   R6,1                    STRIP SIGN                 CN02
+         SRL   R6,1                    REALIGN STAMP              CN02
+         L     R3,16                   POINT TO CVT               CN02
+         L     R7,196(R3)              POINT TO SMCA              CN02
+         L     R3,8(R7)                LOAD JWT FROM SMF BLOCK    CN02
+         ST    R3,SMFWTIME             SAVE IN WORK AREA          CN02
+         SPACE 2
+*--------------------------------------------------------------------*
+*        VALIDATE SUBMITTORS ACF2 AUTHORITY.  OBTAIN LOGON ID RECORD *
+*              VIA ACF2 CONTROL BLOCK CHASE AND SET REGISTER 5 TO    *
+*              1 IF SUBMITTOR HAS OPER  AUTHORITY, 0 IF NOT.         *
+*                                                                    *
+*--------------------------------------------------------------------*
+         USING ACCVT,R4                REQUIRED FOR CB CHASE    TP01
+         LA    R5,1                    SET AUTH IN CASE NO ACF2 TP01
+         ACFGACVT R4,                  GET ACCVT ADDR IN R4     TP01   X
+               NONE=NOTAUTH             ACF2 ISN'T UP...        TP01
+         XR    R5,R5                   RESET TO NOT AUTH IF ACF2TP01
+         ACFGUCB R4,                   GET ACF2 UCB ADDR IN R4  TP01   X
+               NONE=NOTAUTH,           DEFAULT TO NO OPER       TP01   X
+               INLINE=YES,             NO EXTERNAL CALL         TP01   X
+               SYS=AOS2                GENERATE MVS CODE ONLY   TP01
+         DROP  R4                                               TP01
+         USING ACUCB,R4                MAP THE ACF2 UCB         TP01
+         L     R3,X'224'               POINT TO ASCB            CN02
+         L     R7,X'3C'(R3)            POINT TO TSB             CN02
+         USING TSB,R7                  ESTABLISH ADDRESSABILITY CN02
+         MVC   SVC34LU,TSBTRMID        VTAM LU NAME INTO SVC34  CN02
+         DROP  R7                                               CN02
+         L     R4,ACULRECP             POINT TO LOGON ID RECORD TP01
+         DROP  R4                                               TP01
+         USING LIDREC,R4               MAP THE LOGON ID RECORD  TP01
+         MVC   SMFWORKH(1),LIDTSIDL    HOLD WAIT TIME ALLOWANCE CN02
+         TM    LIDTFLG3,LIDT3OPR       SUBMITTOR HAVE ACF OPER ?TP01
+         BNO   NOTAUTH                   NOPE                   TP01
+         LA    R5,1                      ELSE SET AUTHORIZED FLGTP01
+         DROP  R4
+NOTAUTH  DS    0H
+         SPACE 2
+*
+*  EVALUATE REGISTER 0 = 0 - JOB CPU TIME EXCEEDED
+*                      = 4 - STEP CPU TIME EXCEEDED
+*                      = 8 - JOB WAIT TIME EXCEEDED
+*
+         C     R2,FULL4                SEE IF JOB/STEP TIME EXCEEDED
+         BH    WAITTIME                NO.....GO DO ANALYSIS FOR WAIT
+         EJECT
+*
+*  PROCESS CPU TIME LIMIT EXCEEDED
+*
+         MVC   0(TIMEMSGL,R10),TIMEMSG MOVE MESSAGE LIST TO WORK AREA
+         TM    SMFOPT,SMFTSO           SEE IF TSO SESSION
+         BNO   PCPU                    NO.....MUST BE BACKGROUND JOB
+         LTR   R5,R5                   AUTHORIZED USER ?          TP01
+         BNZ   CPUEXTND                 YES, EXTEND W/O TPUT      TP01
+         TPUT  TSOMSG1,L'TSOMSG1       PUT OUT MESSAGE TO USER    TP01
+         B     CPUEXTND                 SKIP THE WTO              TP01
+PCPU     DS    0H
+         MVC   TIMENAME(8,R10),SMFJOBN MOVE JOBNAME TO MESSAGE
+         MVC   TIMETYPE(4,R10),=C' CPU' INDICATE CPU TIME EXCEEDED
+         LR    R1,R10                  POINT TO MESSAGE
+         SVC   WTOSVC                  LET THE OPERATOR KNOW
+         CLI   SMFJOBN,C'Z'   IS THIS A TEST JOB?
+         BNE   NOCANCEL                NO, DON'T CANCEL IT.       TP01
+         LTR   R5,R5                   AUTHORIZED USER (R5 =1 )?  TP01
+         BZ    CANCEL                   NOT AUTH, SO CANCEL JOB   TP01
+NOCANCEL DS    0H                                                 TP01
+         SLR   R1,R1          CLEAR WORK REGISTER
+         IC    R1,SMFCPUE     GET CURRENT NUMBER OF CPU EXTENSIONS.
+         LA    R1,1(R1)       UPDATE NUMBER OF CPU TIME EXTENSIONS.
+         STC   R1,SMFCPUE     SAVE IN WFB SMF PARMLIST.
+         C     R1,SIX         HAVE WE EXTENDED THIS JOB 6 TIMES?
+         BH    CANCEL         YES - GO CANCEL IT.
+CPUEXTND DS    0H
+         LA    R2,8           SET RETURN CODE TO 8.
+         LA    R3,60*5        EXTEND CPU TIME FOR 5 MINUTES
+         B     RETURN         GO RETURN TO CALLER
+         EJECT
+*
+*  PROCESS WAIT TIME LIMIT EXCEEDED
+*
+WAITTIME DS    0H
+         SLR   R3,R3          CLEAR THE TIME EXTENSION REGISTER
+         MVC   0(TIMEMSGL,R10),TIMEMSG MOVE MESSAGE TO WORK AREA
+         TM    SMFOPT,SMFTSO  IS THIS A TIME SHARING USER
+         BNO   PWAIT          NO - GO PROCESS BACKGROUND JOBS
+         CLC   SMFLSTMP(4),F0 PREVIOUS TIME STAMP IN RECORD?      CN02
+         BE    WCLEAR         NO, FIRST TIME OUT                  CN02
+         L     R3,SMFWTIME    GET SMF JWT                         CN02
+         LA    R3,240(R3)     BUMP BY 4 MINUTES FOR COMPARE       CN02
+         SR    R3,R6          SUBTRACT TIME STAMP                 CN02
+         A     R3,SMFLSTMP    ADD PREVIOUS TIME STAMP             CN02
+         BP    TSMOVE         YES, CONTINUOUS TIMEOUT             CN02
+WCLEAR   MVI   SMFWAITE,X'00' NO, NEW TIMEOUT, CLR XTNSION COUNT  CN02
+TSMOVE   EQU    *                                                 CN02
+         ST    R6,SMFLSTMP    STORE CURRENT TIME STAMP            CN02
+         XR    R3,R3          CLEAR WORK REG                      CN02
+         L     R6,SMFWTIME    MULTIPLY BY SMF TIME LIMIT          CN02
+         SRDA  R6,32          SHIFT FOR MULTIPLY                  CN02
+**********************************************************************
+*  THE SMF WAIT TIME VALUE IS STORED IN UNITS OF 2**20 MICROSECONDS  *
+*  OR 1.048576 SECONDS. IN ORDER TO CONVERT THE VALUE TO SECONDS FOR *
+*  TIME LIMIT COMPARISONS AND WAIT TIME EXTENSIONS THE SMF VALUE IS  *
+*  MULTIPLIED BY 1.05. FOR EXAMPLE 15 MINUTES (900 SECONDS) WOULD BE *
+*  STORED AS 858 IN THE SMF JWT FIELD. MULTIPLYING 858 BY 1.05       *
+*  CONVERTS THIS VALUE BACK TO AN AMOUNT CLOSELY AND USUALLY EXACTLY *
+*  MATCHING THE NUMBER OF SECONDS (IN THIS CASE 900).                *
+**********************************************************************
+         M     R6,F105        MULTIPLY BY 105                     CN02
+         D     R6,F100        DIVIDE BY 100 TO CONVERT TO SECONDS CN02
+         ST    R7,SMFWTIME    STORE VALUE FOR NEXT INCREMENT IF NEEDED
+         IC    R3,SMFWAITE    INSERT EXTENSION COUNTER            CN02
+         LA    R3,1(R3)       ADD 1 FOR CALCULATIONS              CN02
+         STC   R3,SMFWAITE    STORE INCREMENTED COUNTER           CN02
+         MR    R6,R3          CALCULATE ELAPSED TIME              CN02
+         ST    R7,SMFELAP     STORE TOTAL                         CN02
+         XR    R6,R6          CLEAR WORK REG                      CN02
+         CLI   SMFWORKH,X'5A' GREATER THAN 90 MINUTE JWT          CN02
+         BNH   ICREG          NO, DO REGULAR INSERT CHAR          CN02
+         LA    R6,90          YES, LIMIT JWT TO 90 MINUTES        CN02
+         B     SHIFT          BRANCH AROUND IC                    CN02
+ICREG    IC    R6,SMFWORKH    INSERT ACF WAIT TIME INTO REG       CN02
+SHIFT    SRDA  R6,32          SHIFT FOR MULTIPLY                  CN02
+         M     R6,F60         CONVERT TO SECONDS                  CN02
+         C     R7,SMFELAP     ACF VALUE > ELAPSED TIME            CN02
+         BH    WTEXTND        YES, GRANT EXTENSION                CN02
+         MVC   0(65,R10),TSOMSG3    MOVE TPUT MSG TO WORK AREA    CN02
+         TIME  DEC                                                CN02
+         SRL   R0,4           SHIFT OFF HUNDRETHS DIGIT           CN02
+         ST    R0,SMFWORKD    STORE TIME                          CN02
+         OI    SMFWORKD+3,X'0F' REPLACE TENTHS DIGIT WITH SIGN    CN02
+*                               THUS CREATING PACKE FORMAT        CN02
+         MVC   55(10,R10),TMSK      MOVE EDIT MASK TO TPUT AREA   CN02
+         ED    55(10,R10),SMFWORKD      EDIT TIME INTO TPUT AREA  CN02
+         TPUT  (R10),L'TSOMSG3 TELL USER WHAT'S HAPPENING         CN02
+         B     CANCEL         NO, CANCEL                          CN02
+PWAIT    DS    0H
+         CLI   SMFJOBN,C'Z'            IS THIS A TEST JOB ?      TP01
+         BNE   JOBWAIT                 NO, DON'T CANCEL          TP01
+         LTR   R5,R5                   AUTHORIZED SUBMITTOR ?    TP01
+         BZ    CANCEL                    NOT A CHANCE, WASTE IT. TP01
+*        B     JOBWAIT                 PRIVILEDED BATCH JOB      TP01
+JOBWAIT  DS    0H
+         SLR   R1,R1          CLEAR WORK REGISTER
+         IC    R1,SMFWAITE    GET SMFWAITE COUNT
+         LA    R1,1(R1)       UP COUNT BY 1
+         STC   R1,SMFWAITE    SAVE IN WFB'S SMF RECORD
+         C     R1,SIX         HAVE WE EXTENDED THIS JOB 6 TIMES?
+         BH    CANCEL         YES - GO CANCEL IT.
+WTEXTND  DS    0H
+         LA    R2,8           SET THE RETURN CODE TO 8 (EXTEND JOB)
+         L     R3,SMFWTIME    EXTEND WAIT TIME BY 1 INCREMENT     CN02
+         B     RETURN         AND RETURN TO CALLER
+         EJECT
+*
+*  PROCESSING FOR JOB CANCELLATION
+*
+CANCEL   DS    0H
+         TM    SMFOPT,SMFTSO  IS THIS A TIME SHARING USER
+         BNO   NOTTSU         NO - CONTINUE
+         MVC   0(DISCMSGL,R10),DISCMSG     COPY DISCONNECT MSG    TP01
+         MVC   DISCNAME(8,R10),SMFJOBN     PLUG IN USERID         TP01
+         LR    R1,R10                      POINT TO MSG.          TP01
+         SVC   WTOSVC                      ISSUE SVC              TP01
+         LTR   R9,R9                   IS SMFLIST PRESENT ?       TP01
+         BNP   NOTTSU                  NO, ALLOW CANCEL TO STAND  TP01
+         XR    R0,R0                   CLEAR R0 (SET CONSOLE ID)  TP01
+         LR    R1,R8                   POINT TO SVC34 PARM LIST   TP01
+         SVC   34
+         LA    R2,8                    SET EXTEND RETURN CODE     TP01
+         L     R3,SMFWTIME              & EXTEND FOR JWT          CN02
+         LA    R3,60(R3)                + 1 MINUTE                CN02
+         B     RETURN                   (I.E. RESET JWT FOR AFTER TP01
+*                                       LOGON REONNECT).          TP01
+NOTTSU   DS    0H
+         MVC   0(CANMSGL,R10),CANMSG  MOVE MESSAGE TO WORK AREA
+         MVC   CANNAME(8,R10),SMFJOBN INDICATE JOBNAME
+         LR    R1,R10         POINT TO MESSAGE
+         SVC   WTOSVC         TELL THE OPERATOR
+         SLR   R2,R2          0 INDICATES CANCEL JOB/TSU
+*
+*        NORMAL END PROCESSING
+*
+RETURN   DS    0H
+         FREEMAIN R,LV=WTOAREAL,A=(R10),SP=241
+         FREEMAIN R,LV=SVC34GM,A=(R8),SP=241
+         L     R14,D12(,R13)           LOAD ADDRESS FOR RETURN
+         LR    R15,R2                  SET THE RETURN CODE
+         LR    R1,R3                   SET THE EXTENSION (IF ANY)
+         LM    R2,R12,D28(R13)         RESTORE REGISTERS 2 TO 12
+         BR    R14                     RETURN TO CALLER
+         EJECT
+*
+*  C O N S T A N T S   A N D   M E S S A G E S
+*
+FULL4    DC    F'4'
+SIX      DC    F'6'
+F0       DC    F'0'
+F60      DC    F'60'
+F100     DC    F'100'
+F105     DC    F'105'
+         SPACE 2
+TMSK     DC    XL10'402120204B20204B2020'
+TSOMSG1  DC    C'IEFUTL - CPU TIME EXPIRED, TSO SESSION EXTENDED'
+TSOMSG2  DC    C'IEFUTL - WAIT TIME EXPIRED, TSO SESSION EXTENDED'
+TSOMSG3  DC    C'IEFUTL - WAIT TIME EXPIRED, TSO SESSION DISCONNECTED AX
+               T  HH.MM.SS'
+TERMMSG  DC    C'V NET,TERM,NOTIFY=NO,TYPE=COND,SLU=XXXXXXXX'
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        ROUTCDE=2 WAS USED SO THAT ENQ RET=TEST WAS UNNECESSARY      *
+*        ENQ RET=TEST IS NECESSARY FOR ROUTCDE=11 (WTP) WHETHER       *
+*           OR NOT THAT ROUTING OCCURS BY DEFAULT                     *
+*        WTP CAUSES AN ENQ OF THE FOLLOWING FORM:                     *
+*           MAJORNAME: SYSSJWTP                                       *
+*           MINORNAME: RPL + ASID (LENGTH OF 6)                       *
+*              RPL IS THE 4 BYTE REQUEST PARAMETER LIST POINTER       *
+*                 LOCATED AT OFFSET JSCBSMLR (X'128') IN THE JSCB     *
+*              ASID IS THE 2 BYTE ADDRESS SPACE IDENTIFIER            *
+*                 LOCATED AT OFFSET ASCBASID (X'24') IN THE ASCB      *
+*                                                                     *
+***********************************************************************
+         SPACE
+ERRMSG   WTO   'IEFUTL - WFB SMFLIST MISSING',ROUTCDE=(2,9),DESC=6,MF=L
+ERRMSGL  EQU   *-ERRMSG
+         SPACE
+TIMEMSG  WTO   'IEFUTL - JOB JOBNAMEX WAIT TIME EXPIRED',              X
+               ROUTCDE=(2,9),DESC=(6),MF=L
+TIMEJOB  EQU   13              OFFSET TO JOB/TSU FIELD
+TIMENAME EQU   17              OFFSET TO JOBNAME FIELD
+TIMETYPE EQU   26              OFFSET TO WAIT/CPU FIELD
+TIMEMSGL EQU   *-TIMEMSG
+         SPACE
+CANMSG   WTO   'IEFUTL - JOB JOBNAMEX CANCELLED',                      X
+               ROUTCDE=(2,9),DESC=(6),MF=L
+CANJOB   EQU   13              OFFSET TO JOB/TSU FIELD
+CANNAME  EQU   17              OFFSET TO JOBNAME FIELD
+CANMSGL  EQU   *-CANMSG
+         SPACE
+DISCMSG  WTO   'IEFUTL - TSU JOBNAMEX DISCONNECTED AT HH.MM.SS',       X
+               ROUTCDE=(2,9),DESC=(6),MF=L
+DISCNAME EQU   17              OFFSET TO JOBNAME FIELD
+DISCMSGL EQU   *-DISCMSG
+         SPACE
+         LTORG
+         EJECT
+*
+*  D S E C T S   (M A P P I N G   M A C R O S)
+*
+SMFEPLA  DSECT
+SMFJOBN  DS    CL8
+SMFTIME  DS    CL4
+SMFDATE  DS    CL4
+SMFSID   DS    CL4
+SMFUSID  DS    CL8
+SMFSTEP  DS    CL1
+SMFOPT   DS    CL1
+SMFTSO   EQU   X'01'
+SMFVS1   DS    CL1
+SMFRESV  DS    CL1
+SMFUSER  DS    CL4
+         ORG   SMFUSER
+SMFUSERC DS    CL1
+SMFUSERW DS    CL1
+         ORG
+         SPACE 3
+SMFDSECT SMFLIST
+         SPACE 3
+SVC34    DSECT                         PARM LIST FOR SVC34
+SVC34L   DS    F                       LENGTH (INCLUDING LLBB)
+SVC34M   DS    C'V NET,TERM,NOTIFY=NO,TYPE=COND,SLU=XXXXXXXX'
+         ORG   *-8
+SVC34LU  DS    CL8                     TARGET LU NAME
+SVC34GM  EQU   *-SVC34
+         SPACE 3
+         ACCVT                         ACF2 CVT MAP
+         ACFASVT                       ACF2 SUBSYSTEM VECTOR TABLE
+         IHAPSA                        MVS: PREFIX AREA
+         IHAASCB                       MVS: ASCB
+         IKJTSB                        VTAM: TSB
+         ACUCB                         ACF2 USER CONTROL BLOCK
+         LIDREC                        ACF2 LOGON ID RECORD
+         END   IEFUTL

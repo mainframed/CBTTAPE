@@ -1,0 +1,1053 @@
+ENQM     TITLE 'STARTED TASK ENQ CONTENTION MONITOR'
+         PRINT NOGEN
+*---------------------------------------------------------------------*
+*---     NAME: ENQMON                                              ---*
+*---                                                               ---*
+*---     PURPOSE: DISPLAY AND LOG DATASET CONTENTION PROBLEMS.     ---*
+*---                                                               ---*
+*---     METHOD: EACH MINUTE, USE GQSCAN TO LOCATE ANY DATASET     ---*
+*---           CONTENTION SITUATIONS.  USE THE INFORMATION RETURNED---*
+*---           BY GRS TO DISPLAY, ON CONSOLES AND SYSLOG, THE      ---*
+*---           DSNAME INVOLVED, THE HOLDERS, AND REQUESTORS.       ---*
+*---           IF THE HOLDER(S) ARE TSU USER(S), THEN THIS TASK    ---*
+*---           DOES TPUT TO ASK THE TSO USER TO FREE THE DATA SET  ---*
+*---           IN CONTENTION.  THE CONSOLE MESSAGES WILL BE        ---*
+*---           REPEATED EVERY MINUTE (AFTER THE PREVIOUS ONES      ---*
+*---           HAVE BEEN DELETED - (DOM'ED)).  THESE MESSAGES DO   ---*
+*---           INDICATE HOW LONG THE WAIT HAS BEEN.                ---*
+*---                                                               ---*
+*---           ALSO, THE JOB WAITING FOR THE DATA SET WILL RECEIVE ---*
+*---           MESSAGES (IN THE JOB LOG) INDICATING THE WAIT.      ---*
+*---           THESE MESSAGES HAVE THE EXACT SAME CONTENT AS THE   ---*
+*---           CONSOLE MESSAGES.                                   ---*
+*---                                                               ---*
+*---     PARAMETERS: NONE                                          ---*
+*---                                                               ---*
+*---     DD STATEMENTS REQUIRED: NONE                              ---*
+*---                                                               ---*
+*---     TERMINATION: THIS PROGRAM WILL ACCEPT A MVS STOP COMMAND  ---*
+*---           AS A SIGNAL TO SHUTDOWN.  ACTUAL SHUTDOWN MAY TAKE  ---*
+*---           UP TO ONE MINUTE.                                   ---*
+*---                                                               ---*
+*---     PROGRAM ATTRIBUTES: AMODE-31, RMODE-24, NOT-RENT, APF AUTH---*
+*---           APF AUTH IS REQUIRED TO ISSUE THE IEFSSREQ MACRO    ---*
+*---           TO OBTAIN THE JOBID OF A JOB, AND ALSO TO MAKE A    ---*
+*---           'WTO' A TRUE HILITE.  THE COMMAND USED TO LOG       ---*
+*---           A MESSAGE IN THE BATCH JOB ('$DM') ALSO REQUIRES    ---*
+*---           APF AUTHORIZATION.                                  ---*
+*---                                                               ---*
+*---     AUTHOR - VINH VU - 06/01/99                               ---*
+*---           I TOOK THE A PROGRAM FROM THE CBT TAPE AND MADE     ---*
+*---           'HEAVY' MODIFICATIONS TO IT TO DO EVERYTHING        ---*
+*---           I SAID IT WOULD DO ABOVE.  THE ORGINAL PROGRAM      ---*
+*---           DOES THE GSCAN AND PUT OUT JUST THE WTOS DISPLAYING ---*
+*---           ENQ HOLDERS/WAITERS (NON-HILITE) EVERY MINUTE.      ---*
+*---                                                               ---*
+*---     REGISTER USAGE:                                           ---*
+*---                                                               ---*
+*---           R2  - WORK                                          ---*
+*---           R3  - RIBE BASE                                     ---*
+*---           R4  - WORK - USED AS COUNTER                        ---*
+*---           R5  - BASE FOR THE OWNER'S LIST                     ---*
+*---           R6  - BASE FOR THE WAITER'S LIST                    ---*
+*---           R7  - WORK (AVAIL)                                  ---*
+*---           R8  - OWNERS COUNT                                  ---*
+*---           R9  - WAITERS COUNT                                 ---*
+*---           R10 - RIB BASE                                      ---*
+*---           R11 - 2ND CODE BASE                                 ---*
+*---           R12 - 1ST CODE BASE                                 ---*
+*---           R13 - STORAGE BASE (GETMAIN'ED)                     ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+*
+OWN_LST  EQU   5                   REG 5
+WAIT_LST EQU   6                   REG 6
+*
+ENQMON   CSECT
+ENQMON   AMODE 31
+ENQMON   RMODE 24
+*
+         SET   (R12,R11),LV=WKLENG,DSECT=WKAREA
+*---------------------------------------------------------------------*
+*---     1. SET UP CIB INTERFACE FOR STOP COMMAND.                 ---*
+*---------------------------------------------------------------------*
+         LA    R2,COMMPTR          POINT TO RETURN AREA
+         EXTRACT (2),FIELDS=COMM
+         L     R2,COMMPTR          LOAD THE COMMAREA POINTER
+         USING COM,R2              AND BASE THE DSECT
+         ICM   R3,15,COMCIBPT      LOAD CIB POINTER
+         BZ    NOCIB               NONE TO FREE ---
+         LA    R4,COMCIBPT         POINT TO CIB START ADDRESS
+         QEDIT ORIGIN=(4),BLOCK=(3)    RELEASE 'START' CIB
+*
+NOCIB    EQU   *
+         QEDIT ORIGIN=(4),CIBCTR=1
+         DROP  R2
+*---------------------------------------------------------------------*
+*---     2. GRAB STORAGE FOR GQSCAN RETURN AREA AND BASE ITS       ---*
+*---        DSECT(S)                                               ---*
+*---------------------------------------------------------------------*
+         L     R2,GQSCSIZE         LOAD SIZE
+         GETMAIN RC,LV=(2),SP=POOL6,BNDRY=PAGE,LOC=ANY
+         LR    R4,R1               COPY STORAGE ADDRESS
+         ST    R1,GQAREA           AND SAVE FOR LATER
+         LR    R5,R2               COPY AREA SIZE
+         LA    R6,0                SOURCE ADDRESS OF ZERO
+         LA    R7,0                AND LENGTH OF ZERO
+         MVCL  R4,R6               CLEAR IT OUT...
+*
+         GETMAIN RU,SP=POOL10,LV=OWN_GM,LOC=ANY     BUILD OWNERS LIST
+         ST    R1,@OWNERS          SAVE ADDRESS TO THE OWNERS LIST
+*
+         GETMAIN RU,SP=POOL11,LV=WAIT_GM,LOC=ANY    BUILD WAITERS LIST
+         ST    R1,@WAITERS         SAVE ADDRESS TO THE WAITERS LIST
+*
+         GETMAIN RU,SP=POOL12,LV=STAT_GM,LOC=ANY    BUILD SSCS STORAGE
+         ST    R1,SSCSPTR          SAVE ADDRESS TO THE SSCS POINTER
+*
+         L     R14,CVTPTR          FIND THE CVT
+         MVC   OWNSYS,CVTSNAME-CVTMAP(R14)    SAVE MY OWN SYS-ID
+*
+         XC    ANCHOR,ANCHOR       CLEAR OUT THE 1ST LL IN THE CHAIN
+         XC    TOKEN,TOKEN         START THE TOKEN (WTO) WITH ZEROS
+*
+INIT_IT  EQU   *
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG0),MSG0       I AM READY
+         MVC   WTOLENG,=AL2(L'MSG0)
+         XR    R0,R0
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2),TOKEN=BEGTOKEN
+*
+*---------------------------------------------------------------------*
+*---     5. ISSUE GQSCAN FOR SYSDSN CONTENTION                     ---*
+*---------------------------------------------------------------------*
+*
+RESCAN   EQU   *
+         BAL   R14,CLEARLL         RESET ALL FLAGS FOR THE LINKLIST
+         BAL   R14,DOMLL           DELETE ALL OLD HILITED WTO'S
+         L     R9,GQAREA           GET THE AREA POINTER BACK
+         L     R3,GQSCSIZE         LOAD AREA SIZE
+         GQSCAN AREA=((R9),(R3)),SCOPE=ALL,REQLIM=MAX,                 X
+               WAITCNT=1,XSYS=NO,RESNAME=QNAME
+         ST    R1,RIBSLEFT         SAVE RIB COUNT
+         CH    R15,=H'4'           ANY CONTENTION ??
+         BE    NOWAIT              NOPE; RELEASE CHAINS
+         BL    PARSEIT             SOMEONE IS WAITING; CHECK IT OUT
+*
+BADSCAN  EQU   *
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG901),MSG901   I AM TERMINATING
+         MVC   WTOLENG,=AL2(L'MSG901)
+         XR    R0,R0
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2)
+         ABEND 999,DUMP
+*
+BAD_JES2 EQU   *
+*
+         DOM   TOKEN=BEGTOKEN      UN-HILITE THE 'READY' MESSAGE 1ST
+*
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG900),MSG900   I AM SUSPENDING FOR 5 MINUTES
+         MVC   WTOLENG,=AL2(L'MSG900)
+         XR    R0,R0
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2),TOKEN=BEGTOKEN
+*
+         STIMER WAIT,BINTVL=FIVEMIN
+         BAL   R14,INCR_TME        INCREASE ALL WAIT TIME (+5 MIN)
+*
+         DOM   TOKEN=BEGTOKEN      UN-HILITE THE 'SUSPEND' MSG
+*
+         B     INIT_IT             AND BACK AGAIN ---
+*
+*
+*---------------------------------------------------------------------*
+*---     NOBODY WAITING FOR DATASETS. RELEASE ANY CHAINS WE HAVE   ---*
+*---           AND GO WAIT FOR ANOTHER MINUTE.                     ---*
+*---------------------------------------------------------------------*
+*
+NOWAIT   EQU   *
+         BAL   R14,FREELL          DO FREEMAIN ON UNUSED LL
+*                                  BEFORE GOING BACK TO WAIT AND
+*                                  DO MORE SCAN
+         L     R2,COMMPTR          LOAD COMM AREA POINTER
+         USING COM,R2
+         ICM   R3,15,COMCIBPT      IS THERE A CIB ??
+         BZ    WAITMORE            NOPE ---
+         USING CIB,R3              YES; MAP IT
+         CLI   CIBVERB,CIBSTOP     STOP COMMAND ??
+         BE    ENDITALL
+         LA    R4,COMCIBPT         POINT TO ORIGIN
+         QEDIT ORIGIN=(R4),BLOCK=(R3)
+         DROP  R2,R3               DISCARD MAPS
+*
+WAITMORE EQU   *
+         STIMER WAIT,BINTVL=MINUTE
+         B     RESCAN              AND SCAN AGAIN ---
+*
+MINUTE   DC    A(60*100)           ONE MINUTE WAIT INTERVAL
+FIVEMIN  DC    A(60*100*5)         FIVE MINUTE WAIT INTERVAL
+*
+*---------------------------------------------------------------------*
+*---     A STOP COMMAND WAS ISSUED.  I JUST NEED TO CLEAN UP AND   ---*
+*---     GO AWAY.                                                  ---*
+*---------------------------------------------------------------------*
+*
+ENDITALL EQU   *
+*
+         BAL   R14,DOMLL           DELETE ALL OLD HILITED WTO'S
+         DOM   TOKEN=BEGTOKEN
+*
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG999),MSG999   I AM TERMINATING
+         MVC   WTOLENG,=AL2(L'MSG999)
+         XR    R0,R0
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2)
+*
+         FREEMAIN RC,SP=POOL6
+         FREEMAIN RC,SP=POOL7
+         FREEMAIN RC,SP=POOL10
+         FREEMAIN RC,SP=POOL11
+         FREEMAIN RC,SP=POOL12
+         EXIT
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     PARSE THE RIB RETURNED BY GQSCAN                          ---*
+*---                                                               ---*
+*---     R3  - BASE FOR THE RIBE                                   ---*
+*---     R10 - BASE FOR THE RIB                                    ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+*
+PARSEIT  EQU   *
+         L     R10,GQAREA          COPY AREA POINTER FOR LATER
+         USING RIB,R10             AND BASE ITS DSECT
+*
+NEWRIB   EQU   *
+         ST    R1,RIBSLEFT         SAVE UPDATED RIB COUNT
+         LA    R3,RIBEND           POINT TO START OF RIBVAR
+         AH    R3,RIBVLEN          ADD VARIABLE AREA LENGTH
+         USING RIBE,R3             AND BASE ANOTHER DSECT
+         L     R4,RIBNRIBE         LOAD RIBE COUNT
+*
+         L     OWN_LST,@OWNERS     POINT TO OWNERS' LIST
+         L     WAIT_LST,@WAITERS   POINT TO WAITERS' LIST
+*
+         XC    OWN_CNT,OWN_CNT     NO OWNERS YET
+         XC    WAIT_CNT,WAIT_CNT   NO WAITERS YET
+*
+LOOPRIBE EQU   *
+*---------------------------------------------------------------------*
+*---     FIND THE OWNERS AND WAITERS FIRST                         ---*
+*---                                                               ---*
+*---           R4 - COUNTERS USED TO PROCESS # OF RIBE'S           ---*
+*---           R5 (OWN_LST) POINTS TO LIST OF OWNERS               ---*
+*---           R6 (WAIT_LST) POINTS TO LIST OF WAITERS             ---*
+*---                                                               ---*
+*---     HERE, WE JUST FILL OUT THE TWO TABLES (OWNERS AND         ---*
+*---     WAITERS) FROM THE RIBE'S.  WE'RE STILL PROCESSING THIS    ---*
+*---     ONE RIB (FOR A DATASET IN CONTENTION).                    ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+         TM    RIBESFLG,RIBESTAT   WAITING FOR RESOURCE ??
+         BZ    RES_WAIT            YES ---
+         MVC   0(16,OWN_LST),RIBEJBNM    COPY JOB/SYSTEM NAMES
+         MVC   16(1,OWN_LST),RIBERFLG    COPY REQUEST FLAGS
+         MVC   17(2,OWN_LST),RIBEASID    SAVE THE OWNER ASID
+         LA    OWN_LST,OWN_LNG(,OWN_LST)      POINT TO NEXT SLOT
+         L     R15,OWN_CNT         GET 'OWNERS' COUNT BACK
+         LA    R15,1(,R15)         INCREMENT COUNTER BY ONE
+         ST    R15,OWN_CNT          AND SAVE IT BACK
+         C     R15,=AL4(MAXLIMIT)  IS THERE TOO MUCH  ????
+         BH    ALLRIBES            YEAH - THEN DON'T PROCESS MORE
+         B     NEXTRIBE            AND CONTINUE TO NEXT RIBE
+*
+RES_WAIT EQU   *
+         MVC   0(16,WAIT_LST),RIBEJBNM    COPY JOB/SYSTEM NAMES
+         MVC   16(1,WAIT_LST),RIBERFLG    COPY REQUEST FLAGS
+         MVC   17(2,WAIT_LST),RIBEASID    SAVE THE WAITER ASID
+         MVC   JOBID,RIBEJBNM      SAVE JOB NAME
+*
+         BAL   R14,JOB_SRC         NOW - FIND THE JOBID TO DO $DM LATER
+         CLC   JOBID,=8C'?'        IS JES2 RUNNING OK ??
+         BE    BAD_JES2            NOPE - THEN I NEED TO WAIT 5 MINUTES
+*
+         MVC   19(8,WAIT_LST),JOBID       SAVE THE FOUND JES2_JOBID
+*
+         LA    WAIT_LST,WAIT_LNG(,WAIT_LST)     POINT TO NEXT SLOT
+         L     R15,WAIT_CNT        GET 'WAITERS' COUNT BACK
+         LA    R15,1(,R15)         INCREMENT COUNTER BY ONE
+         ST    R15,WAIT_CNT           AND SAVE IT BACK
+         C     R15,=AL4(MAXLIMIT)  IS THERE TOO MUCH  ????
+         BH    ALLRIBES            YEAH - THEN DON'T PROCESS MORE
+*
+NEXTRIBE EQU   *
+         LA    R3,RIBEEND          POINT TO NEXT RIBE
+         BCT   R4,LOOPRIBE         AND CONTINUE ---
+*
+ALLRIBES EQU   *
+         ICM   R15,15,OWN_CNT      ANY OWNERS ??
+         BZ    NOMORE              NOP - (SHOULDN'T BE) - BUT HECK
+         ICM   R15,15,WAIT_CNT     ANY WAITERS ??
+         BZ    NOMORE              NOP - (SHOULDN'T BE) - BUT HECK
+*---------------------------------------------------------------------*
+*---                                                               ---*
+*---     HERE, I'VE GOT ALL 'OWNERS' AND 'WAITERS' FOR ONE         ---*
+*---     DATA SET LOADED IN TWO DIFFERENT TABLES.  NOW, GO         ---*
+*---     PROCESS THEM.                                             ---*
+*---                                                               ---*
+*---     START BUILDING/SPITING MESSAGES                           ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+*
+         LA    R15,RIBEND          POINT TO RIB VARIABLE AREA
+         USING RIBVAR,R15
+         XR    R1,R1               CLEAR OUT CONTENTS FOR IC LATER
+         IC    R1,RIBRNMLN         LOAD LENGTH OF THE RNAME
+         ST    R1,DSNLENG          SAVE THIS LENG FOR LATER USAGE
+         BCTR  R1,R0
+         MVI   DSNAME,C' '
+         MVC   DSNAME+1(L'DSNAME-1),DSNAME
+         EX    R1,RIBM             MOVE DSNAME TO MESSAGE
+         B     GOTDSN
+*
+RIBM     MVC   DSNAME(1),RIBRNAME COPY THE DSNAME
+         DROP  R15
+*
+GOTDSN   EQU   *
+         BAL   R14,DO_TPUT         SEND TSO MESSAGES WHEN APPROPRIATE
+         BAL   R14,DO_WTOS         NOW GO THROUGH AND ISSUE
+*                                  WTO'S AS NEEDED
+*
+*---------------------------------------------------------------------*
+*---     I'VE PROCESSED ALL ENTRIES BELONGING TO ONE ENQ'ED DSN    ---*
+*---     READY TO GO BACK FOR ANOTHER DATASET IN CONTENTION        ---*
+*---------------------------------------------------------------------*
+NOMORE   EQU   *
+         LR    R10,R3              START A NEW RIBE
+         L     R1,RIBSLEFT         GET NUMBER OF RIBS LEFT
+         BCT   R1,NEWRIB           PROCESS NEXT RIB, IF ANY
+*
+         B     NOWAIT              AND LOOP ---
+*
+         EJECT
+*---------------------------------------------------------------------*
+*---     GO THROUGH ALL 'OWNERS' ENTRIES AND ISSUE TPUT'S WHEN     ---*
+*---     APPROPRIATE.                                              ---*
+*---                                                               ---*
+*---           R5 (OWN_LST) POINTS TO LIST OF OWNERS               ---*
+*---           R6 (WAIT_LST) POINTS TO LIST OF WAITERS             ---*
+*---                                                               ---*
+*---           R8 - OWNERS COUNT                                   ---*
+*---           R9 - WAITERS COUNT                                  ---*
+*---                                                               ---*
+*---     HERE, I'M JUST LOOKING AT ONE DSN IN CONTENTION.          ---*
+*---     WE'RE JUST TRYING TO DO TPUT TO ALL HOLDERS OF THIS       ---*
+*---     DATA SET.                                                 ---*
+*---------------------------------------------------------------------*
+*
+DO_TPUT  EQU   *
+         ST    R14,TP_R14          SAVE RETURNED ADDRESS
+         L     OWN_LST,@OWNERS     GET ADDRESS OF THE 'OWNERS' TAB
+         L     WAIT_LST,@WAITERS   GET ADDRESS OF THE 'WAITERS' TAB
+         L     R8,OWN_CNT          RELOAD THE 'OWNERS' COUNT
+*
+TP_BYOWN EQU   *
+         CLC   OWNSYS,8(OWN_LST)   IS THE OWNER LOCAL ??
+         BNE   TP_NXOWN            NOPE - GO TO NEXT  'OWNER'
+*
+         MVC   JOBASID,17(OWN_LST)
+         LOCASCB ASID=JOBASID      GET ASCB OF OWNER
+         LTR   R15,R15             ASCB WAS FOUND ?
+         BNZ   TP_NXOWN            NOP - THEN GO TO NEXT 'OWNER'
+*
+         L     R1,ASCBOUCB-ASCB(,R1)      YES, GET OUCB OF OWNER
+         TM    OUCBYFL-OUCB(R1),OUCBLOG   LOGON CREATED USER?
+         BZ    TP_NXOWN            NO, THEN GO TO NEXT 'OWNER'
+*
+         L     R9,WAIT_CNT         RELOAD THE 'WAITERS' COUNT
+*
+TP_1WAIT EQU   *
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG100),MSG100
+         MVC   BUFFER+22(8),0(WAIT_LST)      GET JOBNAME
+         MVC   BUFFER+L'MSG100(8),8(WAIT_LST) GET SYSID
+         MVC   BUFFER+37(4),=CL4'EXCL'       START OUT WITH 'EXCL'
+         TM    16(WAIT_LST),X'80'  TEST FOR 'EXCL'
+         BNO   TP_1STLN            IF SO - THEN GO TPUT
+         MVC   BUFFER+37(4),=CL4'SHR '       ELSE - MAKE IT 'SHR '
+*
+TP_1STLN EQU   *
+*
+         LA    R1,BUFFER
+         LA    R0,L'BUFFER
+         TPUT  (R1),L'BUFFER,ASIDLOC=JOBASID
+*
+TP_BYPAS EQU   *
+         LA    WAIT_LST,WAIT_LNG(,WAIT_LST)     POINT TO NEXT SLOT
+         BCT   R9,TP_1WAIT         CHECK FOR EVERY 'WAITER'
+*
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG101),MSG101
+         MVC   BUFFER+L'MSG101(44),DSNAME
+         MVC   BUFFER+15(4),=CL4'EXCL'       START OUT WITH 'EXCL'
+         TM    16(OWN_LST),X'80'   TEST FOR 'EXCL'
+         BNO   TP_OWNLN            IF SO - THEN GO TPUT
+         MVC   BUFFER+15(4),=CL4'SHR '       ELSE - MAKE IT 'SHR '
+*
+TP_OWNLN EQU   *
+         LA    R1,BUFFER
+         LA    R0,L'BUFFER
+         TPUT  (R1),L'BUFFER,ASIDLOC=JOBASID
+*
+TP_NXOWN EQU   *
+         LA    OWN_LST,OWN_LNG(,OWN_LST)     POINT TO NEXT SLOT
+         BCT   R8,TP_BYOWN         PROCESS ALL OWNERS
+*
+TPUT_ALL EQU   *
+         L     R14,TP_R14          RELOAD RETURNED ADDRESS
+         BR    R14                 AND BACK TO THE CALLER
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     GO THROUGH THE LINKLIST AND RESET ALL ENTRIES             ---*
+*---------------------------------------------------------------------*
+CLEARLL  EQU   *
+         LA    R4,ANCHOR           GET THE HEAD OF THE CHAIN
+         USING LNKLST,R4
+         B     CLLSKIP             GO RIGHT BY THE FIRST (DUMMY) LL
+*
+CLLLOOP  EQU   *
+         OI    LLFLAG,LLCLEAR      TURN ON 'START-OF-CYCLE' FLAG
+*
+CLLSKIP  EQU   *
+         ICM   R4,15,LLNEXT        AND GO TO NEXT ENTRY
+         BNZ   CLLLOOP
+*
+CLLEXIT  EQU   *
+         DROP  R4
+         BR    R14                 BACK TO CALLER
+*
+*
+*---------------------------------------------------------------------*
+*---     GO THROUGH THE LINKLIST AND FREE UNUSED LL ENTRIES        ---*
+*---------------------------------------------------------------------*
+FREELL   EQU   *
+         ST    R14,FLLR14          SAVE RETURNED ADDRESS
+         USING LNKLST,R4
+         LA    R4,ANCHOR           GET THE HEAD OF THE CHAIN
+         B     FRLBYPAS            GO RIGHT BY THE FIRST (DUMMY) LL
+*
+FRLLOOP  EQU   *
+         TM    LLFLAG,LLCLEAR      DO I NEED TO FREE THIS LL ??
+         BZ    FRLBYPAS            NOP - THEN GO AROUND
+         MVC   SAVENEXT,LLNEXT     SAVE THE NEXT LL POINTER
+*
+FRLNORM  EQU   *
+         FREEMAIN RU,SP=POOL7,LV=LLLENG,A=(R4)
+         ICM   R4,15,LASTLL        USE THE LASTLL AGAIN
+         MVC   LLNEXT,SAVENEXT     RESET THE NEXT LL POINTER
+*
+FRLBYPAS EQU   *
+         ST    R4,LASTLL           SAVE THE LAST LL PROCESSED
+         ICM   R4,15,LLNEXT        GET NEXT ENTRY
+         BNZ   FRLLOOP
+*
+FRLEXIT  EQU   *
+         DROP  R4
+         L     R14,FLLR14          RELOAD RETURNED ADDRESS
+         BR    R14                 BACK TO CALLER
+*
+*---------------------------------------------------------------------*
+*---     GO THROUGH THE LINKLIST AND 'DOM' ALL PREVIOUS 'WTOS'     ---*
+*---------------------------------------------------------------------*
+DOMLL    EQU   *
+         ST    R14,DOMR14          SAVE RETURNED ADDRESS
+         LA    R4,ANCHOR           GET THE HEAD OF THE CHAIN
+         USING LNKLST,R4
+         B     DOMSKIP             GO RIGHT BY THE FIRST DUMMY LL
+*
+DOMLOOP  EQU   *
+         CLC   OWNSYS,LLSYSID      IS THIS A LOCAL JOB ??
+         BNE   DOMSKIP             NOPE - THEN NO NEED TO 'DOM'
+         DOM   TOKEN=LLTOKEN
+*
+DOMSKIP  EQU   *
+         ICM   R4,15,LLNEXT        AND GO TO NEXT ENTRY
+         BNZ   DOMLOOP
+*
+DOMEXIT  EQU   *
+         DROP  R4
+         L     R14,DOMR14          RELOAD RETURNED ADDRESS
+         BR    R14                 BACK TO CALLER
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     GO THROUGH THE LINKLIST AND INCREASE ALL WAIT TIME BY     ---*
+*---     5.  I JUST WENT THROUGH A 5 MIN SUSPENSION DUE TO JES2    ---*
+*---     PROBLEM.                                                  ---*
+*---------------------------------------------------------------------*
+*
+INCR_TME EQU   *
+         LA    R4,ANCHOR           GET THE HEAD OF THE CHAIN
+         USING LNKLST,R4
+         B     INC_SKIP            GO RIGHT BY THE FIRST (DUMMY) LL
+*
+INC_LOOP EQU   *
+         L     R1,LLWAIT           GET THE 'WAIT' TIME IN MINUTE
+         LA    R1,5(,R1)           ADD '5 MORE MIN' TO IT
+         ST    R1,LLWAIT           AND STORE IT RIGHT BACK
+*
+INC_SKIP EQU   *
+         ICM   R4,15,LLNEXT        AND GO TO NEXT ENTRY
+         BNZ   INC_LOOP
+*
+INC_EXIT EQU   *
+         DROP  R4
+         BR    R14                 BACK TO CALLER
+         EJECT
+*
+*
+*---------------------------------------------------------------------*
+*---           R5 (OWN_LST) POINTS TO LIST OF OWNERS               ---*
+*---           R6 (WAIT_LST) POINTS TO LIST OF WAITERS             ---*
+*---           R8 - OWNERS COUNT                                   ---*
+*---           R9 - WAITERS COUNT                                  ---*
+*---------------------------------------------------------------------*
+*
+DO_WTOS  EQU   *
+         ST    R14,WTOR14          SAVE RETURNED ADDRESS
+*
+         L     WAIT_LST,@WAITERS   POINT TO LIST OF WAITERS
+         L     R9,WAIT_CNT
+*
+DO_1WAIT EQU   *
+         CLC   19(8,WAIT_LST),=8C'_'     IS THIS A 'GONE GONE' JOB ?
+         BE    DO_NOWTO            YEAH - THEN DON'T DO 'WTO' OR '$DM'
+         BAL   R14,PROCWAIT        PROCESS THIS WAITER
+*
+DO_NOWTO EQU   *
+         LA    WAIT_LST,WAIT_LNG(,WAIT_LST)     POINT TO NEXT SLOT
+         BCT   R9,DO_1WAIT         AND CONTINUE ---
+*
+         L     OWN_LST,@OWNERS     POINT TO LIST OF OWNERS
+         L     R8,OWN_CNT
+*
+DO_1OWN  EQU   *
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   WTOLENG,=AL2(L'BUFFER)
+         MVC   BUFFER(L'MSG201),MSG201
+         MVC   BUFFER+10(8),0(OWN_LST)      GET HOLDING JOBNAME
+         MVC   BUFFER+22(8),8(OWN_LST)      GET HOLDING SYSID
+         MVC   BUFFER+L'MSG201(44),DSNAME   GET DSNAME IN CONTENTION
+         MVC   BUFFER+37(4),=CL4'EXCL'      START OUT WITH 'EXCL'
+         TM    16(OWN_LST),X'80'   TEST FOR 'EXCL'
+         BNO   DO_NXOWN            IF SO - THEN GO WTO
+         MVC   BUFFER+37(4),=CL4'SHR '       ELSE - MAKE IT 'SHR '
+*
+DO_NXOWN EQU   *
+         XR    R0,R0
+         WTO   TEXT=WTOLENG
+         LA    OWN_LST,OWN_LNG(,OWN_LST)     POINT TO NEXT SLOT
+         BCT   R8,DO_1OWN          AND CONTINUE ---
+*
+WTOEXIT  EQU   *
+         L     R14,WTOR14          RELOAD RETURNED ADDRESS
+         BR    R14                 BACK TO CALLER
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     WAIT_LST POINTS TO THE 'WAITERS' TABLE ENTRY              ---*
+*---                                                               ---*
+*---     HERE, I NEED TO GO THROUGH AND SEARCH THE LINKLIST FOR    ---*
+*---     MATCHING ONWER,DSNAME,ASID AND SYSID.  IF FOUND, THEN     ---*
+*---     INCREASE WAITING TIME (IN MIN), RESET FLAG SO THE ENTRY   ---*
+*---     STORAGE WON'T BE FREE'ED AND THEN DO 'WTO' WITH TOKEN     ---*
+*---     (SAVED IN THE LINKLIST ENTRY SO 'DOM' CAN BE DONE LATER). ---*
+*---                                                               ---*
+*---     IF NOT FOUND, GO ACQUIRE STORAGE, UPDATE LINKLIST CHAIN   ---*
+*---     AND DO THE SAME WTO (WITHOUT SHOWING THE WAITING TIME).   ---*
+*---                                                               ---*
+*---     ALSO, HERE IS WHERE I ISSUE A $DM TO LOG A MESSAGE TO     ---*
+*---     THE WAITING JOB SAYING THAT IT CANNOT RUN DUE TO DATA     ---*
+*---     SET CONTENTION.                                           ---*
+*---                                                               ---*
+*---     THE WTO AND $DM WILL ONLY BE DONE IF JOBNUM IS NOT '___'. ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+*
+PROCWAIT EQU   *
+         ST    R14,PROCR14         SAVE RETURNED ADDRESS
+         USING LNKLST,R4
+         LA    R4,ANCHOR           GET THE HEAD OF THE CHAIN
+         B     PRCBYPAS            GO RIGHT BY THE FIRST (DUMMY) LL
+*
+PRCLOOP  EQU   *
+         CLC   LLJOB,0(WAIT_LST)   IS IT THE SAME JOB ?
+         BNE   PRCBYPAS            NOPE - THEN GO TO NEXT ENTRY
+         CLC   LLSYSID,8(WAIT_LST) IS IT ON THE SAME SYSTEM ??
+         BNE   PRCBYPAS            NOPE - THEN GO TO NEXT ENTRY
+         CLC   LLASID,17(WAIT_LST) IS IT THE SAME ASID ??
+         BNE   PRCBYPAS            NOPE - THEN GO TO NEXT ENTRY
+         CLC   LLJOBNUM,19(WAIT_LST)   IS IT THE SAME JOBNUM
+         BNE   PRCBYPAS            NOPE - THEN GO TO NEXT ENTRY
+         CLC   LLDSN,DSNAME        IS IT THE SAME DATASET ??
+         BNE   PRCBYPAS            NOPE - THEN GO TO NEXT ENTRY
+         B     PRCGOTIT            ELSE - I NEED TO WTO THIS GUY
+*
+PRCBYPAS EQU   *
+         ST    R4,LASTLL           SAVE THIS AS THE LASTLL PROCESSED
+         ICM   R4,15,LLNEXT        AND GO TO NEXT ENTRY
+         BNZ   PRCLOOP
+*
+*---------------------------------------------------------------------*
+*---     IF I GOT HERE, THAT MEANS I COUND NOT FIND A MATCHING     ---*
+*---     LNKLST ENTRY (SAME JOBNAME, SYSID, ETC).                  ---*
+*---------------------------------------------------------------------*
+*
+         GETMAIN RU,SP=POOL7,LV=LLLENG,LOC=ANY
+         L     R14,LASTLL          GET THE LASTLL I PROCESSED
+         ST    R1,LLNEXT-LNKLST(R14) MAKE ME THE LAST GUY IN THE CHAIN
+         LR    R4,R1               AND START USING THE NEW STORAGE
+         XC    LNKLST(LLLENG),LNKLST   ZERO OUT THE STORAGE THOUGH
+         MVC   LLJOB,0(WAIT_LST)   SAVE THIS JOBNAME
+         MVC   LLSYSID,8(WAIT_LST) SAVE THE SYSID
+         MVC   LLASID,17(WAIT_LST) SAVE THE ASID
+         MVC   LLJOBNUM,19(WAIT_LST)    SAVE JES2 JOBNUM
+         MVC   LLDSN,DSNAME        SAVE THE DSNAME
+         B     PRCDOWTO            NOW - GO DO THE WTO
+*
+PRCGOTIT EQU   *
+         XC    LLFLAG,LLFLAG       TURN OFF 'DO CLEAR' FLAG
+         L     R1,LLWAIT           GET WAITING TIME (MINUTE)
+         LA    R1,1(,R1)           INCREMENT BY 1
+         ST    R1,LLWAIT           STORE THE NEW WAITING TIME BACK
+*
+PRCDOWTO EQU   *
+         L     R1,TOKEN            GET THE TOKEN (COUNTER)
+         LA    R1,1(,R1)           INCREASE THIS TOKEN (COUNTER)
+         ST    R1,TOKEN            AND SAVE THIS ONE FOR EACH WTO
+         MVC   LLTOKEN,TOKEN       ALSO SAVE TO 'DOM' LATER
+*
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   WTOLENG,=AL2(L'BUFFER)
+         MVC   BUFFER(L'MSG200),MSG200
+         MVC   BUFFER+10(8),LLJOB            GET HOLDING JOBNAME
+         MVC   BUFFER+22(8),LLSYSID          GET HOLDING SYSID
+         MVC   BUFFER+39(4),=CL4'EXCL'       START OUT WITH 'EXCL'
+         TM    16(WAIT_LST),X'80'  TEST FOR 'EXCL'
+         BNO   PRCFILL             IF SO - THEN GO FILL IN OTHER DATA
+         MVC   BUFFER+39(4),=CL4'SHR '       ELSE - MAKE IT 'SHR '
+*
+PRCFILL  EQU   *
+         LA    R14,BUFFER+L'MSG200
+         MVC   0(44,R14),DSNAME    MOVE DSNAME TO WTO BUFFER
+         ICM   R15,15,LLWAIT       HAVE I BEEN WAITING ??
+         BZ    PRCNOWAT            NOP - THEN DON'T SAY THAT
+*
+         L     R1,DSNLENG          GET LENG OF DSNAME
+         LA    R14,1(R1,R14)       BUMP PAST THE END OF DSNAME
+         MVC   0(L'MSG200A,R14),MSG200A   GET THE 2ND PART OF MSG
+         LA    R14,L'MSG200A(,R14)        GO PAST THE 2ND PART OF MSG
+         CVD   R15,DWORD
+         MVC   MSG200B(L'$PAT5),$PAT5      EDIT AND
+         ED    MSG200B(L'$PAT5),DWORD+5    PRINT OUT MINUTES
+*
+         TRT   MSG200B,BLANKTB     TRY TO CATCH THE 1ST NON-BLANK CHAR
+*
+         LA    R15,MSG200B+L'MSG200B
+         SR    R15,R1              GET LENG OF DATA TO BE MOVED
+         BCTR  R15,0               MINUS 1 FOR EXECUTE INSTRUCTION
+         EX    R15,MOVEMSG         NOW MOVE LAST PART OF MSG TO BUFFER
+         B     PRCBUILD
+*
+*---------------------------------------------------------------------*
+*---     BUILDING THE '$DM' COMMAND                                ---*
+*---------------------------------------------------------------------*
+*
+PRCNOWAT EQU   *
+         L     R15,DSNLENG
+         BCTR  R15,R0
+*
+PRCBUILD EQU   *
+         LA    R14,1(R15,R14)      NOW I'M LOOKING AT THE END OF BUFFER
+         LA    R15,BUFFER+10       PAST THE 'QM200 JOB '
+         SR    R14,R15
+         MVI   CMDTEXT,C' '
+         MVC   CMDTEXT+1(L'CMDTEXT-1),CMDTEXT
+         BCTR  R14,R0
+         EX    R14,BLDCMD
+         LA    R15,CMDTEXT
+         LA    R15,1(R14,R15)
+         MVI   0(R15),X'7D'        PUT THE QUOTE AT THE END OF CMD
+         MVC   CMDJOB,LLJOBNUM
+         LA    R14,15(,R14)        ADD '$DMJOBXXX,"   "' TO IT
+         STH   R14,CMDLEN          AND THERE IS THE CMD LENGTH
+*
+PRCRDY   EQU   *
+*
+         XR    R0,R0
+*
+         CLC   OWNSYS,LLSYSID      IS THIS JOB A LOCAL JOB ??
+         BE    PROC_HIL            YEAH - THEN HIGHLIGHT THE WTO
+*
+         WTO   TEXT=WTOLENG        ELSE - DON'T HIGHLIGHT THE WTO
+         B     PROCEXIT            AND DON'T DO '$DM'
+*
+PROC_HIL EQU   *
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2),TOKEN=LLTOKEN
+*
+         MODESET KEY=ZERO,MODE=SUP
+         LA    R2,CMDAREA          USE CONSID AS 0
+         MGCRE MF=(E,COMMANDS),TEXT=(R2),CONSID=MYCONS
+         MODESET KEY=NZERO,MODE=PROB
+*
+*---------------------------------------------------------------------*
+*---     NOW, DO WTOS INDICATING THE HOLDING JOB(S).  ONLY THE     ---*
+*---     FIRST 4 JOBS ARE LISTED (THEY'LL ALL FIT ON ONE LINE).    ---*
+*---     THERE IS NO REASON TO LIST MORE THAN 4 AT THIS POINT.     ---*
+*---------------------------------------------------------------------*
+*
+         MVI   CMDTEXT,C' '
+         MVC   CMDTEXT+1(L'CMDTEXT-1),CMDTEXT
+         MVC   CMDTEXT(L'MSG202),MSG202
+         LA    R15,CMDTEXT+L'MSG202
+         L     R1,@OWNERS          GET ADDR OF 'OWNERS' TABLE
+         L     R14,OWN_CNT
+         C     R14,=F'4'           IS IT > 4 ??
+         BNH   PRC_HOLD            NOPE - THEN USE IT
+         LA    R14,4               ELSE - USE 4
+*
+PRC_HOLD EQU   *
+         MVC   0(8,R15),0(R1)      GET JOBNAME FOR THE OWNER
+         MVC   9(6,R15),=CL6'(EXCL)'
+         TM    16(R1),X'80'        TEST FOR 'SHR'
+         BNO   PRC_GOT
+         MVC   9(6,R15),=CL6'(SHR)'
+*
+PRC_GOT  EQU   *
+         LA    R15,16(,R15)        BUMP TO NEXT ADDRESS
+         LA    R1,OWN_LNG(,R1)     BUMP TO NEXT OWNER
+*
+         BCT   R14,PRC_HOLD        DO THIS FOR ALL OWNERS
+         MVI   0(R15),X'7D'        MOVE THE ENDING QUOTE THERE
+         LA    R14,CMD-2           FIGURE OUT THE CMD LENG
+         SR    R15,R14
+         STH   R15,CMDLEN          AND SAVE IT
+*
+         MODESET KEY=ZERO,MODE=SUP
+         LA    R2,CMDAREA          USE CONSID AS 0
+         MGCRE MF=(E,COMMANDS),TEXT=(R2),CONSID=MYCONS
+         MODESET KEY=NZERO,MODE=PROB
+*
+PROCEXIT EQU   *
+         DROP  R4
+         L     R14,PROCR14         RELOAD RETURNED ADDRESS
+         BR    R14                 BACK TO CALLER
+*
+MOVEMSG  MVC   0(0,R14),0(R1)
+BLDCMD   MVC   CMDTEXT(0),BUFFER+10
+         EJECT
+*
+*
+*---------------------------------------------------------------------*
+*---     HERE, WE NEED TO FIND THE JOBID FOR THE WAITING JOB SO    ---*
+*---     THAT WE CAN LOG A MESSAGE TO IT LATER (USING $DM) TO      ---*
+*---     INDICATE THAT IT IS WAITING FOR A DATA SET.               ---*
+*---                                                               ---*
+*---     AT ENTRY, JOBID WILL HAVE THE JOBNAME.  AFTER EVERYTHING  ---*
+*---     SAID AND DONE, JOBID WILL ACTUALLY CONTAIN THE JES2       ---*
+*---     JOBID OF THAT JOB.  IF FOR SOME REASONS, THE JOB IS NO    ---*
+*---     LONGER IN THE SYSTEM AT THE TIME, JOBID WILL BE '_____'.  ---*
+*---     IF FOR SOME REASONS, JES2 IS NOT AVAILABLE, I WILL RETURN ---*
+*---     JOBID AS '??????'.                                        ---*
+*---                                                               ---*
+*---     THIS JOB SEARCH IS DONE AFTER THE GQSCAN HAS BEEN DONE.   ---*
+*---     THERE IS A SLIGHT CHANCE THAT THE JOB IS NO LONGER IN     ---*
+*---     THE SYSTEM DUE TO THE TIMING.  IF NOT, THERE IS ALSO      ---*
+*---     A CASE WHERE THE JOB STILL RUNS, BUT WHILE I'M DOING      ---*
+*---     OTHER THINGS, THE JOB FINALLY GAINS CONTROL OF THE DATA   ---*
+*---     SET, RUNS, AND FINISHES IN A HURRY, BEFORE MY NEXT SCAN.  ---*
+*---     IN THIS CASE, I WILL NOT DO EITHER A 'WTO' OR A '$DM'.    ---*
+*---                                                               ---*
+*---------------------------------------------------------------------*
+*
+JOB_SRC  EQU   *
+         ST    R14,JOBSR14         SAVE THE RETURNED ADDRESS
+*
+         XC    MYSSOB,MYSSOB       CLEAR MY AREA
+         MVC   MYSSOB+SSOBID-SSOB(4),=CL4'SSOB'
+         MVC   MYSSOB+SSOBLEN-SSOB(2),=AL2(SSOBHSIZ)   SET UP LENGTH
+         MVC   MYSSOB+SSOBFUNC-SSOB(2),=AL2(SSOBSTAT)  DO 'STATUS'
+         L     R14,SSCSPTR                     GET ADDR OF MY SSCS
+         ST    R14,MYSSOB+SSOBINDV-SSOB         STORE IT
+*
+         USING STATSTOR,R14
+         XC    MYSSCS(SSCSIZE),MYSSCS          CLEAR THE AREA
+         MVC   MYSSCS+SSCSLEN-SSCSBGN(2),=AL2(SSCSIZE)
+         MVC   MYSSCS+SSCSJOBN-SSCSBGN(8),JOBID       GET JOBNAME
+         MVC   MYSSCS+SSCSJOBI-SSCSBGN(8),=CL8' '     BLANK JOB ID
+         MVC   JOBID,=8C'_'        JUST IN CASE I CAN'T FIND THE JOB
+         MVC   MYSSCS+SSCSDIMP-SSCSBGN(2),=AL2(STATLENG)
+         DROP  R14
+*
+         MODESET KEY=ZERO,MODE=SUP
+         LA    R1,MYSSOB
+         ST    R1,MYADDR
+         OI    MYADDR,X'80'        TURN ON THE HI-ODER BIT
+         LA    R1,MYADDR           GET THE ADDR INTO R1
+         IEFSSREQ
+         LR    R2,R15              SAVE RETURN CODE
+         MODESET KEY=NZERO,MODE=PROB
+*
+         LTR   R2,R2               TEST RETURN CODE
+         BZ    JOB_CK              IF OKAY THEN GO ON AND CHECK MORE
+         C     R2,=AL4(16)         IS SUBSYSTEM AVAILABLE ??
+         BH    JOB_BAD             YES - THEN SOME OTHER ERRORS
+*
+         MVC   JOBID,=8C'?'        ELSE - FLAG THIS AS 'REAL TROUBLE'
+         B     JOB_EXIT            AND GET OUT
+*
+JOB_CK   EQU   *
+         ICM   R2,B'1111',MYSSOB+SSOBRETN-SSOB   GET RETURN CODE
+         BZ    JOB_FND             IF ZERO - THEN FOUND
+         C     R2,=AL4(4)          R15 = '4' ??
+         BE    JOB_EXIT            YEAH - NOT FOUND
+*
+JOB_BAD  EQU   *
+         MVI   BUFFER,C' '
+         MVC   BUFFER+1(L'BUFFER-1),BUFFER
+         MVC   BUFFER(L'MSG902),MSG902   I AM TERMINATING
+         MVC   WTOLENG,=AL2(L'MSG902)
+         XR    R0,R0
+         WTO   TEXT=WTOLENG,ROUTCDE=(11),DESC=(2)
+         ABEND 999,DUMP
+*
+*
+JOB_FND  EQU   *
+         L     R14,SSCSPTR         GET ADDRESS TO THE SSCS ARRAYS
+         USING STATSTOR,R14
+         LH    R1,MYSSCS+SSCSDIMR-SSCSBGN      GET ARRAYS USED
+         LA    R15,MYSSCS+SSCSARAY-SSCSBGN     GET MYSSCS ARRAY ADDR
+         AR    R1,R15              GET TO THE END OF DATA
+         ST    R1,SAVEEND          SAVE THIS
+         USING SSCSARAY,R15        ESTAB ADDRESSABILITY
+*
+JOB_LOOP EQU   *
+         C     R15,SAVEEND         COMPARE AGST ENDING ADDR
+         BNL   JOB_EXIT            IF NOT LOW - NOT FOUND
+         TM    SSCSFLG1,SSCSJACT   IS IT ACTIVE ??
+         BO    JOB_ACTV            YEAH - THEN GO THRU
+         LA    R15,SSCSELSZ(,R15)  BUMP TO NEXT ADDR
+         B     JOB_LOOP            BACK TO LOOP
+*
+JOB_ACTV EQU   *
+         MVC   JOBID,SSCSARID      SAVE THE JOBID FOUND
+*
+JOB_EXIT EQU   *
+         DROP  R14
+         L     R14,JOBSR14         RELOAD THE RETURNED ADDRESS
+         BR    R14                 AND BACK TO THE CALLER
+*
+         EJECT
+*
+*
+         DS    0F
+BEGTOKEN DC    XL4'FFFFFFFF'       USED FOR THE 'INITIALIZATION' WTO
+GQSCSIZE DC    AL4(1024*1024*8)    8 MEGABYTES
+POOL6    EQU   6                   SUBPOOL FOR GQSCAN RETURN AREA
+POOL7    EQU   7                   LINK LIST USED FOR WTO'S
+POOL10   EQU   10                  OWNERS LIST
+POOL11   EQU   11                  WAITERS LIST
+POOL12   EQU   12                  STORAGE USED FOR 'IEFSSREQ'
+*
+QNAME    DC    CL8'SYSDSN'
+*
+DSNAME   DC    CL44' '
+*
+*
+$PAT5    DC    X'402020202120'
+*
+MSG0     DC    C'QM001 ENQMON IS READY. DATA SET ENQ MONITORING IS NOW *
+               ACTIVE.'
+*
+MSG100   DC    C'QM100 CONTENTION WITH XXXXXXXX NEEDS XXXX ON '
+MSG101   DC    C'QM101 YOU HOLD XXXX ON '
+*
+MSG200   DC    C'QM200 JOB XXXXXXXX OF XXXXXXXX WAITING XXXX ON '
+MSG200A  DC    C'FOR '
+MSG200B  DC    C'XXXXXX MIN'
+*
+MSG201   DC    C'QM201 JOB XXXXXXXX ON XXXXXXXX HOLDS XXXX ON '
+*
+MSG202   DC    C'HOLDING JOB(S):  '
+*
+MSG900   DC    C'QM900 ERROR COMMUNICATING TO JES2. ENQMON IS TEMPORARI*
+               LY SUSPENDED FOR FIVE MINUTES.'
+*
+MSG901   DC    C'QM901 QSCAN SEVERE ERRORS HAVE OCCURRED. ENQMON IS TER*
+               MINATED. PLEASE NOTIFY TECH SERVICES.'
+*
+MSG902   DC    C'QM902 INVALID RETURN CODE FROM IEFSSREQ. ENQMON IS TER*
+               MINATED. PLEASE NOTIFY TECH SERVICES.'
+*
+MSG999   DC    C'QM999 ENQMON HAS TERMINATED. DATA SET ENQ MONITORING I*
+               S NO LONGER ACTIVE.'
+*
+*
+MYCONS   DC    F'0'                MY CONSID
+*
+$DMLENG  EQU   110
+*
+CMDAREA  DS    0CL(CMDEND+L'CMDLEN)
+CMDLEN   DC    AL2(CMDEND)
+*
+CMD      DC    C'$DM'
+CMDJOB   DC    CL8' '
+         DC    C','''
+CMDTEXT  DS    CL($DMLENG)
+         DC    C' '
+CMDEND   EQU   *-CMD
+*
+COMMANDS MGCRE MF=L
+*
+BLANKTB  DC    256X'FF'
+         ORG   BLANKTB+X'40'
+         DC    X'00'
+         ORG
+         LTORG
+         EJECT
+*
+*
+WKAREA   DSECT
+SA       DS    18F
+*
+DWORD    DS    D
+*
+GQAREA   DS    F
+RIBSLEFT DS    F
+COMMPTR  DS    F
+WAIT_CNT DS    F                   COUNT OF ALL 'WAITERS'
+OWN_CNT  DS    F                   COUNT OF ALL 'OWNERS'
+TOKEN    DS    F                   TOKEN USED BY 'WTO' AND 'DOM'
+DSNLENG  DS    F
+*
+@OWNERS  DS    F                   ADDRESS OF OWNERS LIST
+@WAITERS DS    F                   ADDRESS OF WAITERS LIST
+*
+LASTLL   DS    F
+SAVENEXT DS    F
+*
+SAVEEND  DS    F                   ENDING ADDRESS FOR SSCS ARRAYS
+*
+TP_R14   DS    F                   SAVED RETURNED ADDRESS
+FLLR14   DS    F                   SAVED RETURNED ADDRESS
+DOMR14   DS    F                   SAVED RETURNED ADDRESS
+WTOR14   DS    F                   SAVED RETURNED ADDRESS
+PROCR14  DS    F                   SAVED RETURNED ADDRESS
+JOBSR14  DS    F                   SAVED RETURNED ADDRESS
+*
+MYADDR   DS    F                   POINTS TO MYSSOB
+SSCSPTR  DS    F                   ADDRESS TO THE SSOB EXTENSION
+*
+         DS    0F
+MYSSOB   DS    CL(SSOBHSIZ)
+*
+JOBASID  DS    H
+*
+WTOLENG  DS    H                   *** DO NOT SEPERATE THESE  ***
+BUFFER   DS    CL133               *** TWO FIELDS             ***
+*
+*
+OWNSYS   DS    CL8                 MY OWN SYSTEM-ID
+JOBID    DS    CL8
+*
+ANCHOR   DS    CL(LLLENG)          HEAD OF THE LL CHAIN (DUMMY)
+*
+*
+WKLENG   EQU   *-WKAREA
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     THIS IS THE INFO RELATED TO THE 'OWNERS' & 'WAITERS'      ---*
+*---     TABLES.                                                   ---*
+*---------------------------------------------------------------------*
+*
+MAXLIMIT EQU   1000                MAX # ENTRIES I CAN DEAL WITH
+WAIT_GM  EQU   MAXLIMIT*WAIT_LNG   'MAXLIMIT' OWNERS ALLOWED
+WAIT_LNG EQU   8+8+1+2+8           JOB+SYSID+FLAG+ASID+JES2_JOB_ID
+*
+OWN_GM   EQU   MAXLIMIT*OWN_LNG    'MAXLIMIT' WAITERS ALLOWED
+OWN_LNG  EQU   8+8+1+2             JOB+SYSID+FLAG+ASID
+         EJECT
+*
+*---------------------------------------------------------------------*
+*---     LNKLST IS A LINKED-LIST CHAIN, STARTING OUT WITH A DUMMY  ---*
+*---     LL (ANCHOR).  EACH LL WILL HAVE A POINTER TO ADDRESS      ---*
+*---     THE NEXT LL IN THE CONTROL BLOCK CHAIN.  THESE LL'S WILL  ---*
+*---     BE GETMAIN'ED AS THEY ARE NEEDED.  EACH LL WILL CONTAIN   ---*
+*---     DATA FOR A JOB WAITING ON A SPECIFIC DSNAME, I.E. TOKEN   ---*
+*---     TO BE USED IN 'WTO' AND 'DOM', NUMBER OF MINUTES WAITING. ---*
+*---     AT THE BEGINNING OF EACH SCAN CYCLE, ALL LL'S WILL BE     ---*
+*---     MARKED.  IF AFTER ALL DATA HAS BEEN PROCESSED, AND THE    ---*
+*---     FLAG STAYS THE SAME, THEN THE LL WILL BE FREE'ED (THE     ---*
+*---     CONTENTION FOR THAT SPECIFIC JOB NO LONGER EXISTS).       ---*
+*---------------------------------------------------------------------*
+*
+LNKLST   DSECT
+LLNEXT   DS    F                   NEXT LL ENTRY (X'00000000'=LAST)     E)
+LLWAIT   DS    F                   WAITS IN MINUTES                     E)
+LLTOKEN  DS    F                   TOKEN USED BY 'DOM'                  E)
+LLASID   DS    H                   ASID OF WAITING JOB
+LLFLAG   DS    X
+LLCLEAR  EQU   X'80'               START OF A NEW CYCLE
+LLJOB    DS    CL8                 JOB WAITING ON DSN
+LLJOBNUM DS    CL8                 JES2 JOBID FOR THIS JOB
+LLSYSID  DS    CL8                 SYSID OF WAITING JOB
+LLDSN    DS    CL44                DATA SET IN CONTENTION
+LLLENG   EQU   *-LNKLST            LENG OF LL ENTRY
+         EJECT
+*---------------------------------------------------------------------*
+*---     STORAGE USED FOR 'IEFSSREQ' (LIKE A TSO STATUS COMMAND    ---*
+*---     TO CHECK/OBTAIN THE JOBID FOR A JOB).                     ---*
+*---------------------------------------------------------------------*
+STATSTOR DSECT
+STATMAX  EQU   300                 ALLOW 1000 RETURNED ENTRIES
+STATLENG EQU   STATMAX*SSCSELSZ
+MYSSCS   DS    CL(STATLENG)
+         DS    ((14+62)*(STATMAX+100))C
+STAT_GM  EQU   *-STATSTOR
+         EJECT
+         PRINT GEN
+         ISGRIB
+         EJECT
+*
+COM      DSECT
+         IEZCOM
+         EJECT
+*
+CIB      DSECT
+         IEZCIB
+         EJECT
+         PRINT NOGEN
+*
+         CVT   DSECT=YES
+         EJECT
+         IHAASCB DSECT=YES,LIST=YES
+         EJECT
+         IRAOUCB DSECT=YES
+         EJECT
+*
+         IEFJESCT
+         EJECT
+         PRINT GEN
+         IEFJSSOB (CS),CONTIG=NO
+         END

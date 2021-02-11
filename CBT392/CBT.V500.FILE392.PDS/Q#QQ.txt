@@ -1,0 +1,690 @@
+         TITLE '--- QUEUE--MAINLINE MODULE ---'
+*---------------------------------------------------------------------*
+*                                                                     *
+*   QUEUE - Entry point and mainline                                  *
+*                                                                     *
+*   Updates:                                                          *
+*      16Jul91  GLA  Fix handling of table display repositioning      *
+*                    Improve QNEWCMD entry to support message         *
+*      11Feb91  LDW  Use local area instead of global for CALL MF=L   *
+*                       (was TBLST and VCALLST in QCOMMON)            *
+*                    Move V9 from QCOMMON to =CL8'QROWID'             *
+*      31Jan91  LDW  Retrofit GLA's updates below (update flags       *
+*                       removed because this will now be considered   *
+*                       part of the base level code)                  *
+*                    KILLPCS routine integrated here instead of in    *
+*                       QSUBS (it's now time to move all the          *
+*                       termination code out of here... not today)    *
+*     (10Jul90) GLA  Add call to terminate PC access at end.          *
+*                    Fix attention handling for ISPF.                 *
+*     (20Sep89) GLA  Change logic when all line cmds are done to      *
+*                    reissue previously stacked command.              *
+*                    Handle reprompts from reissued stacked commands. *
+*     (20Jul89) GLA  Improve interface to eliminate DY3 and QQ1       *
+*                    errors after invalid command combinations        *
+*     (16Jun89) GLA  Add interface to redrive commands in stack as    *
+*                    results of terminations of other commands.       *
+*     (29Mar89) GLA  Add support for ISPF BROWSE and Tables.          *
+*      17Nov90  LDW  Fix bug in previous update which caused last     *
+*                       operand character to be ignored for line      *
+*                       commands with an 8 character operand          *
+*      20Jun90  LDW  Fix for 6 character DSID                         *
+*      10Dec89  LDW  Use name of OACFSORT from &@@OACFS               *
+*                    Pick up Doron's 21Nov89 mod:                     *
+*               DMS  Conditionally assemble out OACFSORT usage        *
+*       3Jun87  EMS  Add support for Starting/Draining Spool vols     *
+*                    Fix 0c3 if initial command invalid followed by   *
+*                       end.                                          *
+*                    Delete OACFSORT                                  *
+*      08Feb87  LDW  Save first command in QCMDRING                   *
+*      18Jan87  LDW  Display command in "no data" message             *
+*                    Eliminate use of "LC" macro                      *
+*      04/22/86 LDW  MOVE ATTN FLAG FROM QTERMFLG TO QMISCFLG         *
+*      03/31/86 LDW  RE-DESIGN 3278-5 SUPPORT (THIRD TRY!)            *
+*                    CREATE COMMON LOGIC ERROR ROUTINE                *
+*                    MOVE STAX MF=L FROM QCOMMON TO THIS ROUTINE'S    *
+*                       LOCAL WORKAREA                                *
+*      08/30/84 LDW  DON'T S0C3 IF ILLOGICAL LINE COMMAND SEQUENCE    *
+*                    SUPPORT QM1STACK                                 *
+*                    FREE ALL GETMAINED STORAGE                       *
+*      04/12/84 LDW  INITIALIZE THE COMMAND STACK WITH A 'STATUS' CMD *
+*      03/27/84 LDW  MOVE CALL TO 'DISPCHG' FROM 'PARSE'              *
+*      01/23/84 LDW  ADD SUPPORT FOR COMMAND STACKING                 *
+*                    DO NOT MOVE IN ***OK*** IF DESTRUCTIVE LINE CMD  *
+*      07/05/83 LDW  CHECK FOR NEW "DATASET IS EMPTY" MSG             *
+*      03/18/83 LDW  ADD SUPPORT FOR LINE COMMANDS                    *
+*                    CHANGE USING/DROP TO USNGX/DROPX                 *
+*      02/24/83 LDW  CLEAR QDLCTBL WHEN NECESSARY                     *
+*                    DELETE HELP AND CHANGES MODULES IF NECESSARY     *
+*      02/03/83 LDW  REMOVE ALL CODE RELATED TO REPROMPTING (Q1INQ#)  *
+*      02/02/83 LDW  SET QCODE TO ZERO WHEN INVOKING "PRINT OFF"      *
+*      01/19/83 LDW  ADD WORKLEN= TO QSTART TYPE=ENTRY                *
+*      01/06/83 LDW  ADD SPF SUPPORT                                  *
+*                    ADD SUPPORT FOR "Q2LISTDS"                       *
+*                    FREEMAIN BLOCK TABLE AT EXIT                     *
+*      01/03/83 LDW  ADD LOCAL WORK AREA                              *
+*      12/21/82 LDW  CHANGE SOME MESSAGES TO LOWER CASE               *
+*                    CLEAR # OF ATTR BYTES IN LINE FOR NEW SUBCMD     *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SPACE 3
+QUEUE    QSTART  Q1,TYPE=MAIN,WORKLEN=QQ@WORKL
+         USNGX WORK,R13
+         MVC   QQ@STAX(QQ#STAXL),QQ#STAX  COPY STAX MF=L
+         LA    R3,QQ@STAX               PASS ADDRESS TO 'INITIAL'
+         LA    R10,QQINTER              INTERRUPTED RETURN ADDRESS
+***********************************************************************
+*                                                                     *
+*   CALL - INITIALIZATION                                             *
+*                                                                     *
+***********************************************************************
+         L     R11,=V(QCOMMON)          POINT TO "QCALL" SUBROUTINE
+         QCALL INITIAL                  INITIALIZE
+         USNGX QCOMMON,R11              IT'S NOW VALID
+         L     R1,QVRING                -> RING COMMAND BUFFER
+         MVC   0(QDREPLYL,R1),QDREPLY   SAVE FIRST COMMAND
+         QSTACK  X'01','STATUS'         INITIALIZE THE STACK
+         B     QQLOOP                   enter main loop
+         EJECT
+***********************************************************************
+*                                                                     *
+*   ** INTERRUPT DISPLAY COMMAND PROCESSING ENTRY **                  *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+QQINTER  DS    0H                       Display Interupt Point
+*
+*  On entry (which is from the QNEWCMD macro), R15 has
+*  the entry code:
+*     0  from DISPLAY module - handle primary command
+*     4  from DISPLAY module - handle line command
+*     8  reexcute the current command in top of stack
+*    12  execute command passed in R1
+*
+*   R0 may contain either a 0 or address of message to issue.
+*
+         LTR   R14,R0                   check if message
+         BZ    *+10         ======+     no message so skip
+         MVC   QERRMSG,0(R14)     |     move in message
+         XC    QROWID,QROWID  <===+     indicate no row
+         CH    R15,=H'12'               check max code
+         BH    QQLOOP                   ignore
+         LTR   R15,R15                  check least code
+         BL    QQLOOP                   ignore
+         B     *+4(R15)                 use table
+         B     QQ$NPRI                  R15=0 normal prim cmd
+         B     QQLOOP                   R15=4 normal line cmd
+         B     QQ$REDRI                 R15=8 use top of stack
+         B     QQ$NCMD                  R15=C use cmd -> by R1
+         SPACE 2
+QQ$REDRI TM    QMODE1,QM1STACK          STACKING ENABLED?
+         BNO   QQLOOP                   NO - ignore
+         L     R2,QVSTACK               -> BOTTOM OF STACK
+         L     R3,QVSTACKC              -> TOP OF STACK
+         CLR   R3,R2                    PAST BOTTOM?
+         BL    QQLOOP                   YES - ignore
+         MVC   QDREPLY,2(R3)            RESTORE COMMAND LINE
+*
+QQ$RED1  MVC   QDRLNG,=Y(QDREPLYL)      FAKE LENGTH
+         MVC   QDPROMPT,QDREPLY         SAVE FOR REPROMPT
+         QCALL PARSE                    PARSE IT
+         MVI   QQ@FLAG,0                init flags
+         B     QQ$PARSE                 GO EXECUTE IT
+         SPACE 2
+QQ$NCMD  MVC   QDREPLY,0(R1)            move in command
+         B     QQ$RED1                  go process it
+         SPACE 2
+QQ$NPRI  MVI   QQ@FLAG,0                init flags
+         B     QQ$PARSE                 go and execute it
+         EJECT
+***********************************************************************
+*                                                                     *
+*   ** MAIN LOOP **                                                   *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+QQLOOP   MVI   QQ@FLAG,0                INIT FLAGS
+         TM    QISFLAG1,QIS1ISPF        are we in ISPF?
+         BZ    QQ$NISP1                 no - skip code
+         SPACE 1
+*---  SEE IF A LINE COMMAND TO EXECUTE                             ---*
+*---       ISPF mode                                               ---*
+         TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$PARSE                 no - no line commands
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBVCLEAR',TBNAM),VL,                         $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         XC    QLCBE+LCBTPTR-LCBUFF(L'LCBTPTR),QLCBE+LCBTPTR-LCBUFF
+         MVI   QLCBE+4,C'*'             fudge for now *%%%%
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBSARG',TBNAM,0,=CL8'NEXT',                  $
+               =C'(QLCBE,NE)'),VL,                                     $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBTOP',TBNAM),VL,                            $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         SPACE 2
+QQ$LCNXT TM    QISFLAG1,QIS1ISPF        are we in ispf
+         BZ    QQ$LCSTP                 if not go to self proc
+         TM    QQ@FLAG,QQ@DCMD          was a dest. cmd done?
+         BO    QQ$LCDNE                 yes - orig table gone
+*                                         and need to issue new
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBSCAN',TBNAM,0,0,=CL8'QROWID'),VL,          $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         CH    R15,=H'8'                error, end, or got one?
+         BE    QQ$LCDNE                 =8 so done
+         BNH   *+6                      SEVERE ERROR
+         DC    H'0'                     SEVERE ERROR BOMB
+         LA    R3,QLCBE                 point at LCB entry
+         B     QQ$LC$GO                 process line command
+         SPACE 1
+*---  SEE IF A LINE COMMAND TO EXECUTE                             ---*
+*---       non ISPF mode                                           ---*
+QQ$NISP1 L     R3,QVLCBUF               -> LINE CMD BUFFER
+         USNGX LCBUFF,R3
+         LA    R4,43-3                  MAX LINE COMMANDS
+*
+QQ$LC$L1 OC    LCBFLD1,LCBFLD1          UNUSED LINE?
+         BZ    QQ$LCSTP                 YES - SKIP THIS ENTRY
+         CLC   LCBFLD1,QBLANK           ANY LINE CMD HERE?
+         BNE   QQ$LC$GO                 YES - DO IT
+*
+QQ$LCSTP LA    R3,LCBELEN(,R3)          -> NEXT LINE CMD
+         BCT   R4,QQ$LC$L1              CHECK ALL LINE COMMANDS
+*
+QQ$LCDNE TM    QQ@FLAG,QQ@LCMD          DID WE EXECUTE ANY LINE CMDS?
+         BNO   QQ$PARSE                 NO - GO EXECUTE PRIMARY CMD
+         TM    QQ@FLAG,QQ@DCMD          YES - WAS IT A DESTRUCTIVE CMD?
+         BNO   QQ$LCEND                 NO - SAY PROCESSING COMPLETE
+         TM    QISFLAG1,QIS1ISPF        are we in ispf?
+         BO    QQLCDISP                 yes - do display
+         CLC   QDHLINE+21(12),=C'IS EMPTY ***'  IS DATASET EMPTY?
+         BE    QQLCDISP                 YES - SKIP
+         MVC   QDMSG(80),ENDDATA        MOVE IN "END OF DATA" MSG
+         MVI   QDATRNUM+1,2             INDICATE 2 ATTR BYTES IN LINE
+         BAL   R14,QADDLINE             MOVE TO SCREEN
+         B     QQLCDISP                 SKIP AROUND
+QQ$LCEND MVC   QDHLINE,QBLANK           CLEAR THE HEADER LINE
+         MVC   QDHLINE+03(36),=C'Line subcommand processing complete.'
+         OI    QFLAG1,Q1MVHDR           REQUEST MOVE HEADER
+         NI    QFLAG2,255-Q2NEWSCR      dont blank scr
+*                                       since was not dest. cmd
+QQLCDISP QCALL DISPLAY                  DISPLAY RESULTS OF LINE CMDS
+         B     QQ$REDRI                 redrive last stked. cmd
+         SPACE 2
+QQ$LC$GO ICM   R2,B'1111',LCBTPTR       -> LINE CMD TABLE ENTRY
+         BP    QQ$LC$EX                 GO EXECUTE IT IF VALID
+         L     R0,=C'QQ1 '              GET ERROR CODE
+         B     LOGICERR                 SHOW LOGIC ERROR
+         SPACE 2
+         USNGX LCTABLE,R2
+QQ$LC$EX MVC   QDREPLY,QBLANK           CLEAR THE COMMAND AREA
+         MVC   QDREPLY(4),LCTTRUNM      SET ACTUAL SUBCOMMAND NAME
+         MVC   QDREPLY+7(6),LCBID       JOBID OR DSID
+         OC    LCBFLD2,LCBFLD2          ANY SECOND OPERAND?
+         BZ    *+10                     NO - SKIP
+         MVC   QDREPLY+14(8),LCBFLD2    FILL IN OPERAND
+         TM    LCTFLAGS,LCTFDD          THIS 'DD' SUBCMD?
+         BNO   QQ$LC$PA                 NO - SKIP
+         MVI   QDREPLY+5,C'*'           YES - SELECT CURRENT JOB
+         CLI   QDREPLY+7,C'J'           IS THIS A SYSTEM DATASET?
+         BNE   QQ$LC$PA                 NO - OK
+         MVC   QDREPLY(4),QDREPLY+7     YES - USE THE DSID AS SUBCMD
+         MVC   QDREPLY+7(6),QBLANK      AND REMOVE FROM OPERAND AREA
+         SPACE 1
+QQ$LC$PA MVC   QDRLNG,=H'22'            SET REPLY LENGTH
+         MVC   LCBFLD1,QBLANK           CLEAR COMMAND FROM TABLE
+         ICM   R14,B'1111',LCBADDR1     GET ADDR OF SELECT FIELD
+         BZ    *+10                     SKIP IF NOT SUPPLIED
+         MVC   0(2,R14),QBLANK          BLANK IT - WE'RE EXECUTING IT
+         MVC   LCBFLD2,QBLANK           CLEAR OPERAND FROM TABLE
+         ICM   R14,B'1111',LCBADDR2     GET ADDR OF OPERAND FIELD
+         BZ    *+10                     SKIP IF NOT SUPPLIED
+         MVC   0(8,R14),QBLANK          BLANK IT - WE'RE EXECUTING IT
+         QCALL PARSE                    PARSE IT
+         MVC   QDMSG,QBLANK             CLEAR MSG WORK LINE
+         MVC   QDHLINE,QBLANK           CLEAR OUTPUT HEADER LINE
+         XC    QDATRNUM,QDATRNUM        NO ATTR BYTES CURRENTLY IN LINE
+         OI    QFLAG1,Q1MVHDR+Q1PROFOK  MOVE THE HEADER THE FIRST TIME
+*                                       AND PROFILE COMPLETE
+         NI    QFLAG2,255-Q2LISTDS      ASSUME NOT LISTDS
+         OI    QFLAG2,Q2NEWSCR          INDICATE NEXT OUTPUT TO LINE 1
+         MVC   QACTION,=CL8'***OK***'   ASSUME IT WILL WORK
+         TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$LC$CL                 no - skip
+         TM    LCTFLAGS,LCTFDCMD        destructive subcmd empty
+         BNO   QQ$LC$CL                   ISPF table
+         XC    QTBDROW,QTBDROW          clear saved row id
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBEND',TBNAM),VL,                            $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         NI    QISFLAG1,255-QIS1TBOP    mark table closed
+*
+QQ$LC$CL TM    QISFLAG1,QIS1TBOP        is table open
+         BZ    QQ$LC$SB                 no so do call
+         XC    LCBTPTR,LCBTPTR          indicate subcmd processed
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBPUT',TBNAM),VL,                            $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+*
+QQ$LC$SB L     R15,QSUBCMD              GET SUBCMD ENTRY POINT
+         OI    QSCFLAG2,QSC2LINE        INDICATE IT'S A LINE SUBCMD
+         QCALL (R15)                    CALL IT
+         OI    QQ@FLAG,QQ@LCMD          WE EXECUTED A LINE CMD
+         TM    LCTFLAGS,LCTFDCMD        WAS THIS A DESTRUCTIVE SUBCMD?
+         BNO   QQ$LCNDS                 NO - SKIP
+         OI    QQ@FLAG,QQ@DCMD          YES - REMEMBER
+         B     QQ$LCFIN                 AND GO PROCESS NEXT LINE
+QQ$LCNDS DS    0H                       non destructive
+         TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$LCACT                 no so skip to set action
+         OC    QROWID,QROWID            any row?
+         BZ    QQ$LCACT                 no - so skip to set actn
+         L     R15,ISPLNK               re-access row in question
+         CALL  (15),(=CL8'TBSKIP',TBNAM,0,0,0,QROWID),VL,              $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+*
+QQ$LCACT ICM   R14,B'1111',LCBADDR2     OPERAND FIELD ADDR
+         BZ    QQ$LCFIN                 SKIP IF NOT SUPPLIED
+         MVC   0(8,R14),QACTION         SHOW WHAT WE DID
+         SPACE 1
+* --  for ISPF update row in table to save status
+QQ$LCFIN TM    QISFLAG1,QIS1ISPF        are we in ispf?
+         BZ    QQ$LCNXT                 if not go process next
+         TM    QISFLAG1,QIS1BRCP        has browse finished ok?
+         BO    QQ$ISPXT                 yes - sim END command
+         TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$LCNXT                 no - skip
+         OC    QROWID,QROWID            any row
+         BZ    QQ$LCNXT                 no - skip to set actn
+         XC    LCBTPTR,LCBTPTR          indicate subcmd processed
+*                                       and save action code
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBPUT',TBNAM),VL,                            $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         XC    QROWID,QROWID            clear row pointer
+         B     QQ$LCNXT                 GO PROCESS NEXT LINE CMD
+         SPACE 1
+         DROPX R3,R2                    LCBUFF, LCTABLE
+***********************************************************************
+*                                                                     *
+*   CALL SUB-COMMAND MODULE SELECTED BY PARSE                         *
+*                                                                     *
+***********************************************************************
+QQ$PARSE MVC   QDMSG,QBLANK             CLEAR MSG WORK LINE
+         XC    QROWID,QROWID            clear row pointer
+         XC    QTBDROW,QTBDROW          clear saved row id
+         MVC   QDHLINE,QBLANK           CLEAR OUTPUT HEADER LINE
+         XC    QDATRNUM,QDATRNUM        NO ATTR BYTES CURRENTLY IN LINE
+         OI    QFLAG1,Q1MVHDR+Q1PROFOK  MOVE THE HEADER THE FIRST TIME
+*                                       AND PROFILE COMPLETE
+         NI    QFLAG2,255-Q2LISTDS      ASSUME NOT LISTDS
+         XC    QDLCTBL,QDLCTBL          NO LINE COMMANDS TABLE NOW
+         TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$PR$I1                 no so skip
+         L     R15,ISPLNK               ge-ISPF interface
+         CALL  (15),(=CL8'TBEND',TBNAM),VL,   kill current table       $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         NI    QISFLAG1,255-QIS1TBOP    mark table closed
+*
+QQ$PR$I1 DS    0H
+         L     R15,QSUBCMD              ADDR OF SUBCMD FROM QCOMMON
+         CL    R15,=A(EXIT)             IS THIS EXIT?
+         BE    EXIT                     YES - DON'T CALL IT, GO THERE
+         TM    QISFLAG1,QIS1ISPF        are we in ISPF?
+         BO    QQ$ISPF2                 yes
+**%%     TM    QFLAG2,Q2REPOS
+**%%     BO    ???
+**%%**%% **%%* *%%**%%**%%  CODE FROM " PARSE" GOES HERE
+         SPACE 1
+         QCALL (R15)                    GO TO IT
+         TM    QMISCFLG,QMFATTN         DID USER PRESS ATTENTION?
+         BO    QQATTN                   YES - LEAVE SCREEN AS IS
+         CLC   QDHLINE,QBLANK           WAS ANYTHING WRITTEN?
+         BE    QQNDATA                  NO - SKIP
+         CLC   QDHLINE+21(12),=C'IS EMPTY ***'  IS DATASET EMPTY?
+         BE    QQFINAL                  YES - SKIP
+         MVC   QDMSG(80),ENDDATA        MOVE IN "END OF DATA" MSG
+         MVI   QDATRNUM+1,2             INDICATE 2 ATTR BYTES IN LINE
+         BAL   R14,QADDLINE             MOVE TO SCREEN
+         B     QQFINAL                  SKIP AROUND
+         SPACE 2
+*  DO WE NEED TO DO ANYTHING WITH MOD5 STUFF HERE????    %%%%
+QQATTN   NI    QMISCFLG,255-QMFATTN     RESET FLAG
+         MVC   QD3270OP,QDERASE         SET WRITE OP TO ERASE WRITE
+         ZAP   QPREC,QCCREC             SET DESIRED LOC TO CURRENT LOC
+         SPACE 1
+         STFSMODE  ON                   ATTN TURNS OFF FULLSCR MODE
+         SPACE 1
+         B     QQFINAL                  CONTINUE
+         SPACE 2
+QQNDATA  MVC   QDHLINE(40),=C'No data is available for this request - '
+         MVC   QDHLINE+40(L'QDHLINE-40),QDREPLY  SHOW THE COMMAND
+         SPACE 2
+QQFINAL  QCALL DISPLAY                  WRITE LAST SCRN, GET NEXT INPUT
+         B     QQLOOP                   EXECUTE NEXT OR SAME SUBCOMMAND
+         SPACE 3
+*****************************************************************
+*
+*   CALL - SUB-COMMAND MODULE SELECTED BY PARSE    ISPF MODE
+*
+*****************************************************************
+QQ$ISPF2 L     R15,QSUBCMD              addr of command to do
+         QCALL (R15)                    go to it
+         TM    QMISCFLG,QMFATTN         Attention hit?
+         BO    QQ$IATTN                 yes - handle
+         TM    QISFLAG1,QIS1BRCP        has browse finished ok?
+         BO    QQ$ISPXT                 yes - sim END command
+         CLC   QDHLINE,QBLANK           was anything written?
+         BE    QQNDATA                  no - give message
+         B     QQFINAL                  go write screen
+         SPACE 1
+*---  PF3 from ISPF BROWSE - do END command
+QQ$ISPXT TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQ$ISBXT                 no - skip
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBEND',TBNAM),VL,                            $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         NI    QISFLAG1,255-QIS1TBOP    mark table closed
+*
+QQ$ISBXT NI    QISFLAG1,255-QIS1BRCP    off BROWSE flag
+         TM    QMODE1,QM1STACK          STACKING ENABLED?
+         BNO   QQ$ISBX2                 NO - TERMINATE PROCESSOR
+         L     R2,QVSTACK               -> BOTTOM OF STACK
+         L     R3,QVSTACKC              -> TOP OF STACK
+         SH    R3,=Y(QDSTACKL)          -> PREVIOUS STACK ELEMENT
+         CLR   R3,R2                    PAST TOP?
+         BNL   *+8                      NO - CONTINUE
+         B     QQ$ISBX2                 yes - exit now
+         ST    R3,QVSTACKC              SAVE NEW TOS POINTER
+         OC    QDRLNG,QDRLNG            any command back from br
+         BNZ   QQ$ISBX2                 command from browse
+         MVC   QDREPLY,2(R3)            RESTORE COMMAND LINE
+         MVC   QDRLNG,=Y(QDREPLYL)      FAKE LENGTH
+         MVC   QDPROMPT,QDREPLY         SAVE FOR REPROMPT
+*
+QQ$ISBX2 QCALL PARSE                    PARSE IT
+         B     QQ$PARSE                 GO EXECUTE IT
+         SPACE 2
+QQ$IATTN NI    QMISCFLG,255-QMFATTN     reset flag
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'CONTROL',=CL8'DISPLAY',=CL8'REFRESH'),VL,    $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         TM    QISFLAG1,QIS1BRCP        has browse finished ok?
+         BO    QQ$ISPXT                 yes - sim END command
+         B     QQFINAL                  Continue
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*   CLEAN UP AND GO HOME                                              *
+*                                                                     *
+***********************************************************************
+         ENTRY EXIT
+EXIT     CLI   QCODE,4                  'END' COMMAND?
+         BNE   QQEXIT0                  NO - TERMINATE PROCESSOR
+         TM    QMODE1,QM1STACK          STACKING ENABLED?
+         BNO   QQEXIT0                  NO - TERMINATE PROCESSOR
+         L     R2,QVSTACK               -> BOTTOM OF STACK
+         L     R3,QVSTACKC              -> TOP OF STACK
+         SH    R3,=Y(QDSTACKL)          -> PREVIOUS STACK ELEMENT
+         CLR   R3,R2                    PAST TOP?
+         BNL   *+8                      NO - CONTINUE
+*%%%     EX    0,*                      YES - LOGIC ERROR
+         B     QQEXIT0                  yes - exit now
+         ST    R3,QVSTACKC              SAVE NEW TOP OF STACK POINTER
+         MVC   QDREPLY,2(R3)            RESTORE COMMAND LINE
+         MVC   QDRLNG,=Y(QDREPLYL)      FAKE LENGTH
+         MVC   QDPROMPT,QDREPLY         SAVE FOR REPROMPT
+         QCALL PARSE                    PARSE IT
+         B     QQ$PARSE                 GO EXECUTE IT
+         SPACE 2
+QQEXIT0  STAX  ,                        CANCEL STAX EXIT
+         SPACE 1
+*---  Kill the PC number authorization                             ---*
+          AIF   (&QLEVEL LT 8).QQ02
+         TM    QKFLAG,QKFKAC            Is KAC access active?
+         BZ    QSTOP                    no.. no need to kill
+         LA    R1,4                     Get authorized
+         QCALL AUTHFUNC
+         MODESET KEY=ZERO,MODE=SUP      Get key=0
+         SPACE 3
+*---  disconnect access                                            ---*
+QQ$DISET ETDIS TKLIST=QPCTKL,RELATED=II$CET1
+         SPACE 3
+*---  destroy the entry table                                      ---*
+QQ$DESET ETDES TOKEN=QPCTKVAL,RELATED=II$CET1
+         SPACE 3
+*---  free LX for reuse                                            ---*
+QQ$FRLX  LXFRE LXLIST=QPCLXL,RELATED=II$GLX
+         SPACE 3
+         MODESET KEY=NZERO,MODE=PROB    Out of supervisor state
+         LA    R1,8                     release authorization
+         QCALL AUTHFUNC
+.QQ02     ANOP
+         SPACE 3
+         TM    QISFLAG1,QIS1ISPF        are we in ISPF?
+         BO    QQEXIT1                  yes - terminate tables
+         TM    QTERMFLG,QTFVTAM         VTAM TERMINAL?
+         BO    QQEXIT2                  YES - SKIP
+         TM    QTERMFLG,QTFTTY          NON-FULLSCR TERMINAL?
+         BO    QQEXIT3                  YES - SKIP
+         SPACE 1
+         TPUT  QQCLEAR,L'QQCLEAR,FULLSCR,,HOLD  NO - CLEAR THE SCREEN
+         B     QQEXIT3                  SKIP
+         SPACE 2
+*---  exit after ISPF BROWSE/TABLE invocation
+QQEXIT1  TM    QISFLAG1,QIS1TBOP        is table open?
+         BZ    QQEXIT1A                 no - skip
+         L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'TBEND',TBNAM),VL,   kill current table       $
+               MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         NI    QISFLAG1,255-QIS1TBOP    mark table closed
+*
+QQEXIT1A L     R15,ISPLNK               -> ISPLINK
+         CALL  (15),(=CL8'VDELETE',=CL8'(*)'),VL,MF=(E,QQ@CALLP)
+         CH    R15,=H'20'               severe error ???
+         BNL   ISPFERR                  tell about  ???
+         B     QQEXIT3                  continue with rest
+         SPACE 3
+*---  exit after regular VTAM invocation
+         SPACE 2
+QQEXIT2  STFSMODE  OFF                  TELL VTAM WE'RE DONE
+         SPACE 2
+QQEXIT3  CLOSE MF=(E,QCCKPT)            CLOSE HASPCKPT
+         SPACE 1
+         L     R1,QCSPOOLS              -> open list
+         CLOSE MF=(E,(1))               close haspace(s)
+         SPACE 2
+         TM    QPFLAG,HARDCPY           IS HARDCOPY INVOKED?
+         BNO   QQNOPRNT                   NO..SPLIT THIS STUFF
+         MVC   QPARM1,=CL8'OFF'             INVOKE PRINT TO FREE UP
+         MVC   QPARM2,QBLANK                  HARDCOPY SYSOUT FILE
+         XC    QCODEH,QCODEH            SET ENTRY CODE FOR PRINT
+         SPACE 2
+QQASKLP  TPUT  QQASKPRT,L'QQASKPRT,ASIS ASK IF HE REALLY WANTS IT
+         SPACE 1
+         LA    R1,QDREPLY               -> MY ANSWER AREA
+         TGET  (1),80
+         SPACE 1
+         OI    QDREPLY,C' '             MAKE IT UPPER CASE
+         CLI   QDREPLY,C'Y'             WANT IT?
+         BE    QQPRINT                  YES
+         CLI   QDREPLY,C'N'             WANT IT?
+         BNE   QQASKLP                  HUH?
+         MVC   QPARM1(3),=C'DEL'        NO - TELL "PRINT" TO DELETE
+         SPACE 1
+QQPRINT  QCALL PRINT                    PRINT OR DELETE HARDCOPY SYSOUT
+         SPACE 2
+QQNOPRNT OC    QVHELP,QVHELP            HELP LOADED?
+         BZ    QQNODEL1                 NO - SKIP
+         SPACE 1
+         DELETE  EPLOC==CL8'QHLPTXT'    GET RID OF IT
+         SPACE 2
+QQNODEL1 OC    QVCHGS,QVCHGS            CHGS LOADED?
+         BZ    QQNODEL2                 NO - SKIP
+         SPACE 1
+         DELETE  EPLOC==CL8'QCHGTXT'    GET RID OF IT
+         SPACE 2
+QQNODEL2 DC    0H'0'
+          AIF   ('&@@OACFS' EQ '').QQ01
+         DELETE  EPLOC==CL8'&@@OACFS'   get rid of sort
+.QQ01     ANOP
+         SPACE 2
+         TM    QFLAG2,Q2SPF             IN SPF?
+         BNO   QQFREEMN                 NO - SKIP
+         SPACE 1
+*---  TELL SPF TO REFRESH THE WHOLE SCREEN
+         LINK  EP=ISPLINK,PARAM=(QQ#CTL,QQ#DISP,QQ#REFR),VL=1
+         SPACE 1
+*---  USE STEINBACH'S GUIDELINE FOR SYSTEMS PROGRAMMING:  "NEVER TEST
+*---  FOR AN ERROR CONDITION YOU DON'T KNOW HOW TO HANDLE."
+         SPACE 2
+*  FREE ALL GETMAINED STORAGE
+QQFREEMN OI    QLENLAST,X'80'           INDICATE END OF LIST
+         SPACE 1
+         FREEMAIN  LU,SP=1,A=QADDRS,LA=QLENGTHS,MF=(E,QFREEMFL)
+         SPACE 2
+         L     R0,QGETMAIN              GET LENGTH OF THE QCOMMON AREA
+         SPACE 1
+         FREEMAIN  RU,A=(R11),LV=(0),SP=44      FREE THE QCOMMON AREA
+         SPACE 1
+         L     R13,4(,R13)              DE-CHAIN SAVE AREAS
+         LM    R14,R12,12(R13)          RELOAD CALLER (SYSTEM) REGS
+         SR    R15,R15                  RC = 0 IS NICE, GUYS
+         BR    R14
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*   ABEND FOR DEBUGGING PURPOSES                                      *
+*                                                                     *
+***********************************************************************
+ABEND    QSTART  TYPE=ENTRY
+         DC    X'00C1'                  GET AN 0C1
+         QTILT '*** OUCH ***'           IN CASE RESTARTED BY TSO "TEST"
+***********************************************************************
+*                                                                     *
+*   ATTENTION EXIT                                                    *
+*                                                                     *
+***********************************************************************
+         PUSH  USING
+         DROP  ,                        CAN'T DROPX UNTIL HAVE PUSHX
+STAXEXIT LR    R12,R15
+         USING STAXEXIT,R12
+         L     R11,8(,R1)               GET USADDR FIELD
+         USING QCOMMON,R11
+         TM    QMISCFLG,QMFATTN         ATTN PREVIOUSLY PRESSED?
+         BO    QQDBLATN                 YES - ABEND AS REQUESTED
+         OI    QMISCFLG,QMFATTN         NO - INDICATE ATTN PRESSED
+         BR    R14                      AND RETURN
+         SPACE 2
+*  HOW ABOUT ASKING IF WANT TO ABEND????  %%%%%%
+QQDBLATN LR    R2,R14                   SAVE RETURN ADDRESS
+         LA    R1,=C'*** ABEND REQUESTED BY DOUBLE ATTENTION ***'
+         LA    R0,43                    LENGTH
+         SPACE 1
+         TPUT  (1),(0),R                TELL HIM WHY WE'RE ABENDING
+         SPACE 1
+         ABEND 1001                     AND DO IT
+         SPACE 1
+         BR    R2                       RETURN IF RESTARTED BY "TEST"
+         POP   USING
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*   COMMON LOGIC ERROR ROUTINE                                        *
+*                                                                     *
+***********************************************************************
+         DROPX R12                      QUEUE
+         ENTRY LOGICERR
+LOGICERR BALR  R15,0
+         USNGX *,R15
+         MVC   QERRMSG(46),=C'*** INTERNAL QUEUE LOGIC ERROR, CODE = ??$
+               ? ***'
+         STCM  R0,B'1110',QERRMSG+39    SET LOGIC CODE INTO ERROR MSG
+         QTILT *
+         DROPX R15                      LOGICERR
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*   COMMON ISPF FUNCTION ERROR ROUTINE                                *
+*                                                                     *
+***********************************************************************
+         ENTRY ISPFERR
+ISPFERR  BALR  R10,0
+         USNGX *,R10                    setup base
+         LR    R2,R1                    save calling list
+         LA    R1,QQ#MSG1               get errmsg
+         LA    R0,L'QQ#MSG1             get length
+         TPUT  (1),(0),R
+         SR    R0,R0
+         IC    R0,4(,R12)               get entry pt len
+         LA    R1,5(,R12)               -> entry pt name
+         TPUT  (1),(0),R
+         L     R1,0(,R2)                get service id
+         LA    R0,8                     and length
+         TPUT  (1),(0),R
+         ABEND 13,DUMP
+         DROPX R10
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*   CONSTANTS AND OTHER ODDITIES                                      *
+*                                                                     *
+***********************************************************************
+         LTORG
+         DROPX R13                      WORK
+QQCLEAR  DC    X'C1115D7E1140403C4040001DC813'  *** SPF TCAM
+QQASKPRT DC    C'SHOULD HARDCOPY BE QUEUED TO SYSOUT? (Y/N)'
+         SPACE 1
+QQ#CTL   DC    CL8'CONTROL'             SPF SERVICE
+QQ#DISP  DC    CL8'DISPLAY'             "TYPE"
+QQ#REFR  DC    CL8'REFRESH'             "MODE"
+QQ#MSG1  DC    C'ISPF SERVICE FUNCTION FAILED IN QUEUE:'
+         SPACE 1
+         ENTRY ENDDATA
+ENDDATA  DC    X'1DE8'                  HIGH INTENSITY, PROTECTED
+         DC    CL72'                            *** End of Data ***'
+         DC    X'1D60'                  NORMAL INTENSITY, PROTECTED
+         DC    CL4' '
+         SPACE 2
+QQ#STAX  STAX  STAXEXIT,REPLACE=NO,MF=L
+         SPACE 1
+QQ#STAXL EQU   *-QQ#STAX                LENGTH OF STAX PARM BLOCK
+         SPACE 3
+         QCOMMON
+         SPACE 3
+WORK     DSECT
+         ORG   WORK+72
+         SPACE 1
+QQ@STAX  STAX  MF=L
+         SPACE 2
+QQ@FLAG  DS    B
+QQ@LCMD  EQU   X'80'                    A LINE COMMAND WAS EXECUTED
+QQ@DCMD  EQU   X'40'                    A DESTRUCTIVE LINE CMD WAS EX'D
+QQ@WORKL EQU   *-WORK                   LENGTH OF LOCAL WORK AREA
+QQ@CALLP DS    6A                       CALL MF=L area

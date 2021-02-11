@@ -1,0 +1,594 @@
+Finding the users of a load module
+
+//MYJOB    JOB  .....
+//STEP1    EXEC PGM=CHECKLM
+//STEPLIB  DD   DISP=SHR,DSN=...
+//SYSABEND DD   DUMMY
+//
+
+CHECKLM SOURCE CODE
+
+         MACRO
+*-----               VDSAVE IN-STREAM MACRO                     -----*
+* THIS MACRO SAVES THE REGS ON ENTRY TO A SUBROUTINE ACCORDING TO    *
+* IBM LINKAGE CONVENTIONS.                                           *
+&LABEL   VDSAVE &EQUR=NO
+        USING    *,12
+        STM      14,12,12(13)    SAVE REGISTERS IN CALLING SA
+        LR       12,15           R12 - BASE REGISTER
+        LR       2,1             SAVE R1 BEFORE GETMAIN CHANGES IT
+        GETMAIN  RU,LV=72        GET 72 BYTES OF MEMORY - THIS SA
+        ST       1,8(13)         SAVE THIS SA ADDRESS IN CALLING SA
+        ST       13,4(1)         SAVE CALLING SA ADDRESS IN THIS SA
+        LR       13,1            R13 - THIS SAVE AREA ADDRESS
+        LR       1,2             RESTORE R1 - PARAMETER TABLE POINTER
+        AIF      ('&EQUR' NE 'YES').NOREG
+        LCLA     &NUM
+.LOOP   ANOP
+R&NUM   EQU      &NUM
+        AIF      (&NUM EQ 15).NOREG
+&NUM    SETA     &NUM+1
+        AGO      .LOOP
+.NOREG  ANOP
+        MEND
+*-----               VDRTRN INSTREAM MACRO                      -----*
+* THIS MACRO RESTORES THE REGS ON EXIT FROM A SUBROUTINE ACCORDING TO*
+* IBM LINKAGE CONVENTIONS.                                           *
+        MACRO
+&SYM    VDRTRN
+&SYM    DS       0H
+        L        11,4(13)        LOAD CALLING SA INTO R11
+        LR       R10,R15         SAVE R15 IN R10
+        FREEMAIN RU,LV=72,A=(13) FREE THIS SA
+        LR       R15,R10         RESTORE R15 WHICH CONTAINS RC.
+        LR       13,11           LOAD CALLING SA INTO R13 FROM R11
+        LM       14,14,12(13)    LOAD REGISTERS FROM CALLING SA -
+        LM       0,12,20(13)      - BESIDES THE R15 WHICH IS RC.
+        OI       R15(R13),X'01'  TURN ON RIGHT BIT AT R14 AT CALLING AS
+        BSM      0,14            RETURN TO CALLING PROGRAM
+        MEND
+CHECKLM  START
+CHECKLM  AMODE 31
+CHECKLM  RMODE 24
+         VDSAVE EQUR=YES
+INITCSA  EQU *
+*-----  FIND ALL ADDRESS SPACES USING A SPECIFIC LOAD MODULE    -----*
+*    THIS PROGRAM ISSUES A REPLY TO THE CONSOLE, AND RECEIVES THE    *
+* NAME OF THE LOAD MODULE.                                           *
+*    THEN IT SCHEDULES AN SRB ON EVERY ACTIVE ADDRESS SPACE. THE     *
+* SRB CHECKS WHETHER THIS ADDRESS SPACE IS USING THE TESTED LOAD-    *
+* MODULE. FINALLY, THE PROGRAM PRINTS THE RESULTS.                   *
+*   ONE CASE IS DEFINED AS A "FAILURE" : WHEN THE SRB DOES NOT       *
+* COMPLETE WHITHIN 10 SECS. PROBABLE REASONS ARE :                   *
+*           1) THE ADDRESS SPACE UNDER WHICH THE SRB IS RUNNING WAS  *
+*              SWAPPED OUT.                                          *
+*           2) THE SRB ABENDS.                                       *
+* IF THIS OCCURS, THE NAME OF THE ADDRESS SPACE IN ERROR WILL BE     *
+* PRINTED IN THE FINAL REPORT.                                       *
+* INPUT  : NONE                                                      *
+* USAGE  : R2  -> ASVT                                               *
+*          R3  =  ASVT ENTRIES COUNTER                               *
+*          R4  =  INDEX IN ASVT                                      *
+*          R5  -> SRB CB                                             *
+*          R6  -> WORK AREA                                          *
+*          R8  =  ASID OF A/S BEING SCHEDULED                        *
+*          R9  -> CURRENT ASCB                                       *
+*          R11 -> PARMS AREA                                         *
+*          R12 =  BASE                                               *
+* RESTRICTIONS : 1. THE PROGRAM MUST BE LINKED-EDITED WITH 'AC 1'    *
+*                   AND PUT INTO AN APF-AUTHORIZED LIBRARY.          *
+*                2. THE PROGRAM MUST BE LINKED-EDITED WITH 'RENT'    *
+*                   OPTION.                                          *
+*--- GET LM NAME TO SEARCH (VIA A WTOR TO THE CONSOLE).              *
+         GETMAIN  RC,LV=WKSIZE,LOC=(ANY,ANY),SP=0
+         LR    R6,R1
+         USING WKAREA,R6                 ;ADDRESSABILITY ON WORK AREA
+         SR    R0,R0
+         XC    WTORECB,WTORECB
+         XC    TOTFOUND,TOTFOUND
+         MVC   LMNAME,=CL8' '            ;ZERO WTOR ANSWEAR AREA
+         MVC   MESSAGE,MSGLENV
+         MVC   MSGSTAB,=C' ASID(DEC) : '
+         MVC   WKWTOR(WTOR_LEN),WTORV
+         WTOR  ' ',LMNAME,L8,WTORECB,MF=(E,WKWTOR)
+         WAIT  ECB=WTORECB               ;WAIT FOR RESPONSE
+* CHECK WTOR RESULTS                                                 *
+         LTR   R15,R15
+         BNE   WTOROK
+         MVC   WKWTO1(WTO1_LEN),WTO1V
+         WTO   MF=(E,WKWTO1)
+         B     EXIT
+* ....IF WTOR IS OK, THEN CONTINUE.                                  *
+WTOROK   EQU   *
+         CLC   LMNAME,=CL8' '            ;Q : IS IT A NULL RESPONSE ?
+         BNE   SEARCHLM                  ;A : NO, CONTINUE
+         MVC   WKWTO2(WTO2_LEN),WTO2V
+         WTO   MF=(E,WKWTO2)
+         B     EXIT
+* GET CSA AREA AND INITIALIZE THE HEADER. THE SRB AND ITS PARAMETERS *
+* BLOCK MUST RESIDE IN THE CSA.                                      *
+SEARCHLM EQU   *
+         GETMAIN RC,LV=PREFSIZE+SRBSIZE+PARMSIZE,SP=227,LOC=(ANY,ANY)
+         LTR   R15,R15                    ;GOT CSA ...?
+         BNZ   EXIT                       ;...NO.EXIT.
+         LR    R3,R1
+* ESTABLISH A RECOVERY ROUTINE, IF NECESSARY.                        *
+* THE  ROUTINE WILL BE INVOKED IF THIS PROGRAM ABENDS.               *
+         LA    R2,CLEANUP                       ;R2 -> RETRY ADDRESS
+         MVC   WKESTAEC(ESTAECV_LEN),ESTAECV
+         ESTAE ESTAEX,CT,PARAM=(R2),TERM=YES,MF=(E,WKESTAEC)
+         MVC   0(4,R3),=C'LSRB'                 ;EYECATCHER
+         MVC   4(1,R3),=AL1(227)
+         MVC   5(3,R3),=AL3(PREFSIZE+SRBSIZE+PARMSIZE)
+         ST    R3,CSAADR                        ;SAVE CSA AREA ADDR
+* LOAD SRB INTO CSA AREA.                                            *
+         MVC   WKMODON(MODON_LEN),MODONV
+         MODESET MF=(E,WKMODON)
+         MVC   WKLOAD(LOAD_LEN),LOADV
+         LOAD  EP=ALMSRB,GLOBAL=YES,EOM=NO,SF=(E,WKLOAD)
+         LR    R2,R0                       ;R2 -> MODULE ENTRY POINT
+         MVC   WKMODOF(MODOF_LEN),MODOFV
+         MODESET MF=(E,WKMODOF)
+         ST    R2,LMEP
+         L     R2,FLCCVT-PSA(0)            ;R2 -> CVT
+         L     R2,CVTASVT-CVT(R2)          ;R2 -> ASVT
+         L     R3,ASVTMAXU-ASVT(R2)        ;R3 = ASVT SIZE
+         SR    R4,R4                       ;R4 = ASCB COUNTER
+* RUN OVER THE ASVT. FOR EACH ENTRY CHECK IF IT'S A VALID ASCB.      *
+* IF IT IS THEN INITIALIZE AN SRB AND RUN IT IN THAT ASCB.           *
+CHKASCB  EQU   *
+         L     R9,ASVTENTY-ASVT(R4,R2)     ;R9 -> ASCB
+         LTR   R9,R9                       ;Q.: DOES ASCB EXIST ?
+         BM    NOTFOUND                    ;A.: NO. GOTO NEXT ASCB
+         SR    R8,R8
+         LH    R8,ASCBASID-ASCB(R9)        ;R8 = ASID NO.
+         L     R5,CSAADR
+         LA    R5,PREFSIZE(R5)
+* LOAD VALUES INTO SRB CONTROL BLOCK                                 *
+         USING SRBSECT,R5                  ;R5 -> SRB CB
+         XC    SRBSECT(SRBSIZE),SRBSECT
+         MVC   SRBID,=CL4'SRB'             ;EYECATCHER
+         ST    R9,SRBASCB                  ;SAVE ASCB TO RUN SRB ON
+         MVC   SRBEP,LMEP
+         LA    R11,SRBSECT+SRBSIZE         ;R11 -> PARMS PASSED TO SRB
+         ST    R11,SRBPARM
+* LOAD VALUES INTO PARAMETER LIST PASSED TO THE SRB                  *
+         USING PARMS,R11
+         XC    PARMS(PARMSIZE),PARMS
+         MVC   PRMMY,PSAAOLD-PSA(0)        ;LOAD MY ASCB ADDR.
+         MVC   PRMLM,LMNAME                ;LOAD REQUESTED LM NAME
+         LA    R7,PRMECB                   ;R7 -> ECB
+         ST    R7,TPARM                    ;STORE ECB ADDR FOR TIMER
+         ST    R9,PRMCALED                 ;STORE TARGET ASCB ADDR.
+         XC    PRMECB,PRMECB
+* SCHEDULE THE SRB                                                   *
+         MVC   WKMODON(MODON_LEN),MODONV
+         MODESET MF=(E,WKMODON)
+         SCHEDULE SRB=(R5),SCOPE=LOCAL
+         MVC   WKMODOF(MODOF_LEN),MODOFV
+         MODESET MF=(E,WKMODOF)
+* ESTABLISH AN ASYNC TIMER. IF THE SRB DOES NOT END IN 10 SECS THEN *
+* THE TIMER EXIT IS TAKEN, FREEING THE WAIT STATUS OF THE JOB.     *
+         MVC   WKSET(SET_LEN),SETV
+         STIMERM SET,WAIT=NO,EXIT=TIMEX,ID=TID,PARM=TPARM,             *
+               BINTVL=SECS10,MF=(E,WKSET)
+* WAIT TILL THE SRB ENDS.                                            *
+         WAIT  ECB=PRMECB
+* CHECK IF THE SRB COMPLETED OK, OR THE STIMER EXIT WAS TAKEN.       *
+         XC    PRMCALED,PRMCALED
+         MVC   WKSET(SET_LEN),SETV
+         STIMERM CANCEL,ID=TID,MF=(E,WKSET) ;CANCEL STIMER EXIT
+         L     R7,PRMECB                   ;R7 = SRB RETURN CODE
+         SLL   R7,2
+         LTR   R7,R7                       ;Q. : IS RC = 0 ?
+         BZ    SRBOK                       ;A. : YES. SRB WAS OK.
+         MVC   MSGTEXT,=C'SYSLM  - ***** FAILED TO CHECK JOB '
+         B     PRINTIT
+SRBOK    EQU   *
+         CLI   PRMFLAG,X'0'                ;Q. : SRB FOUND LM ?
+         BE    NOTFOUND                    ;A. : NO
+FOUNDLM  EQU   *
+         MVC   MSGTEXT,=C'SYSLM  - FOUND    MODULE   IN  JOB '
+         L     R7,TOTFOUND                 ;INCREMENT MODULE COUNTER
+         LA    R7,1(R7)
+         ST    R7,TOTFOUND
+* PRINT THE CHECKED ASID NUMBER                                      *
+PRINTIT  EQU   *
+         CVD   R8,ASIDNO
+         OC    ASIDNO+7(1),=X'0F'
+         UNPK  ASIDNO(3),ASIDNO+6(2)
+         MVC   MSGJOB,=CL8' '
+         L     R7,ASCBJBNI-ASCB(R9)
+         LTR   R7,R7
+         BZ    NOJOB
+         MVC   MSGJOB,0(R7)
+         B     PREMSG
+NOJOB    EQU   *
+         L     R7,ASCBJBNS-ASCB(R9)
+         LTR   R7,R7
+         BZ    PREMSG
+         MVC   MSGJOB,0(R7)
+PREMSG   EQU   *
+         XR    R0,R0
+         LA    R7,MESSAGE
+         MVC   WKWTO3(WTO3_LEN),WTO3V
+         WTO   TEXT=((R7)),MF=(E,WKWTO3)
+* CONTINUE TO NEXT ASVT ENTRY                                        *
+NOTFOUND EQU   *
+         LA    R4,4(,R4)                 ;R4 -> NEXT ASVT ENTRY
+         BCT   R3,CHKASCB
+         CLC   TOTFOUND,=F'0'            ;Q. : FOUND ANY USERS ?
+         BNE   CLEANUP                   ;A. : NO. EXIT
+         MVC   WKWTO4(WTO4_LEN),WTO4V    ;PRINT SOME TOTALS.
+         WTO   MF=(E,WKWTO4)
+* CLEANUP AFTER FINISHED PROCESSING.                                 *
+CLEANUP  EQU   *
+         DELETE EP=LISTLM                ;DELETE MODULE FROM CSA
+         MVC   WKESTAED(ESTAEDV_LEN),ESTAEDV
+         ESTAE 0,MF=(E,WKESTAED)         ;KILL ESTAE
+         L     R1,CSAADR
+         L     R0,CSASIZE
+         FREEMAIN R,A=(R1),LV=(R0),SP=227 ;FREE CSA DATA AREA
+EXIT     EQU   *
+         FREEMAIN RU,A=(R6),LV=WKSIZE,SP=0 ;FREE WORK AREA
+         DROP  R5
+         DROP  R11
+         SR    R15,R15
+         VDRTRN
+         LTORG
+***                   TIMER EXIT ROUTINE                           ***
+*    THIS ROUTINE IS INVOKED. IF, AFTER A CONSTANT PERIOD OF TIME,   *
+* THE WAIT ON THE SRB ECB WASN'T POSTED (BY THE SRB), WHICH MEANS    *
+* THAT SOMETHING IS WRONG IN THE SRB.                                *
+* THIS ROUTINE IS RUNNING ASYNC. ALL IT DOES IS TO POST THE ECB (TO  *
+* FREE THE MAIN PROGRAM) AND RETURN TO THE MAIN BLOCK.               *
+*    NOTE THAT THE EXIT POSTS THE ECB WITH A SPECIAL RC OF X'00C'.   *
+* THE 'BAD' RC IS AN INDICATION FOR THE WAIT THAT SOMETHING IS WRONG.*
+* USAGE : R4 -> ECB TO POST                                          *
+TIMEX    DS    0F
+         STM   R14,R12,12(R13)           ;STORE REGS IN SAVE AREA
+         L     R5,4(R1)                  ;R4 -> ECB
+         POST  (R5),X'00C'               ;FREE WAIT
+         LM    R14,R12,12(R13)           ;RESTORE REGS
+         BR    R14                       ;CONTINUE NORMAL FLOW
+***                ESTAE EXIT ROUTINE                              ***
+* THIS ROUTINE IS ENTERED IN CASE OF AN ABEND IN THE MAIN PROGRAM.   *
+* IT PERFORMS A RETRY TO THE MAIN PROGRAM BLOCK. THE RETRY POINT     *
+* BEING WHERE THE MAIN PROGRAM PERFORMS A CLEAN-UP AND TERMINATES.   *
+* USAGE : R10 -> RETURN POINT IN THE MAIN BLOCK                      *
+*         R11 -> SDWA                                                *
+*         R13 -> BASE REG                                            *
+ESTAEX   DS    0F
+         USING ESTAEX,R15          ;CHECK FOR SDWA
+         CL    R0,=F'12'
+         BE    NOSDWA
+         LA    R15,*-ESTAEX+4(R15)
+         DROP  R15
+         VDSAVE
+         USING SDWA,R11            ;ADDRESSABILITY ON SDWA
+         LR    R11,R1              ;R11 -> SDWA
+         L     R10,SDWAPARM        ;R10 -> RETURN POINT
+         SETRP WKAREA=(R11),DUMP=NO,RC=4,RETREGS=YES,FRESDWA=YES,      *
+               RETADDR=(R10)
+         WTO   'ESTAE ENTERED',ROUTCDE=(2)
+         VDRTRN
+NOSDWA   EQU   *
+         BR    R14
+         LTORG
+PARM     DS    0H
+L8       EQU  8
+PREFSIZE EQU   8
+CSASIZE  DC    AL4(PREFSIZE+SRBSIZE+PARMSIZE)  ;SIZE OF CSA AREA
+SECS10   DC    AL4(2000)                       ;10 SECS CONSTANT
+MSGLENV  DC    AL2(MSGLEN)
+ESTAECV  ESTAE ESTAEX,CT,PARAM=PARM,TERM=YES,MF=L
+ESTAECV_LEN EQU *-ESTAECV
+ESTAEDV  ESTAE 0,MF=L
+ESTAEDV_LEN EQU *-ESTAEDV
+WTO1V    WTO   'SYSLM   - WTOR FAILED',ROUTCDE=(2),MF=L
+WTO1_LEN EQU   *-WTO1V
+WTO2V    WTO   'SYSLM   - NO ACTION. NULL LM NAME SPECIFIED',          *
+               ROUTCDE=(2),MF=L
+WTO2_LEN EQU   *-WTO2V
+WTO4V    WTO   'SYSLM   - NO ADDRESS SPACE IS CURRENTLY USING THE LM', *
+               ROUTCDE=(2),MF=L
+WTO4_LEN EQU   *-WTO4V
+MODONV   MODESET KEY=ZERO,MODE=SUP,MF=L
+MODON_LEN EQU  *-MODONV
+MODOFV   MODESET KEY=NZERO,MODE=PROB,MF=L
+MODOF_LEN EQU  *-MODOFV
+WTORV    WTOR 'SYSLM   - ENTER MODULE NAME : ',PARM,L8,PARM,           *
+               ROUTCDE=(1),MF=L
+WTOR_LEN EQU   *-WTORV
+LOADV    LOAD  EP=ALMSRB,GLOBAL=YES,EOM=NO,SF=L
+LOAD_LEN  EQU  *-LOADV
+SETV     STIMERM SET,MF=L
+SET_LEN   EQU  *-SETV
+WTO3V    WTO   TEXT=,ROUTCDE=(2),MF=L
+WTO3_LEN  EQU  *-WTO3V
+* WORKAREA                                                        *
+WKAREA   DSECT
+DUMMY    DS    0H
+WTORECB  DS    F
+CSAADR   DS    F                  ;ADDRESS OF CSA DATA AREA
+LMEP     DS    F                  ;SRB ENTRY POINT
+TID      DS    F                  ;TIMER ID
+TPARM    DS    F                  ;PARMS PASSED TO ASYNC TIMER ROUTINE
+LMNAME   DS    CL8                ;LM SEARCHED
+TOTFOUND DS    F                  ;COUNTER FOR AS USING THE LM.
+MESSAGE  DS    H
+MSGTEXT  DS    CL35
+MSGJOB   DS    CL8
+MSGSTAB  DS    CL13
+ASIDNO   DS    XL3
+MSGLEN   EQU   *-MESSAGE-2
+STUB     DS    XL5
+WKESTAEC ESTAE ESTAEX,CT,PARAM=DUMMY,TERM=YES,MF=L
+WKESTAED ESTAE 0,MF=L
+WKWTO1   WTO   'SYSLM   - WTOR FAILED',ROUTCDE=(2),MF=L
+WKWTO2   WTO   'SYSLM   - NO ACTION. NULL LM NAME SPECIFIED',          *
+               ROUTCDE=(2),MF=L
+WKWTO4   WTO   'SYSLM   - NO ADDRESS SPACE IS CURRENTLY USING THE LM', *
+               ROUTCDE=(2),MF=L
+WKMODON  MODESET KEY=ZERO,MODE=SUP,MF=L
+WKMODOF  MODESET KEY=NZERO,MODE=PROB,MF=L
+WKWTOR   WTOR 'SYSLM   - ENTER MODULE NAME : ',DUMMY,L8,DUMMY,         *
+               ROUTCDE=(1),MF=L
+WKLOAD   LOAD  EP=ALMSRB,GLOBAL=YES,EOM=NO,SF=L
+WKSET    STIMERM SET,MF=L
+WKWTO3   WTO   TEXT=,ROUTCDE=(2),MF=L
+WKSIZE   EQU *-WKAREA
+* PARMS PASSED TO SRB                                             *
+PARMS    DSECT
+PRMECB   DS    F
+PRMCALED DS    A
+PRMMY    DS    A
+PRMLM    DS    CL8
+PRMFLAG  DS    AL1
+PARMSIZE EQU   *-PARMS
+         IHASRB
+         IHAASCB DSECT=YES
+         IHASDWA
+         IHAPSA
+         CVT     DSECT=YES
+         IHAASVT
+         END
+ALMSRB SOURCE CODE
+ALMSRB  START
+ALMSRB  AMODE 31
+ALMSRB  RMODE ANY
+*----- SCAN  ALL MODULES REFERENCED BY AN ADDRESS SPACE          -----*
+*    THIS PROGRAM SCANS  ALL THE LMS REFERENCED BY AN ADDRESS SPACE.  *
+* IT RUNS AS AN SRB UNDER EACH ACTIVE ADDRESS SPACE.                  *
+* THE TERM "CURRENT ADDRESS SPACE" REFERS TO THE ADDRESS SPACE UNDER  *
+* WHICH THE SRB IS CURRENTLY RUNNING.                                 *
+* THE TERM "FATHER ADDRESS SPACE" REFERS TO THE ADDRESS SPACE WHICH . *
+* SCHEDULED THIS SRB (THE 'CHECKLM' PROGRAM)                          *
+* INPUT : R15 -> ENTRY POINT                                          *
+*         R14 -> RETURN ADDRESS                                       *
+*         R1  -> PARAMETER PASSED BY THE SCHEDULE MACRO               *
+* USAGE : R6  -> PARMS AREA                                           *
+*         R9  =  SRB IDENTIFIER                                       *
+*         R12 = BASE REGISTER                                         *
+*         R8  -> TO THE NAME OF THE LM BEING SEARCHED                 *
+*         R2  -> ASXB OF CURRENT AS                                   *
+*         R11 -> FIRST TCB IN CURRENT AS                              *
+*         R7  -> ASID OF FATHER AS                                    *
+*         R5  -> FRR ROUTINE                                          *
+* MODE  : THIS PROGRAM RUNS IN SRB MODE. SVCS ARE NOT ALLOWED         *
+* RESTRICTIONS :1) MUST BE LINKED-EDITED WITH 'AC 1' AND PUT INTO AN  *
+*                  APF-AUTHORIZED LIBRARY.                            *
+*               2) MUST BE LINK EDITED WITH THE 'RENT' OPTION.        *
+        BAKR   14,0                       ;SAVE REGS
+        LR     R12,R15
+        USING  ALMSRB,R12
+        LR    R6,R1                       ;R6 -> PARAMETERS CB.
+        USING PARMS,R6
+* GET STORAGE FOR THE FRR EXIT IN COMMON STORAGE, AND SET IT.         *
+* IN CASE OF AN ABEND IN THE SRB (OR ANY OTHER TASK IN THE 'CURRENT   *
+* ADDRESS SPACE') THE FRR EXIT WILL BE INVOKED.                       *
+* NOTICE THAT R9 = 'ILAN' DURING THE SRB EXECUTION. WHEN THE FRR IS   *
+* INVOKED IT WILL CHECK THE VALUE OF R9 AT THE TIME OF THE ABEND.     *
+* IF R9 ^= 'ILAN' IT MEANS THAT THE SRB WASN'T THE CAUSE OF THE ABEND.*
+        STORAGE OBTAIN,LENGTH=FRRSIZE,SP=227,LOC=(ANY,ANY)
+        LR    R2,R1                       ;R2 -> FRR EXIT
+        L     R9,=C'ILAN'                 ;R9 = IDENTIFIER
+        SETFRR A,FRRAD=(R2),WRKREGS=(R4,R5),PARMAD=(R3)
+        ST    R12,0(0,R3)                 ;SAVE R12 FOR FRR USE
+        ST    R6,4(0,R3)                  ;SAVE R6  FOR FRR USE
+        ST    R2,12(0,R3)                 ;SAVE R2  FOR FRR USE
+        MVC   16(4,R3),=C'ILAN'           ;SAVE EYECATCHER
+        LA    R5,ERROR
+        BSM   R5,0
+        ST    R5,8(0,R3)                  ;SAVE RETURN ADDR FROM FRR
+        LR    R7,R2
+        LA    R3,FRRSIZE
+        LA    R4,FRREX
+        LR    R5,R3
+        MVCL  R2,R4                       ;MOVE FRR EXIT SOURCE INTO..
+        LR    R5,R7                       ;...CSA.
+* ONE OF THE PARAMS PASSED TO THE SRB IS THE 'CURRENT ADDRESS SPACE'  *
+* ASCB ADDRESS. BECAUSE THE PARAM AREA RESIDES IN THE CSA, YOU MUST   *
+* VERIFY THAT IT BELONGS TO YOU. THIS PREVENTS A SITUATION IN WHICH   *
+* THIS SRB COULDN'T COMPLETE WITHIN 10 SECONDS AND THE 'FATHER ADDRESS*
+* SPACE' SCHEDULED ANOTHER SRB. THE NEXT SRB USES THE SAME PARAMS     *
+* AREA. THE VERIFICATION ACTION PREVENTS THE CASE OF TWO SRBS UPDATING*
+* ONE PARAMS AREA.                                                    *
+        CLC   PRMCALED,PSAAOLD-PSA(0)     ;IF PARM AREA BELONGS TO..
+        BE    PRMOK                       ;...YOU,THEN CONTINUE...
+        B     ERROR                       ;..ELSE CLEAN UP AND EXIT
+* IF PARM AREA (WHICH WAS PASSED TO THE SRB) IS OK, START PERFORMING  *
+* THE SEARCH.                                                         *
+PRMOK   EQU   *
+        LA    R8,PRMLM                    ;R8 -> MODULE NAME
+        L     R2,PSAAOLD-PSA(0)           ;R2 -> CURRENT ASCB
+        L     R2,ASCBASXB-ASCB(R2)        ;R2 = CURRENT ASXB
+        L     R11,ASXBFTCB-ASXB(R2)       ;R11= FIRST   TCB
+        LR    R1,R11
+        L     R15,CALLADR
+        BALR  R14,R15                     ;RUN SCANNING ROUTINE.
+* PERFORM CLEANUP : POST THE WAITING AS WHICH SCHEDULED THE SRB,      *
+*                   CLEAR FRR AND RELEASE THE STORAGE ALLOCATED FOR   *
+*                   THE FRR EXIT.                                     *
+SIGEND  EQU   *
+        L     R7,PRMMY                    ;R7 -> SRB CREATOR ASCB
+        POST  PRMECB,X'00',ASCB=(R7),ERRET=EPILOG,BRANCH=YES
+ERROR   EQU   *
+        SETFRR D,WRKREGS=(R9,R10)         ;DELETE FRR
+        STORAGE RELEASE,LENGTH=FRRSIZE,SP=227,ADDR=(R5)
+EPILOG  EQU   *
+        DROP  R6
+        DROP  R12
+        PR
+        LTORG
+CALLADR DC    V(PRTRB)
+*                   THE FRR EXIT ROUTINE                              *
+*    THE FRR EXIT. ENTER IN CASE OF ABEND.                            *
+* IF THE SRB ABENDS THE  FRR IS INVOKED. THE FRR FIRST CHECKS THAT    *
+* THE ABENDING TASK IS MY SRB (BY CHECKING R9). IF IT IS THEN IT      *
+* PERFORMS A RETRY TO END THE SRB NORMALLY, OTHERWISE IT PERCOLATES.  *
+*   THIS SRB ESTABLISHES AN FRR IN THE ADDRESS SPACE IN WHICH IT RUNS.*
+* IF ANY TASK (NOT NECESSARILY MY SRB) ABENDS, THE FRR COULD BE       *
+* INVOKED. SO FIRST WE MUST CHECK THAT THE FRR WAS INVOKED BECAUSE OF *
+* AN ABEND IN MY SRB. IF THIS IS NOT THE CASE, PERCOLATE.             *
+* IF IT IS THE CASE - THEN WE CAN PERFORM A RETRY, TO END THE SRB     *
+* AS NORMALLY AS POSSIBLE.                                            *
+FRREX    EQU  *
+         USING FRREX,R4
+         USING SDWA,R3
+         LR   R4,R15                      ;R4 -> FRR EXIT ENTRY POINT
+         LR   R3,R1                       ;R3 -> SDWA AREA
+         LR   R2,R14                      ;R2 -> RET. ADDR TO RTM
+         L    R5,SDWAPARM                 ;R5 -> 24-BYTE PARM AREA
+         CLC  SDWASRSV+36(4),FRRID        ;IF I'M NOT THE CAUSE OF..
+         BNE  NOT_MY                      ;...ERROR THEN PERCOLATE.
+* INITIALIZE NECCESARY REGS. THESE REGS WILL BE SET WHEN CONTROL      *
+* RETURNS TO THE POINT OF RETRY IN THE MAIN SRB BLOCK.                *
+         L    R7,12(0,R5)
+         ST   R7,SDWASRSV+20              ;R5 -> FRR ADDR
+         L    R7,4(0,R5)
+         ST   R7,SDWASRSV+24              ;R6 -> PARM DSECT
+         L    R7,0(0,R5)
+         ST   R7,SDWASRSV+48              ;R12 = BASE REGISTER
+         L    R7,8(0,R5)
+         SETRP WKAREA=(R3),DUMP=NO,RC=4,RETREGS=YES,RETADDR=(R7)
+         BR   R2
+NOT_MY   EQU  *
+         SETRP WKAREA=(R3),RC=0,DUMP=NO
+         BR   R2
+FRRID    DC   C'ILAN'
+FRRSIZE  EQU  *-FRREX
+         DROP R3
+         DROP R4
+*        A PROCEDURE TO SEARCH MODULE IN A TCB (RECURSIVE)            *
+* INPUT : R1  -> TO THE TCB BEING CHECKED.                            *
+* USAGE : R12 = BASE REG.                                             *
+*         R11 -> CURRENT TCB BEING CHECKED                            *
+*         R3  -> RB/LLE BEING CHECKED.                                *
+*         R4  -> CDE OF RB/LLE                                        *
+*         R8  -> TO NAME OF L.M. BEING SEARCHED                       *
+*         R6  -> TO THE PARMS AREA.                                   *
+* PROCESS : THE PROCEDURE CHECKES IF THE CURRENT TCB HAS A SON OR A   *
+*           BROTHER. IF IT DOES, IT CALLS ITSELF (RECURSIVELY) TO     *
+*           SCAN THE MODULES OF THE SON/BROTHER TCB.                  *
+*           IF THE CURRENT TCB HAS NO SON/BROTHER THE PROCEDURE       *
+*           SCANS TWO LISTS POINTED FROM THE TCB :                    *
+*             1. THE RB CHAIN                                         *
+*             2. THE LLE CHAIN                                        *
+*           EACH ENTRY IN THESE LISTS CONTAINS A POINTER TO A         *
+*           CDE/LPDE OF A MODULE.                                     *
+*           THE PROCEDURE CHECKS IF ONE OF THESE CBS' POINTS          *
+*           TO THE TARGET MODULE (HIS NAME IS POINTED BY R8).         *
+* OUTPUT  : 'PRMFLAG' FIELD OF THE PARMS AREA IS SET BY THE SRB TO    *
+*           ONE OF THESE VALUES :                                     *
+*                   NOT CHANGED - MODULE NOT FOUND.                   *
+*                   1           - MODULE WAS FOUND.                   *
+PRTRB   CSECT
+        BAKR  14,0
+        LR    R12,R15
+        USING PRTRB,R12
+        LR    R11,R1
+        USING TCB,R11                     ;R11 -> CURRENT TCB
+        L     R10,TCBNTC                  ;R10 -> SISTER TCB
+        N     R10,=X'FFFFFFFE'            ;Q. TCB HAS SISTER ?
+        BZ    NOSISTR                     ;A. NO.
+        LR    R1,R10                      ;FOUND SISTER, CALL YOURSELF
+        LA    R15,PRTRB                   ;RECURSIVELY.
+        BALR  R14,R15
+        CLI   PRMFLAG-PARMS(R6),X'1'      ;Q. FOUND LM IN SISTER TCB?
+        BE    EXIT                        ;A. YES. YOU MAY LEAVE.
+NOSISTR EQU *
+        L     R10,TCBLTC                  ;R10 -> SON TCB
+        N     R10,=X'FFFFFFFE'            ;Q. TCB HAS A SON ?
+        BZ    NOSON                       ;A. NO. CONTINUE !
+        CR    R10,R11                     ;Q. TCB IS THE SON OF ITSELF?
+        BE    NOSON                       ;A. NO. CONTINUE.
+        LR    R1,R10                      ;CALL YOURSELF RECURSIVELY.
+        LA    R15,PRTRB
+        BALR  R14,R15
+        CLI   PRMFLAG-PARMS(R6),X'1'      ;Q. FOUND MODULE IN SON TCB?
+        BE    EXIT                        ;A. YES. YOU MAY LEAVE.
+* IF THE CURRENT TCB HAS NO SONS AND NO BROTHERS THEN YOU CAN START   *
+* SCANNING THE LLE AND RB CHAINS. FIRST CHECK THE RB CHAIN.           *
+NOSON   EQU   *
+        L     R3,TCBRBP                   ;R3 = LAST RB
+        USING RBBASIC,R3
+NEXTRB  EQU *
+        SR    R5,R5
+        IC    R5,RBSIZE+2
+        LTR   R5,R5
+        BNZ   CONT
+        L     R4,RBCDE1                   ;R4 = CURRENT CDE
+        SRL   R4,8
+        CLC   0(8,R8),CDNAME-CDENTRY(R4)  ;Q. FOUND LM ?
+        BE    FOUNDIT                     ;A. YES.
+CONT    EQU   *
+        L     R3,RBLINKB                  ;R3 -> PREV RB IN CHAIN
+        SRL   R3,8
+        CR    R3,R11                      ;Q. END OF RB CHAIN ?
+        BNE   NEXTRB                      ;A. NO.
+* CHECK THE L.M. POINTED BY THE LLE CHAIN                             *
+LLELST  EQU *
+        DROP  R3
+        USING LLE,R3
+        L     R3,TCBLLS                   ;R3 -> FIRST LLE ENTRY
+        B     CHECKLL
+NEXTLLE EQU *
+        L     R4,LLECDPT                  ;R4 -> CURRENT CDE ENTRY
+        CLC   0(8,R8),CDNAME-CDENTRY(R4)  ;Q. FOUND MODULE ?
+        BE    FOUNDIT                     ;A. YES !
+        L     R3,LLECHN                   ;R3 -> NEXT LLE ENTRY
+CHECKLL EQU   *
+        LTR   R3,R3                       ;CHECK IF END OF LLE CHAIN
+        BNZ   NEXTLLE
+        B     EXIT
+FOUNDIT EQU   *
+        MVI   PRMFLAG-PARMS(R6),X'1'
+EXIT    EQU   *
+        DROP  R12
+        PR
+        LTORG
+* THE PARMS CB. PASSED TO THE SRB BY THE FATHER AS                    *
+PARMS    DSECT
+PRMECB   DS F          ;ECB ON WHICH THE FATHER AS WAITS TO THE SRB
+PRMCALED DS A          ;POINTER TO THE CURRENT AS ASCB
+PRMMY    DS A          ;POINTER TO THE FATHER  AS ASCB
+PRMLM    DS CL8        ;THE NAME OF THE LM BEING SEARCHED
+PRMFLAG  DS AL1        ;FLAG WORD
+PRMSIZE  EQU *-PARMS
+        IHARB
+        IHAPSA
+        IHAASXB
+        IHAASCB
+        IHACDE
+        IKJTCB
+        IHALLE
+        IHASDWA
+        IHAFRRS
+        CVT     DSECT=YES
+        END
+
+
+Ilan Shiber
+Systems Programmer (Israel)                                                         c Xephon 1995
+

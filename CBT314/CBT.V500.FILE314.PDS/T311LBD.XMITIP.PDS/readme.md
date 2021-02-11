@@ -1,0 +1,181 @@
+
+## $DOC.txt
+```
+This dataset contains the REXX Application XMITIP.  The contents are:
+
+*********************************************************************
+*** Important: If you received this from a site other than        ***
+***            http://www.lbdsoftware.com then you should check   ***
+***            there for a possible more current version.         ***
+*********************************************************************
+
+NOTE: A STEPLIB or update to linklist is now required to use this code.
+
+Installation Step 1:
+    To execute the RECEIVE member issue
+       "TSO EXEC 'hlq.pds-dsname(RECEIVE)' EXEC"
+    This will create the rexx, panels, etc. libraries and place you in
+    ISPF Browse on some key members.
+Installation Step 2.
+    Update XMITIPCU - see the Installation Guide.
+
+Optional packages that you might need/want:
+
+         TXT2PDF used for the text to PDF conversion
+                 for file attachments
+
+Updates and the optional packages can be found
+at http://www.lbdsoftware.com
+
+Mutual Support:
+Mark Regan has created a listserv for mutual support:
+               Subscribe:    xmitip-subscribe@yahoogroups.com
+               Unsubscribe:  xmitip-unsubscribe@yahoogroups.com
+               Post message: xmitip@yahoogroups.com
+               List owner:   xmitip-owner@yahoogroups.com
+
+Reference: If you have questions on setting up SMTP or using National
+           languages check out Andy Robertson's site:
+           http://home.clara.net/andywrobertson/mvshowtosmtp.html
+
+Caution: Be sure to run the IVPJOB to verify your installation.
+
+$DOC     what you are reading
+$WISH    list of requested changes/enhancements
+ALLOCGDG doc on using this new exec
+ASM      Assembler source modules
+         * in IDTF format
+CHANGES  what's changed
+COMPILE  information if you want to compile this application
+DISTINFO information on using distribution lists
+EXEC     The rexx execs in TSO Transmit (IDTF) format
+FEEDBACK Sample JCL you can use to send feedback on XMITIP
+GERMAN   Code changes to TXT2HTML and TXT2RTF for the German
+         code page
+IEFDB401 Sample dynamic allocation exit from University of Florida
+         modified by Lionel Dyck.  Will issue Notify messages to
+         TSO users for incoming mail.
+IOF      References how to use XMITIP with IOF from the IOF Vendor
+IOFOLD   Shows how to e-mail from IOF using XMITSDSF
+IVP*     These members are the Installation Verification members
+         - see member IVPJOB for the job to run
+IZGERMAN ZAP to InfoZip for German language code page
+LDAP     Information on the setup for using LDAP to query/validate
+         e-mail addresses
+LICENSE  The license under which this package is distributed
+LOAD     Load library containing various load modules
+         * in IDTF format
+LOTUS    Info on enabling Lotus Notes to support Return Receipt from SMTP
+MSGS     The ISPF messages in TSO Transmit (IDTF) format
+NOTIFY   From Paul Wells: (in TSO Transmit (IDTF) format)
+         This allows you to route the SMTP Logfile to OPS/MVS which
+         will then process the logfile and issue messages to the user
+         about incoming mail.
+PN*****  APARs that you might find interesting      <<<<<<<<<<<<<<<
+PQ*****  APARs that you might find interesting      <<<<<<<<<<<<<<<
+PANELS   The ISPF panels in TSO Transmit (IDTF) format
+PDF      Short description on how to use TXT2PDF outside of
+         XMITIP to create PDF files.
+RECEIVE  A simple exec to receive the EXEC and PANELS members
+         into partitioned datasets
+SAMPDISC Sample Disclaimers if you need to use one
+SDSF     Information on using the XMITSDSF to interface to XMITIPFE
+SENDMAIL Thoughts on how to enable XMITIP to deliver mail using sendmail
+         (not implemented as I can't get it working yet)
+SMTPRTN  Batch JCL for REXX Code SMTPRTN
+SMTPUPD  Doc on the SMTPUPD Exec from Kent Garrett
+SMTPVFY  Batch JCL to verify that SMTP is properly installed
+SPOOF1   Discussion on spoofing and the XMITIP antispoof option
+SPOOF2   A technique to prevent spoofing using SECURE SMTP
+         * Thanks to Matt
+TCPDATA  Information on how TCP/IP looks for the TCPDATA file
+TEST$GIF Sample GIF for testing GIF attachments (US Flag)
+TEST$CSV Sample CSV for testing CSV attachments
+TESTXMIT Rexx code to test the new dialog using altlib and libdef
+         ** May also be used under a different name to invoke XMITIP
+         ** without copying the xmitip libraries into production
+         libraries
+TMSGQ    Sample exec for testing MSGQ
+TXT2HTML User documentation on Text-to-HTML tool
+TOOLS    Brief summary of the tools included with XMITIP
+XMITSTAT Doc on how to generate SMTP Statistics
+STATJCL  JCL to generate SMTP statistics from the IBM SMTP
+         Server.
+
+For National Language Support:
+IZIPA    - sample zap JCL to update the ASCII Translation Table for
+           InfoZip (thanks to Ottosson Staffan) IBM-278 to ISO8859-1 (Swedish).
+IZIPE    - sample zap JCL to update the EBCDIC Translation Table for
+           InfoZip (thanks to Ottosson Staffan) IBM-278 to ISO8859-1 (Swedish).
+PDFXLTB  - Build a national language translate table for XMITIPTR *
+SMTPXLTB - Build a national language translate table for SMTP *
+PQ36249  - Documents IBM APAR for @ support for other languages
+FRENCH   - Information on setting up the SMTP translation tables
+           for the French language. *
+           * thanks to Felipe Cvitanich
+
+For Disclaimer support:
+
+Update XMITIPCU variable with the fully qualified data set name of a
+data set which contains your installations standard disclaimer.  The
+contents of this data set will be included with every e-mail for which a
+message is generated.
+
+IMPORTANT: Local customizations should be made in the XMITIPCU rexx
+exec and in the XMITLDAP rexx exec:
+
+  XMITIPCU - general customizations
+  XMITIPDT - change NLS days and months if not English
+  XMITLDAP - customizations related to the use of ldap to verify and/or
+             find e-mail addresses.
+  XMITIPML - you may need to customize this exec if the ldap server
+             returns information in a format different from what
+             is defined. (if you change this you should remember what
+             you changed for future updates and if you can generalize
+             what you've done let me know).
+             PLUS you may need to change the comments on the panel
+             XMITIPML.
+
+If you need to change the dollar symbol to a pound or you need to change
+the PDF ebcdic->ascii translation table then you need to update
+XMITIPTR.
+
+   e.g. For the dollar to pound change location 5B to be A3
+
+ZIP Notes:
+1. PKZIP/MVS can be found at www.asizip.com
+2. ISPZIP can be found at www.ase.com.au
+3. ZIP390 can be found at www.data21.com
+4. InfoZip is now supported
+   InfoZIp can be found (for FREE) at:
+     ftp://ftp.freesoftware.com/pub/infozip/MVS/
+   - does not support name-in-archive for pds members
+   - infozip must be installed in a steplib or in linklist ****
+   - load module (zip) is provided in the load library
+   - you may need to download and recompile InfoZip if you need
+     a different ASCII character set.
+   - *** Check out this for more info
+         http://www.mildredbrennan.com/blog/?p=309
+5. PKZIP/MVS pre 2.51 does not support the name-in-archive option
+6. PKZIP/MVS version 5 has a problem with mixed case commands
+   XMITIP has been fixed to generate upper case commands for
+   PKZIP/MVS V5.  Now it seems that ASI has a patch to allow
+   mixed case - available at their web site.
+7. PKZIP/MVS Version 5 requires fix level 508 at a minimum
+8. ISPZIP issues
+   - does not support ZIPPASS or ZIPMETHOD
+   - does not support name-in-archive for pds members
+   - resultant zip file does not work with Infozip
+     or Lotus Notes Viewer
+
+National Language Information:
+If you have an issue with your language and the @ character then check
+out IBM APAR PQ36249
+
+Comments, suggestions, and complaints should be directed to the author
+at:
+
+  Lionel B. Dyck
+  Internet: lbdyck@gmail.com
+```
+

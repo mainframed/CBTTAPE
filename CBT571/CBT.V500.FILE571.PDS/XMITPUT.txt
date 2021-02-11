@@ -1,0 +1,284 @@
+XMITPUT  TITLE 'WRITE segment'
+*
+* Copyright 2001, 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+* Things to do:
+* 1) Provide EXLST to set BLKSIZE if not coded in JCL/JFCB
+*----------------------------------------------------------------------
+         U#SET FUNC=XMIT
+*----------------------------------------------------------------------
+* Function: Write a segment (XMITSEG), respecting LRECL boundaries
+*           and buffer data as necessary.
+*           Similar to fputc support in the C language.
+*           This code maintains the DCB associated with it's
+*           output file.
+*
+* Caller: various
+*
+* Entry:  AMODE=24, ASC=PRIMARY, KEY=*, STATE=*
+*
+*         R0  =
+*         R1  =  Address of buffer to be written
+*                when = 0, buffers will be flushed & DCB closed
+*                length of SEGL must be correct
+*
+* Exit:   R15 = 0
+*
+* Abends: DCB didn't open
+*         residual data handling error (buffer hosed)
+*
+* Notes:  The caller is responsible for setting the segment's
+*         length and flags.
+*         We PUT the whole segment, including the length & flag;
+*         RECEIVE needs the length & flag to reconstruct the file.
+*         Some older code's documentation might refer to this code
+*         as PUTSEG.
+*----------------------------------------------------------------------
+* R2     XPSWA
+* R3     DCB
+* R4     input buffer
+* R5     length of input buffer
+* R6     length of residual data in XPSSEG
+* R7     length of input data to copy to residual data
+* R8     scratch
+* R9     constant: 80 = LRECL
+* R10    internal linkage
+* R11    xmtwa
+* R12    base reg
+* R13    savearea
+*----------------------------------------------------------------------
+         TITLE ' '
+*----------------------------------------------------------------------
+XMITPUT  UPROC L=L$SA,ID=XPUT,WA=SAVEAREA
+         STM   R0,R15,XMTREGS               <debug>
+         LA    R4,0(,R1)                    save input parm, clear hi
+         UDIAG 1,'XMITPUT entered'
+         UDIAG 6,'XMITPUT entry regs',XMTREGS,16*4
+         LTR   R4,R4                        term request?
+         BZ    TERM
+         USING XMITSEG,R4
+*
+         L     R2,XMT@PS                    find our workarea
+         LTR   R2,R2                        does it exist?
+         BNZ   NORMAL
+         EJECT ,
+*----------------------------------------------------------------------
+* Initialize XPSWA
+*----------------------------------------------------------------------
+         UDIAG 2,'XMITPUT: initializing XPSWA'
+         LA    R2,XMTXPSWA
+         USING XPSWA,R2
+         UZERO (R2),L$XPSWA                 clear storage
+         MVC   XPSDCB(L$DCB),MODLDCB        copy model DCB macro
+         MVC   XPSOPN(L$OPN),MODLOPN        copy model OPEN macro
+         MVC   XPSCLOS(L$CLOS),MODLCLOS     copy model CLOSE macro
+         ST    R2,XMT@PS                    save ptr to out workarea
+         B     NORMAL
+         EJECT ,
+*----------------------------------------------------------------------
+* Terminate request
+*----------------------------------------------------------------------
+TERM     DS    0H
+         L     R2,XMT@PS
+*
+* Fill remainder of LRECL with blanks, write if any residual data
+*
+         UDIAG 6,'XMITPUT: term residual',XPSSEG,80
+         L     R6,XPSRL                     residual data length
+         LTR   R6,R6
+         BZ    TERMCLOS
+         LA    R15,80                       lrecl
+         LR    R9,R15                       <bogus> for PUT snap
+         SR    R15,R6                       # bytes to blank
+         LA    R4,XPSSEG
+         LA    R14,0(R6,R4)                 @ 1st byte to set to blank
+         MVI   0(R14),C' '                  blank to be propogated
+         BCTR  R15,0
+         EX    R15,BLANKRES                 blank rest of residual
+         UDIAG 6,'XMITPUT: term residual write',XPSSEG,80
+         BAL   R10,PUT                      write last record
+TERMCLOS DS    0H
+         UDIAG 2,'XMITPUT: closing XMITOUT ddname'
+         CLOSE (XPSDCB,),MF=(E,XPSCLOS)
+         XC    XMT@PS,XMT@PS                workarea gone
+         B     EXITRC0
+*
+BLANKRES MVC   1(*-*,R14),0(R14)            executed
+         EJECT ,
+*----------------------------------------------------------------------
+* Normal write request - open DCB if needed
+*----------------------------------------------------------------------
+NORMAL   DS    0H
+         UDIAG 6,'XMITPUT: XPSWA dump <NORMAL>',XMTXPSWE,L$XPSWA+8
+         LA    R9,80                        LRECL (constant)
+         SLR   R5,R5
+         IC    R5,SEGL                      segment length
+         UDIAG 3,'XMITPUT: input segment',(R4),(R5)
+         LA    R3,XPSDCB
+         USING IHADCB,R3
+         TM    DCBOFLG1,DCBOFOPN            dcb open?
+         BO    DCBOPEN
+         TM    XPSFLG1,XPS1OPN              not open, but did already?
+         BNO   NEWOPEN                      first time, OK
+*
+         UDIAG 0,'XMITPUT: XMITOUT DCB error',XMTXPSWE,L$XPSWA+8
+         UABEND DUMP=Y
+*
+NEWOPEN  DS    0H
+         UDIAG 2,'XMITPUT: opening XMITOUT ddname'
+         OPEN  (XPSDCB,OUTPUT),MF=(E,XPSOPN)
+         OI    XPSFLG1,XPS1OPN              OPEN request issued
+         TM    DCBOFLG1,DCBOFOPN            opened?
+         BO    DCBOPEN
+         UDIAG 0,'XMITPUT: XMITOUT DCB open error',XMTXPSWE,L$XPSWA+8
+         UABEND ,                           output DCB didn't open
+         EJECT ,
+*----------------------------------------------------------------------
+* Try to output residual data in XPSSEG before putting input buffer
+*----------------------------------------------------------------------
+COPYRES  MVC   0(*-*,R14),0(R4)             executed
+*
+DCBOPEN  DS    0H
+         L     R6,XPSRL                     l' residual data
+         LTR   R6,R6                        any?
+         BZ    PUTINIT                      no, just put input buffer
+*
+         UDIAG 7,'XMITPUT: XPSSEG contains residual data',XPSSEG,(R6)
+         LR    R7,R9                        lrecl
+         SR    R7,R6                        minus l' residual data
+*                            R7 = # bytes needed to complete LRECL
+*
+* Calc how much data to copy from input to behind current residual.
+* A maximum of LRECL bytes will be stored in XPSSEG, the remainder
+* of the input bytes (if any) will remain in the input buffer
+* to be processed by PUTLOOP below.
+*                                           assume just enough bytes
+         LR    R15,R7                       in input seg to fill lrecl
+         CR    R5,R7                        have more than needed?
+         BH    *+6                          yes, leave r15 alone
+         LR    R15,R5                       no use l' input buffer
+*                            R15 = # bytes to copy from input buffer
+*
+         BCTR  R15,0                        minus 1 for EXexute
+         LA    R14,XPSSEG(R6)               copy destination
+*
+*** <Perform sanity test here>
+*
+         EX    R15,COPYRES                  copy residual to XPSSEG
+         LA    R15,1(,R15)                  plus 1 for EXecute
+         AR    R6,R15                       new l' residual data
+         AR    R4,R15                       account for copied data
+         SR    R5,R15                       account for copied data
+*
+* If possible, write a full lrecl from residual data
+*
+         ST    R6,XPSRL                     update l' residual data
+         UDIAG 7,'XMITPUT: input added to residual',XPSSEG,(R6)
+         CR    R6,R9                        have full residual rec?
+         BL    EXITRC0                      no, can't PUT data yet
+         BH    BADCODE                      oops, we spaced out
+*
+* Write a lrecl's worth of data from the "residual" buffer
+*
+         UDIAG 4,'XMITPUT: write full residual buffer',XPSSEG,(R9)
+         LA    R0,XPSSEG                    record address
+         PUT   XPSDCB,(0)                   write record
+         XC    XPSRL,XPSRL                  no more residual data
+         XC    XPSSEG,XPSSEG                clear residual data
+*----------------------------------------------------------------------
+* Output as much data as possible from input buffer
+*----------------------------------------------------------------------
+PUTINIT  DS    0H
+         LTR   R5,R5                        any data left?
+         BZ    EXITRC0                      no, all done
+         BM    BADCODE                      oops, went negative
+         LA    R10,PUTLOOP                  (term uses "put" rtn)
+         UDIAG 6,'XMITPUT: PUT from input buffer'
+PUTLOOP  DS    0H
+         CR    R5,R9                        more recs to output?
+         BL    RESIDUAL                     no, save residual data
+*
+*----------------------------------------------------------------------
+*  Internal routine to PUT data
+*  R4 @ data byte to output, R5 = length, R9 = lrecl, R10 = return
+*----------------------------------------------------------------------
+*
+PUT      DS    0H
+         UDIAG 4,'XMITPUT: PUT segment',(R4),(R9)
+         LR    R0,R4                        record address
+         PUT   XPSDCB,(0)                   write record
+         AR    R4,R9                        bump record ptr
+         SR    R5,R9                        decr length
+         BR    R10
+*----------------------------------------------------------------------
+* Save unwritten input buffer data as residual in XPSSEG
+*----------------------------------------------------------------------
+COPY     MVC   XPSSEG(*-*),0(R4)            executed
+*
+RESIDUAL DS    0H            less than 80 bytes to output from segment
+         STM   R0,R15,XMTREGS               <debug>
+         UDIAG 7,'XMITPUT: <RESIDUAL> regs',XMTREGS,16*4
+         ST    R5,XPSRL                     save residual length
+         LTR   R5,R5                        anything left?
+         BZ    EXITRC0                      no, leave XPSSEG alone
+         BM    BADCODE                      arggh, negative
+         BCTR  R5,0                         length minus 1 for EX
+         EX    R5,COPY                      copy residual data
+         EJECT ,
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+EXITRC0  SLR   R15,R15                      set good return code
+EXIT     DS    0H
+         ST    R15,SARC
+         L     R14,XPSRL
+         LTR   R14,R14                      any residual data?
+         BZ    SKIPDSP
+         UDIAG 7,'XMITPUT: residual at exit',XPSSEG,(R14)
+SKIPDSP  DS    0H
+         UDIAG 7,'XMITPUT: XPSWA at exit',XMTXPSWE,L$XPSWA+8
+         UDIAG 1,'XMITPUT exited'
+         L     R15,SARC
+         UPEND ,
+*
+BADCODE  DS    0H
+         STM   R0,R15,XMTREGS
+         USNAP 'XMITPUT: internal error - regs',XMTREGS,16*4
+         USNAP 'XMITPUT: <badcode> xpswa',XMTXPSWE,L$XPSWA+8
+         UABEND DUMP=Y                      buffer handling error
+         EJECT ,
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+MODLCLOS CLOSE (,),MF=L                model CLOSE
+L$CLOS   EQU   *-MODLCLOS              l' model close
+*
+MODLOPN  OPEN  (,),MF=L                model OPEN
+L$OPN    EQU   *-MODLOPN               l' model open
+*
+MODLDCB  DCB   DDNAME=XMITOUT,                                         +
+               MACRF=PM,DSORG=PS,RECFM=FB,                             +
+               LRECL=80,BLKSIZE=3200         NEED EXLST to fill blksize
+L$DCB    EQU   *-MODLDCB
+*
+         LTORG ,
+         EJECT ,
+*----------------------------------------------------------------------
+*  Savearea/workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SA       DS    18F
+SARC     DS    F
+         DS    0D
+L$SA     EQU   *-SAVEAREA
+         EJECT ,
+         PRINT NOGEN
+         DXSEG ,
+*        EJECT ,
+         WAXMIT ,
+*        EJECT ,
+         DCBD  DSORG=PS,DEVD=DA
+         PRINT GEN
+XMITPUT  UFINI DXDXPUT,L$SA
+         END   ,

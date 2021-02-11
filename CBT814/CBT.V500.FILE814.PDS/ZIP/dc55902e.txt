@@ -1,0 +1,159 @@
+Enabling full RACF operations attribute
+
+
+INTRODUCTION
+
+The RACF operations attribute is meant to allow certain users
+or programs full access to all datasets on a MVS system. This
+is typically used for storage management and 'custodian'
+purposes. The attribute is assigned either to a RACF user-id or,
+sometimes, it can be dynamically turned on in the RACF
+ACEE (for example by DFDSS).
+
+IBM's design of the RACHECK processing logic means that, if
+users have been granted access by the standard access list of a
+RACF profile, they will receive that authority level even if they
+have the operations attribute which might otherwise grant them
+a higher level. This results in requests for UPDATE or ALTER
+access via the operations attribute being denied, because the
+user of one of their connect groups is in the access list with
+READ access. This can occur quite frequently and is especially
+a problem with user catalogs.
+
+Many installations would like to reverse the order of checking
+so that the operations attribute takes precedence over the access
+list. This can be achieved using the RACHECK post-
+processing exit ICHRCX02 as shown below. This intercepts
+denied requests and allows them to proceed if the user or task
+has the operations attribute at the system level.
+
+
+SOURCE CODE FOR EXIT ICHRCX02
+
+************************************************************
+* MODULE : ICHRCX02, REENTRANT, AC=1, SYS1.LPALIB
+* RACF RACHECK POST PROCESSING EXIT
+* CHECKS IF A DATASET ACCESS WAS DENIED BECAUSE OF A PROFILE
+* ACCESS LIST (RC 8). IF OPERATIONS ACCESS IN ACEE THEN
+* OVERRIDES THE RACF DECISION BY ISSUING RC 0, WTOS ARE
+* ISSUED TO LOG THIS EVENT AND THE DATASET NAME.
+************************************************************
+ICHRCX02 CSECT
+ICHRCX02 AMODE 31
+ICHRCX02 RMODE ANY
+         STM   R14,R12,12(R13)   SAVE REGISTERS
+         LR    R12,R15           ADDRESSABILITY
+         LR    R5,R1             SAVE PARM ADDR
+         USING ICHRCX02,R12
+         GETMAIN R,LV=WORKLEN    GETMAIN DYNAMIC AREA
+         LR    R10,R1            R10 -> DYNAMIC AREA
+         USING WORKAREA,R10      ADDRESS DYNAMIC AREA
+         ST    R13,SAVEAREA+4    SAVE CALLER'S SAVEAREA ADDRESS
+         ST    R10,8(R13)        SAVE SAVEAREA ADDRESS
+         LR    R13,R10           SAVE AREA PTR
+*----------------------------------------------------------------------
+* ADDRESS PARAMETER LIST, CHECK RACF ABEND CODE
+*----------------------------------------------------------------------
+         USING RCXPL,R5          ADDR PARM LIST
+         L     R1,RCXCOMP        ADDR RCOMP FROM RACHECK
+         CLC   0(4,R1),=F'0'     IS IT ZERO?
+         BNE   EXIT              NO, RACF WILL ABEND
+* CHECK IF USER HAS ACCESS TO PROTECTED RACF RESOURCE ALREADY
+         L     R1,RCXRCODE       ADDR RCODE FROM RACHECK
+         CLC   0(4,R1),=F'0'     IS IT ZERO?
+         BE    EXIT              YES, USER HAS ACCESS OK
+* RACF RC > 0, CHECK THE CLASS FOR BEING A DATASET
+         L     R1,RCXCLASS       ADDR CLASS FROM RACHECK
+         CLI   0(R1),X'07'       LENGTH OF CLASS = 7
+         BNE   EXIT              NO, NOT A DATASET
+         CLC   1(7,R1),=CL7'DATASET'  CHECK NAME
+         BNE   EXIT              NO, NOT A DATASET
+* DATASET, IS IT PROTECTED ALREADY BY A PROFILE
+         L     R1,RCXRCODE       ADDR RCODE FROM RACHECK
+         CLC   0(4,R1),=F'4'     IS IT FOUR?
+         BE    EXIT              YES, DATASET UNDEFINED
+         CLC   0(4,R1),=F'8'     IS IT EIGHT?
+         BE    OPERCHK           YES, DATASET PROTECTED, CHECK OPER
+         B     EXIT              OTHER, LEAVE ALONE
+*----------------------------------------------------------------------
+* LOOK FOR USER/TASK HAVING THE OPERATIONS ATTRIBUTE
+*----------------------------------------------------------------------
+OPERCHK  EQU   *
+         L     R1,RCXACEE        ADDR ACEE PARM IF ANY
+         L     R2,0(R1)          LOAD ADDRESS ACEE
+         LTR   R2,R2             TEST IT
+         BNZ   GOTACEE           ACEE PARM ON RACHECK
+         USING PSA,R0            ADDRESSABILITY FOR PSA
+         L     R2,PSATOLD        ADDR OUR TCB
+         USING TCB,R2
+         ICM   R2,15,TCBSENV     ADDR THE ACEE
+         BNZ   GOTACEE           BRANCH IF PRESENT
+         L     R2,PSAAOLD        ADDR OUR ASCB
+         USING ASCB,R2
+         L     R2,ASCBASXB       ADDR THE ASXB
+         USING ASXB,R2
+         L     R2,ASXBSENV       ADDR THE ACEE
+GOTACEE  EQU   *
+         LTR   R2,R2             TEST ACEE
+         BZ    EXIT              NOT THERE
+* FOUND TASK OR ADDRESS SPACE ACEE, TEST FOR OPERATIONS ATTR (SYSTEM)
+         USING ACEE,R2           ADDR ACEE
+         TM    ACEEFLG1,ACEEOPER OPERATIONS ATTRIBUTE
+         BO    FORCE             YES, ALLOW ACCESS
+         B     EXIT              NO, EXIT (FAIL RC 8)
+*----------------------------------------------------------------------
+* ALLOW ACCESS (NEEDED IF USERID/GROUP ON ACL WITH LOWER AUTHORITY)
+*----------------------------------------------------------------------
+FORCE    EQU   *
+         MVC   WTO2(WTO2L),WTO1  COPY WTO
+         L     R1,RCXENORP       RESOURCE NAME ADDR
+         MVC   WTO2+4+11(44),0(R1) COPY RESOURCE NAME (DSNAME)
+         WTO   MF=(E,WTO2)       ISSUE WTO
+         WTO   'ICHRCX02 - USR/GRP IN ACL, OPER ATTR FORCED',ROUTCDE=11
+         L     R1,RCXLCNTL       ADDR LOGGING AREA
+         MVC   0(4,R1),=F'4'     SET TO 4, FORCE LOGGING
+         L     R1,RCXRCODE       ADDR RCODE FROM RACHECK
+         MVC   0(4,R1),=F'0'     SET RETURN CODE 0 (PERMIT ACCESS)
+         L     R1,RCXREASN       ADDR REASON FROM RACHECK
+         MVC   0(4,R1),=F'0'     SET REASON CODE 0 (NORMAL)
+         B     EXIT              AND EXIT
+*----------------------------------------------------------------------
+* QUIT EXIT WITH RC ZERO (RCODE IN EXIT LIST MAY BE MODIFIED)
+*----------------------------------------------------------------------
+EXIT     EQU   *
+         L     R13,SAVEAREA+4    RESTORE R13
+         FREEMAIN R,LV=WORKLEN,A=(10) FREE DYNAMIC AREA
+         LA    R15,0             RETURN CODE TO R15 (ZERO)
+         L     R14,12(R13)       RESTORE R14
+         LM    R0,R12,20(R13)    RESTORE R0 TO R12
+         BR    R14               RETURN
+         LTORG
+*----------------------------------------------------------------------
+* STATIC AREA
+*----------------------------------------------------------------------
+WTO1     WTO   'ICHRCX02 - MSG UP TO LEN 50 HERE                       X
+                      ',ROUTCDE=11,MF=L
+*----------------------------------------------------------------------
+* PROGRAM DATA AREA
+*----------------------------------------------------------------------
+WORKAREA DSECT
+SAVEAREA DS    18F               SAVE AREA
+WTO2     WTO   'ICHRCX02 - MSG UP TO LEN 50 HERE                       X
+                      ',ROUTCDE=11,MF=L
+WTO2L    EQU   *-WTO2
+WORKLEN  EQU   *-WORKAREA
+*----------------------------------------------------------------------
+* DSECTS
+*----------------------------------------------------------------------
+         ICHRCXP                 RACHECK EXIT PARM MAPPING
+         YREGS
+         IHAACEE                 ACEE
+         IHAASCB                 ASCB
+         IHAASXB                 ASXB
+         IHAPSA                  PSA
+         IKJTCB                  TCB
+         END
+
+
+                                                                        c Xephon 1993
+

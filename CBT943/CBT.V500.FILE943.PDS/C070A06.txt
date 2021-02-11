@@ -1,0 +1,136 @@
+Bypassing the sign-on screen for MSA
+
+We recently attempted to implement a feature of MSA/DCI
+which bypasses the MSA sign-on screen.  We found plenty of
+documentation stating it could be done but very little on how to
+actually do it.  In our environment we run CICS/MVS 2.1.1,
+MSA/DCI 9001(from Dun and Bradstreet), and CA-TOP
+SECRET 9006.
+
+The idea behind this 'transparent' sign-on is that control is
+received in the exit, LUSRSION, then security information is
+retrieved from a table or VSAM file.  To activate the exit, the
+exit must be compiled into a CICS load library and the client
+option table must be changed to use BYSINON=FILE (or
+BYSINON=TBL).  What is not documented is how to get the
+security information into the file without having to maintain it
+manually (a security nightmare).
+
+We wanted to centralize where this information was created
+and maintained.  We chose the installation data area of CA-
+TOP SECRET, a 255-byte area of user data.  We stored the
+MSA operator-id (which must be numeric) and the password in
+this area, prefixed by 'MSA=', followed by a comma, space,
+or null.  Since most of our users are MSA users, we chose to
+use a VSAM file that is updated every time a user signs on.
+An alternative would be to give the exit control when the user
+enters the transaction MSAS and have the exit XCTL to the
+normal MSA program.  The VSAM file must be an 80-byte
+KSDS file with a 4-byte key.  In our case we delete and define
+the file every time CICS is restarted.
+
+A copy of our exit is shown below.  The basic logic is to use
+the EIBTRMID field for the key to the VSAM file.  Our exit
+checks CA-TOP SECRET installation data for the characters
+'MSA='.  If not found, we attempt to delete the record for that
+terminal-id.  If found, we ensure that it is valid and the next six
+bytes are placed in the file as the operator-id with the
+characters that follow used as the password (up to 12
+characters).  We then add or update the record, as appropriate.
+For CA-TOP SECRET users, the copybook TSSCPLA is found
+in the TSSOPMAT file.
+
+TNV30040 TITLE 'TNV30040 - SIGNON PROC. FOR MSA (SITR)
+*** THIS PROGRAM READS THE INSTALLATION DATA FROM CA-TOP SECRET AND ***
+*   SCANS FOR 'MSA='.  IF FOUND, THE NEXT 6 BYTES ARE USED AS THE     *
+*   OPERATOR ID AND THE REMAINING BYTES ARE USED AS THE PASSWORD.     *
+*   THE PASSWORD MUST BE FOLLOWED BY A SPACE, NULL, OR COMMA TO BE    *
+*   VALID.  THE VALID INFORMATION IS WRITTEN TO THE USRSEC FILE USED  *
+*** BY MSA.                                                         ***
+DFHEISTG DSECT
+         COPY  TSSCPLA             COPYBOOK FOR TOP SECRET CALL
+*  WORKING STORAGE FIELDS
+         DFHREGS
+TSSQID   DS    0CL8
+TSSQPREF DS    CL4
+TSSQTERM DS    CL4
+USRREC   DS    0CL80
+USRTERM  DS    CL4
+USRFLDS  DS    0CL18
+USROPID  DS    CL6
+USRPASS  DS    CL12
+USRFILL  DS    CL58
+TNV30040 DFHEIENT CODEREG=5,DATAREG=6,EIBREG=7
+         B     STARTUP
+         DC    C'TNV30040 - ASSEMBLED ON '
+         DC    CL8'&SYSDATE'
+         DC    C' AT '
+         DC    CL8'&SYSTIME'
+STARTUP  DS    0H
+         MVC   TSSQPREF,=CL4'TSSA' SET UP CALL FOR TOP SECRET
+         MVC   TSSQTERM,EIBTRMID
+         EXEC  CICS IGNORE CONDITION QIDERR
+         EXEC  CICS DELETEQ TS QUEUE(TSSQID)
+         MVC   TSSHEAD,=CL8'TCPLV4L2'
+         MVC   TSSCLASS,=CL8'DUFXTR'
+         XC    TSSRNAME,TSSRNAME          SET TO LOW-VALUES
+         XC    TSSPPGM,TSSPPGM
+         XC    TSSACC,TSSACC
+         EXEC  CICS WRITEQ TS QUEUE(TSSQID) FROM(TSSCPL)               C
+               LENGTH(TSSLNGTH) MAIN
+         EXEC  CICS LINK PROGRAM('TSSCAI')    CALL TOP SECRET
+         EXEC  CICS READQ TS QUEUE(TSSQID) INTO(TSSCPL)                C
+               LENGTH(TSSLNGTH)
+         EXEC  CICS DELETEQ TS QUEUE(TSSQID)
+         LA    R2,TSSRTN PUT INSTALL DATA IN R2
+         LA    R3,252
+MSALOOP1 CLC   =CL4'MSA=',0(R2) LOOP TO LOOK FOR MSA=
+         BE    MSAFND
+         LA    R2,1(,R2)
+         BCT   R3,MSALOOP1
+MSANFND  EXEC  CICS HANDLE CONDITION NOTFND(ENDIT)  NOT AN MSA USER
+         MVC   USRTERM,EIBTRMID
+         EXEC  CICS READ DATASET('USRSEC') INTO(USRREC)                C
+               RIDFLD(USRTERM) UPDATE
+         EXEC  CICS DELETE DATASET('USRSEC')  DELETE ANY PREV. REC.
+         B     ENDIT
+MSAFND   LA    R2,4(R2)
+         LR    R4,R2
+         LA    R3,19
+MSALOOP2 CLI   0(R2),C' ' FIND END OF PASSWORD
+         BE    VALIDATA
+         CLI   0(R2),C','
+         BE    VALIDATA
+         CLI   0(R2),X'00'
+         BE    VALIDATA
+         LA    R2,1(R2)
+         BCT   R3,MSALOOP2
+         B     BADDATA
+VALIDATA BCTR  R2,R0                            SUBTRACT 1 FROM R2
+         SR    R2,R4
+         EXEC  CICS HANDLE CONDITION NOTFND(ADDIT)
+         MVI   USRFLDS,C' '                     FILL WITH BLANKS
+         MVC   USRFLDS+1(17),USRFLDS
+         MVI   USRFILL,C' '                     FILL WITH BLANKS
+         MVC   USRFILL+1(57),USRFILL
+         EX    R2,MVCUSR
+         MVC   USRTERM,EIBTRMID
+READIT   EXEC  CICS READ DATASET('USRSEC') SET(R9)                     C
+               RIDFLD(USRTERM) UPDATE
+UPDTIT   EXEC  CICS REWRITE DATASET('USRSEC') FROM(USRREC)
+         B     ENDIT
+MVCUSR   MVC   USRFLDS(0),0(R4)
+ADDIT    EXEC  CICS WRITE DATASET('USRSEC') FROM(USRREC)               C
+               RIDFLD(USRTERM)
+         B     ENDIT
+BADDATA  EXEC  CICS SEND TEXT FROM(MSG) ERASE
+         B     RETURN
+ENDIT    EXEC  CICS SEND CONTROL TERMINAL FREEKB ERASE
+RETURN   EXEC  CICS RETURN
+TSSLNGTH DC    H'+320'
+MSG      DC    CL80'INVALID TOP SECRET INSTDATA - CALL ADMINISTRATOR'
+         END
+
+
+
+

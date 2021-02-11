@@ -1,0 +1,347 @@
+Reconstructing transaction screen images
+
+We had a requirement at our shop to create an audit trail of
+CEMT commands issued for production CICS.  We considered
+front-ending all master terminal type requests with our own
+program that recorded the data passed and then calling the
+programmable interface to the master terminal program, but
+this seemed like a lot of work.
+
+Instead, I set up a special profile using RDO for the CEMT
+transaction specifying MSGJRNL INOUT and JOURNAL 01
+for the system log.  This caused all the input and output data
+for the transaction to be journalled.  In the MRO environment
+this profile needs to be set up for the transaction in the
+Terminal Owning Region.  I then wrote the JSCRNFMT
+program that reads a flat copy of the journal dataset and
+reconstructs the images of the screens journalled.  We have
+also used this technique for debugging problem transactions
+that go wrong because of invalid input.
+
+
+PROGRAM SOURCE CODE
+
+         TITLE 'JSCRNFMT - REPRODUCE TRANSACTION SCREEN IMAGES'
+*---------------------------------------------------------------------*
+*  JSCRNFMT - READ CICS SYSLOG DATASET AND CREATE REPRODUCTION OF     *
+*             INPUT AND OUTPUT SCREEN IMAGES.                         *
+*---------------------------------------------------------------------*
+         DFHJCR CICSYST=YES
+         COPY   DFHFMIDS
+* TERMINAL RECORD DSECT
+         DS    0H
+TERMREC  DSECT
+         DS    CL6
+         DS    CL12
+TRTIME   DS    PL4                RECORD TIME
+TRTRAN   DS    CL4                RECORD TRANSACTION ID
+TRTERM   DS    CL4                RECORD TERMINAL
+         DS    CL4
+TRLEN    DS    XL2                LENGTH OF RECORD
+         DS    XL2
+TRSCREEN EQU   *                  SCREEN STARTS HERE
+LINKREG  EQU   12
+*---------------------------------------------------------------------*
+*    HOUSEKEEPING. SAVE THE REGISTERS. OPEN THE DATASETS.             *
+*---------------------------------------------------------------------*
+JSCRNFMT CSECT
+         SAVE  (14,12)            SAVE THE REGISTERS
+         BALR  R2,0
+         USING *,R2
+         ST    R13,SAVE13
+         LA    R13,SAVEAREA       POINT TO THE REGISTER SAVE AREA
+         B     INIT               BRANCH AROUND DC
+         DC    C'JSCRNFMT.04/16/91'
+INIT     DS    0H
+         ZAP   SEQNO,=P'0'        INITIALIZE SEQUENCE NUMBER
+         OPEN  (SYSLOG,INPUT)
+         OPEN  (OUTPUTF,OUTPUT)   OPEN OUTPUT FILE
+READ     DS    0H
+         GET   SYSLOG             GET AN INPUT RECORD
+         LR    R3,R1              POINT TO RECORD
+         LH    R6,0(R3)           GET THE LENGTH
+         USING DFHJCRDS,R3        ADDRESSABILITY
+         AR    R6,R3              POINT TO END OF THE RECORD
+         LA    R3,8(R3)           POINT PAST LLBB AND STUFF
+         B     CHECK              CHECK FOR CORRECT RECORD TYPE
+NEXT     DS    0H
+         CLC   JCRLL,=H'0'        Q. IS THE LENGTH 0?
+         BNE   NEXT1              A. NO, BRANCH
+     DC X'00'                     WE SHOULDN'T EVER FALL THROUGH
+NEXT1    DS    0H
+         AH    R3,JCRLL           POINT TO NEXT LOGICAL RECORD
+         CR    R3,R6              Q. PROCESSED THEM ALL ?
+         BNL   READ               A. YES, BRANCH
+CHECK    DS    0H
+         CLC   JCRSTRID,=X'8045'  Q. THIS THE HEADER ?
+         BNE   CHK1               A. NO, BRANCH
+         UNPK  HDRDATE,JCLRDATE+1(3) UNPACK THE DATE
+         OI    HDRDATE+4,X'F0'    ENSURE POSITIVE
+         B     NEXT
+*---------------------------------------------------------------------*
+*   WE WANT TO FILTER OUT ALL BUT TERMINAL CONTROL WRITTEN RECORDS    *
+*---------------------------------------------------------------------*
+CHK1     DS    0H
+         CLI   JCRSTRID+1,MODIDTC WRITTEN BY TERMINAL CONTROL ?
+         BNE   NEXT               A. NO, BRANCH
+         MVC   HDRINOUT,=C'INPUT '
+         TM    JCRSTRID,FIDTCAJ+FIDTCIM Q. JOURNALLED INPUT MESSAGE ?
+         BO    FORMAT             A. YES, BRANCH
+         MVC   HDRINOUT,=C'OUTPUT'
+         TM    JCRSTRID,FIDTCAJ+FIDTCONN Q. JOURNALLED OUTPUT MESSAGE ?
+         BO    FORMAT             A. YES, BRANCH
+         B     NEXT
+*---------------------------------------------------------------------*
+*   SAVE INFORMATION ABOUT THE MESSAGE IN THE HEADER. LOCATE THE      *
+*   WORK BUFFER AND INITIALIZE TO HEX ZEROES.  GET POINTERS TO        *
+*   BEGINNING AND END OF THE SCREEN RECORD.                           *
+*---------------------------------------------------------------------*
+FORMAT   DS    0H
+         DROP  R3
+         USING TERMREC,R3         ADDRESSABILITY AS TERMINAL REC
+         UNPK  HDRTIME,TRTIME     MOVE THE TIME TO THE HEADER
+         MVI   HDRTIME+6,C' '     GET RID OF FRACTION OF SECONDS
+         MVC   HDRTERM,TRTERM     MOVE THE TERMINAL ID
+         MVC   HDRTRAN,TRTRAN     MOVE THE TRANID
+         LA    R5,WORKBUF         HERE'S THE WORK OUTPUT BUFFER
+         LA    R10,4095(R5)       POINT TO LAST BYTE
+         ST    R10,ENDBUF         SAVE IT
+         LR    R10,R5             POINT TO WORKBUF
+         LA    R11,4095           LENGTH TO CLEAR
+         LA    R11,1(R11)
+         SR    R9,R9              SET UP ZERO LENGTH, ZERO PAD
+         MVCL  R10,R8             THIS SHOULD CLEAR TO HEX ZEROES
+         LA    R10,TRSCREEN       POINT TO THE START OF THE SCREEN
+         ICM   R11,B'0011',TRLEN  GET LENGTH OF THE SCREEN
+         AR    R11,R10            POINT TO END OF THE SCREEN
+         ST    R11,ENDSCRN        SAVE POINTER TO END SCREEN
+         LA    R8,WORKBUF         ASSSUME START OF THE BUFFER
+         MVI   MOVEFLAG,X'FF'     DEFAULT FLAG TO PRINT IT
+*---------------------------------------------------------------------*
+*  BUMP THROUGH THE INPUT SCREEN LOOKING FOR SBAS AND START           *
+*  FIELDS W/APPROPRIATE ATTRIBUTES. MOVEFLAG WILL BE SET TO           *
+*  DETERMINE IF THE DATA IS OUTPUT DATA AND SHOULD BE MOVED TO        *
+*  THE WORK BUFFER OR IF IT IS ATTRIBUTE DATA THAT SHOULD NOT BE      *
+*  MOVED.  EACH BYTE WILL BE EXAMINED INDIVIDUALLY.  SBAS WILL        *
+*  FORCE A CHANGE OF THE POINTER WITHIN THE WORK BUFFER. SFS WILL     *
+*  DETERMINE WHETHER OR NOT THE MOVEFLAG SHOULD BE SET ON.            *
+*---------------------------------------------------------------------*
+SCRNLOOP DS    0H
+         C     R8,ENDBUF          Q. AT END OF THE BUFFER
+         BNH   SCRL1              A. NO, BRANCH
+     DC X'00'                     WE SHOULDN'T EVER FALL THROUGH
+SCRL1    DS    0H
+         C     R10,ENDSCRN        Q. AT END OF THE SCREEN ?
+         BH    HDRPUT             A. YES, TIME TO OUTPUT IT
+         CLI   0(R10),X'3C'       Q. THIS A REPEAT TO ADDRESS
+         BE    SCRNREP            A. YES, BRANCH
+         CLI   0(R10),X'11'       Q. THIS AN SBA ?
+         BE    SCRNSBA            A. YES, BRANCH
+         CLI   0(R10),X'1D'       Q. IS THIS A START FIELD ?
+         BE    SCRNSF             A. YES, BRANCH
+         CLI   0(R10),X'29'       Q. IS THIS A START FIELD  EXTENDED ?
+         BE    SCRNSFE            A. YES, BRANCH
+         CLI   MOVEFLAG,X'FF'     Q. SHOULD I MOVE THIS DATA ?
+         BNE   SCRNBUMP           A. NO, BRANCH
+         MVC   0(1,R8),0(R10)     MOVE THE DATA
+         LA    R8,1(R8)           BUMP PAST IT IN OUTPUT BUFFER
+SCRNBUMP DS    0H
+         LA    R10,1(R10)         BUMP TO NEXT CHARACTER
+         B     SCRNLOOP           GO DO MORE
+*---------------------------------------------------------------------*
+*  FROM THE 3270 BUFFER ADDRESS THIS ROUTINE CALCULATES A RELATIVE    *
+*  ADDRESS TO THE START OF THE WORK BUFFER.                           *
+*---------------------------------------------------------------------*
+SCRNSBA  DS    0H
+         BAL   LINKREG,CONVSBA    CONVERT IT
+         LA    R10,3(R10)         BUMP PAST SBA
+         MVI   MOVEFLAG,X'FF'     SET THE FLAG
+         CLC   HDRINOUT,=C'INPUT ' Q. IS THIS AN INPUT SCREEN ?
+         BNE   SCRNLOOP           A. NO, BRANCH
+         LA    R8,1(R8)           A. YES, BUMP THE POINTER ONE.
+         B     SCRNLOOP           LOOP AT NEXT CHARACTER
+*---------------------------------------------------------------------*
+*  THIS ROUTINE PROCESSES A REPEAT TO ADDRESS.                        *
+*---------------------------------------------------------------------*
+SCRNREP  DS    0H
+         ST    R8,SAVER8          SAVE CURRENT POSITION FOR LATER
+         BAL   LINKREG,CONVSBA    CONVERT IT
+         ST    R8,SAVEEREP        SAVE ADDR OF THE END OF THE REPEAT
+         L     R8,SAVER8          RESTORE REGISTER
+SREPLOOP DS    0H
+         C     R8,ENDBUF          Q. AT END OF THE BUFFER
+         BNH   SRPL1              A. NO, BRANCH
+     DC X'00'                     WE SHOULDN'T EVER FALL THROUGH
+SRPL1    DS    0H
+         C     R8,SAVEEREP        Q. AT END OF REPEAT ?
+         BNL   SREPEND            A. YES, BRANCH
+         MVC   0(1,R8),3(R10)     MOVE IN THE CHARACTER
+         LA    R8,1(R8)           BUMP THE POINTER
+         B     SREPLOOP           GO BACK
+SREPEND  DS    0H
+         LA    R10,3(R10)         BUMP PAST SBA
+         B     SCRNLOOP           LOOP AT NEXT CHARACTER
+SAVEEREP DS    A
+*---------------------------------------------------------------------*
+*   DEFAULT FLAG TO NOT MOVE THE DATA. ONLY CERTAIN ATTRIBUTES WILL   *
+*   FORCE ITS CHANGE TO MOVE.                                         *
+*---------------------------------------------------------------------*
+SCRNSF   DS    0H
+         MVI   MOVEFLAG,X'00'     RESET THE FLAG
+         LA    R8,1(R8)           BUMP ONE CHARACTER IN OUTPUT BUFFER
+         TM    1(R10),X'04'       Q. NON-DISPLAY ?
+         BO    SCRNSFSK           A. NO, LEAVE MOVE FLAG OFF
+         TM    1(R10),X'C8'       Q. AN OUTPUT FIELD ?
+         BO    SETFLAG            A. YES, PROCESS IT
+         TM    1(R10),X'40'       Q. WANT THIS ONE ?
+         BNO   SCRNSFSK           A. NO, BRANCH
+SETFLAG  DS    0H
+         MVI   MOVEFLAG,X'FF'     SET THE FLAG
+SCRNSFSK DS    0H
+         LA    R10,2(R10)         BUMP PAST SF
+         B     SCRNLOOP           GO BACK
+*---------------------------------------------------------------------*
+*   DEFAULT FLAG TO     MOVE THE DATA. ONLY CERTAIN EXTENDED ATTRI-   *
+*   BUTES WILL FORCE ITS CHANGE TO MOVE.                              *
+*---------------------------------------------------------------------*
+SCRNSFE  DS    0H
+         MVI   MOVEFLAG,X'FF'     RESET THE FLAG
+         LA    R8,1(R8)           BUMP ONE CHARACTER IN OUTPUT BUFFER
+         IC    R9,1(R10)          GET THE COUNT
+         LA    R10,2(R10)         POINT TO FIRST TYPE FIELD
+SFELOOP  DS    0H
+         CLI   1(R10),X'C0'       Q. FIELD ATTRIBUTE ?
+         BNE   SFETEST            A. NO, BRANCH
+         TM    2(R10),X'06'       Q. NON-DISPLAY ?
+         BNO   SFETEST            A. NO, BRANCH
+         MVI   MOVEFLAG,X'00'     SET THE FLAG TO NOT MOVE THE DATA
+SFETEST  DS    0H
+         LA    R10,2(R10)         NEXT TYPE
+         BCT   R9,SFELOOP         IF MORE GO PROCESS IT
+         B     SCRNLOOP           RETURN TO CALLER
+         DROP  R3
+*---------------------------------------------------------------------*
+*  CONVERT THE BUFFER ADDRESS TO RELATIVE ADDRESS.                    *
+*  ON ENTRY -    R10 POINTS TO THE BUFFER ADDRESS                     *
+*           -    R5  MUST POINT TO THE START OF THE WORK BUFFER       *
+*  ON EXIT  -    R8 CONTAINS THE RELATIVE LOCATION                    *
+*---------------------------------------------------------------------*
+CONVSBA  DS    0H
+         MVC   SCRNBA,1(R10)      SAVE THE BUFFER ADDRESS
+         NC    SCRNBA,=B'0011111100111111'  REMOVE HI ORDER BITS
+         SR    R9,R9              PREPARE FOR MULTIPLY
+         IC    R9,SCRNBA          PREPARE FOR CALC OF RELATIVE BUF ADDR
+         M     R8,=F'64'          MULTIPLY BY 64
+         SR    R8,R8              CLEAR REGISTER
+         IC    R8,SCRNBA+1        GET SECOND HALF OF ADDRESS
+         AR    R8,R9              R8 NOW HAS RELATIVE BUFFER ADDRESS
+         AR    R8,R5              AND NOW THE RELATIVE LOCATION
+         C     R8,ENDBUF          Q. PAST END OF BUFFER ?
+         BNH   CVRET              A. NO, BRANCH
+      DC   X'00'
+CVRET    DS    0H
+         ST    R8,SAVECONV        SAVE CONVERSION ADDRESS
+         BR    LINKREG            RETURN TO CALLER
+SAVECONV DS    A
+*---------------------------------------------------------------------*
+*    AFTER THE ENTIRE SCREEN HAS BEEN PROCESSED FIRST WRITE A HEADER  *
+*    AND THEN WRITE THE WORK BUFFER, ONE LINE AT A TIME.              *
+*    LINE NUMBERS ARE ADDED TO THE REPORT AND BLANK LINES OF THE      *
+*    SCREEN ARE NOT OUTPUT, THIS TO SAVE PRINT OUTPUT LINES.          *
+*---------------------------------------------------------------------*
+HDRPUT   DS    0H
+         PUT   OUTPUTF            GET A BUFFER
+         LR    R4,R1              GET ITS ADDRESS
+         MVC   100(13,R4),HDRDATE MOVE HEADER DATE AND TIME TO DETAIL
+         AP    SEQNO,=P'1'        INITIALIZE SEQUENCE NUMBER TO 0
+         ZAP   SCRSEQ,=P'0'       INITIALIZE LINE COUNTER
+         ZAP   120(4,R4),SEQNO    MOVE THE SEQUENCE NUMBER
+         MVC   90(5,R4),=C'     ' CLEAR THE LINE NUMBER
+         MVC   0(80,R4),DASHES    MOVE IN DASHES
+         PUT   OUTPUTF            WRITE THE DASHES GET A NEW BUFFER
+         LR    R4,R1              GET ITS ADDRESS
+         MVC   100(13,R4),HDRDATE MOVE HEADER DATE AND TIME TO DETAIL
+         AP    SEQNO,=P'1'        INITIALIZE SEQUENCE NUMBER TO 0
+         ZAP   120(4,R4),SEQNO    MOVE THE SEQUENCE NUMBER
+         MVC   0(80,R4),HEADER    MOVE THE HEADER
+         LA    R8,WORKBUF         POINT TO OUTPUT BUFFER
+         LA    R9,51              LINES IN THE BUFFER
+OUTTEST  DS    0H
+         AP    SCRSEQ,=P'1'       BUMP THE SEQUENCE NUMBER
+         CLC   NULLS,0(R8)        Q. ANYTHING TO MOVE ?
+         BE    OUTSKIP            A. NO, BRANCH
+OUTLOOP  DS    0H
+         PUT   OUTPUTF            GET A BUFFER
+         LR    R4,R1              GET ITS ADDRESS
+         MVC   100(13,R4),HDRDATE MOVE HEADER DATE AND TIME TO DETAIL
+         AP    SEQNO,=P'1'        BUMP THE SEQUENCE NUMBER
+         ZAP   120(4,R4),SEQNO    MOVE THE SEQUENCE NUMBER
+         UNPK  90(5,R4),SCRSEQ    MOVE THE LINE NUMBER
+         OI    94(R4),X'F0'       ENSURE NUMERIC
+         MVC   0(80,R4),0(R8)     MOVE OUTPUT DATA TO BUFFER
+OUTSKIP  DS    0H
+         LA    R8,80(R8)          NEXT LINE
+         BCT   R9,OUTTEST         IF THERE'S MORE TO DO, GO BACK
+         B     NEXT
+*---------------------------------------------------------------------*
+*  CLOSE THE FILES                                                    *
+*---------------------------------------------------------------------*
+CLOSE    DS    0H
+         CLOSE (SYSLOG,,OUTPUTF)
+         L     R13,SAVE13
+         RETURN (14,12),RC=0
+* DCBS
+SYSLOG   DCB  DDNAME=SYSLOG,EODAD=CLOSE,MACRF=GL,DSORG=PS,SYNAD=CLOSE
+OUTPUTF  DCB   DDNAME=OUTPUTF,DSORG=PS,MACRF=PL
+* REGISTER SAVE AREA
+SAVE13   DS    A
+SAVEAREA DS    18F
+SAVER8   DS    A
+HEADER   DS    0CL80
+HDRDATE  DS    CL5
+         DC    C' '
+HDRTIME  DS    CL7
+         DC    C' '
+HDRTRAN  DS    CL4
+         DC    C' '
+HDRTERM  DS    CL4
+         DC    C' '
+HDRINOUT DS    CL6
+         DC    CL50' '
+ENDBUF   DS    A                  ADDRESS OF LAST BYTE IN WORK BUF
+ENDSCRN  DS    A                  ADDRESS OF LAST BYTE IN SCREEN
+         DC    C'SCRNBA----->'
+SCRNBA   DS    H                  ADDRESS IN LAST SBA
+SEQNO    DS    PL3
+SCRSEQ   DS    PL2
+MOVEFLAG DC    X'00'
+NULLS    DC    XL80'00'
+DASHES   DS    0CL80
+         DC    C'+'
+         DC    78C'-'
+         DC    C'+'
+         LTORG
+         DC    C'WORKBUF---->'
+WORKBUF  DS    CL4096
+         END
+
+SAMPLE JCL
+
+//STEP1    EXEC PGM=IDCAMS
+//INDD     DD  DSN=CICS.TOR.SYSLOG1A,DISP=SHR
+//OUTDD    DD  DSN=&&OUTLOG,DISP=(NEW,PASS,DELETE),
+//             UNIT=SYSDA,SPACE=(TRK,(450,15),RLSE),
+//             DCB=(RECFM=VB,LRECL=4092,BLKSIZE=4096)
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+  REPRO  INFILE(INDD) OUTFILE(OUTDD)
+//*
+//STEP2    EXEC PGM=JSCRNFMT
+//SYSLOG   DD DSN=&&OUTLOG,DISP=(OLD,DELETE,DELETE)
+//OUTPUTF  DD SYSOUT=T,
+//            DCB=(LRECL=130,RECFM=FB,BLKSIZE=13000,OPTCD=)
+//SYSUDUMP DD SYSOUT=*
+
+
+Marje Rhine (USA)
+

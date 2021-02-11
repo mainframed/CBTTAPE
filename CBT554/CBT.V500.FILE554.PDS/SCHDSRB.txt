@@ -1,0 +1,320 @@
+*+--------------------------------------------------------------------+    1
+*| FUNCTION:                                                          |    2
+*|   THIS PROGRAM SCHEDULES A LOCAL SRB AND WAITS UNTIL THE ROUTINE   |    3
+*|   EXECUTING UNDER THAT SRB COMPLETES.                              |    4
+*| INPUTS:                                                            |    5
+*|   R1 - ADDRESS OF A PARMLIST MAPPED BY SCHDPRM DSECT CONTAINING:   |    6
+*|        1) THE NAME OF THE SRB ROUTINE LOAD MODULE.                 |    7
+*|        2) THE NAME OF THE ADDRESS SPACE WHERE THE SRB ROUTINE      |    8
+*|           WILL EXECUTE.                                            |    9
+*|        3) PARAMETERS FOR THE SRB ROUTINE.                          |   10
+*| OUTPUTS:                                                           |   11
+*|   R15- RETURN CODE.                                                |   12
+*|         0 = THE SRB ROUTINE EXECUTED SUCCESSFULLY.                 |   13
+*|         8 = A TARGET ADDRESS SPACE NOT SPECIFIED IN THE PARMLIST.  |   14
+*|        12 = THE TARGET ADRESS SPACE WAS NOT FOUND.                 |   15
+*|        16 = THE LOAD FOR THE SRB IN PRIVATE STORAGE FAILED:        |   16
+*|             R0 CONTAINS THE RETURN CODE FROM LOAD.                 |   17
+*|        20 = THE LOAD FOR THE SRB ROUTINE IN SQA FAILED             |   18
+*|             R0 CONTAINS THE RETURN CODE FROM LOAD.                 |   19
+*|        24 = THE SRB ROUTINE FAILED.                                |   20
+*|             R0 CONTAINS THE CODE FROM CROSS-MEMORY POST:           |   21
+*|                12 - THE RMT ROUTINE WAS DRIVEN BY PURGEDQ.         |   22
+*|                ANY OTHER CODE - ABEND CODE FROM THE FRR SDWA.      |   23
+*| LOGIC:                                                             |   24
+*|   1)   CALL GETASCB TO OBTAIN THE TARGET ADDRESS SPACE'S ASCB.     |   25
+*|   2)   LOAD THE SRB ROUTINE MODULE INTO PRIVATE STORAGE. OBTAIN    |   26
+*|        THE LENGTH OF THE ROUTINE AND DELETE IT.                    |   27
+*|   3)   OBTAIN SQA STORAGE FOR:                                     |   28
+*|        - THE SRB CONTROL BLOCK (WITH A USER EXTENSION)             |   29
+*|        - THE SRB ROUTINE LOAD MODULE                               |   30
+*|        - PARAMETERS FOR THE SRB ROUTINE                            |   31
+*|   4)   LOAD THE SRB ROUTINE INTO THE OBTAINED SQA STORAGE.         |   32
+*|   5)   COPY THE RMT ROUTINE INTO THE OBTAINED SQA STORAGE.         |   33
+*|   6)   BUILD THE SRB CONTROL BLOCK.                                |   34
+*|   7)   PUT THE ADDRESS OF THE RMT ROUTINE AND THE PARAMTERS        |   35
+*|        FOR THE SRB ROUTINE INTO THE SRB CONTROL BLOCK. COPY        |   36
+*|        THE PARAMETERS INTO THE OBTAINED SQA.                       |   37
+*|   8)   SCHEDULE THE SRB TO THE TARGET ADDRESS SPACE.               |   38
+*|   9)   SET THE STIMER AND WAIT ON THE ECB.                         |   39
+*|        - IF THE SRB ROUTINE COMPLETES BEFORE THE STIMER EXPIRES,   |   40
+*|        THE SRB ROUTINE CROSS-MEMORY POSTS THE ECB.  THE SRB        |   41
+*|        ROUTINE USE THE POST-CODE AS A RETURN CODE TO THIS ROUTINE. |   42
+*|        - IF STIMER EXPIRES BEFORE THE SRB ROUTINE COMPLETES,       |   43
+*|        THE STIMER EXIT ROUTINE RECEIVES CONTROL AND ISSUES PURGEDQ.|   44
+*|        PURGEDQ DRIVES THE RMT ROUTINE IN THE TARGET ADDRESS SPACE  |   45
+*|        WHICH POSTS THE ECB.                                        |   46
+*|  10)   CANCEL THE STIMER AND FREE THE SQA STORAGE.                 |   47
+*| ATTRIBUTES:                                                        |   48
+*|   AMODE 31, RMODE ANY, REENTRANT, REQUIRES APF AUTHORIZATION       |   49
+*|   ESA DEPENDENCIES (LINKAGE STACK, STORAGE MACRO)                  |   50
+*+--------------------------------------------------------------------+   51
+*+--------------------------------------------------------------------+
+*|  Copyright (c) 1992, 1993, 2002 by Mitchell Marx & Penelope Davis  |
+*|                                                                    |
+*|  Address questions to: mmarx@mdpaladin.com                         |
+*|                                                                    |
+*|  Permission is hereby granted, free of charge, to any person       |
+*|  obtaining a copy of this software and associated documentation    |
+*|  files (the "Software"), to deal in the Software without           |
+*|  restriction, including without limitation the rights to use,      |
+*|  copy, modify, merge, publish, distribute, sublicense, and/or sell |
+*|  copies of the Software, and to permit persons to whom the         |
+*|  Software is furnished to do so, subject to the following          |
+*|  conditions:                                                       |
+*|                                                                    |
+*|  The above copyright notice and this permission notice shall be    |
+*|  included in all copies or substantial portions of the Software.   |
+*|                                                                    |
+*|  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,   |
+*|  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES   |
+*|  OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND          |
+*|  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT       |
+*|  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,      |
+*|  WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING      |
+*|  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR     |
+*|  OTHER DEALINGS IN THE SOFTWARE.                                   |
+*+--------------------------------------------------------------------+
+         MODULE SCHDSRB,BASE=12,LOC=BELOW,AMODE=31,RMODE=ANY,          X  52
+               TEXT='SCHEDULES AN SRB'                                    53
+         LR    R9,R1                   PARMLIST ADDRESS TO R9             54
+         USING SCHDPRM,R9              MAP INPUT PARMLIST                 55
+*        *---------------------------------------*                        56
+*        *     CALL GETASCB TO GET TARGET ASCB   *                        57
+*        *---------------------------------------*                        58
+         LA    R3,GETPARMS             PARMS FOR GETASCB ROUTINE          59
+         USING GETPRM,R3               MAP GETASCB PARMLIST               60
+         MVC   GETNAME,SCHTASID        ADDRESS SPACE NAME TO GETPRM       61
+         LA    R1,8                    ..PUT LENGTH OF ADDRESS SPACE      62
+         ST    R1,GETNAMEL             ..NAME IN GETASCB PARMLIST         63
+         ICM   R15,15,=V(GETASCB)      ADDRESS OF THE GETASCB SERVICE     64
+         BZ    EXIT08                  =0; NOT LINK-EDITED - EXIT         65
+         O     R15,=A(X'80000000')     SET FOR 31 BIT ENTRY               66
+         LA    R1,GETPARMS             PARMS FOR GETASCB ROUTINE          67
+         BASSM R14,R15                 INVOKE THE GETASCB SERVICE         68
+         LTR   R15,R15                 RC = 0 ?                           69
+         BNZ   EXIT0C                  NO; EXIT                           70
+*        *---------------------------------------*                        71
+*        *     LOAD THE SRB ROUTINE INTO         *                        72
+*        *     PRIVATE TO OBTAIN LENGTH          *                        73
+*        *---------------------------------------*                        74
+         LOAD  EPLOC=SCHNAME,ERRET=EXIT10                                 75
+         N     R1,=A(X'00FFFFFF')      TURN OFF NON-LENGTH BITS           76
+         SLL   R1,3                    MULTIPLY LENGTH BY 8               77
+         ST    R1,LSRBRTN              SAVE LENGTH OF SRB ROUTINE         78
+         DELETE EPLOC=SCHNAME          DELETE MODULE FROM PRIVATE         79
+*        *---------------------------------------*                        80
+*        *     GET STORAGE FOR SRB CONTROL BLOCK,*                        81
+*        *     SRB ROUTINE AND PARMS FOR THE RTN *                        82
+*        *---------------------------------------*                        83
+         L     R5,SCHLPARM             ..TOTAL STORAGE = L'SRB PARMS      84
+         LA    R5,SRBSIZE1(R1,R5)      ..+ LENGTH OF SRB AND SRB RTN      85
+         LA    R5,LSRBRMTM(R5)         ..+ SIZE OF RMT ROUTINE            86
+         ST    R5,SRBTSTOR             SAVE AMOUNT TOTAL STORAGE          87
+         MODESET MODE=SUP,KEY=ZERO     GET A SUPERVISOR/KEY 0 PSW         88
+         STORAGE OBTAIN,LENGTH=(5),ADDR=(4),SP=SRBSP,LOC=BELOW            89
+         ST    R4,ADSTOR               SAVE ADDRESS SQA STORAGE           90
+         XR    R6,R6                   ..INITIALIZE                       91
+         XR    R7,R7                   ..STORAGE                          92
+         MVCL  R4,R6                   ..TO X'00'                         93
+*        *---------------------------------------*                        94
+*        *     LOAD THE SRB ROUTINE INTO         *                        95
+*        *     COMMON STORAGE                    *                        96
+*        *---------------------------------------*                        97
+         MVC   LOADLIB(LDCBD),LOADLIBD COPY DCB TO WORK AREA              98
+         MVC   OLIST(LOLIST),MOLIST    COPY OPEN PARMLIST TO WORK AREA    99
+         LA    R6,LOADLIB              ADDRESS OF LOADLIB DCB            100
+         OPEN  ((R6),INPUT),MF=(E,OLIST)  OPEN THE LOADLIB               101
+         L     R4,ADSTOR               ADDRESS OF SQA STORAGE            102
+         LA    R5,SCHNAME              ADDRESS OF SRB MODULE NAME        103
+         LOAD  EPLOC=(R5),ERRET=EXIT14,              ..LOAD THE MODULE X 104
+               ADRNAPF=(R4),DCB=(R6),SF=(E,LLIST)    ..INTO SQA STORAGE  105
+         ST    R0,LOADEP               SAVE AMODE/ENTRYPOINT FROM LOAD   106
+         CLOSE MF=(E,OLIST)            CLOSE THE LOADLIB                 107
+*        *---------------------------------------*                       108
+*        *     COPY THE RMT ROUTINE TO COMMON    *                       109
+*        *---------------------------------------*                       110
+         L     R5,LSRBRTN              LENGTH OF SRB ROUTINE +           111
+         LA    R4,0(R4,R5)             ADDR OF SRB RTN = ADDR RMT RTN    112
+         ST    R4,ADRMTRTN             SAVE THE ADDRESS OF RMT RTN       113
+         LA    R5,LSRBRMTM             LENGTH THE THE RMT RTN            114
+         LR    R7,R5                   COPY LENGTH TO R7                 115
+         LA    R6,SRBRMTM              ADDRESS OF RMT RTN IN SCHDSRB     116
+         MVCL  R4,R6                   MOVE RMT RTN TO COMMON STORAGE    117
+*        *---------------------------------------*                       118
+*        *     BUILD THE SRB                     *                       119
+*        *---------------------------------------*                       120
+         LR    R10,R4                  ADDR OF SRB RTN = ADDR SRB        121
+         USING SRBSECT,R10             MAP THE SRB                       122
+         MVC   SRBID,=CL4'SRB'         MOVE SRB LITERAL TO SRB           123
+         L     R4,LOADEP               LOAD AMODE/ENTRYPOINT FROM LOAD   124
+         ST    R4,SRBEP                STORE ADDR OF SRB RTN IN SRB      125
+         MVC   SRBASCB,GETADDR         ADDRESS OF TARGET ASCB TO SRB     126
+         EPAR  R2                        ..THIS ASID                     127
+         STCM  R2,B'0011',SRBPASID       ..INTO THE SRB                  128
+         L     R2,PSATOLD-PSA          ..ADDRESS OF CURRENT TCB          129
+         STCM  R2,15,SRBPTCB           ..INTO THE SRB                    130
+         L     R7,ADRMTRTN               ..ADDRESS OF THE RMT RTN        131
+         ST    R7,SRBRMTR                ..INTO THE SRB                  132
+         ICM   R5,15,SCHLPARM          LENGTH OF PARMS FOR SRB RTN       133
+         BZ    NOPARM                  =0; DO NOT COPY PARMS TO SQA      134
+         LA    R4,SRBEND1              POINT AT PARMS FOR SRB ROUTINE    135
+         ST    R4,SRBPARM              SAVE ADDRESS IN SRB               136
+         LR    R7,R5                   LENGTH FOR MVCL                   137
+         L     R6,SCHAPARM             ADDRESS OF SRB ROUTINE PARMS      138
+         MVCL  R4,R6                   COPY PARMS INTO SQA.              139
+NOPARM   DS    0H                                                        140
+*                                        ..MOVE ADDRESS THIS ASCB TO     141
+         MVC   ADASCB,PSAAOLD-PSA        ..COMMON STORAGE FOR XM POST    142
+*        *---------------------------------------*                       143
+*        *     SCHEDULE THE SRB                  *                       144
+*        *---------------------------------------*                       145
+         SCHEDULE SRB=(R10),SCOPE=LOCAL                                  146
+*        *---------------------------------------*                       147
+*        *     SET THE STIMER. WAIT FOR THE      *                       148
+*        *     SRB ROUTINE TO COMPLETE.          *                       149
+*        *---------------------------------------*                       150
+         ST    R13,ADWORK               ..PASS ADDRESS OF WORKAREA       151
+         LA    R5,ADWORK                ..AS PARM TO STIMERM EXIT RTN    152
+         LA    R4,SRBTIMM               ADDRESS OF STIMERM EXIT RTN      153
+         LA    R1,STIMLIST              STIMERM PARAMETER LIST           154
+         STIMERM SET,ID=STIMID,BINTVL=TIMER,EXIT=(R4),PARM=(R5),       X 155
+               MF=(E,(1))                                                156
+         LA    R1,SRBECB               ..WAIT FOR THE SRB                157
+         WAIT  1,ECB=(R1)              ..TO COMPLETE                     158
+         XR    R7,R7                   CLEAR R7                          159
+         ICM   R7,B'0111',SRBECB+1     PRESERVE THE POST CODE IN R7      160
+*        *---------------------------------------*                       161
+*        *     FREE SRB AND SRB ROUTINE STORAGE  *                       162
+*        *---------------------------------------*                       163
+         LA    R1,STIMLIST              STIMERM PARAMETER LIST           164
+         STIMERM CANCEL,ID=STIMID,MF=(E,(1))   CANCEL THE STIMERM        165
+         L     R0,SRBTSTOR             SIZE OF STORAGE IN SQA            166
+         L     R1,ADSTOR               ADDRESS OF SQA STORAGE            167
+         STORAGE RELEASE,LENGTH=(0),ADDR=(1),SP=SRBSP                    168
+         MODESET MODE=PROB,KEY=NZERO   GET A PROBLEM STATE/KEY 8 PSW     169
+         LTR   R15,R7                  POST CODE = 0?                    170
+         BNZ   EXIT18                  NO;  EXIT WITH ERROR              171
+         B     EXIT00                  EXIT                              172
+*---------------------------------------------------------------------*  173
+*        STIMER EXIT ROUTINE.                                         *  174
+*        THIS ROUTINE IS DISPATCHED WHEN THE STIMERM INTERVAL EXPIRES.*  175
+*        THE ROUTINE ISSUES THE PURGEDQ MACRO, WHICH CAUSES MVS       *  176
+*        SUPERVISOR ROUTINES TO:                                      *  177
+*              1) REMOVE THE SRB ROUTINE FROM ANY DISPATCH QUEUES.    *  178
+*              2) TRANSFER CONTROL TO THE RMT ROUTINE.  THE RMT       *  179
+*                 ROUTINE CROSS-MEMORY POSTS THE ECB IN THIS ROUTINE. *  180
+*---------------------------------------------------------------------*  181
+SRBTIMM  DS    0F                                                        182
+         BAKR  R14,R0                  SAVE ENVIRONMENT ON STACK         183
+         LR    R12,R15                 ENTRYPOINT TO BASE REGISTER       184
+         LA    R2,SRBTIMM-SCHDSRB      ..BACKUP FOR DISPLACEMENT         185
+         SLR   R12,R2                  ..OF THIS ROUTINE                 186
+         L     R13,4(R1)               WORKAREA  ADDRESS                 187
+         L     R10,ADSTOR              ADDRESS OF SRB                    188
+         L     R2,SRBASCB              TARGET ASCB                       189
+         LA    R2,ASCBASID-ASCB(R2)    POINT AT ASN OF TARGET ASCB       190
+         MVC   PRGFLC(L'SRBFLC),SRBFLC COPY SRBFLC                       191
+         NC    PRGFLC(L'SRBCPAFF),=XL2'00' TURN OFF HIGH BYTES           192
+         LA    R8,PRGFLC               ASID/TCB FOR PURGEDQ              193
+         L     R7,SRBRMTR              ADDRESS OF RMT ROUTINE            194
+         LA    R1,PDQLIST              PARMLIST FOR PURGEDQ              195
+         PURGEDQ RMTR=(7),ASID=(R2),ASIDTCB=(8),MF=(E,(1))               196
+         PR                            RETURN                            197
+*---------------------------------------------------------------------*  198
+*        RMT ROUTINE.                                                 *  199
+*        THIS ROUTINE RECEIVES CONTROL WHEN THE STIMERM IN THE        *  200
+*        SCHEDULING ADDRESS SPACE EXPIRES AND THE STIMERM EXIT        *  201
+*        ROUTINE ISSUES PURGEDQ.  THIS ROUTINE CAN FREE RESOURCES     *  202
+*        SUCH AS LOCKS OR COMMON STORAGE ACQUIRED FOR THE SRB ROUTINE.*  203
+*        IN THIS CASE IT POSTS THE ECB FOR THE SCHEDULING TASK.       *  204
+*---------------------------------------------------------------------*  205
+SRBRMTM  DS    0F                                                        206
+         BAKR  R14,R0                  SAVE ENVIRONMENT ON STACK         207
+         LR    R9,R15                  ENTRYPOINT TO BASE REGISTER       208
+         LA    R2,SRBRMTM-SCHDSRB      ..BACK UP FOR DISPLACEMENT        209
+         SLR   R9,R2                   ..OF THIS ROUTINE                 210
+         LR    R10,R1                  ADDRESS OF SRB                    211
+         LA    R4,SRBECB               ADDRESS OF SRB ECB                212
+         L     R5,ADASCB               ADDRESS OF SCHEDULER'S ASCB       213
+         LA    R6,POSTERR              ERROR ROUTINE FOR POST            214
+         LA    R7,12                   POST CODE = 12                    215
+         POST  (4),(7),ASCB=(5),ERRET=(6),LINKAGE=BRANCH                 216
+         PR                            RETURN                            217
+*---------------------------------------------------------------------*  218
+*        POST ERROR ROUTINE.  THIS ROUTINE IS ONLY ENTERED IF THE     *  219
+*        SCHEDULING ADDRESS SPACE NO LONGER EXISTS                    *  220
+*---------------------------------------------------------------------*  221
+POSTERR  DS    0H                                                        222
+         PR                            POP THE STACK AND RETURN          223
+ESRBRMTM DS    0F                      FORCE FULLWORD ALIGNMENT          224
+LSRBRMTM EQU   ESRBRMTM-SRBRMTM        LENGTH OF THE RMT ROUTINE         225
+*---------------------------------------------------------------------*  226
+*        EXIT ROUTINES                                                *  227
+*---------------------------------------------------------------------*  228
+EXIT00   DS    0H                      SUCCESSFUL COMPLETION             229
+         LA    15,X'00'                                                  230
+         B     EXIT                                                      231
+EXIT08   DS    0H                      LENGTH OF TARGET ADDRES SP=0      232
+         LA    15,X'08'                                                  233
+         B     EXIT                                                      234
+EXIT0C   DS    0H                      TARGET ADDRESS SP NOT FOUND       235
+         LA    15,X'0C'                                                  236
+         B     EXIT                                                      237
+EXIT10   DS    0H                      LOAD OF SRB ROUTINE INTO          238
+         PERCRC RC=X'10'               PRIVATE FAILED                    239
+         B     EXIT                                                      240
+EXIT14   DS    0H                      LOAD OF SRB ROUTINE INTO          241
+         PERCRC RC=X'14'               SQA FAILED                        242
+         B     EXIT                                                      243
+EXIT18   DS    0H                      SRB ROUTINE ROUTINE FAILED        244
+         PERCRC RC=X'14'                                                 245
+         B     EXIT                                                      246
+*---------------------------------------------------------------------*  247
+*        COMMON EXIT                                                  *  248
+*---------------------------------------------------------------------*  249
+EXIT     DS   0H                                                         250
+         ENDMOD                                                          251
+*---------------------------------------------------------------------*  252
+*        DCB AND OPEN/CLOSE PARMLIST MODELS                           *  253
+*---------------------------------------------------------------------*  254
+LOADLIBD DCB   DSORG=PS,MACRF=GL,EODAD=EXIT,LRECL=256,                 X 255
+               BLKSIZE=256,RECFM=FB,DDNAME=LOADLIB                       256
+LDCBD    EQU   *-LOADLIBD              LENGTH OF DCB                     257
+MOLIST   OPEN  (,),MF=L                OPEN/CLOSE PARMLIST               258
+LOLIST   EQU   *-MOLIST                LENGTH OF OPEN/CLOSE PARMLIST     259
+*---------------------------------------------------------------------*  260
+*        CONSTANTS                                                    *  261
+*---------------------------------------------------------------------*  262
+SRBSP    EQU   245                     SUBPOOL FOR SRB AND ROUTINE STG   263
+TIMER    DC    A(10*SECOND)            TIMER VALUE FOR 10 SECONDS        264
+SECOND   EQU   100                     TIMER VALUE FOR 1 SECOND          265
+*---------------------------------------------------------------------*  266
+*        WORK AREA                                                    *  267
+*---------------------------------------------------------------------*  268
+WSCHDSRB DSECT                         WORK AREA FOR SCHDSRB             269
+PRGFLC   DS    D                       ASID/TCB FOR PURGEDQ              270
+LOADEP   DS    A                       AMODE/ENTRYPOINT OF SRB ROUTINE   271
+LSRBRTN  DS    F                       LENGTH OF SRB ROUTINE             272
+ADRMTRTN DS    A                       ADDRESS IF THE RMT ROUTINE        273
+ADWORK   DS    F                       ADDRESS OF THIS WORK AREA         274
+ADSTOR   DS    A                       ADDRESS OF OBTAINED STORAGE       275
+STIMID   DS    A                       STIMERM ID                        276
+SRBTSTOR DS    F                       AMOUNT TOTAL STORAGE              277
+GETPARMS DS    CL(GETPRML)             PARMS FOR GETASCB                 278
+STIMLIST STIMERM SET,MF=L              PARMLIST FOR STIMERM              279
+PDQLIST  PURGEDQ MF=L                  PARMLIST FOR PURGEDQ              280
+LOADLIB  DS    0F,CL(LDCBD)            LOADLIB DCB                       281
+OLIST    DS    CL(LOLIST)              OPEN/CLOSE PARMLIST               282
+LLIST    LOAD  ,SF=L                   PARMLIST FOR LOAD ADRNPF=         283
+LSCHDSRB EQU   *-WSCHDSRB              LENGTH OF THE WORK AREA           284
+*---------------------------------------------------------------------*  285
+*        OTHER DSECTS                                                 *  286
+*---------------------------------------------------------------------*  287
+         SCHDPRM                       MAP PARMLIST FOR THIS ROUTINE     288
+         SRBPRM                        MAP SRB AND USER PARMS            289
+         GETPRM                        PARMS FOR GETASCB                 290
+         IHAASCB                       MAP ASCB                          291
+         CVT   DSECT=YES,LIST=NO       MAP CVT                           292
+         IHAPSA                        MAP PSA                           293
+         END                                                             294

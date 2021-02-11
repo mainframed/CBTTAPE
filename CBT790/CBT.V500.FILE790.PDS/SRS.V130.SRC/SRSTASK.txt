@@ -1,0 +1,1359 @@
+*PROCESS RENT,FLAG(PAGE0)                                          V121
+SRSTASK TITLE '- SYSOUT Retrieval Services (SRS) SAPI interface'
+SRSTASK CSECT , ATTR=RENT,REUS,REFR
+SRSTASK AMODE 31
+SRSTASK RMODE ANY                                                  V130
+*=====================================================================*
+*                                                                     *
+*  MODULE NAME:  SRSTASK                                              *
+*                                                                     *
+*  DESCRIPTIVE-NAME: SYSOUT Retrieval Services (SRS) SAPI interface   *
+*                                                                     *
+*  STATUS: z/OS Release 1.9 and higher *ONLY*                      V130
+*                                                                     *
+*  OPERATION:                                                         *
+*                                                                     *
+*    SRSTASK takes SYSOUT datasets from the JES2 spool, and calls     *
+*    a user-written program to process the datasets.                  *
+*                                                                     *
+*    The SRSDRVR program attaches one SRSTASK for each unique         *
+*    combination of supported selection criteria, which are:          *
+*                                                                     *
+*       1) SYSOUT class                                               *
+*       2) Jobname                                                    *
+*       3) Destination                                                *
+*       4) Forms ID                                                   *
+*       5) JES2 jobid                                                 *
+*       6) User-writer name                                           *
+*       7) DDNAME of spool data set                                V120
+*                                                                     *
+*    The name of the program to be invoked to process the datasets    *
+*    is passed in the SRSTBLK.  Immediately after the program is      *
+*    loaded, it is called with an initialization bit on.  Similarly,  *
+*    just prior to being deleted, it is called with a termination     *
+*    indicator set.  After a dataset is returned from                 *
+*    the SSI, the program is called with a "start-of-dataset"         *
+*    indicator.  The program is then called for each record read, and *
+*    then once more with an "end-of-file" indicator.  At any time,    *
+*    the program can return a non-zero return code, and stop the      *
+*    SSI.                                                             *
+*                                                                     *
+*    NOTES:                                                           *
+*      This program uses the SYSOUT Application Program Interface     *
+*      (SAPI) - SSI Function Code 79 - subsystem                      *
+*      brodcast to request sysout from JES2.  This support was        *
+*      introduced in OS/390 Release 3.                                *
+*                                                                     *
+*      The program issues the following Return Codes:                 *
+*                                                                     *
+*        0 - Normal completion                                        *
+*        4 - No SYSOUT datasets were processed                        *
+*       16 - The user-supplied program requested the SRS interface    *
+*            to shutdown or rejected the dataset                      *
+*       20 - A SAPI error was encountered                             *
+*       24 - A catastrophic error occurred                            *
+*       32 - SRSTASK abended processing a spool dataset               *
+*                                                                     *
+*                                                                     *
+*    ATTRIBUTES:                                                      *
+*                                                                     *
+*      Location:  resident in own address space                       *
+*      State:  problem; does not need to be APF authorized         V130
+*      Amode:  31-bit                                                 *
+*      Rmode:  ANY                                                 V130
+*      Key:  8                                                     V130
+*      Mode:  task                                                    *
+*      Serialization: none                                            *
+*      Type:  Reentrant                                               *
+*                                                                     *
+*  Written By: Dave Danner                                      @A11202
+*              Summit Technical Services, Inc.                  @A11202
+*                                                               @A11202
+*          January, 1998                                              *
+*                                                                     *
+*  Change log:                                                        *
+*    DWD 04/98: Add DISP=KEEP/DELETE support                       V111
+*    DWD 01/99: Reset ECBPOST prior to IEFSSREQ                 @A11101
+*    DWD 03/99: STATUS= support                                 @A11102
+*    DWD 03/99: Fix ABEND0C4 HASCHAM+4F6                        @A11103
+*    DWD 07/99: STC/TSU support for JOBID (JI=) parameter          V112
+*               Fix S001-3 abends following system crash           V112
+*    DWD 09/99: Document non-zero RC's from SSI call            @A11201
+*    DWD 05/00: Eliminate termination due to SSOBRETN=12        @A11203
+*    DWD 05/01: Don't delete last dataset if SRSTASK abends     @A11204
+*    DWD 03/02: Recursive abends after SD37 abend during CLOSE  @A11205
+*    DWD 03/02: 7-digit job numbers in JOIID                    @A11206
+*    DWD 09/03: Select by DDNAME                                   V120
+*               Support for parameter list passed to despool pgm   V120
+*    DWD 12/04: Separator record support                           V121
+*               Installation defaults                              V121
+*    DWD 10/06: Expand DEST to 18 characters                    @A12101
+*    DWD 03/08: Unauthorized SAPI                                  V130
+*    DWD 11/08: Fix S337-04 abends when invoked from APF lib    @A13001
+*=====================================================================*
+SRSTASK  SRSBEGIN LEVEL=A13001                                  @A13001
+         BAKR  R14,0                Save environment               V130
+         LR    R12,R15              Set base register
+         USING SRSTASK,R12
+         LA    R11,4095(R12)        Set second base register
+         LA    R11,1(R11)           Set second base register
+         USING SRSTASK+4096,R11
+         LR    R6,R1                Save address of SRSTBLK
+         USING SRSTBLK,R6           And address it
+*
+         STORAGE OBTAIN,LENGTH=SRSTLEN,LOC=BELOW                   V130
+         LR    R4,R1                Copy work area address
+         LA    R5,SRSTLEN           Get length of work area
+         SLR   R15,R15              Zero source length for MVCL
+         LR    R14,R15              Zero source address for MVCL
+         MVCL  R4,R14               Clear entire work area
+         LR    R13,R1               Point to my save area
+         MVC   4(4,R13),=C'F1SA'    Indicate linkage stack in use  V130
+         USING SRSTWORK,R13         Address work area
+         USING S99RB,SVC99RBB       Address SVS99 RB in work area
+*
+         BRAS  R10,SETUP           Perform general setup functions V130
+         LTR   R15,R15             Was setup successfull ?
+         BNZ   RETURN              No, quit now
+         TM    STATUS,STATREJ      Reject from user pgm ?
+         BO    PROGREJ             Yes, tell oper & quit now
+         SPACE 5
+*=====================================================================*
+* Initialize an SSOB to make the SAPI call                            *
+*=====================================================================*
+         STORAGE OBTAIN,LENGTH=BUFSSLEN Get storage for SSOB       V130
+         ST    R1,WORKSSOB         Save address of SSOB work area
+         USING BUFSSWK,R1          Address SSOB buffer
+         LA    R7,BUFSSOB          Point at actual SSOB
+         ST    R7,BUFSSPTR         Save in ptr for IEFSSREQ
+         OI    BUFSSPTR,X'80'      Turn on high-order bit
+         DROP  R1
+         USING SSOB,R7
+         LR    R4,R7               Copy SSOB address
+         LA    R5,SSOFLEN          Get length of SSOB buffer
+         SLR   R15,R15             Zero source length for MVCL
+         LR    R14,R15             Zero source address for MVCL
+         MVCL  R4,R14              Clear entire SSOB
+         MVC   SSOB(WTRSOSIZ),WTRSSOB Initialize header
+         LA    R3,SSOBGN           Initialize ssob
+         ST    R3,SSOBINDV         Save address of sysout extention
+         LA    R4,SSS2SIZE         Get sysout extention size
+         STH   R4,SSS2LEN          Save in SAPI extention
+         MVI   SSS2VER,SSS2CVER    Set version in SAPI extention
+         MVC   SSS2EYE,=C'SSS2'    Set eyecatcher in SAPI extention
+         MVI   SSS2TYPE,SSS2PUGE   Indicate PUT/GET request
+*DEL     MVI   SSS2SEL1,SSS2SWTR   Select only ODISP=WRITE or KE@A11102
+         TM    SRSTFLAG,SRSTKEEP   KEEP despooled datasets ?       V130
+         BZ    UPDAUTH             No, need JESSPOOL UPDATE auth   V130
+         OI    SSS2SEL5,SSS2SRON   Set READ only request           V130
+UPDAUTH  DS    0H                                                  V130
+         BO    NODSKEEP            Yes, leave default (KEEP)       V112
+         LA    R15,ECBSAPI         Get the SAPI ECB addr
+         ST    R15,SSS2ECBP        Save in SAPI extention
+         CLI   SRSTCLAS,X'00'      Select by SYSOUT class ?
+         BE    NOCLASS             No, continue
+         MVI   SSS2CLSL,C' '       Init SSS2CLSL to blanks
+         MVC   SSS2CLSL+1(L'SSS2CLSL-1),SSS2CLSL
+         MVC   SSS2CLSL(1),SRSTCLAS   Set class to select
+         OI    SSS2SEL1,SSS2SCLS   Check SYSOUT class
+NOCLASS  DS    0H
+         CLI   SRSTJOBN,X'00'      Select by jobname ?
+         BE    NOJOBNM             No, continue
+         MVC   SSS2JOBN,SRSTJOBN   Set jobname to select
+         OI    SSS2SEL1,SSS2SJBN   Check jobname
+NOJOBNM  DS    0H
+         CLC   =CL4'ALL',SRSTDEST  Select all destinations ?    @A12101
+         BE    NODEST              Yes, skip dest checking
+         OI    SSS2SEL1,SSS2SDST   Check destination
+         MVC   SSS2DEST,SRSTDEST   Set destid to check             V121
+NODEST   DS    0H
+         CLC   SRSTFORM,=CL8'ALL'  Select all forms?               V121
+         BE    NOFORM              Yes, skip forms checking        V121
+         OI    SSS2SEL2,SSS2SFRM   Check forms
+         MVI   SSS2FORM,C' '       Init forms fields to blanks
+         MVC   SSS2FORM+1(L'SSS2FORC-1),SSS2FORM
+         MVC   SSS2FORM(8),SRSTFORM Set forms ID to check          V121
+NOFORM   DS    0H
+         CLI   SRSTJBID,X'00'      Select by jobid ?
+         BE    NOJBID              No, continue
+         MVC   SSS2JBIL,SRSTJBID   Set low jobid
+         MVC   SSS2JBIH,SRSTJBID   Set high jobid
+         OI    SSS2SEL1,SSS2SJBI   Check jobid
+         MVI   SSS2SEL3,SSS2SJOB   Assume JOB                      V112
+         CLI   SRSTJBID,C'J'       Selecting batch job ?           V112
+         BE    NOJBID              Yes, continue                   V112
+         MVI   SSS2SEL3,SSS2SSTC   Assume STC                      V112
+         CLI   SRSTJBID,C'S'       Selecting started tasks ?       V112
+         BE    FIXJBID             Yes, reset JBID to 'JOB'        V112
+         MVI   SSS2SEL3,SSS2STSU   Must be selecting TSU           V112
+FIXJBID  DS    0H                                                  V112
+         MVI   SSS2JBIL,C'J'       Reset low jobid              @A11206
+         MVI   SSS2JBIH,C'J'       Reset high jobid             @A11206
+NOJBID   DS    0H
+         CLC   SRSTWTRN,=CL8'ALL'  Select all writer ID's?         V121
+         BE    NOWTRN              Yes, skip writer ID checking    V121
+         OI    SSS2SEL2,SSS2SPGM   Check writer name
+         MVC   SSS2PGMN,=CL8' '    If not spec, verify null writer
+         CLI   SRSTWTRN,X'00'      Select by writer name ?
+         BE    NOWTRN              No, continue
+         MVC   SSS2PGMN,SRSTWTRN   Set writer ID to check          V121
+NOWTRN   DS    0H
+         TM    SRSTFLAG,SRSTSHLD+SRSTSNHL Select all output?    @A11102
+         BNO   NOSALL                                           @A11102
+         OI    SSS2SEL1,SSS2SAWT   Select all output            @A11102
+NOSALL   DS    0H                                               @A11102
+         TM    SRSTFLAG,SRSTSNHL   Select NONHELD output?       @A11102
+         BNO   NOSNHL                                           @A11102
+         OI    SSS2SEL1,SSS2SWTR   Select ODISP=WRITE/KEEP      @A11102
+NOSNHL   DS    0H                                               @A11102
+         TM    SRSTFLAG,SRSTSHLD   Select HELD output?          @A11102
+         BNO   NOSHLD                                           @A11102
+         OI    SSS2SEL1,SSS2SHLD   Select ODISP=HOLD/LEAVE      @A11102
+NOSHLD   DS    0H                                               @A11102
+         SPACE 3
+* Write "initialization complete" message
+         TM    SRSTFLAG,SRSTWLIM   WTO limit option on ?
+         BO    NO003I              Yes, skip SRS003I
+         MVC   WTOBUFF+2(L'SRS003I),SRS003I
+         LA    R15,L'SRS003I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOBUFF+42(8),SRSTPGMN  Move in despooler pgm name  V130
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SHUTDOWN request
+NO003I   DS    0H
+         OI    SRSTFLAG,SRSTACT    Task is now active
+*=====================================================================*
+* Establish a recovery routine.                                       *
+*=====================================================================*
+         STM   R2,R12,ESTAREGS     Save current regs for recovery rtn
+         MVC   WTOBUFF(ESTAPRML),ESTAPARM Move in ESTAE parm list
+         ACONTROL FLAG(NOPAGE0)    ESTAE uses IX instead of base   V121
+         ESTAE STAEXIT,TERM=YES,PARAM=(R13),MF=(E,WTOBUFF)
+         ACONTROL FLAG(PAGE0)      Restore PAGE0 checking          V121
+         OI    STATUS,STATESTA     Flag ESTAE now in effect
+*=====================================================================*
+* Make the SAPI SSI call to request sysout from JES2                  *
+*=====================================================================*
+GETWORK  DS    0H
+         L     R1,ECBCOMM          Get addr ecb posted by driver
+         TM    0(R1),ECBPOST       Were we posted ?
+         BO    PROCDRVR            Yes, check it out
+         CLC   SRSTLIMT,=AL2(0)    Limit number datasets selected?
+         BE    NOLIMCK             No, bypass check
+         L     R15,SRSTCNT         Pick up current dataset count
+         CH    R15,SRSTLIMT        Limit hit ?
+         BL    NOLIMCK             No, keep processing
+         MVC   WTOBUFF+2(L'SRS021I),SRS021I
+         LA    R15,L'SRS021I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB)
+         B     STOPXWTR            Shutdown now
+NOLIMCK  DS    0H
+         NI    ECBSAPI,X'FF'-ECBPOST Reset POST bit in SAPI ECB @A11101
+         L     R1,WORKSSOB         Point at addr of addr of ssob
+         IEFSSREQ                  Ask jes2 for sysout
+         ST    R15,SSIRC           Save return code             @A11201
+         ICM   R15,15,SSIRC        SSI RC=0 ?                   @A11201
+         BNZ   SAPIERR             No, handle SAPI error        @A11201
+SSRCHEK  DS    0H
+         OI    STATUS,STATSAPI     SAPI interface is active
+         CLC   SSOBRETN,=A(SSS2RTOK)  SYSOUT dataset returned ?
+         BE    PROCDS              Yes, go process it
+         CLC   SSOBRETN,=A(SSS2EODS)   Any more datasets ?
+         BE    WAITDS              Yes, wait for some
+         CLC   SSOBRETN,=A(SSS2UNAV)   Unavailable now ?        @A11203
+         BE    SAPIUNAV            Yes, wait and try again      @A11203
+SAPIERR  DS    0H                                               @A11201
+*===============================================================@A11201
+* The SAPI call failed.  Either IEFSSREQ returned a non-zero RC @A11201
+* in R15, or SSOBRETN was greater than 4.  Write the SRS100E    @A11201
+* message to document each code, then write a second line to    @A11201
+* report the textual meaning of the error.                      @A11201
+*===============================================================@A11201
+         MVC   WTOBUFF+2(L'SRS100E),SRS100E                     @A11201
+         LA    R15,L'SRS100E       Get length of message        @A11201
+         STH   R15,WTOBUFF         Save length in WTO           @A11201
+         L     R15,PSATOLD-PSA(,0)        Get TCB address       @A11201
+         L     R15,TCBJSCB-TCB(,R15)      Get JSCB address      @A11201
+         L     R15,JSCBSSIB-IEZJSCB(,R15) Get SSIB address      @A11201
+         MVC   WTOBUFF+37(L'SSIBSSNM),SSIBSSNM-SSIB(R15) SSN    @A11201
+         L     R15,SSIRC           Get SSI RC                   @A11201
+         CVD   R15,DOUBWORK        Make it decimal              @A11201
+         OI    DOUBWORK+7,X'0F'    Fix up sign                  @A11201
+         UNPK  WTOBUFF+49(2),DOUBWORK+6(2)  Move to msg         @A11201
+         L     R15,SSOBRETN        Get SSOB return code         @A11201
+         CVD   R15,DOUBWORK        Make it decimal              @A11201
+         OI    DOUBWORK+7,X'0F'    Fix up sign                  @A11201
+         UNPK  WTOBUFF+62(2),DOUBWORK+6(2)  Move to msg         @A11201
+         SLR   R15,R15             Clear work reg               @A11201
+         IC    R15,SSS2REAS        Get reason code              @A11201
+         CVD   R15,DOUBWORK        Make it decimal              @A11201
+         OI    DOUBWORK+7,X'0F'    Fix up sign                  @A11201
+         UNPK  WTOBUFF+70(2),DOUBWORK+6(2)  Move to msg         @A11201
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer      @A11201
+         WTO   TEXT=WTOBUFF,DESC=2,MF=(E,WTOPARMB) Write msg    @A11201
+         ICM   R15,15,SSIRC        Get SSI RC                   @A11201
+         BZ    CKSSORC             If zero, use SSOB RC         @A11201
+         C     R15,=A(HISSIRC)     RC w/in range of known RC's? @A11201
+         BH    SAPIERRX            Yes, no description          @A11201
+         LA    R5,SSIMSG           Set pointer to msg table     @A11201
+         B     SAPIEDES            Get error description        @A11201
+CKSSORC  DS    0H                                               @A11201
+         L     R15,SSOBRETN        Get SSOB return code         @A11201
+         C     R15,=A(HISSORC)     RC w/in range of known RC's? @A11201
+         BH    SAPIERRX            Yes, no description          @A11201
+         LA    R5,SSOMSG           Set pointer to msg table     @A11201
+SAPIEDES DS    0H                                               @A11201
+         SH    R15,=H'4'           Set msg index                @A11201
+         L     R5,0(R5,R15)        Point at msg len & text      @A11201
+         IC    R15,0(,R5)          Get length of msg               V121
+         BCTR  R15,0               Prep for execute             @A11201
+         EX    R15,MVCSSIM         Move in error text           @A11201
+         LA    R15,1+8(R15)        Rest length & add msgid      @A11201
+         STH   R15,WTOBUFF         Save length in WTO           @A11201
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer      @A11201
+         WTO   TEXT=WTOBUFF,DESC=2,MF=(E,WTOPARMB) Write msg    @A11201
+SAPIERRX DS    0H                                               @A11201
+         LA    R15,20              Set SAPI error RC            @A11201
+         ST    R15,SRSTRC          Save in block                @A11201
+         B     STOPXWTR            Go shutdown                  @A11201
+MVCSSIM  MVC   WTOBUFF+10(*-*),1(R5)                            @A11201
+         EJECT                                                  @A11201
+*===============================================================@A11203
+* JES not available now.  Wait and try the call again.          @A11203
+*===============================================================@A11203
+SAPIUNAV DS    0H                                               @A11203
+         MVC   WTOBUFF+2(L'SRS025I),SRS025I                     @A11203
+         LA    R15,L'SRS025I       Get length of message        @A11203
+         STH   R15,WTOBUFF         Save length in WTO           @A11203
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer      @A11203
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write message       @A11203
+         STIMER WAIT,DINTVL=SAPIWAIT  Wait just a minute        @A11203
+         B     GETWORK             And try the call again       @A11203
+         EJECT                                                  @A11203
+*=====================================================================*
+* No sysout datasets are available.  Wait for some.                   *
+*=====================================================================*
+WAITDS   DS    0H
+         OI    STATUS,STATWADS     Set wait-for-datasets
+         TM    SRSTFLAG,SRSTNOWT   Not waiting for datasets ?
+         BO    STOPXWTR            Yes, shutdown now
+         L     R15,SSS2ECBP        Get address of ecb jes2 will post
+         ST    R15,ECBSSOB         Save in ecb list
+         OI    ECBSSOB,X'80'       Set end-of list bit
+WAITM    DS    0H
+         WAIT  1,ECBLIST=ECBLIST   Wait for sysout or stop/modify
+         B     GETWORK             Go get more sysout
+*=====================================================================*
+* Process the dataset returned.                                       *
+*=====================================================================*
+PROCDS   DS    0H
+         BRAS  R10,PROCESS         Call routine to process the DS  V130
+         TM    STATUS,STATREJ      Was dataset rejected ?
+         BO    PROGREJ             Yes, tell oper & quit now
+         LTR   R15,R15             Dataset processed ?
+         BZ    GETWORK             Yes, request more SYSOUT from JES2
+         B     CATASTRO            Go issue horrible msg & shutdown
+         SPACE 3
+*==================================================================
+* The user-supplied program requested SRS processing stop.
+*==================================================================
+PROGREJ  DS    0H
+         MVC   WTOBUFF+2(L'SRS010I),SRS010I
+         LA    R15,L'SRS010I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOBUFF+38(8),SRSTPGMN  Move in user program name
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+*DEL120  OI    WTOPARMB+X'1C',X'40'   Set DESC=2                   V120
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SHUTDOWN request
+         TM    STATUS,STATSAPI     Is the SAPI interface active?   V120
+         BNO   NOSSOBSH            No, SSOB ain't there            V120
+         OI    SSS2DSP1,SSS2DKPE   Keep last dataset selected
+NOSSOBSH DS    0H                                                  V120
+         LA    R15,16              Set return code
+         ST    R15,SRSTRC          Save in block
+         B     STOPXWTR            Go shutdown
+*
+CATASTRO DS    0H
+         MVC   WTOBUFF+2(L'SRS110E),SRS110E
+         LA    R15,L'SRS110E       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+34(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         OI    WTOPARMB+X'1C',X'80'   Set DESC=1
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SHUTDOWN request
+         LA    R15,24              Set return code
+         ST    R15,SRSTRC          Save in block
+         B     STOPXWTR            Go shutdown
+*=====================================================================*
+* Process the request from the driver.                                *
+*=====================================================================*
+PROCDRVR DS    0H
+         OI    SRSTECBX,X'FF'-ECBPOST  Clear POST bit
+         TM    SRSTFLAG,SRSTSHUT   Should we shutdown ?
+         BNO   WAITM               No, go wait again
+STOPXWTR DS    0H
+         TM    STATUS,STATSAPI     Is the SAPI interface active?   V120
+         BNO   RETURN              No, skip these checks           V120
+         XC    SSS2JBIR,SSS2JBIR   Clear the SSOB jobid            V120
+         BRAS  R9,CKDDNAME         ...and perform DDNAME check     V130
+* See if any datasets were selected from spool
+         ICM   R15,15,SRSTCNT      Get number of datasets selected
+         BNZ   DSELECTY            Branch if any selected
+         ICM   R15,15,SRSTRC       Get task RC                  @A11201
+         BNZ   DSELECTY            If error ocurred, skip msg   @A11201
+         MVC   WTOBUFF+2(L'SRS020I),SRS020I
+         LA    R15,L'SRS020I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB)
+         LA    R15,4               Set return code
+         C     R15,SRSTRC          Worse RC already issued ?
+         BL    DSELECTY            Yes, keep worse one
+         ST    R15,SRSTRC          Save in block
+         B     SHUTDOWN            Start shutdown
+DSELECTY DS    0H
+         TM    SRSTFLAG,SRSTSHUT   Was a STOP cmd issued ?
+         BO    STRTSHUT            Yes, write SHUTDOWN message
+         TM    SRSTFLAG,SRSTNOWT   Not waiting for datasets ?
+         BNO   SHUTDOWN            No, skip message
+         TM    STATUS,STATWADS     Did we wait-for-datasets ?
+         BNO   SHUTDOWN            No, skip message
+         MVC   WTOBUFF+2(L'SRS022I),SRS022I
+         LA    R15,L'SRS022I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB)
+         B     SHUTDOWN            Start shutdown
+STRTSHUT DS    0H
+* Write "SHUTDOWN in progress" message
+         MVC   WTOBUFF+2(L'SRS011I),SRS011I
+         LA    R15,L'SRS011I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SHUTDOWN request
+*=====================================================================*
+* Tell JES2 we no longer want sysout.                                 *
+*=====================================================================*
+SHUTDOWN DS    0H
+         OI    SSS2MSC1,SSS2CTRL   Indicate Processing Complete
+         L     R1,WORKSSOB         Point at addr of addr of ssob
+         IEFSSREQ                  Tell JES2 we are all done
+* Document SRS interface deactivated
+         TM    SRSTFLAG,SRSTWLIM   WTO limit option on ?
+         BO    NO012I              Yes, skip SRS012I
+         MVC   WTOBUFF+2(L'SRS012I),SRS012I
+         LA    R15,L'SRS012I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SRS SSI closed
+NO012I   DS    0H
+*
+         L     R1,WORKSSOB         Get address of ssob buffer
+         STORAGE RELEASE,ADDR=(1),LENGTH=BUFSSLEN Free SSOB        V130
+RETURN   DS    0H
+         TM    STATUS,STATLOAD     User program loaded ?
+         BNO   NOLOAD              No, continue
+* Call the user-written routine for the termination call
+         MVI   SRSFLAGS,SRSTERM    Set initialization indicator
+         LA    R1,SRSDATA          Get address of SRSDATA block
+         L     R15,SRSPGMA         Get address of user program
+         BASSM R14,R15             Call user program
+         SAM31                     Force AMODE31                   V130
+NOTCALL  DS    0H                                               @A11205
+         LA    R1,SRSTPGMN         Get address of program name
+         DELETE  EPLOC=(1)         Delete the routine
+NOLOAD   DS    0H
+         TM    SRSTFLAG,SRSTWLIM   WTO limit option on ?
+         BO    NO013I              Yes, skip SRS013I
+         MVC   WTOBUFF+2(L'SRS013I),SRS013I
+         LA    R15,L'SRS013I       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         MVC   WTOBUFF+13(2),SRSTWRID  Move in SRS task ID
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SRS SSI closed
+NO013I   DS    0H
+*
+         TM    STATUS,STATESTA     Was ESTAE issued ?
+         BZ    NOESTAE             No, skip cancel
+         ESTAE 0                   Cancel ESTAE
+NOESTAE  DS    0H
+         LR    R1,R13               Save getmained storage address
+         L     R13,SAVE+4           Restore caller's save area addr
+         STORAGE RELEASE,LENGTH=SRSTLEN,ADDR=(1)                   V130
+         NI    SRSTFLAG,X'FF'-SRSTACT    Task is now inactive
+         SLR   R15,R15             Set RC=0                        V130
+         PR                        Return to caller                V130
+         EJECT
+*=====================================================================*
+* General setup routine.                                              *
+*  1) Initialize global variables and work area.                      *
+*  2) Initialize the ECB list.                                        *
+*  3) Set up the allocation parm.                                     *
+*  4) Load the user routine to process the dataset.                V130
+*  5) Call the user program with the initialization flag on.       V130
+*=====================================================================*
+SETUP    DS    0H
+* Initialize global variables and work area.
+         LA    R1,TASKRETR             Get ESTAE retry routine addr
+         ST    R1,TASKRETA             Save it
+         MVC   SYSSAPI,SYSSRSD         Initialize the SYSSRS DCB
+         LA    R1,SYSSAPI+(SYSSRSDE-SYSSRSD) Get DCBE address   @A13001
+         ST    R1,SYSSAPI+(DCBDCBE-IHADCB)   And save in DCB    @A13001
+         CLI   SRSTDDNM,C' '           Select by DDNAME ?          V120
+         BNH   SETSV99                 No, skip flag set           V120
+         OI    STATUS2,STA2DDNS        Set select-by-DDNAME        V120
+SETSV99  DS    0H                                                  V120
+* Set up the SVC99 parms
+         LA    R1,SVC99RBB             Get address of request block
+         ST    R1,SVC99P               Save in pointer
+         OI    SVC99P,S99RBPND         Set end-of-list
+         MVI   S99RBLN,S99RBEND-S99RB  Set length
+*
+A1       USING S99TUNIT,ALTXTU1        Addressability to text unit V130
+         LA    R1,ALTXTU1              Get address of text unit
+         ST    R1,AALTXTU1             Save in pointer list
+         MVC   A1.S99TUKEY,=AL2(DALRTDDN)   Set "return DDNAME"    V130
+         MVC   A1.S99TUNUM,=AL2(1)          Set number of entries  V130
+         MVC   A1.S99TULNG,=AL2(L'ALLOCDDN) Set length of entry    V130
+         DROP  A1                                                  V130
+*
+A2       USING S99TUNIT,ALTXTU2        Addressability to text unit V130
+         LA    R1,ALTXTU2              Get address of text unit
+         ST    R1,AALTXTU2             Save in pointer list
+         MVC   A2.S99TUKEY,=AL2(DALDSNAM)   Set "DSN=" key         V130
+         MVC   A2.S99TUNUM,=AL2(1)          Set number of entries  V130
+         MVC   A2.S99TULNG,=AL2(L'ALLOCDSN) Set length of entry    V130
+         DROP  A2                                                  V130
+*
+A3       USING S99TUNIT,ALTXTU3        Addressability to text unit V130
+         LA    R1,ALTXTU3              Get address of text unit
+         ST    R1,AALTXTU3             Save in pointer list
+         MVC   A3.S99TUKEY,=AL2(DALUASSR)   Set unauth "SUBSYS="   V130
+         MVC   A3.S99TUNUM,=AL2(1)          Set number of entries  V130
+         MVC   A3.S99TULNG,=AL2(L'ALLOCSSN) Set length of entry    V130
+         DROP  A3                                                  V130
+*                                                                  V130
+U1       USING S99TUNIT,UATXTU1        Addressability to text unit V130
+         LA    R1,UATXTU1              Get address of text unit    V130
+         ST    R1,UALTXTU1             Save in pointer list        V130
+         OI    UALTXTU1,S99TUPLN       Set last text ptr indicator V130
+         MVC   U1.S99TUKEY,=AL2(DALDDNAM)   Set "DDNAME"           V130
+         MVC   U1.S99TUNUM,=AL2(1)          Set number of entries  V130
+         MVC   U1.S99TULNG,=AL2(L'UALOCDDN) Set length of entry    V130
+         DROP  U1                                                  V130
+* Initialize the ECB list.
+         LA    R15,SRSTECBX            ECB SRSDRVR will POST
+         ST    R15,ECBCOMM             SAVE IN ECB LIST
+* Set up the allocation parm.
+         L     R15,PSATOLD-PSA(,0)     GET MY TCB ADDRESS
+         L     R15,TCBJSCB-TCB(,R15)   GET JSCB ADDRESS
+         L     R15,JSCBSSIB-IEZJSCB(,R15) GET SSIB ADDRESS
+         MVC   ALLOCSSN,SSIBSSNM-SSIB(R15)
+* Load the user-written routine to process the dataset
+         LA    R1,SRSTPGMN         Get address of program name
+         LOAD  EPLOC=(1)           Load the routine                V121
+         ST    R0,SRSPGMA          Save entry point of program
+         OI    STATUS,STATLOAD     Indicate program has been loaded
+* Call the user program with the initialization flag on.
+         MVI   SRSFLAGS,SRSINIT    Set initialization indicator
+         MVC   SRSPARM,SRSTPPRM    Set program parms               V120
+         CLI   SRSPARM,C' '        Are there any parms?            V121
+         BNH   NOPPARM             No, leave length zero           V121
+         LA    R15,SRSPARM+L'SRSPARM-1 Point at last char in parm  V121
+PPLOOP   DS    0H                                                  V121
+         CLI   0(R15),C' '         Blank char?                     V121
+         BH    PPEND               Yes, found end                  V121
+         BCTR  R15,0               Bump to next char               V121
+         B     PPLOOP              And check it out                V121
+PPEND    DS    0H                                                  V121
+         LA    R1,SRSPARM-1        Point at first char (less one)  V121
+         SR    R15,R1              Get length of parm              V121
+         STC   R15,SRSPARML        Set program parms length        V121
+NOPPARM  DS    0H                                                  V121
+         LA    R1,SRSDATA          Get address of SRSDATA block
+         L     R15,SRSPGMA         Get address of user program
+         BASSM R14,R15             Call user program
+         SAM31                     Force AMODE31                   V130
+         LTR   R15,R15             RC=0 from user pgm ?
+         BZ    SETUPX              Yes, return to main routine
+         OI    STATUS,STATREJ      Set reject from user pgm
+         SLR   R15,R15             Set SETUP RC=0
+         B     SETUPX              Return to main routine
+SETUPX   DS    0H
+         LR    R5,R15              Save routine's RC
+         LR    R15,R5              Restore routine's RC
+         BR    R10                 Return to main routine
+         EJECT
+*=====================================================================*
+* Process sysout dataset.                                             *
+*  1) Build the SRS001I message text.                                 *
+*  2) Call the user-program with the "new dataset" indicator on.      *
+*  3) If the user program wants to process the dataset,               *
+*     then issue message SRS001I indicating datset has been selected  *
+*     else return with RC from program                                *
+*  4) Dynamically allocate the SYSOUT dataset.                        *
+*  5) Open sysout dataset.                                            *
+*  6) Read a record from the SYSOUT dataset.                          *
+*  7) Pass the record to the user program.                            *
+*  8) When EOF hit, call the user-program with the "eof" bit on       *
+*  9) Dynamically un-allocate SYSOUT dataset.                         *
+* 10) Return to caller.                                               *
+*=====================================================================*
+PROCESS  DS    0H
+         TM    STATUS,STATABND     In here for error cleanup ?
+         BO    CLSDATA             Yes, process end of dataset
+         NI    STATUS2,X'FF'-STA2IOER Reset I/O error flag         V120
+* Set the disp flags to keep.  If the dataset is successfully      V112
+* processed, we'll reset this to delete.                           V112
+         OI    SSS2DSP1,SSS2DKPE+SSS2RNPR  Keep the dataset, but don't +
+                                           return it to me again   V112
+         TM    SSS2RET1,SSS2DSF    First dataset in output group ?
+         BZ    NODSF               No, skip down
+         XC    DSID,DSID           Reset the dataset counter
+         BRAS  R9,CKDDNAME         Perform DDNAME check            V130
+NODSF    DS    0H
+         LH    R15,DSID            Get dataset ID counter
+         LA    R15,1(R15)          Bump counter
+         STH   R15,DSID            Save updated count
+         MVC   SRSTLJBN,SSS2JOBR   Update last jobname selected
+         MVC   SRSTLJBI,SSS2JBIR   Update last jobid selected
+         TM    STATUS2,STA2DDNS    Select by DDNAME ?              V120
+         BZ    NOSELDD             No, don't check DDNAME          V120
+         SLR   R15,R15             Clear work reg                  V120
+         LA    R15,L'SRSTDDNM      Get length of ddname mask       V121
+         ST    R15,DOUBWORK        Save as fullword                V120
+         ASAXWC PATTERNSTR=SRSTDDNM, Set pattern address               +
+               PATTERNSTRLEN=DOUBWORK, and length                      +
+               STRING=SSS2DDND,     Set string address                 +
+               STRINGLEN==AL4(L'SSS2DDND),  and length                 +
+               ZEROORMORE==C'*',    Generic character                  +
+               ONECHAR==C'?',       Single wildcard character          +
+               DELIMITER==C' ',     End of data delimiter              +
+               WORKAREA=WORK256,    Work area for ASAXWC               +
+               MF=(E,XWCLIST,COMPLETE)  Test DDNAME match          V120
+         LTR   R14,R15             Save and test RC                V120
+         LA    R15,0               Set PROCESSX RC for poss exit   V120
+         BNZ   NODSKEEP            Exit if no DDNAME match         V120
+         OI    STATUS2,STA2DDNF    Set DDNAME found                V120
+NOSELDD  DS    0H                                                  V120
+* Build the SRS001I message text.
+         MVI   WTOBUFF,C' '                    INITIALIZE ...
+         MVC   WTOBUFF+1(L'WTOBUFF-1),WTOBUFF  ... WTO BUFFER
+         LA    R1,WTOBUFF+2        Point at first character of text
+         MVC   0(L'SRS001I,R1),SRS001I Move in message ID
+         LA    R1,L'SRS001I+1(R1)  Point character after msgid
+         MVC   0(L'SSS2JOBR,R1),SSS2JOBR    Move jobname to msg
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVI   0(R1),C'('          Insert paren
+         MVC   1(L'SSS2JBIR,R1),SSS2JBIR    Move JOBID to msg
+         LA    R1,L'SSS2JBIR+1(R1) Point character after JOBID
+         MVC   0(4,R1),=C') Q='    Add next part
+         LA    R1,4(R1)            Update message pointer
+         MVC   0(1,R1),SSS2CLAR    Move in class of SYSOUT
+         MVC   1(3,R1),=C' D='     Add next part
+         LA    R1,4(R1)            Update message pointer
+         MVC   0(L'SSS2DESR,R1),SSS2DESR    Move dest to msg
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Add a blank after dest
+         MVC   0(7,R1),=C'O=?.?.?' Add next part
+         TM    SSS2RET1,SSS2GNVA   Is output group ID good ?
+         BNO   NOOUTGP             No, skip it
+         MVC   2(L'SSS2OGNM,R1),SSS2OGNM    Move output group ID to msg
+NOOUTGP  DS    0H                                                  V130
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char
+         LA    R1,1(R1)            Add a blank after outgroup
+         MVC   0(3,R1),=C'DS='     Add next part
+         LA    R1,3(R1)            Point at insertion point
+         SLR   R15,R15             Clear work reg
+         ICM   R15,B'0011',DSID    Get datset number
+         CVD   R15,DOUBWORK        Make it decimal
+         OI    DOUBWORK+7,X'0F'    Fix up sign
+         UNPK  DOUBWORK(5),DOUBWORK+5(3)
+         LA    R15,DOUBWORK-1      Point at 1st digit
+CKDSZERO DS    0H
+         LA    R15,1(R15)          Skip to next digit
+         CLI   0(R15),C'0'         Look for leading zero
+         BE    CKDSZERO            If found, skip to next digit
+         LA    R14,DOUBWORK+4      Point at last digit
+         SR    R14,R15             Get length of DS number
+         EX    R14,MVCDSID         Move DS number to message
+         LA    R1,1(R14,R1)        Point past DS number            V120
+         MVI   0(R1),C'/'          Add a slash                     V120
+         MVC   1(8,R1),SSS2DDND    Move DDNAME of data set         V120
+         LA    R1,2(R1)            Reset index                     V120
+         BRAS  R9,FINDBLNK         ... and find next blank char    V130
+         MVC   1(6,R1),=C'on WTR'  Add next part                   V120
+         MVC   7(2,R1),SRSTWRID    Move writer ID of this SRSTASK  V120
+         LA    R1,9(R1)            Point at next slot              V120
+         MVI   1(R1),C'('          Insert paren
+         LA    R1,2(R1)            Update message pointer
+         MVI   0(R1),C'?'          Assume unknown line count
+         TM    SSS2RET1,SSS2DSCL   Is line count accurate ?
+         BZ    LINEUNKN            No, don't use it
+         MVC   EDBUF,EDPAT         Move edit pattern to buffer
+         L     R15,SSS2LNCT        Get dataset line count
+         CVD   R15,DOUBWORK        Make it decimal
+         ED    EDBUF,DOUBWORK+3    Edit record count
+         LR    R3,R1               Save message pointer
+         LA    R1,EDBUF+L'EDBUF-1  Point at last char in record cnt
+         LR    R2,R1               Save pointer
+         LA    R0,4                Set backward scan direction
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at first digit
+         SR    R2,R1               Get length of cnt (minus one)
+         EX    R2,MOVECNT          Move record count to message
+         LR    R1,R3               Restore message pointer
+LINEUNKN DS    0H
+         SLR   R0,R0               Set foward scan direction
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVC   1(5,R1),=C'RECS)'   Move in end of message
+         LA    R1,6(R1)            Point at end of message (plus 1)
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Indicate dataset sel'd
+*==================================================================*
+* Call the user-program with the "new dataset" indicator on.       *
+*==================================================================*
+         LA    R1,SSS2             Get address of SAPI SSOB ext'n
+         ST    R1,SRSSSOB          Save for user program
+         XC    SRSREC,SRSREC       Clear record pointer...
+         XC    SRSRECL,SRSRECL     ... and length
+         MVI   SRSFLAGS,SRSFIRST   Set new dataset indicator
+         LA    R1,SRSDATA          Get address of SRSDATA block
+         L     R15,SRSPGMA         Get address of user program
+         BASSM R14,R15             Call user program
+         SAM31                     Force AMODE31                   V130
+         LR    R5,R15              Save return code
+         LTR   R5,R5               Does user want this dataset ?
+         BZ    ALLOCDS             Yes, go allocate it
+         OI    STATUS,STATREJ      Set reject from user pgm
+         B     PROCESSX            End processing this dataset
+* Dynamically allocate the SYSOUT dataset.
+ALLOCDS  DS    0H
+         STCK  SRSTTIME            Save time dataset selected
+         NI    SRSFLAGS,X'FF'-SRSFIRST Turn off new dataset indicator
+         MVI   S99VERB,S99VRBAL    Set allocate verb
+         MVC   ALLOCDSN,SSS2DSN    Set DSN to allocate
+         MVC   ALTXBTOK,SSS2BTOK   Set the allocation token from JES
+         OI    ALTXBTOK,S99TUPLN   Set last text ptr indicator
+         LA    R15,ALTXTBK         Get address of text pointer list
+         ST    R15,S99TXTPP        Point header at alloc block
+         LA    R1,SVC99P           Point at svc99 parmeter list
+         SVC   99                  Allocate sysout dataset
+         LTR   R5,R15              Was allocation successfull ?    V130
+         BNZ   ALOCFAIL            No, issue diagnostic msg
+ALLOCOK  DS    0H
+* Open sysout dataset.
+         LA    R3,SYSSAPI          Get SYSSAPI DCB address         V130
+         USING IHADCB,R3           DCB Addressability              V130
+         MVC   DCBDDNAM,ALLOCDDN   Use DDNAME from Dynalloc        V130
+         MVC   DOUBWORK(OPNPARML),OPNPARM
+         OI    STATUS,STATSAPO     Flag spool dataset open
+         OPEN  (SYSSAPI),MF=(E,DOUBWORK)  Open dataset
+         MVC   SRSRECL,DCBLRECL    Copy SYSSAPI LRECL              V130
+         DROP  R3                                                  V130
+         LA    R4,SYNADMSG         SYNADAF message buffer address  V112
+         MVI   SRSFLAGS,SRSDREC    Assume no separators            V121
+         CLI   SRSTSEPO,SRSTSEPD   DATASET separators in effect?   V121
+         BE    DOSEP               Yes, write a separator rec      V121
+         CLI   SRSTSEPO,SRSTSEPJ   Job separators in effect?       V121
+         BNE   NOJBSEP             No, skip job sep check          V121
+         CLC   SSS2JBIR,SRSSEPJI   Sep already done for this job?  V121
+         BE    DATALOOP            Yes, none needed                V121
+         B     DOSEP               No, produce separator           V121
+NOJBSEP  DS    0H                                                  V121
+         CLI   SRSTSEPO,SRSTSEPG   OUTGRP separators in effect?    V121
+         BNE   DATALOOP            No, skip OG sep check           V121
+         TM    SSS2RET1,SSS2DSF    First dataset in output group ? V121
+         BZ    DATALOOP            Yes, none needed                V121
+* Produce separator record                                         V121
+DOSEP    DS    0H                                                  V121
+         MVC   SRSSEPJI,SSS2JBIR   Set jobname for sep produced    V121
+         LH    R0,SRSRECL          Get data record length          V121
+         CH    R0,=H'130'          Lower than minimum?             V121
+         BNL   GETSEPST            No, use DS LRECL                V121
+         LH    R0,=H'130'          Use minimum length              V121
+GETSEPST DS    0H                                                  V121
+         STH   R0,SRSSEPL          Save sep buffer length          V121
+         STORAGE OBTAIN,LENGTH=(0) Get storage for separator       V130
+         ST    R1,SRSSEPA          Save sep buffer addr            V121
+         LR    R2,R1               Get address of buffer           V121
+         LH    R3,SRSSEPL          Get length of buffer            V121
+         L     R15,=A(X'40000000')  Set blank pad & zero length    V121
+         MVCL  R2,R14              Set buffer to blanks            V121
+         MVC   0(L'SRSTSEPI,R1),SRSTSEPI  Set sep record ID        V121
+         SLR   R0,R0               Set function code for findblnk  V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVC   0(5,R1),=C' JOB='   Set data tag                    V121
+         LA    R1,5(R1)            Point past tag                  V121
+         MVC   0(L'SSS2JOBR,R1),SSS2JOBR  Move in jobname          V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVC   0(7,R1),=C' JOBID='  Set data tag                   V121
+         MVC   7(L'SSS2JBIR,R1),SSS2JBIR  Move in jobid            V121
+         CLI   SRSTSEPO,SRSTSEPJ   Job separators in effect?       V121
+         BE    DATASEP             Yes, end of job separato        V121
+         LA    R1,16(R1)           Point at spot for next element  V121
+         MVC   0(6,R1),=C'CLASS='  Set data tag                    V121
+         MVC   6(L'SSS2CLAR,R1),SSS2CLAR  Move in SYSOUT class     V121
+         LA    R1,7+L'SSS2CLAR(R1) Point at spot for next element  V121
+         MVC   0(5,R1),=C'DEST='   Set data tag                    V121
+         MVC   5(L'SSS2DESR,R1),SSS2DESR  Move in DESTID           V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at spot for next element  V121
+         MVC   0(4,R1),=C'WTR='    Set data tag                    V121
+         MVC   4(L'SSS2PGMR,R1),SSS2PGMR  Move in WRITER name      V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at spot for next element  V121
+         MVC   0(5,R1),=C'FORM='   Set data tag                    V121
+         MVC   5(L'SSS2FORR,R1),SSS2FORR  Move in FORMS ID         V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at spot for next element  V121
+         MVC   0(7,R1),=C'OUTGRP=' Set data tag                    V121
+         MVC   7(L'SSS2OGNM,R1),SSS2OGNM  Move in output grp name  V121
+         CLI   SRSTSEPO,SRSTSEPG   OUTGRP separators in effect?    V121
+         BE    DATASEP             Yes, end of OUTGRP separator    V121
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R1,1(R1)            Point at spot for next element  V121
+         MVC   0(3,R1),=C'DD='     Set data tag                    V121
+         MVC   3(L'SSS2DDND,R1),SSS2DDND  Move in DDNAME           V121
+DATASEP  DS    0H                                                  V121
+         MVI   SRSFLAGS,SRSDREC+SRSDSEP  Set sep call flag         V121
+         L     R1,SRSSEPA          Get addr of separator record    V121
+DATALOOP DS    0H
+* Read a record from the SYSOUT dataset.
+         TM    SRSFLAGS,SRSDSEP    Processing separator record?    V121
+         BO    DATACALL            Yes, skip SYSOUT read           V121
+         GET   SYSSAPI             Read the next data record
+* Pass the record to the user program.
+DATACALL DS    0H                                                  V121
+         ST    R1,SRSREC           Save buffer address
+         LA    R1,SRSDATA          Get address of SRSDATA block
+         L     R15,SRSPGMA         Get address of user program
+         BASSM R14,R15             Call user program
+         SAM31                     Force AMODE31                   V130
+         MVI   SRSFLAGS,SRSDREC    Turn off sep indicator          V121
+         LR    R5,R15              Save return code
+         LTR   R5,R5               RC=0 ?
+         BZ    DATALOOP            Yes, read next record
+         OI    STATUS,STATREJ      Set reject from user pgm
+         B     CLSDATA             Close and deallocate data set
+         SPACE 5                                                   V112
+*=================================================================*V112
+* SYNAD routine for the SYSSAPI DCB.                              *V112
+*                                                                 *V112
+* The following routine gets control if QSAM GET encounters an I/O*V112
+* error reading the SYSSAPI JES spool dataset.  This most often   *V112
+* happens following a system crash when JES did not close spool   *V112
+* datasets.  The routine does the following:                      *V112
+*                                                                 *V112
+* 1) Invoke SYNADAF to create a formatted I/O error mesage.       *V112
+* 2) Save the message in the work area.                           *V112
+* 3) Free the SYNADAF work area and re-establish our R13.         *V112
+* 4) Write SRS050E & 51E to document the I/O error.               *V112
+* 5) Continue processing as if EOF was hit.                       *V112
+*                                                                 *V112
+* Note that when the routine is called, R4 must point to the      *V112
+* buffer used to hold the I/O error message.                      *V112
+*=================================================================*V112
+SRSSYNAD DS    0H                                                  V112
+         SYNADAF ACSMETH=QSAM      Create error message            V112
+         MVC   0(L'SYNADMSG,R4),50(R1) Save formatted message      V112
+         SYNADRLS                  Free SYNADAF acquired storage   V112
+         SAM31                     Reset AMODE31                   V130
+         OI    STATUS2,STA2IOER    Flag I/O error                  V120
+* Write message SRS050E                                            V112
+         MVC   WTOTEXT(L'SRS050E),SRS050E Move in message ID       V112
+         MVC   WTOTEXT+L'SRS050E(L'SYNADMSG),SYNADMSG              V112
+         LA    R15,L'SRS050E+L'SYNADMSG  Get length of msg         V112
+         STH   R15,WTOBUFF         Save length                     V112
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer         V112
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SYNADAF err msg  V112
+* Write message SRS051E                                            V112
+         MVC   WTOTEXT(L'SRS051E),SRS051E Move in message ID       V112
+         MVC   WTOTEXT+L'SRS051E(L'SSS2DSN),SSS2DSN                V112
+         LA    R15,L'SRS051E+L'SSS2DSN   Get length of msg         V112
+         STH   R15,WTOBUFF         Save length                     V112
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer         V112
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write SYNADAF err msg  V112
+         SPACE 5                                                   V112
+EOFDATA  DS    0H
+* EOF hit, call the user-program with the "eof" bit on
+         MVI   SRSFLAGS,SRSEOF     Set new end-of-file indicator
+         LA    R1,SRSDATA          Get address of SRSDATA block
+         L     R15,SRSPGMA         Get address of user program
+         BASSM R14,R15             Call user program
+         SAM31                     Force AMODE31                   V130
+         LTR   R15,R15             RC=0 ?
+         BZ    CLSDATA             Yes, close and deallocate
+         OI    STATUS,STATREJ      Set reject from user pgm
+CLSDATA  DS    0H
+         TM    STATUS,STATSAPO     Is spool dataset open ?
+         BZ    PROCESSX            No, don't close/dealloc
+         MVC   DOUBWORK(CLSPARML),CLSPARM
+         NI    STATUS,X'FF'-STATSAPO     Flag spool dataset closed
+         CLOSE (SYSSAPI),MF=(E,DOUBWORK) Close spool dataset
+         FREEPOOL SYSSAPI          Release QSAM buffers         @A11103
+         ICM   R1,15,SRSSEPA       Did we get a buffer for a sep?  V121
+         BZ    NOFREESB            No, nothing to free             V121
+         LH    R0,SRSSEPL          Get length of buffer            V121
+         STORAGE RELEASE,ADDR=(1),LENGTH=(0) Free separator buffer V130
+         XC    SRSSEPA,SRSSEPA     Clear buffer pointer            V121
+NOFREESB DS    0H                                                  V121
+* Dynamically un-allocate SYSOUT dataset
+         MVI   S99VERB,S99VRBUN    Set allocate verb
+         MVC   UALOCDDN,ALLOCDDN   Copy DDNAME from allocation     V130
+         LA    R15,UATXTBK         Addr of unallocation text block V130
+         ST    R15,S99TXTPP        Point header at alloc block
+         LA    R1,SVC99P           Point at SVC99 parameter list
+         SVC   99                  Unallocate sysout dataset
+         LTR   R5,R15              Was unallocation successfull ?
+         BNZ   ALOCFAIL            No, handle error                V112
+         TM    STATUS,STATREJ+STATABND  Rejected or abend?      @A11204
+         BNZ   PROCESSX            Yes, don't count or delete   @A11204
+         TM    STATUS2,STA2IOER    I/O error reading dataset ?     V120
+         BO    PROCESSX            Yes, don't count or delete it   V112
+         TM    SRSTFLAG,SRSTKEEP   KEEP despooled datasets ?       V112
+         BO    NODSKEEP            Yes, leave default (KEEP)       V112
+         NI    SSS2DSP1,X'FF'-SSS2DKPE Delete the dataset          V112
+NODSKEEP DS    0H                                                  V112
+         TM    SSS2RET1,SSS2DSL    Last dataset in output group ?  V112
+         BZ    PROCESSX            No, don't count it              V112
+         TM    STATUS2,STA2DDNS+STA2DDNF  DDNAME in effect & found?V120
+         BM    PROCESSX            Yes & no, don't count           V120
+         L     R1,SRSTCNT          Get dataset select count        V112
+         LA    R1,1(R1)            Bump counter                    V112
+         ST    R1,SRSTCNT          Save updated count              V112
+         B     PROCESSX            Finish up                       V112
+ALOCFAIL DS    0H
+         MVI   WTOBUFF,C' '                    INITIALIZE ...
+         MVC   WTOBUFF+1(L'WTOBUFF-1),WTOBUFF  ... WTO BUFFER
+         LA    R1,WTOBUFF+2        Point at first character of text
+         MVC   0(L'SRS101E,R1),SRS101E Move in message ID
+         LA    R1,L'SRS101E+1(R1)  Point character after msgid
+         MVC   0(4,R1),=C'DSN='    Move in next part
+         MVC   4(L'ALLOCDSN,R1),ALLOCDSN Move in failed DSN
+         SLR   R0,R0               Set function code for findblnk
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         OI    WTOPARMB+X'1C',X'80'   Set DESC=1
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Write dataset name
+         LA    R1,WTOBUFF+L'SRS101E+3  Point at first char
+         MVC   0(L'SRS101EA,R1),SRS101EA  Move in next part
+         CLI   S99VERB,S99VRBAL    Was it allocation ?
+         BE    ALFLMSOK            Yes, leave alone
+         MVC   8(10,R1),=C'unallocatn'  make unallocation
+ALFLMSOK DS    0H
+         LR    R2,R1               Copy pointer
+         LR    R1,R5               Copy return code
+         CALL  SRSPRHEX                                            V111
+         STCM  R0,15,30(R2)        Move RC to message
+         STCM  R1,15,34(R2)        Move RC to message
+         L     R1,S99ERROR         Get error & info codes
+         CALL  SRSPRHEX                                            V111
+         STCM  R0,15,43(R2)        Move error code to message
+         STCM  R1,15,52(R2)        Move info code to message
+         LA    R1,L'SRS101EA(R2)   Point at end of message
+         LA    R15,WTOBUFF+2       Point at beginning of msg
+         SR    R1,R15              Get total msg length
+         STH   R1,WTOBUFF          Save length
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         OI    WTOPARMB+X'1C',X'80'   Set DESC=1
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB) Indicate alloc failed
+         OI    SSS2DSP1,SSS2DKPE   Keep last dataset selected
+         LA    R15,16              Set bad RC
+PROCESSX DS    0H
+         BR    R10                 RETURN TO MAINLINE
+MVCDSID  MVC   0(*-*,R1),0(R15)
+MOVECNT  MVC   0(*-*,R3),0(R1)
+         EJECT
+*=================================================================*V120
+* This routine checks to see if the requested DDNAME was found    *V120
+* for each job (*NOT JOE*) processed.  It is called:              *V120
+*                                                                 *V120
+* 1) Each time the first data set of a JOE is processed.          *V120
+* 2) When SRS termination is in process.                          *V120
+*                                                                 *V120
+* If we didn't select any data sets in the previous job processed *V120
+* and we are in DDNAME selection mode, then issue SRS002I to      *V120
+* document that we selected the job, but didn't find a matching   *V120
+* DDNAME.                                                         *V120
+*=================================================================*V120
+CKDDNAME DS    0H                                                  V120
+         TM    STATUS2,STA2DDNS    Select by DDNAME ?              V120
+         BZ    CKDDNAMX            No, don't do check              V120
+         CLI   SRSTLJBN,C' '       First job selected ?            V120
+         BNH   CKDDNAMX            No, don't do check              V120
+         CLC   SRSTLJBI,SSS2JBIR   Processing same job (new OG) ?  V120
+         BE    CKDDNAMX            Yes, don't do check             V120
+         TM    STATUS2,STA2DDNF    Did we find DDNAME for job ?    V120
+         BO    DDNMFND             Yes, cool..no msg needed        V120
+         LR    R15,R9              Save ret addr (used by FINDBLNK)V120
+* Start building SRS002I message                                   V120
+         MVI   WTOBUFF,C' '                    Initialize          V120
+         MVC   WTOBUFF+1(L'WTOBUFF-1),WTOBUFF  ... WTO buffer      V120
+         LA    R1,WTOBUFF+2        Point at first character        V120
+         MVC   0(L'SRS002I,R1),SRS002I Move in message ID          V120
+         LA    R1,L'SRS002I+1(R1)  Point character after msgid     V120
+         MVC   0(L'SRSTLJBN,R1),SRSTLJBN    Move jobname to msg    V120
+         SLR   R0,R0               Set function code for findblnk  V120
+         BRAS  R9,FINDBLNK         Find blank char                 V130
+         MVI   0(R1),C'('          Insert paren                    V120
+         MVC   1(L'SRSTLJBI,R1),SRSTLJBI    Move JOBID to msg      V120
+         LA    R1,L'SRSTLJBI+1(R1) Point character after JOBID     V120
+         MVC   0(27,R1),=C') does not contain DDNAME='             V120
+         LA    R1,26(R1)           Update message pointer          V120
+         MVC   0(L'SRSTDDNM,R1),SRSTDDNM  Move in DDNAME n.f.      V120
+         LA    R1,9(R1)            Point at end of msg (plus 1)    V120
+* Done building SRS002I message                                    V120
+         LR    R9,R15              Restore return address          V120
+         LA    R15,WTOBUFF+2       Point at beginning of msg       V120
+         SR    R1,R15              Get total msg length            V120
+         STH   R1,WTOBUFF          Save length                     V120
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer         V120
+         WTO   TEXT=WTOBUFF,MF=(E,WTOPARMB)                        V120
+DDNMFND  DS    0H                                                  V120
+         NI    STATUS2,X'FF'-STA2DDNF  Reset DDNAME found          V120
+CKDDNAMX DS    0H                                                  V120
+         BR    R9                                                  V120
+         EJECT                                                     V120
+*=====================================================================*
+* Find the next blank character                                       *
+*  At input:                                                          *
+*    R0 - contains a code indicating the scanning direction           *
+*         0 - foward                                                  *
+*         4 - backward                                                *
+*    R1 - points to the character to start searching                  *
+*    R9 - contains the return address                                 *
+*  At output:                                                         *
+*    R1 - points to the next blank character                          *
+*=====================================================================*
+FINDBLNK DS    0H
+         LTR   R0,R0               Foward search ?
+         BZ    GETFWD              Yes, continue
+GETBACK  DS    0H
+         CLI   0(R1),C' '          Blank found ?
+         BER   R9                  Yes, return
+         BCTR  R1,0                Point at previous character
+         B     GETBACK             Check next char
+*
+GETFWD   DS    0H
+         CLI   0(R1),C' '          Blank found ?
+         BER   R9                  Yes, return
+         LA    R1,1(R1)            Point at next character
+         B     GETFWD              Check next char
+         EJECT
+TASKRETR DS    0H
+*=====================================================================*
+* This ESTAE routine loads this address as the retry address.         *
+* This routine issues a message to indicate the abend code, then      *
+* branches to shutdown the SAPI interface and terminate.              *
+*=====================================================================*
+         USING SDWA,R1
+         L     R13,SDWAPARM        Restore work area address
+         LM    R2,R12,ESTAREGS     Restore R2-R12
+         LR    R4,R1               Copy SDWA address
+         DROP  R1
+         USING SDWA,R4
+         OI    STATUS,STATABND     Flag abend
+*V112    OI    SSS2DSP1,SSS2DKPE+SSS2RHLD                          V112
+         MVC   WTOBUFF+2(L'SRS120E),SRS120E
+         LA    R15,L'SRS120E       Get length of message
+         STH   R15,WTOBUFF         Save length in WTO
+         L     R1,SDWAABCC         Get abend code
+         CALL  SRSPRHEX            Make it printable               V111
+         STCM  R0,B'0011',WTOBUFF+30 Move 1st & 2nd chars of system cde
+         STCM  R1,B'1000',WTOBUFF+32 Move 3rd char of system code
+         TM    SDWAABCC,SDWAREQ    Was it a system abend ?
+         BO    ISSABNDM            Yes, issue message
+         MVI   WTOBUFF+29,C'U'     Set user abend indicator
+         STCM  R1,B'0111',WTOBUFF+30 Move user code
+         DROP  R4
+ISSABNDM DS    0H
+         MVC   WTOPARMB,WTOPARM    Move WTO parm to buffer
+         WTO   TEXT=WTOBUFF,DESC=2,MF=(E,WTOPARMB) Write error msg
+         BRAS  R10,PROCESS         Close and dealloc spool dataset V130
+         LA    R15,32              Set return code
+         ST    R15,SRSTRC          Save in block
+         CLI   SRSFLAGS,SRSTERM    Abend during termination?    @A11205
+         BE    NOTCALL             Yes, skip term call again    @A11205
+         B     SHUTDOWN            Shutdown the SAPI interface
+         EJECT
+STAEXIT  DS    0H
+*=====================================================================*
+* This routine gets control in the unfortunate event that             *
+* SRSTASK abends. If an SDWA is present, the routine saves loads the  *
+* parameter address from ESTAE (REG13) and retrys to the              *
+* TASKRETR routine.                                                   *
+*=====================================================================*
+         PUSH  USING               Save prior USINGs
+         DROP  ,                   Can prior USINGs
+         USING STAEXIT,R15         Temporary base
+         CH    R0,=H'12'           SDWA provided ?
+         BE    NOSDWA              No, branch
+         DROP  R15
+         SAVE  (14,12)             Save registers
+         LR    R12,R15             Set base register
+         USING STAEXIT,R12         Exit base register
+         LR    R4,R1               Save SDWA address
+         USING SDWA,R4
+**       WTO   'SRS110E SRSTASK ESTAE given control',DESC=1
+         L     R10,SDWAPARM        Get work area address
+         USING SRSTWORK,R10
+         L     R2,TASKRETA         Load retry routine address
+         LR    R1,R4               Restore SDWA address
+         TM    STATUS,STATABND     Been here before?            @A11205
+         BO    SDTERM              Yes, avoid recursive abends  @A11205
+         DROP  R4,R10
+         SETRP REGS=(14,12),RC=4,RETADDR=(2)  Return to retry routine
+SDTERM   DS    0H                                               @A11205
+         SETRP REGS=(14,12),RC=0   Continue termination         @A11205
+NOSDWA   DS    0H
+         SLR   R15,R15             Set RC = 0
+         BR    R14                 Continue termination
+         SPACE 2
+         POP   USING               Restore prior USINGs
+         EJECT
+* Static constants and areas
+WTRSSOB  DS    0F
+WTSSOBID DC    CL4'SSOB'
+WTSSOBSZ DC    AL2(SSOBHSIZ)
+WTSSOBFN DC    AL2(SSOBSOU2)
+WTRSOSIZ EQU   *-WTRSSOB
+PSWKEY8  DC    X'80'
+SAPIWAIT DC    0D,C'00010000'                                   @A11203
+* Message text
+SRS001I  DC    C'SRS001I'
+SRS002I  DC    C'SRS002I'                                          V120
+SRS003I  DC    C'SRS003I WTRxx Initialization complete P=xxxxxxxx' V130
+SRS010I  DC    C'SRS010I WTRxx SHUTDOWN requested by xxxxxxxx'
+SRS011I  DC    C'SRS011I WTRxx SHUTDOWN in progress'
+SRS012I  DC    C'SRS012I WTRxx SAPI interface deactivated'         V112
+SRS013I  DC    C'SRS013I WTRxx SHUTDOWN complete'
+SRS020I  DC    C'SRS020I No SYSOUT datasets processed'             V112
+SRS021I  DC    C'SRS021I SYSOUT retrieval limit reached'
+SRS022I  DC    C'SRS022I No more SYSOUT datasets to select'
+SRS025I  DC    C'SRS025I SAPI Services unavailable.  Waiting...'       +
+                                                                @A11203
+SRS050E  DC    C'SRS050E '                                         V112
+SRS051E  DC    C'SRS051E I/O error reading spool dataset '         V112
+SRS100E  DC    C'SRS100E SAPI SSI Call Failed - SSN=nnnn SSI RC=nn SSOB+
+                RETN=nn RESN=nn'                                @A11201
+SRS101E  DC    C'SRS101E'
+SRS101EA DC    C'Dynamic allocation failed, RC=xxxxxxxx ERR=xxxx INF=xx+
+               xx'
+SRS110E  DC    C'SRS110E Catastrophic error - WTRxx terminated'
+SRS120E  DC    C'SRS120E Subtask abend code=Snnn'
+*===============================================================@A11201
+* Table of SSI RC descriptions                                  @A11201
+*===============================================================@A11201
+SSIMSG   DS    0F                                               @A11201
+         DC    A(SSIRC4)                                        @A11201
+         DC    A(SSIRC8)                                        @A11201
+         DC    A(SSIRC12)                                       @A11201
+         DC    A(SSIRC16)                                       @A11201
+         DC    A(SSIRC20)                                       @A11201
+         DC    A(SSIRC24)                                       @A11201
+HISSIRC  EQU   *-SSIMSG                                         @A11201
+SSIRC4   DC    AL1(L'SSIRC4T)                                   @A11201
+SSIRC4T  DC    C'Subsystem does not support SAPI'                  V121
+SSIRC8   DC    AL1(L'SSIRC8T)                                   @A11201
+SSIRC8T  DC    C'Subsystem exists, but is not active'           @A11201
+SSIRC12  DC    AL1(L'SSIRC12T)                                  @A11201
+SSIRC12T DC    C'Subsystem does not exist'                      @A11201
+SSIRC16  DC    AL1(L'SSIRC16T)                                  @A11201
+SSIRC16T DC    C'Function not completed-disastrous error'       @A11201
+SSIRC20  DC    AL1(L'SSIRC20T)                                  @A11201
+SSIRC20T DC    C'Logic error - Notify SRS support'              @A11201
+SSIRC24  DC    AL1(L'SSIRC24T)                                  @A11201
+SSIRC24T DC    C'SSI not initialized'                           @A11201
+*===============================================================@A11201
+* Table of SSOBRETN RC descriptions                             @A11201
+*===============================================================@A11201
+SSOMSG   DS    0F                                               @A11201
+         DC    A(0)          RC=4 not possible                  @A11201
+         DC    A(SSORC8)                                        @A11201
+         DC    A(SSORC12)                                       @A11201
+         DC    A(SSORC16)                                       @A11201
+         DC    A(SSORC20)                                       @A11201
+         DC    A(SSORC24)                                       @A11201
+         DC    A(SSORC28)                                       @A11201
+         DC    A(SSORC32)                                       @A11201
+         DC    A(SSORC36)                                       @A11201
+         DC    A(SSORC40)                                       @A11201
+         DC    A(SSORC44)                                       @A11201
+HISSORC  EQU   *-SSOMSG                                         @A11201
+SSORC8   DC    AL1(L'SSORC8T)                                   @A11201
+SSORC8T  DC    C'Invalid search arguments'                      @A11201
+SSORC12  DC    AL1(L'SSORC12T)                                  @A11201
+SSORC12T DC    C'Unable to process now'                         @A11201
+SSORC16  DC    AL1(L'SSORC16T)                                  @A11201
+SSORC16T DC    C'Duplicate jobnames'                            @A11201
+SSORC20  DC    AL1(L'SSORC20T)                                  @A11201
+SSORC20T DC    C'Invalid destination specified'                 @A11201
+SSORC24  DC    AL1(L'SSORC24T)                                  @A11201
+SSORC24T DC    C'Unknown error'                                 @A11201
+SSORC28  DC    AL1(L'SSORC28T)                                  @A11201
+SSORC28T DC    C'Token map failed'                              @A11201
+SSORC32  DC    AL1(L'SSORC32T)                                  @A11201
+SSORC32T DC    C'Logic error - check SSOB RESN code'            @A11201
+SSORC36  DC    AL1(L'SSORC36T)                                  @A11201
+SSORC36T DC    C'Invalid SYSOUT class specified'                @A11201
+SSORC40  DC    AL1(L'SSORC40T)                                  @A11201
+SSORC40T DC    C'Disposition settings incorrect'                @A11201
+SSORC44  DC    AL1(L'SSORC44T)                                  @A11201
+SSORC44T DC    C'Disposition for data set group not uniform'    @A11201
+*
+EDPAT    DC    X'402020206B2020206B202120'  999,999,999
+         DC    C' '
+*
+SYSSRSD  DCB   DSORG=PS,MACRF=(GL),DCBE=SYSSRSDE                   V130
+SYSSRSDE DCBE  EODAD=EOFDATA,SYNAD=SRSSYNAD                        V130
+SYSSRSDL EQU   *-SYSSRSD                                           V130
+*
+ESTAPARM ESTAE TERM=YES,PARAM=0,MF=L                               V120
+ESTAPRML EQU   *-ESTAPARM
+*
+OPNPARM  OPEN  0,MODE=31,MF=L                                      V130
+OPNPARML EQU   *-OPNPARM
+*
+CLSPARM  CLOSE 0,MODE=31,MF=L                                      V130
+CLSPARML EQU   *-CLSPARM
+*
+WTOPARM  WTO   TEXT=(0),ROUTCDE=11,MF=L                            V120
+WTOPARML EQU   *-WTOPARM
+*
+ATTPARM  ATTACH SF=L
+ATTPARML EQU   *-ATTPARM
+*
+SRSTWORK DSECT
+SAVE     DS    18F                     Save area
+DOUBWORK DS    D                       Doubleword work area
+ESTAREGS DS    11F                     GPRs 2-12 for recovery rtn use
+TASKRETA DS    F                       Address of retry routine
+SRSPGMA  DS    A                       Address of user program
+SYSSAPI  DS    CL(SYSSRSDL)            SYSSAPI DCB
+WORKSSOB DS    F
+ECBSAPI  DS    F                  ECB SAPI will post when work is ready
+ECBLIST  DS    0F
+ECBCOMM  DS    F
+ECBSSOB  DS    F
+SSIRC    DS    F                                               .....
+SRSSEPA  DS    F                       Addr of buffer for sep rec  V121
+SRSSEPJI DS    CL8                     JOBID of last sep produced  V121
+SRSSEPL  DS    H                       Length of SRSSEPA           V121
+DSID     DS    H                       Count of dataset per-JOE
+SYNADMSG DS    CL(128-50)         Message returned by SYNADAF      V112
+*
+         DS    0F
+WTOBUFF  DS    CL100
+WTOTEXT  EQU   WTOBUFF+2                                           V112
+         DS    0F
+WTOPARMB DS    CL(WTOPARML)
+*
+EDBUF    DS    CL(L'EDPAT)
+*
+STATUS   DC    BL1'0'    Status bits
+STATLOAD EQU   B'10000000'   User writer program has been loaded
+STATREJ  EQU   B'01000000'   User program has issued stop/reject
+STATSAPI EQU   B'00100000'   JES SAPI interface established
+STATESTA EQU   B'00010000'   ESTAE recovery is in effect
+*TOP     EQU   B'00001000'   STOP command has been issued *unused* V120
+STATABND EQU   B'00000100'   Abend has ocurred
+STATSAPO EQU   B'00000010'   Spool dataset is open
+STATWADS EQU   B'00000001'   No datasets were available for immediate  +
+                             processing
+*                                                                  V112
+STATUS2  DC    BL1'0'    Status bits                               V112
+STA2IOER EQU   B'10000000'   An I/O error ocurred reading SYSSAPI  V120
+STA2DDNS EQU   B'01000000'   DDNAME= checking is in effect         V120
+STA2DDNF EQU   B'00100000'   DDNAME specified has was found        V120
+ST2BIT3  EQU   B'00010000'   Available for future use              V112
+ST2BIT4  EQU   B'00001000'   Available for future use              V112
+ST2BIT5  EQU   B'00000100'   Available for future use              V112
+ST2BIT6  EQU   B'00000010'   Available for future use              V112
+ST2BIT7  EQU   B'00000001'   Available for future use              V112
+*
+*=====================================================================*
+* Common dynamic allocation/unallocation parm
+*=====================================================================*
+SVC99P   DS    F               Address of S99RBP
+SVC99RBL EQU   S99RBEND-S99RBP Length of S99RBP
+SVC99RBB DS    XL(X'14')       Buffer for S99RBP
+* List of text pointers for allocation
+ALTXTBK  DS    0F
+AALTXTU1 DS    A(0)            DDNAME=<retuned>                    V130
+AALTXTU2 DS    A(0)            DSN=xxxxxxxx
+AALTXTU3 DS    A(0)            SUBSYS=JES2
+ALTXBTOK DS    A(0)            Text unit passed from JES
+*
+* List of text pointers for unallocation                           V130
+UATXTBK  DS    0F                                                  V130
+UALTXTU1 DS    A(0)            DDNAME=xxxxxxxx                     V130
+*                                                                  V130
+ALTXTPRE EQU   L'S99TUKEY+L'S99TUNUM+L'S99TULNG
+* Allocation Text unit 1 - DDNAME=<returned>                       V130
+ALTXTU1  DS    XL(ALTXTPRE)
+ALLOCDDN DC    CL8' '                                              V130
+* Allocation Text unit 2 - DSN=xxxxxxxx
+ALTXTU2  DS    XL(ALTXTPRE)
+ALLOCDSN DS    CL44
+* Allocation Text unit 3 - SUBSYS=JESx
+ALTXTU3  DS    XL(ALTXTPRE)
+ALLOCSSN DS    CL4
+* Unallocation Text unit 1 - DDNAME=xxxxxxxx                       V130
+UATXTU1  DS    XL(ALTXTPRE)                                        V130
+UALOCDDN DC    CL8' '                                              V130
+         EJECT
+*
+         SRSDATA DSECT=NO          MAP SRS Data Block
+         ASAXWC MF=(L,XWCLIST,0F)  List form of wildcard macro     V120
+WORK256  DS    CL265                                               V120
+SRSTLEN  EQU   *-SRSTWORK
+         EJECT
+*=====================================================================*
+* The SSOB is built in private storage, SP=0                       V130
+*=====================================================================*
+BUFSSWK  DSECT                  SSOB buffer
+BUFSSPTR DS    F                Pointer to SSOB
+BUFSSOB  DS    CL(SSOFLEN)      Buffer for SSOB & ext'n
+BUFSSLEN EQU   *-BUFSSWK        Total buffer length
+*
+* MAPPING MACROS
+         SRSTBLK                   MAP SRS Task Data Block
+         IEFJSSOB ,                Map SSOB header
+SSOBGN   DS    0D
+         IAZSSS2 DSECT=NO          Map SAPI extention
+SSOFLEN  EQU   *-SSOB              Length of full SSOB & ext'n
+         IEFZB4D0
+         IEFZB4D2
+*        PRINT NOGEN
+         IHAPSA                    MAP PSA
+         IHAASCB                   MAP ASCB
+         CVT   DSECT=YES           MAP CVT
+         IKJTCB
+         IEFJESCT
+         IEFJSSIB
+         IEZJSCB
+CSCB     DSECT
+         IEECHAIN                  MAP CSCB
+         DCBD DSORG=PS             MAP DCB
+         IHAECB
+         IEZCOM
+         IEZCIB
+         IHASDWA
+         YREGS
+         END

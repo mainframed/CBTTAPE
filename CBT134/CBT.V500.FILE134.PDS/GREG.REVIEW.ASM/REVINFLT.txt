@@ -1,0 +1,3498 @@
+         TITLE ' INFLATE - UNZIP DATA COMPRESSED BY DEFLATE '
+*
+* /* inflate.c -- Not copyrighted 1992 by Mark Adler
+*    version c10p1, 10 January 1993 */
+*
+* /* You can do whatever you like with this source file, though I would
+*    prefer that if you modify it and redistribute it that you include
+*    comments to that effect with your name and the date.  Thank you.
+*    ÝThe history has been moved to the file ChangeLog.¨
+*  */
+*
+* /*
+*    Inflate deflated (PKZIP's method 8 compressed) data.  The
+*    compression method searches for as much of the current string of
+*    bytes (up to a length of 258) in the previous 32K bytes.  If it
+*    doesn't find any matches (of at least length 3), it codes the next
+*    byte.  Otherwise, it codes the length of the matched string and
+*    its distance backwards from the current position.  There is a
+*    single Huffman code that codes both single bytes (called
+*    "literals") and match lengths.  A second Huffman code codes the
+*    distance information, which follows a length code.  Each length or
+*    distance code actually represents a base value and a number of
+*    "extra" (sometimes zero) bits to get to add to the base value.  At
+*    the end of each deflated block is a special end-of-block (EOB)
+*    literal/ length code.  The decoding process is basically: get a
+*    literal/length code; if EOB then done; if a literal, emit the
+*    decoded byte; if a length then get the distance and emit the
+*    referred-to bytes from the sliding window of previously emitted
+*    data.
+*
+*    There are (currently) three kinds of inflate blocks: stored,
+*    fixed, and dynamic.  The compressor deals with some chunk of data
+*    at a time, and decides which method to use on a chunk-by-chunk
+*    basis.  A chunk might typically be 32K or 64K.  If the chunk is
+*    uncompressible, then the "stored" method is used.  In this case,
+*    the bytes are simply stored as is, eight bits per byte, with none
+*    of the above coding.  The bytes are preceded by a count, since
+*    there is no longer an EOB code.
+*
+*    If the data is compressible, then either the fixed or dynamic
+*    methods are used.  In the dynamic method, the compressed data is
+*    preceded by an encoding of the literal/length and distance Huffman
+*    codes that are to be used to decode this block.  The
+*    representation is itself Huffman coded, and so is preceded by a
+*    description of that code.  These code descriptions take up a
+*    little space, and so for small blocks, there is a predefined set
+*    of codes, called the fixed codes.  The fixed method is used if the
+*    block codes up smaller that way (usually for quite small chunks),
+*    otherwise the dynamic method is used.  In the latter case, the
+*    codes are customized to the probabilities in the current block,
+*    and so can code it much better than the pre-determined fixed
+*    codes.
+*
+*    The Huffman codes themselves are decoded using a mutli-level table
+*    lookup, in order to maximize the speed of decoding plus the speed
+*    of building the decoding tables.  See the comments below that
+*    precede the lbits and dbits tuning parameters.
+*  */
+*
+*
+* /*
+*    Notes beyond the 1.93a appnote.txt:
+*
+*    1. Distance pointers never point before the beginning of the
+*       output stream.
+*    2. Distance pointers can point back across blocks, up to 32k away.
+*    3. There is an implied maximum of 7 bits for the bit length table
+*       and 15 bits for the actual data.
+*    4. If only one code exists, then it is encoded using one bit.
+*       (Zero would be more efficient, but perhaps a little confusing.)
+*       If two codes exist, they are coded using one bit each (0 and 1)
+*    5. There is no way of sending zero distance codes--a dummy must be
+*       sent if there are none.  (History: a pre 2.0 version of PKZIP
+*       would store blocks with no distance codes, but this was
+*       discovered to be too harsh a criterion.)  Valid only for 1.93a.
+*       2.04c does allow zero distance codes, which is sent as one code
+*       of zero bits in length.
+*    6. There are up to 286 literal/length codes.  Code 256 represents
+*       the end-of-block.  Note however that the static length tree
+*       defines 288 codes just to fill out the Huffman codes.  Codes
+*       286 and 287 cannot be used though, since there is no length
+*       base or extra bits defined for them.  Similarly, there are up
+*       to 30 distance codes.  However, static trees define 32 codes
+*       (all 5 bits) to fill out the Huffman codes, but the last two
+*       had better not show up in the data.
+*    7. Unzip can check dynamic Huffman blocks for complete code sets.
+*       The exception is that a single code would not be complete (see
+*       #4).
+*    8. The five bits following the block type is really the number of
+*       literal codes sent minus 257.
+*    9. Length codes 8,16,16 are interpreted as 13 length codes of 8
+*       bits (1+6+6).  Therefore, to output three times the length, you
+*       output three codes (1+1+1), whereas to output four times the
+*       same length, you only need two codes (1+3).  Hmm.
+*   10. In the tree reconstruction algorithm, Code = Code + Increment
+*       only if BitLength(i) is not zero.  (Pretty obvious.)
+*   11. Correction: 4 Bits: # of Bit Length codes - 4     (4 - 19)
+*   12. Note: length code 284 can represent 227-258, but length code
+*       285 really is 258.  The last length deserves its own, short
+*       code since it gets used a lot in very redundant files.  The
+*       length 258 is special since 258 - 3 (the min match length) is
+*       255.
+*   13. The literal/length and distance code bit lengths are read as a
+*       single stream of lengths.  It is possible (and advantageous)
+*       for a repeat code (16, 17, or 18) to go across the boundary
+*       between the two sets of lengths.
+*  */
+*
+* #define OF(args)  args
+*
+* typedef void *voidp;
+*
+* #include <stdio.h>
+* #include <string.h>
+* #define memzero(s, n)     memset ((voidp)(s), 0, (n))
+*
+* #define local static
+*
+* typedef unsigned char  uch;
+* typedef unsigned short ush;
+* typedef unsigned long  ulg;
+*
+* #define EXTERN(type, array)  extern type arrayÝ¨
+*
+* EXTERN(uch, inbuf);     /* input buffer */
+* EXTERN(uch, outbuf);    /* output buffer */
+* EXTERN(ush, d_buf);     /* buffer for distances, see trees.c */
+* EXTERN(uch, window);    /* Sliding window and suffix table (unlzw) */
+*
+* extern unsigned insize; /* valid bytes in inbuf */
+* extern unsigned inptr;  /* index of next byte to be processed in
+*                            inbuf */
+* extern unsigned outcnt; /* bytes in output buffer */
+*
+* #define WSIZE 0x8000    /* window size--must be a power of two, and *
+*                         /*  at least 32K for zip's deflate method */
+* #define slide window
+*
+* /* Huffman code lookup table entry--this entry is four bytes for
+*    machines that have 16-bit pointers (e.g. PC's in the small or
+*    medium model).  Valid extra bits are 0..13.  e == 15 is EOB (end
+*    of block), e == 16 means that v is a literal, 16 < e < 32 means
+*    that v is a pointer to the next table, which codes e - 16 bits,
+*    and lastly e == 99 indicates an unused code.  If a code with
+*    e == 99 is looked up, this implies an error in the data. */
+*
+* struct huft {
+*   uch e;                /* number of extra bits or operation */
+*   uch b;                /* number of bits in this code or subcode */
+*   union {
+*     ush n;              /* literal, length base, or distance base */
+*     struct huft *t;     /* pointer to next level of table */
+*   } v;
+* };
+*
+*
+* /* Function prototypes */
+* int huft_build OF((unsigned *, unsigned, unsigned, ush *, ush *,
+*                    struct huft **, int *));
+* int huft_free OF((struct huft *));
+* int inflt_codes OF((struct huft *, struct huft *, int, int));
+* int inflt_stored OF((void));
+* int inflt_fixed OF((void));
+* int inflt_dynamic OF((void));
+* int inflt_block OF((int *));
+* int inflate OF((void));
+*
+* /* The inflate algorithm uses a sliding 32K byte window on the
+*    uncompressed stream to find repeated byte strings.  This is
+*    implemented here as a circular buffer.  The index is updated
+*    simply by incrementing and then and'ing with 0x7fff (32K-1). */
+* /* It is left to other modules to supply the 32K area.  It is assumed
+*    to be usable as if it were declared "uch slideÝ32768¨;" or as just
+*    "uch *slide;" and then malloc'ed in the latter case.  The
+*    definition must be in unzip.h, included above. */
+* /* unsigned wp;             current position in slide */
+* #define wp outcnt
+* #define flush_output(w) (wp=(w),flush_window())
+*
+* /* Tables for deflate from PKZIP's appnote.txt. */
+*
+* static unsigned borderÝ¨ = { /* Order of the bit length code lengths
+*         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13,
+*         2, 14, 1, 15};
+*
+* static ush cplensÝ¨ = { /* Copy lengths for literal codes 257..285 */
+*         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35,
+*         43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0};
+*         /* note: see note #13 above about the 258 in this list. */
+*
+* static ush cplextÝ¨ = { /* Extra bits for literal codes 257..285 */
+*         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+*         3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 99, 99};
+*                                               /* 99==invalid */
+*
+* static ush cpdistÝ¨ = { /* Copy offsets for distance codes 0..29 */
+*         1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+*         257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+*         8193, 12289, 16385, 24577};
+*
+* static ush cpdextÝ¨ = { /* Extra bits for distance codes */
+*         0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+*         7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+*         12, 12, 13, 13};
+*
+*
+*
+* /* Macros for inflate() bit peeking and grabbing.
+*    The usage is:
+*
+*         NEEDBITS(j)
+*         x = b & mask_bitsÝj¨;
+*         DUMPBITS(j)
+*
+*    where NEEDBITS makes sure that b has at least j bits in it, and
+*    DUMPBITS removes the bits from b.  The macros use the variable k
+*    for the number of bits in b.  Normally, b and k are register
+*    variables for speed, and are initialized at the beginning of a
+*    routine that uses these macros from a global bit buffer and count.
+*
+*    If we assume that EOB will be the longest code, then we will never
+*    ask for bits with NEEDBITS that are beyond the end of the stream.
+*    So, NEEDBITS should not read any more bytes than are needed to
+*    meet the request.  Then no bytes need to be "returned" to the
+*    buffer at the end of the last block.
+*
+*    However, this assumption is not true for fixed blocks--the EOB
+*    code is 7 bits, but the other literal/length codes can be 8 or 9
+*    bits.  (The EOB code is shorter than other codes because fixed
+*    blocks are generally short.  So, while a block always has an EOB,
+*    many other literal/length codes have a significantly lower
+*    probability of showing up at all.)  However, by making the first
+*    table have a lookup of seven bits, the EOB code will be found in
+*    that first lookup, and so will not require that too many bits be
+*    pulled from the stream.
+*  */
+*
+* ulg bb;                         /* bit buffer */
+* unsigned bk;                    /* bits in bit buffer */
+*
+* ush mask_bitsÝ¨ = {
+*     0x0000,
+*     0x0001, 0x0003, 0x0007, 0x000f, 0x001f, 0x003f, 0x007f, 0x00ff,
+*     0x01ff, 0x03ff, 0x07ff, 0x0fff, 0x1fff, 0x3fff, 0x7fff, 0xffff
+* };
+*
+* #define NEXTBYTE()  (uch)get_byte()
+* #define NEEDBITS(n) {while(k<(n)){b|=((ulg)NEXTBYTE())<<k;k+=8;}}
+* #define DUMPBITS(n) {b>>=(n);k-=(n);}
+*
+*
+* /*
+*    Huffman code decoding is performed using a multi-level table
+*    lookup.  The fastest way to decode is to simply build a lookup
+*    table whose size is determined by the longest code.  However, the
+*    time it takes to build this table can also be a factor if the data
+*    being decoded is not very long.  The most common codes are
+*    necessarily the shortest codes, so those codes dominate the
+*    decoding time, and hence the speed.  The idea is you can have a
+*    shorter table that decodes the shorter, more probable codes, and
+*    then point to subsidiary tables for the longer codes.  The time it
+*    costs to decode the longer codes is then traded against the time
+*    it takes to make longer tables.
+*
+*    This results of this trade are in the variables lbits and dbits
+*    below.  lbits is the number of bits the first level table for
+*    literal/ length codes can decode in one step, and dbits is the
+*    same thing for the distance codes.  Subsequent tables are also
+*    less than or equal to those sizes.  These values may be adjusted
+*    either when all of the codes are shorter than that, in which case
+*    the longest code length in bits is used, or when the shortest code
+*    is *longer* than the requested table size, in which case the
+*    length of the shortest code in bits is used.
+*
+*    There are two different values for the two tables, since they code
+*    a different number of possibilities each.  The literal/length
+*    table codes 286 possible values, or in a flat code, a little over
+*    eight bits.  The distance table codes 30 possible values, or a
+*    little less than five bits, flat.  The optimum values for speed
+*    end up being about one bit more than those, so lbits is 8+1 and
+*    dbits is 5+1.  The optimum values may differ though from machine
+*    to machine, and possibly even between compilers.  Your mileage may
+*    vary.
+*  */
+*
+*
+* int lbits = 9;          /* bits in base literal/length lookup table *
+L_BITS   EQU   9
+* int dbits = 6;          /* bits in base distance lookup table */
+D_BITS   EQU   6
+*
+*
+* /* If BMAX needs to be larger than 16, then h and xÝ¨ should be ulg.
+* #define BMAX 16         /* maximum bit length of any code */
+BMAX     EQU   16
+* #define N_MAX 288       /* maximum number of codes in any set */
+*
+*
+* unsigned hufts;         /* track memory usage */
+         SPACE
+         USING @UNZWORK,R7
+         SPACE
+*
+* int huft_build(b, n, s, d, e, t, m)
+*
+IBUI_ID  DC    0F'0',CL4'@BUI'
+         SPACE
+HUFT@BUI STM   R14,R11,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@8  DC    0H'0'
+         LA    R0,1568
+         ALR   R0,R13
+         ST    R0,#NAB_8-@@AUTO@8(,R13)
+         USING @@AUTO@8,R13
+         ST    R1,1552(,R13)           #SR_PARM_8
+         SPACE
+* unsigned *b;            /* code lengths in bits (all assumed <= BMAX)
+* unsigned n;             /* number of codes (assumed <= N_MAX) */
+* unsigned s;             /* number of simple-valued codes (0..s-1) */
+* ush *d;                 /* list of base values for non-simple codes *
+* ush *e;                 /* list of extra bits for non-simple codes */
+* struct huft **t;        /* result: starting table */
+* int *m;                 /* maximum lookup bits, returns actual */
+* /* Given a list of code lengths and a maximum table size, make a set
+*    of tables to decode that set of codes.  Return zero on success,
+*    one if the given code set is incomplete (the tables are still
+*    built in this case), two if the input is invalid (all zero length
+*    codes or an oversubscribed set of lengths), and three if not
+*    enough memory.
+* {
+*   unsigned a;                   /* counter for codes of length k */
+*   unsigned cÝBMAX+1¨;           /* bit length count table */
+*   unsigned f;                   /* i repeats in table every f entries
+*   int g;                        /* maximum code length */
+*   int h;                        /* table level */
+*   register unsigned i;          /* counter, current code */
+*   register unsigned j;          /* counter */
+*   register int k;               /* number of bits in current code */
+*   int l;                        /* bits per table (returned in m) */
+*   register unsigned *p;         /* pointer into cÝ¨, bÝ¨, or vÝ¨ */
+*   register struct huft *q;      /* points to current table */
+*   struct huft r;                /* table entry for structure assignme
+*   struct huft *uÝBMAX¨;         /* table stack */
+*   unsigned vÝN_MAX¨;            /* values in order of bit length */
+*   register int w;               /* bits before this table == (l * h)
+*   unsigned xÝBMAX+1¨;           /* bit offsets, then code stack */
+*   unsigned *xp;                 /* pointer into x */
+*   int y;                        /* number of dummy codes added */
+*   unsigned z;                   /* number of entries in current table
+*
+*
+*   /* Generate counts for each bit length */
+*   memzero(c, sizeof(c));
+         LA    R14,@27C
+         ST    R14,1532(,R13)          #STRTEMP8
+         XC    0(68,R14),0(R14)
+*   p = b;  i = n;
+         L     R14,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R14
+         L     R14,@19B
+         ST    R14,@30P
+         L     R14,1552(,R13)          #SR_PARM_8
+         L     R14,@20N
+         DROP  R14                     @@PARMD@8
+         ST    R14,@31I
+@8L145   DC    0H'0'
+*   do {
+@8L147   DC    0H'0'
+*   /*Tracecv(*p, (stderr, (n-i >= ' ' && n-i <= '~' ? "%c %d\n" :
+*      "0x%x %d\n"), n-i, *p));*/
+*     cÝ*p¨++;                    /* assume all entries <= BMAX */
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         SLL   R14,2
+         LA    R15,1
+         A     R15,96(R14,R13)         c__0
+         ST    R15,96(R14,R13)         c__0
+*     p++;            /* Can't combine with above line (Solaris bug) */
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+*   } while (--i);
+         L     R14,@31I
+         BCTR  R14,0
+         ST    R14,@31I
+         LTR   R14,R14
+         BNZ   @8L147
+@8L148   DC    0H'0'
+*   if (cÝ0¨ == n)              /* null input--all zero length codes */
+         L     R14,96(,R13)            c__0
+         L     R15,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R15
+         L     R15,@20N
+         DROP  R15                     @@PARMD@8
+         CLR   R14,R15
+         BNE   @8L149
+*   {
+*     *t = (struct huft *)NULL;
+         L     R14,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R14
+         L     R14,@24T
+         LA    R15,0
+         ST    R15,0(,R14)             (*)huft*
+*     *m = 0;
+         L     R14,1552(,R13)          #SR_PARM_8
+         L     R14,@25M
+         ST    R15,0(,R14)             (*)int
+*     return 0;
+         B     @8L197
+@8L149   DC    0H'0'
+*   }
+*
+*
+*   /* Find minimum and maximum length, bound *m by those */
+*   l = *m;
+         L     R14,1552(,R13)          #SR_PARM_8
+         L     R14,@25M
+         L     R14,0(,R14)             (*)int
+         ST    R14,@35L
+*   for (B = 1; j <= BMAX; j++)
+         LA    R14,1
+         ST    R14,@36J
+         LA    R15,BMAX
+         CLR   R14,R15
+         BH    @8L151
+@8L150   DC    0H'0'
+*     if (cÝj¨)
+         L     R14,@36J
+         SLL   R14,2
+         L     R14,96(R14,R13)         c__0
+         LTR   R14,R14
+         BZ    @8L152
+*       break;
+         B     @8L151
+@8L152   DC    0H'0'
+         LA    R14,1
+         A     R14,@36J
+         ST    R14,@36J
+         CL    R14,=F'16'
+         BNH   @8L150
+@8L151   DC    0H'0'
+*   k = j;                        /* minimum code length */
+         L     R14,@36J
+         ST    R14,@37K
+*   if ((unsigned)l < j)
+         L     R14,@35L
+         L     R15,@36J
+         CLR   R14,R15
+         BNL   @8L153
+*     l = j;
+         L     R14,@36J
+         ST    R14,@35L
+@8L153   DC    0H'0'
+*   for (i = BMAX; i; i--)
+         LA    R14,BMAX
+         ST    R14,@31I
+         LTR   R14,R14
+         BZ    @8L155
+@8L154   DC    0H'0'
+*     if (cÝi¨)
+         L     R14,@31I
+         SLL   R14,2
+         L     R14,96(R14,R13)         c__0
+         LTR   R14,R14
+         BZ    @8L156
+*       break;
+         B     @8L155
+@8L156   DC    0H'0'
+         L     R14,@31I
+         BCTR  R14,0
+         ST    R14,@31I
+         LTR   R14,R14
+         BNZ   @8L154
+@8L155   DC    0H'0'
+*   g = i;                        /* maximum code length */
+         L     R14,@31I
+         ST    R14,@38G
+*   if ((unsigned)l > i)
+         L     R14,@35L
+         L     R15,@31I
+         CLR   R14,R15
+         BNH   @8L157
+*     l = i;
+         L     R14,@31I
+         ST    R14,@35L
+@8L157   DC    0H'0'
+*   *m = l;
+         L     R15,@35L
+         L     R14,1552(,R13)          #SR_PARM_8
+         L     R14,@25M
+         ST    R15,0(,R14)             (*)int
+*
+*
+*   /* AdBust last length count to fill out codes, if needed */
+*   for (y = 1 << j; j < i; j++, y <<= 1)
+         L     R15,@36J
+         LA    R14,1
+         SLL   R14,0(R15)
+         ST    R14,@39Y
+         L     R14,@36J
+         L     R15,@31I
+         CLR   R14,R15
+         BNL   @8L159
+@8L158   DC    0H'0'
+*     if ((y -= cÝj¨) < 0)
+         L     R14,@39Y
+         L     R15,@36J
+         SLL   R15,2
+         L     R15,96(R15,R13)         c__0
+         SLR   R14,R15
+         ST    R14,@39Y
+         LTR   R14,R14
+         BNM   @8L160
+*       return 2;                 /* bad input: more codes than bits */
+         LA    R15,2
+         B     @8L197
+@8L160   DC    0H'0'
+         LA    R14,1
+         A     R14,@36J
+         ST    R14,@36J
+         L     R14,@39Y
+         SLL   R14,1
+         ST    R14,@39Y
+         L     R14,@36J
+         L     R15,@31I
+         CLR   R14,R15
+         BL    @8L158
+@8L159   DC    0H'0'
+*   if ((y -= cÝi¨) < 0)
+         L     R14,@39Y
+         L     R15,@31I
+         SLL   R15,2
+         L     R15,96(R15,R13)         c__0
+         SLR   R14,R15
+         ST    R14,@39Y
+         LTR   R14,R14
+         BNM   @8L161
+*     return 2;
+         LA    R15,2
+         B     @8L197
+@8L161   DC    0H'0'
+*   cÝi¨ += y;
+         L     R14,@31I
+         SLL   R14,2
+         L     R15,96(R14,R13)         c__0
+         L     R0,@39Y
+         ALR   R15,R0
+         ST    R15,96(R14,R13)         c__0
+*
+*
+*   /* Generate starting offsets into the value table for each length *
+*   xÝ1¨ = j = 0;
+         LA    R14,0
+         ST    R14,@36J
+         ST    R14,1436(,R13)          x__0
+*   p = c + 1;  xp = x + 2;
+         LA    R14,@27C+4
+         ST    R14,@30P
+         LA    R14,@40X+8
+         ST    R14,@42XP
+*   while (--i) {                 /* note that i == g from above */
+         L     R14,@31I
+         BCTR  R14,0
+         ST    R14,@31I
+         LTR   R14,R14
+         BZ    @8L163
+@8L162   DC    0H'0'
+*     *xp++ = (j += *p++);
+         L     R14,@36J
+         L     R15,@30P
+         L     R15,0(,R15)             (*)uint
+         ALR   R15,R14
+         ST    R15,@36J
+         L     R14,@42XP
+         ST    R15,0(,R14)             (*)uint
+         L     R14,@42XP
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@42XP
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+         L     R14,@31I
+         BCTR  R14,0
+         ST    R14,@31I
+         LTR   R14,R14
+         BNZ   @8L162
+@8L163   DC    0H'0'
+*   }
+*
+*
+*   /* Make a table of values in order of bit lengths */
+*   p = b;  i = 0;
+         L     R14,1552(,R13)          #SR_PARM_8
+         L     R14,@19B
+         DROP  R14                     @@PARMD@8
+         ST    R14,@30P
+         LA    R14,0
+         ST    R14,@31I
+*   do {
+@8L164   DC    0H'0'
+*     if ((j = *p++) != 0)
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         ST    R14,@36J
+         LTR   R14,R14
+         BZ    @8L165
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+*       vÝxÝj¨++¨ = i;
+         L     R0,@31I
+         L     R14,@36J
+         SLL   R14,2
+         L     R15,1432(R14,R13)       x__0
+         ST    R15,1556(,R13)          #wtemp_1
+         AH    R15,=H'1'
+         ST    R0,1560(,R13)           #wtemp_2
+         ST    R15,1432(R14,R13)       x__0
+         L     R14,1556(,R13)          #wtemp_1
+         SLL   R14,2
+         L     R15,1560(,R13)          #wtemp_2
+         ST    R15,272(R14,R13)        v__0
+         B     @8L166
+@8L165   DC    0H'0'
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+@8L166   DC    0H'0'
+*   } while (++i < n);
+         LA    R14,1
+         A     R14,@31I
+         ST    R14,@31I
+         L     R15,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R15
+         L     R15,@20N
+         DROP  R15                     @@PARMD@8
+         CLR   R14,R15
+         BL    @8L164
+@8L167   DC    0H'0'
+*
+*
+*   /* Generate the Huffman codes and for each, make the table entries
+*   xÝ0¨ = i = 0;                 /* first Huffman code is zero */
+         LA    R14,0
+         LR    R15,R14
+         ST    R15,@31I
+         ST    R15,1432(,R13)          x__0
+*   p = v;                        /* grab values in bit order */
+         LA    R15,@43V
+         ST    R15,@30P
+*   h = -1;                       /* no tables yet--level -1 */
+         SR    R15,R15
+         BCTR  R15,0
+         ST    R15,@45H
+*   w = -l;                       /* bits decoded == (l * h) */
+         L     R15,@35L
+         LCR   R15,R15
+         ST    R15,@46W
+*   uÝ0¨ = (struct huft *)NULL;   /* just to keep compilers happy */
+         ST    R14,208(,R13)           u__0
+*   q = (struct huft *)NULL;      /* ditto */
+         ST    R14,@49Q
+*   z = 0;                        /* ditto */
+         ST    R14,@50Z
+*
+*   /* go through the bit lengths (k already is bits in shortest code)
+*   for (; k <= g; k++)
+         L     R14,@37K
+         L     R15,@38G
+         CR    R14,R15
+         BH    @8L169
+@8L168   DC    0H'0'
+*   {
+*     a = cÝk¨;
+         L     R14,@37K
+         SLL   R14,2
+         L     R14,96(R14,R13)         c__0
+         ST    R14,@51A
+*     while (a--)
+         LTR   R14,R14
+         BZ    @8L171
+@8L170   DC    0H'0'
+         L     R14,@51A
+         BCTR  R14,0
+         ST    R14,@51A
+*     {
+*       /* here i is the Huffman code of length k bits for value *p */
+*       /* make tables up to required level */
+*       while (k > w + l)
+         L     R14,@37K
+         L     R0,@46W
+         L     R15,@35L
+         ALR   R15,R0
+         CR    R14,R15
+         BNH   @8L173
+@8L172   DC    0H'0'
+*       {
+*         h++;
+         LA    R14,1
+         A     R14,@45H
+         ST    R14,@45H
+*         w += l;                 /* previous table always l bits */
+         L     R14,@46W
+         L     R15,@35L
+         ALR   R15,R14
+         ST    R15,@46W
+*
+*         /* compute minimum size table less than or equal to l bits */
+*         z = (z = g - w) > (unsigned)l ? l : z;  /* upper limit on tab
+         L     R14,@38G
+         SLR   R14,R15
+         ST    R14,@50Z
+         L     R15,@35L
+         CLR   R14,R15
+         BNH   @8L174
+         L     R14,@35L
+         B     @8L175
+@8L174   DC    0H'0'
+         L     R14,@50Z
+@8L175   DC    0H'0'
+         ST    R14,@50Z
+*         if ((f = 1 << (j = k - w)) > a + 1) /* try a k-w bit table */
+         L     R15,@37K
+         L     R14,@46W
+         SLR   R15,R14
+         ST    R15,@36J
+         LA    R14,1
+         SLL   R14,0(R15)
+         ST    R14,@53F
+         LA    R15,1
+         A     R15,@51A
+         CLR   R14,R15
+         BNH   @8L176
+*         {                       /* too few codes for k-w bit table */
+*           f -= a + 1;           /* deduct codes from patterns left */
+         L     R14,@53F
+         LA    R15,1
+         A     R15,@51A
+         SLR   R14,R15
+         ST    R14,@53F
+*           xp = c + k;
+         L     R14,@37K
+         SLL   R14,2
+         LA    R14,@27C(R14)
+         ST    R14,@42XP
+*           while (++j < z)       /* try smaller tables up to z bits */
+         LA    R14,1
+         A     R14,@36J
+         ST    R14,@36J
+         L     R15,@50Z
+         CLR   R14,R15
+         BNL   @8L178
+@8L177   DC    0H'0'
+*           {
+*             if ((f <<= 1) <= *++xp)
+         L     R15,@53F
+         SLL   R15,1
+         ST    R15,@53F
+         L     R14,@42XP
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R15,1564(,R13)          #wtemp_3
+         ST    R14,@42XP
+         L     R15,0(,R14)             (*)uint
+         L     R14,1564(,R13)          #wtemp_3
+         CLR   R14,R15
+         BH    @8L179
+*               break;            /* enough codes to use up j bits   */
+         B     @8L178
+@8L179   DC    0H'0'
+*             f -= *xp;           /* else deduct codes from patterns */
+         L     R14,@53F
+         L     R15,@42XP
+         L     R15,0(,R15)             (*)uint
+         SLR   R14,R15
+         ST    R14,@53F
+         LA    R14,1
+         A     R14,@36J
+         ST    R14,@36J
+         L     R15,@50Z
+         CLR   R14,R15
+         BL    @8L177
+@8L178   DC    0H'0'
+@8L176   DC    0H'0'
+*           }
+*         }
+*         z = 1 << j;             /* table entries for j-bit table   */
+         L     R15,@36J
+         LA    R14,1
+         SLL   R14,0(R15)
+         ST    R14,@50Z
+*
+*         /* allocate and link in new table */
+*         if ((q = (struct huft *)malloc((z + 1)*sizeof(struct huft)))
+         AH    R14,=H'1'
+         SLL   R14,3
+         LA    R15,MALLOC
+         LA    R1,76(,R13)             #MX_TEMP8
+         ST    R14,76(,R13)            #MX_TEMP8
+         MVC   8(4,R13),#NAB_8
+         BASR  R14,R15
+         LR    R14,R15
+         ST    R14,@49Q
+         LTR   R14,R14
+         BNZ   @8L180
+*             (struct huft *)NULL)
+*         {
+*           if (h)
+         L     R14,@45H
+         LTR   R14,R14
+         BZ    @8L181
+*             huft_free(uÝ0¨);
+         L     R14,208(,R13)           u__0
+         LA    R1,76(,R13)             #MX_TEMP8
+         ST    R14,76(,R13)            #MX_TEMP8
+         MVC   8(4,R13),#NAB_8
+         BAS   R14,HUFT@FRE
+@8L181   DC    0H'0'
+*           return 3;             /* not enough memory */
+         LA    R15,3
+         B     @8L197
+@8L180   DC    0H'0'
+*         }
+*         hufts += z + 1;         /* track memory usage */
+         L     R0,HUFTS                hufts
+         LA    R15,1
+         A     R15,@50Z
+         ALR   R15,R0
+         ST    R15,HUFTS               hufts
+*         *t = q + 1;             /* link to list for huft_free() */
+         L     R15,@49Q
+         L     R14,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R14
+         L     R14,@24T
+         DROP  R14                     @@PARMD@8
+         LA    R15,8(,R15)             #AddressShadow
+         ST    R15,0(,R14)             (*)huft*
+*         *(t = &(q->v.t)) = (struct huft *)NULL;
+         L     R14,@49Q
+         LA    R14,4(,R14)             #AddressShadow
+         L     R15,1552(,R13)          #SR_PARM_8
+         USING @@PARMD@8,R15
+         ST    R14,@24T
+         LA    R15,0
+         ST    R15,0(,R14)             (*)huft*
+*         uÝh¨ = ++q;             /* table starts after link */
+         L     R14,@49Q
+         LA    R15,8(,R14)             #AddressShadow
+         ST    R15,@49Q
+         L     R14,@45H
+         SLL   R14,2
+         ST    R15,208(R14,R13)        u__0
+*
+*         /* connect to last table, if there is one */
+*         if (h)
+         L     R14,@45H
+         LTR   R14,R14
+         BZ    @8L182
+*         {
+*           xÝh¨ = i;             /* save pattern for backing up */
+         L     R15,@31I
+         L     R14,@45H
+         SLL   R14,2
+         ST    R15,1432(R14,R13)       x__0
+*           r.b = (uch)l;         /* bits to dump before this table */
+         L     R14,@35L
+         N     R14,=F'255'
+         STC   R14,201(,R13)           r_huft_b
+*           r.e = (uch)(16 + j);  /* bits in this table */
+         LA    R14,16
+         A     R14,@36J
+         N     R14,=F'255'
+         STC   R14,200(,R13)           r_huft_e
+*           r.v.t = q;            /* pointer to this table */
+         L     R14,@49Q
+         ST    R14,204(,R13)           r_t
+*           j = i >> (w - l);     /* (get around Turbo C bug) */
+         L     R15,@31I
+         L     R14,@46W
+         L     R0,@35L
+         SLR   R14,0
+         SRL   R15,0(R14)
+         ST    R15,@36J
+*           uÝh-1¨Ýj¨ = r;        /* connect to last table */
+         L     R14,@45H
+         BCTR  R14,0
+         SLL   R14,2
+         L     R14,208(R14,R13)        u__0
+         SLL   R15,3
+         LA    R14,0(R15,R14)          (*)huft
+         MVC   0(8,R14),@57R
+@8L182   DC    0H'0'
+         L     R14,@37K
+         L     R0,@46W
+         L     R15,@35L
+         ALR   R15,R0
+         CR    R14,R15
+         BH    @8L172
+@8L173   DC    0H'0'
+*         }
+*       }
+*
+*       /* set up table entry in r */
+*       r.b = (uch)(k - w);
+         L     R14,@37K
+         L     R15,@46W
+         SLR   R14,R15
+         N     R14,=F'255'
+         STC   R14,201(,R13)           r_huft_b
+*       if (p >= v + n)
+         L     R14,@30P
+         L     R15,1552(,R13)          #SR_PARM_8
+         L     R15,@20N
+         SLL   R15,2
+         LA    R15,@43V(R15)
+         CR    R14,R15
+         BL    @8L183
+*         r.e = 99;               /* out of values--invalid code */
+         MVI   200(R13),99
+         B     @8L184
+@8L183   DC    0H'0'
+*       else if (*p < s)
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         L     R15,1552(,R13)          #SR_PARM_8
+         L     R15,@21S
+         DROP  R15                     @@PARMD@8
+         CLR   R14,R15
+         BNL   @8L185
+*       {
+*         r.e = (uch)(*p < 256 ? 16 : 15); /* 256 is end-of-block code
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         CL    R14,=F'256'
+         BNL   @8L186
+         LA    R14,16
+         B     @8L187
+@8L186   DC    0H'0'
+         LA    R14,R15
+@8L187   DC    0H'0'
+         N     R14,=F'255'
+         STC   R14,200(,R13)           r_huft_e
+*         r.v.n = (ush)(*p);          /* simple code is just the value
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         N     R14,=X'0000FFFF'
+         STH   R14,204(,R13)           r_n
+*  p++;                           /* one compiler does not like *p++ */
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+         B     @8L188
+@8L185   DC    0H'0'
+*       }
+*       else
+*       {
+*         r.e = (uch)eÝ*p - s¨;   /* non-simple--look up in lists */
+         L     R1,1552(,R13)           #SR_PARM_8
+         USING @@PARMD@8,R1
+         L     R14,@23E
+         L     R15,@30P
+         L     R15,0(,R15)             (*)uint
+         L     R0,@21S
+         SLR   R15,0
+         SLL   R15,1
+         ALR   R14,R15
+         LH    R14,0(,R14)             (*)ushort
+         N     R14,=X'0000FFFF'
+         N     R14,=F'255'
+         STC   R14,200(,R13)           r_huft_e
+*         r.v.n = dÝ*p++ - s¨;
+         L     R1,1552(,R13)           #SR_PARM_8
+         L     R15,@22D
+         L     R14,@30P
+         L     R14,0(,R14)             (*)uint
+         L     R0,@21S
+         SLR   R14,0
+         SLL   R14,1
+         ALR   R14,R15
+         LH    R14,0(,R14)             (*)ushort
+         N     R14,=X'0000FFFF'
+         STH   R14,204(,R13)           r_n
+         L     R14,@30P
+         LA    R14,4(,R14)             #AddressShadow
+         ST    R14,@30P
+         DROP  R1                      @@PARMD@8
+@8L188   DC    0H'0'
+@8L184   DC    0H'0'
+*       }
+*
+*       /* fill code-like entries with r */
+*       f = 1 << (k - w);
+         L     R15,@37K
+         L     R14,@46W
+         SLR   R15,R14
+         LA    R14,1
+         SLL   R14,0(R15)
+         ST    R14,@53F
+*       for (j = i >> w; j < z; j += f)
+         L     R14,@31I
+         L     R15,@46W
+         SRL   R14,0(R15)
+         ST    R14,@36J
+         L     R15,@50Z
+         CLR   R14,R15
+         BNL   @8L190
+@8L189   DC    0H'0'
+*         qÝj¨ = r;
+         L     R14,@49Q
+         L     R15,@36J
+         SLL   R15,3
+         LA    R14,0(R15,R14)          (*)huft
+         MVC   0(8,R14),@57R
+         L     R14,@36J
+         L     R15,@53F
+         ALR   R14,R15
+         ST    R14,@36J
+         L     R15,@50Z
+         CLR   R14,R15
+         BL    @8L189
+@8L190   DC    0H'0'
+*
+*       /* backwards increment the k-bit code i */
+*       for (j = 1 << (k - 1); i & j; j >>= 1)
+         L     R14,@37K
+         BCTR  R14,0
+         LA    R15,1
+         SLL   R15,0(R14)
+         ST    R15,@36J
+         L     R14,@31I
+         NR    R14,R15
+         LTR   R14,R14
+         BZ    @8L192
+@8L191   DC    0H'0'
+*         i ¬= j;
+         L     R14,@31I
+         L     R15,@36J
+         XR    R14,R15
+         ST    R14,@31I
+         L     R15,@36J
+         SRL   R15,1
+         ST    R15,@36J
+         L     R14,@31I
+         NR    R14,R15
+         LTR   R14,R14
+         BNZ   @8L191
+@8L192   DC    0H'0'
+*       i ¬= j;
+         L     R14,@31I
+         L     R15,@36J
+         XR    R14,R15
+         ST    R14,@31I
+*
+*       /* backup over finished tables */
+*       while ((i & ((1 << w) - 1)) != xÝh¨)
+         L     R1,@46W
+         LA    R15,1
+         SLL   R15,0(R1)
+         BCTR  R15,0
+         NR    R14,R15
+         L     R15,@45H
+         SLL   R15,2
+         L     R15,1432(R15,R13)       x__0
+         CLR   R14,R15
+         BE    @8L194
+@8L193   DC    0H'0'
+*       {
+*         h--;                    /* don't need to update q */
+         L     R14,@45H
+         BCTR  R14,0
+         ST    R14,@45H
+*         w -= l;
+         L     R1,@46W
+         L     R14,@35L
+         SLR   R1,R14
+         ST    R1,@46W
+         L     R14,@31I
+         LA    R15,1
+         SLL   R15,0(R1)
+         BCTR  R15,0
+         NR    R14,R15
+         L     R15,@45H
+         SLL   R15,2
+         L     R15,1432(R15,R13)       x__0
+         CLR   R14,R15
+         BNE   @8L193
+@8L194   DC    0H'0'
+         L     R14,@51A
+         LTR   R14,R14
+         BNZ   @8L170
+@8L171   DC    0H'0'
+         L     R14,@51A
+         BCTR  R14,0
+         ST    R14,@51A
+@8L195   DC    0H'0'
+         LA    R14,1
+         A     R14,@37K
+         ST    R14,@37K
+         L     R15,@38G
+         CR    R14,R15
+         BNH   @8L168
+@8L169   DC    0H'0'
+*       }
+*     }
+*   }
+*
+*
+*   /* Return true (1) if we were given an incomplete table */
+*   return y != 0 && g != 1;
+         LA    R15,0
+         L     R14,@39Y
+         LTR   R14,R14
+         BZ    @8L196
+         L     R14,@38G
+         CH    R14,=H'1'
+         BE    @8L196
+         LA    R15,1
+@8L196   DC    0H'0'
+**       B     @8L197
+* }
+@8L146   DC    0H'0'
+@8L197   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@8
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R11,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int huft_free(t)
+*
+IFRE_ID  DC    0F'0',CL4'@FRE'
+         SPACE
+HUFT@FRE STM   R14,R3,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@7  DC    0H'0'
+         LA    R0,96
+         ALR   R0,R13
+         ST    R0,#NAB_7-@@AUTO@7(,R13)
+         USING @@AUTO@7,R13
+         ST    R1,88(,R13)             #SR_PARM_7
+         SPACE
+* struct huft *t;         /* table to free */
+* /* Free the malloc'ed tables built by huft_build(), which makes a
+*    linked list of the tables it made, with the links in a dummy
+*    first entry of each table. */
+* {
+*   register struct huft *p, *q;
+*
+*
+*   /* Go through linked list, freeing from the malloced (tÝ-1¨) addres
+*   p = t;
+         L     R14,88(,R13)            #SR_PARM_7
+         USING @@PARMD@7,R14
+         L     R14,@65T
+         DROP  R14                     @@PARMD@7
+         ST    R14,@67P@3
+@7L140   DC    0H'0'
+*   while (p != (struct huft *)NULL)
+         L     R14,@67P@3
+         LTR   R14,R14
+         BZ    @7L143
+@7L142   DC    0H'0'
+*   {
+*     q = (--p)->v.t;
+         L     R14,@67P@3
+         LA    R15,4088
+         LNR   R15,R15
+         LA    R14,4080(R15,R14)       #AddressShadow
+         ST    R14,@67P@3
+         L     R14,4(,R14)             (*)huft.t
+         ST    R14,@69Q@4
+*     free((char*)p);
+         L     R14,@67P@3
+         LA    R15,1
+         SLL   R15,31
+         OR    R14,R15
+         LA    R15,FREE
+         LA    R1,76(,R13)             #MX_TEMP7
+         ST    R14,76(,R13)            #MX_TEMP7
+         MVC   8(4,R13),#NAB_7
+         BASR  R14,R15
+*     p = q;
+         L     R14,@69Q@4
+         ST    R14,@67P@3
+         LTR   R14,R14
+         BNZ   @7L142
+@7L143   DC    0H'0'
+*   }
+*   return 0;
+         LA    R15,0
+         B     @7L198
+* }
+@7L141   DC    0H'0'
+@7L198   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@7
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R3,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflt_codes(tl, td, bl, bd)
+*
+ICOD_ID  DC    0F'0',CL4'@COD'
+         SPACE
+INFLT@CO STM   R14,R3,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@6  DC    0H'0'
+         LA    R0,144
+         ALR   R0,R13
+         ST    R0,#NAB_6-@@AUTO@6(,R13)
+         USING @@AUTO@6,R13
+         ST    R1,132(,R13)            #SR_PARM_6
+         SPACE
+* struct huft *tl, *td;   /* literal/length and distance decoder tables
+* int bl, bd;             /* number of bits decoded by tlÝ¨ and tdÝ¨ */
+* /* inflate (decompress) the codes in a deflated (compressed) block.
+*    Return an error code or zero if it all goes ok. */
+* {
+*   register unsigned e;  /* table entry flag/number of extra bits */
+*   unsigned n, d;        /* length and index for copy */
+*   unsigned w;           /* current window position */
+*   struct huft *t;       /* pointer to table entry */
+*   unsigned ml, md;      /* masks for bl and bd bits */
+*   register ulg b;       /* bit buffer */
+*   register unsigned k;  /* number of bits in bit buffer */
+*
+*
+*   /* make local copies of globals */
+*   b = bb;                       /* initialize bit buffer */
+         L     R14,BB                  bb
+         ST    R14,@77B@11
+*   k = bk;
+         L     R14,BK                  bk
+         ST    R14,@78K@12
+*   w = wp;                       /* initialize window position */
+         L     R14,WP                  outcnt
+         ST    R14,@80W@9
+*
+*   /* inflate the coded data */
+*   ml = mask_bitsÝbl¨;           /* precompute masks for speed */
+         LA    R14,MASKBITS
+         L     R15,132(,R13)           #SR_PARM_6
+         USING @@PARMD@6,R15
+         L     R0,@74BL
+         SLL   R0,1
+         LR    R15,R14
+         ALR   R15,R0
+         LH    R15,0(,R15)             mask_bitsÝ¨0
+         N     R15,=X'0000FFFF'
+         ST    R15,@81ML
+*   md = mask_bitsÝbd¨;
+         L     R15,132(,R13)           #SR_PARM_6
+         L     R15,@75BD
+         SLL   R15,1
+         ALR   R14,R15
+         LH    R14,0(,R14)             mask_bitsÝ¨0
+         N     R14,=X'0000FFFF'
+         ST    R14,@82MD
+@6L100   DC    0H'0'
+*   for (;;)                      /* do until end of block */
+@6L102   DC    0H'0'
+*   {
+*     NEEDBITS((unsigned)bl)
+         L     R14,@78K@12
+         L     R15,132(,R13)           #SR_PARM_6
+         L     R15,@74BL
+         CLR   R14,R15
+         BNL   @6L104
+@6L103   DC    0H'0'
+         ICM   R0,15,PACKSIZE      **  Any data left?
+         BZ    @6L104              **  No, pretend normal end
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,132(,R13)           #SR_PARM_6
+         L     R15,@74BL
+         DROP  R15                     @@PARMD@6
+         CLR   R14,R15
+         BL    @6L103
+@6L104   DC    0H'0'
+*     if ((e = (t = tl + ((unsigned)b & ml))->e) > 16)
+         L     R14,132(,R13)           #SR_PARM_6
+         USING @@PARMD@6,R14
+         L     R14,@72TL
+         L     R15,@77B@11
+         L     R0,@81ML
+         NR    R15,R0
+         SLL   R15,3
+         LA    R15,0(R15,R14)          #AddressShadow
+         ST    R15,@84T@10
+         SLR   R14,R14
+         IC    R14,0(,R15)             (*)huft.huft.e
+         ST    R14,@86E@6
+         CL    R14,=F'16'
+         BNH   @6L105
+*       do {
+@6L106   DC    0H'0'
+*         if (e == 99)
+         L     R14,@86E@6
+         CH    R14,=H'99'
+         BNE   @6L107
+*           return 1;
+         LA    R15,1
+         B     @6L199
+@6L107   DC    0H'0'
+*         DUMPBITS(t->b)
+         L     R14,@77B@11
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SLR   R14,R15
+         ST    R14,@78K@12
+*         e -= 16;
+         L     R15,@86E@6
+         SH    R15,=H'16'
+         ST    R15,@86E@6
+*         NEEDBITS(e)
+         L     R14,@78K@12
+         CLR   R14,R15
+         BNL   @6L109
+@6L108   DC    0H'0'
+         ICM   R0,15,PACKSIZE      **  Any data left?
+         BZ    @6L115              **  No, pretend normal end
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,@86E@6
+         CLR   R14,R15
+         BL    @6L108
+@6L109   DC    0H'0'
+*       } while ((e = (t = t->v.t + ((unsigned)b & mask_bitsÝe¨))->e)
+         L     R14,@84T@10
+         L     R14,4(,R14)             (*)huft.t
+         L     R15,@77B@11
+         LA    R1,MASKBITS
+         L     R0,@86E@6
+         SLL   R0,1
+         ALR   R1,R0
+         LH    R0,0(,1)                mask_bitsÝ¨0
+         N     R0,=X'0000FFFF'
+         NR    R15,R0
+         SLL   R15,3
+         LA    R15,0(R15,R14)          #AddressShadow
+         ST    R15,@84T@10
+         SLR   R14,R14
+         IC    R14,0(,R15)             (*)huft.huft.e
+         ST    R14,@86E@6
+         CL    R14,=F'16'
+         BH    @6L106
+@6L110   DC    0H'0'
+@6L105   DC    0H'0'
+*                     > 16);
+*     DUMPBITS(t->b)
+         L     R14,@77B@11
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SLR   R14,R15
+         ST    R14,@78K@12
+*     if (e == 16)                /* then it's a literal */
+         L     R14,@86E@6
+         CH    R14,=H'16'
+         BNE   @6L111
+*     {
+*       slideÝw++¨ = (uch)t->v.n;
+         L     R14,@84T@10
+         LH    R0,4(,R14)              (*)huft.n
+         N     R0,=X'0000FFFF'
+         N     R0,=F'255'
+         L     R14,SLIDEWIN            window
+         L     R15,@80W@9
+         STC   R0,0(R15,R14)           window.Ý¨0
+         LA    R14,1
+         A     R14,@80W@9
+         ST    R14,@80W@9
+*     /*Tracevv((stderr, "%c", slideÝw-1¨));*/
+*       if (w == WSIZE)
+         CL    R14,=X'00008000'
+         BNE   @6L112
+*       {
+*         flush_output(w);
+         L     R15,@80W@9
+         ST    R15,WP                  outcnt
+         LA    R15,FLUSH@WI
+         MVC   8(4,R13),#NAB_6
+         BASR  R14,R15
+*         w = 0;
+         LA    R14,0
+         ST    R14,@80W@9
+@6L112   DC    0H'0'
+         B     @6L113
+@6L111   DC    0H'0'
+*       }
+*     }
+*     else                        /* it's an EOB or a length */
+*     {
+*       /* exit if end of block */
+*       if (e == 15)
+*         break;
+         L     R14,@86E@6
+         CH    R14,=H'15'
+         BE    @6L115
+@6L114   DC    0H'0'
+*
+*       /* get length of block to copy */
+*       NEEDBITS(e)
+         L     R14,@78K@12
+         L     R15,@86E@6
+         CLR   R14,R15
+         BNL   @6L117
+@6L116   DC    0H'0'
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,@86E@6
+         CLR   R14,R15
+         BL    @6L116
+@6L117   DC    0H'0'
+*       n = t->v.n + ((unsigned)b & mask_bitsÝe¨);
+         L     R14,@84T@10
+         LH    R15,4(,R14)             (*)huft.n
+         N     R15,=X'0000FFFF'
+         L     R14,@77B@11
+         LA    R1,MASKBITS
+         L     R0,@86E@6
+         SLL   R0,1
+         ALR   R1,R0
+         LH    R0,0(,1)                mask_bitsÝ¨0
+         N     R0,=X'0000FFFF'
+         NR    R14,R0
+         ALR   R14,R15
+         ST    R14,@92N@7
+*       DUMPBITS(e);
+         L     R14,@77B@11
+         L     R15,@86E@6
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R15,@86E@6
+         SLR   R14,R15
+         ST    R14,@78K@12
+*
+*       /* decode distance of block to copy */
+*       NEEDBITS((unsigned)bd)
+         L     R15,132(,R13)           #SR_PARM_6
+         DROP  R14                     @@PARMD@6
+         USING @@PARMD@6,R15
+         L     R15,@75BD
+         CLR   R14,R15
+         BNL   @6L119
+@6L118   DC    0H'0'
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,132(,R13)           #SR_PARM_6
+         L     R15,@75BD
+         DROP  R15                     @@PARMD@6
+         CLR   R14,R15
+         BL    @6L118
+@6L119   DC    0H'0'
+*       if ((e = (t = td + ((unsigned)b & md))->e) > 16)
+         L     R14,132(,R13)           #SR_PARM_6
+         USING @@PARMD@6,R14
+         L     R14,@73TD
+         DROP  R14                     @@PARMD@6
+         L     R15,@77B@11
+         L     R0,@82MD
+         NR    R15,R0
+         SLL   R15,3
+         LA    R15,0(R15,R14)          #AddressShadow
+         ST    R15,@84T@10
+         SLR   R14,R14
+         IC    R14,0(,R15)             (*)huft.huft.e
+         ST    R14,@86E@6
+         CL    R14,=F'16'
+         BNH   @6L120
+*         do {
+@6L121   DC    0H'0'
+*           if (e == 99)
+         L     R14,@86E@6
+         CH    R14,=H'99'
+         BNE   @6L122
+*             return 1;
+         LA    R15,1
+         B     @6L199
+@6L122   DC    0H'0'
+*           DUMPBITS(t->b)
+         L     R14,@77B@11
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SLR   R14,R15
+         ST    R14,@78K@12
+*           e -= 16;
+         L     R15,@86E@6
+         SH    R15,=H'16'
+         ST    R15,@86E@6
+*           NEEDBITS(e)
+         L     R14,@78K@12
+         CLR   R14,R15
+         BNL   @6L124
+@6L123   DC    0H'0'
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,@86E@6
+         CLR   R14,R15
+         BL    @6L123
+@6L124   DC    0H'0'
+*         } while ((e = (t = t->v.t + ((unsigned)b & mask_bitsÝe¨))->e)
+         L     R14,@84T@10
+         L     R14,4(,R14)             (*)huft.t
+         L     R15,@77B@11
+         LA    R1,MASKBITS
+         L     R0,@86E@6
+         SLL   R0,1
+         ALR   R1,R0
+         LH    R0,0(,1)                mask_bitsÝ¨0
+         N     R0,=X'0000FFFF'
+         NR    R15,R0
+         SLL   R15,3
+         LA    R15,0(R15,R14)          #AddressShadow
+         ST    R15,@84T@10
+         SLR   R14,R14
+         IC    R14,0(,R15)             (*)huft.huft.e
+         ST    R14,@86E@6
+         CL    R14,=F'16'
+         BH    @6L121
+@6L125   DC    0H'0'
+@6L120   DC    0H'0'
+*                       > 16);
+*       DUMPBITS(t->b)
+         L     R14,@77B@11
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R1,@84T@10
+         SLR   R15,R15
+         IC    R15,1(,R1)              (*)huft.huft.b
+         SLR   R14,R15
+         ST    R14,@78K@12
+*       NEEDBITS(e)
+         L     R15,@86E@6
+         CLR   R14,R15
+         BNL   @6L127
+@6L126   DC    0H'0'
+         L     R2,@77B@11
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@78K@12
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@77B@11
+         LA    R14,8
+         A     R14,@78K@12
+         ST    R14,@78K@12
+         L     R15,@86E@6
+         CLR   R14,R15
+         BL    @6L126
+@6L127   DC    0H'0'
+*       d = w - t->v.n - ((unsigned)b & mask_bitsÝe¨);
+         L     R14,@80W@9
+         L     R15,@84T@10
+         LH    R15,4(,R15)             (*)huft.n
+         N     R15,=X'0000FFFF'
+         SLR   R14,R15
+         L     R15,@77B@11
+         LA    R1,MASKBITS
+         L     R0,@86E@6
+         SLL   R0,1
+         ALR   R1,R0
+         LH    R0,0(,R1)               mask_bitsÝ¨0
+         N     R0,=X'0000FFFF'
+         NR    R15,R0
+         SLR   R14,R15
+         ST    R14,@93D@8
+*       DUMPBITS(e)
+         L     R14,@77B@11
+         L     R15,@86E@6
+         SRL   R14,0(R15)
+         ST    R14,@77B@11
+         L     R14,@78K@12
+         L     R15,@86E@6
+         SLR   R14,R15
+         ST    R14,@78K@12
+*     /*Tracevv((stderr,"\\Ý%d,%d¨", w-d, n));*/
+*
+*       /* do the copy */
+*       do {
+@6L128   DC    0H'0'
+*         n -= (e = (e = WSIZE -
+*              ((d &= WSIZE-1) > w ? d : w)) > n ? n : e);
+         L     R14,@92N@7
+         ST    R14,136(,R13)           #wtemp_4
+         L     R14,@93D@8
+         N     R14,=X'00007FFF'
+         ST    R14,@93D@8
+         L     R15,@80W@9
+         CLR   R14,R15
+         BNH   @6L129
+         L     R15,@93D@8
+         B     @6L130
+@6L129   DC    0H'0'
+         L     R15,@80W@9
+@6L130   DC    0H'0'
+         LA    R14,32
+         SLL   R14,10
+         SLR   R14,R15
+         ST    R14,@86E@6
+         L     R15,@92N@7
+         CLR   R14,R15
+         BNH   @6L131
+         L     R15,@92N@7
+         B     @6L132
+@6L131   DC    0H'0'
+         L     R15,@86E@6
+@6L132   DC    0H'0'
+         ST    R15,@86E@6
+         L     R14,136(,R13)           #wtemp_4
+         SLR   R14,R15
+         ST    R14,@92N@7
+*         if (w - d >= e) /* (this test assumes unsigned comparison) */
+         L     R14,@80W@9
+         L     R15,@93D@8
+         SLR   R14,R15
+         L     R15,@86E@6
+         CLR   R14,R15
+         BL    @6L133
+*         {
+*           memcpy(slide + w, slide + d, e);
+         L     R15,SLIDEWIN            window
+         L     R2,@80W@9
+         L     R1,@93D@8
+         L     R14,@86E@6
+         LA    R2,0(R2,R15)            window
+         LA    R0,0(R1,R15)            window
+         L     R15,=A(OUTLINECONC)
+         LA    R1,76(,R13)             #MX_TEMP6
+         ST    R2,76(,R13)             #MX_TEMP6
+         ST    R0,80(,R13)             #MX_TEMP6
+         ST    R14,84(,R13)            #MX_TEMP6
+         MVC   8(4,R13),#NAB_6
+         BAS   R14,OUTLINECONC
+*           w += e;
+         L     R15,@80W@9
+         L     R14,@86E@6
+         ALR   R14,R15
+         ST    R14,@80W@9
+*           d += e;
+         L     R15,@93D@8
+         L     R14,@86E@6
+         ALR   R14,R15
+         ST    R14,@93D@8
+         B     @6L134
+@6L133   DC    0H'0'
+*         }
+*         else               /* do it slow to avoid memcpy() overlap */
+*           do {
+@6L135   DC    0H'0'
+*             slideÝw++¨ = slideÝd++¨;
+         L     R14,SLIDEWIN            window
+         L     R15,@93D@8
+         SLR   R0,R0
+         IC    R0,0(R15,R14)           window.Ý¨0
+         L     R15,@80W@9
+         STC   R0,0(R15,R14)           window.Ý¨0
+         LA    R14,1
+         A     R14,@80W@9
+         ST    R14,@80W@9
+         LA    R14,1
+         A     R14,@93D@8
+         ST    R14,@93D@8
+*    /*Tracevv((stderr, "%c", slideÝw-1¨));*/
+*           } while (--e);
+         L     R14,@86E@6
+         BCTR  R14,0
+         ST    R14,@86E@6
+         LTR   R14,R14
+         BNZ   @6L135
+@6L136   DC    0H'0'
+@6L134   DC    0H'0'
+*         if (w == WSIZE)
+         L     R14,@80W@9
+         CL    R14,=X'00008000'
+         BNE   @6L137
+*         {
+*           flush_output(w);
+         L     R15,@80W@9
+         ST    R15,WP                  outcnt
+         LA    R15,FLUSH@WI
+         MVC   8(4,R13),#NAB_6
+         BASR  R14,R15
+*           w = 0;
+         LA    R14,0
+         ST    R14,@80W@9
+@6L137   DC    0H'0'
+*         }
+*       } while (n);
+         L     R14,@92N@7
+         LTR   R14,R14
+         BNZ   @6L128
+@6L138   DC    0H'0'
+@6L113   DC    0H'0'
+         B     @6L102
+         SPACE
+@6L115   DC    0H'0'
+*     }
+*   }
+*
+*
+*   /* restore the globals from the locals */
+*   wp = w;                       /* restore global window pointer */
+         L     R15,@80W@9
+         ST    R15,WP                  outcnt
+*   bb = b;                       /* restore global bit buffer */
+         L     R15,@77B@11
+         ST    R15,BB                  bb
+*   bk = k;
+         L     R15,@78K@12
+         ST    R15,BK                  bk
+*
+*   /* done */
+*   return 0;
+         LA    R15,0
+         B     @6L199
+* }
+@6L101   DC    0H'0'
+@6L199   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@6
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R3,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflt_dynamic()
+*
+IDYN_ID  DC    0F'0',CL4'@DYN'
+         SPACE
+INFLT@DY STM   R14,R11,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@3  DC    0H'0'
+         LA    R0,1424
+         ALR   R0,R13
+         ST    R0,#NAB_3-@@AUTO@3(,R13)
+         USING @@AUTO@3,R13
+         SPACE
+* /* decompress an inflated type 2 (dynamic Huffman codes) block. */
+* {
+*   int i;                /* temporary variables */
+*   unsigned j;
+*   unsigned l;           /* last length */
+*   unsigned m;           /* mask for bit lengths table */
+*   unsigned n;           /* number of lengths to get */
+*   struct huft *tl;      /* literal/length code table */
+*   struct huft *td;      /* distance code table */
+*   int bl;               /* lookup bits for tl */
+*   int bd;               /* lookup bits for td */
+*   unsigned nb;          /* number of bit length codes */
+*   unsigned nl;          /* number of literal/length codes */
+*   unsigned nd;          /* number of distance codes */
+* #ifdef PKZIP_BUG_WORKAROUND
+*   unsigned llÝ288+32¨;  /* literal/length and distance code lengths *
+* #else
+*   unsigned llÝ286+30¨;  /* literal/length and distance code lengths *
+* #endif
+*   register ulg b;       /* bit buffer */
+*   register unsigned k;  /* number of bits in bit buffer */
+*
+*
+*   /* make local bit buffer */
+*   b = bb;
+         L     R14,BB                  bb
+         ST    R14,@114B@35
+*   k = bk;
+         L     R14,BK                  bk
+         ST    R14,@115K@36
+*
+*
+*   /* read in table lengths */
+*   NEEDBITS(5)
+         CL    R14,=F'5'
+         BNL   @3L19
+@3L18    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'5'
+         BL    @3L18
+@3L19    DC    0H'0'
+*   nl = 257 + ((unsigned)b & 0x1f); /* number of literal/length codes
+         L     R14,@114B@35
+         N     R14,=F'31'
+         AH    R14,=H'257'
+         ST    R14,@116NL
+*   DUMPBITS(5)
+         L     R14,@114B@35
+         SRL   R14,5
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'5'
+         ST    R14,@115K@36
+*   NEEDBITS(5)
+         CH    R14,=H'5'
+         BNL   @3L21
+@3L20    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'5'
+         BL    @3L20
+@3L21    DC    0H'0'
+*   nd = 1 + ((unsigned)b & 0x1f);   /* number of distance codes */
+         L     R14,@114B@35
+         N     R14,=F'31'
+         AH    R14,=H'1'
+         ST    R14,@117ND
+*   DUMPBITS(5)
+         L     R14,@114B@35
+         SRL   R14,5
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'5'
+         ST    R14,@115K@36
+*   NEEDBITS(4)
+         CL    R14,=F'4'
+         BNL   @3L23
+@3L22    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'4'
+         BL    @3L22
+@3L23    DC    0H'0'
+*   nb = 4 + ((unsigned)b & 0xf);    /* number of bit length codes */
+         L     R14,@114B@35
+         N     R14,=F'15'
+         AH    R14,=H'4'
+         ST    R14,@118NB
+*   DUMPBITS(4)
+         L     R14,@114B@35
+         SRL   R14,4
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'4'
+         ST    R14,@115K@36
+* #ifdef PKZIP_BUG_WORKAROUND
+*   if (nl > 288 || nd > 32)
+* #else
+*   if (nl > 286 || nd > 30)
+         L     R14,@116NL
+         CL    R14,=X'0000011E'
+         BH    @3L24
+         L     R14,@117ND
+         CL    R14,=F'30'
+         BNH   @3L25
+@3L24    DC    0H'0'
+* #endif
+*     return 1;                   /* bad lengths */
+         LA    R15,1
+         B     @3L202
+@3L25    DC    0H'0'
+@3L26    DC    0H'0'
+*
+*
+*   /* read in bit-length-code lengths */
+*   for (B = 0; j < nb; j++)
+         LA    R14,0
+         ST    R14,@119J@27
+         L     R15,@118NB
+         CLR   R14,R15
+         BNL   @3L29
+@3L28    DC    0H'0'
+*   {
+*     NEEDBITS(3)
+         L     R14,@115K@36
+         CL    R14,=F'3'
+         BNL   @3L31
+@3L30    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'3'
+         BL    @3L30
+@3L31    DC    0H'0'
+*     llÝborderÝj¨¨ = (unsigned)b & 7;
+         L     R15,@114B@35
+         N     R15,=F'7'
+         L     R14,@119J@27
+         SLL   R14,2
+         L     R14,BORDER(R14)         borderÝ¨0
+         SLL   R14,2
+         ST    R15,152(R14,R13)        ll___0
+*     DUMPBITS(3)
+         L     R14,@114B@35
+         SRL   R14,3
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'3'
+         ST    R14,@115K@36
+         LA    R14,1
+         A     R14,@119J@27
+         ST    R14,@119J@27
+         L     R15,@118NB
+         CLR   R14,R15
+         BL    @3L28
+@3L29    DC    0H'0'
+*   }
+*   for (; j < 19; j++)
+         L     R14,@119J@27
+         CL    R14,=F'19'
+         BNL   @3L33
+@3L32    DC    0H'0'
+*     llÝborderÝj¨¨ = 0;
+         L     R14,@119J@27
+         SLL   R14,2
+         L     R14,BORDER(R14)         borderÝ¨0
+         SLL   R14,2
+         LA    R15,0
+         ST    R15,152(R14,R13)        ll___0
+         LA    R14,1
+         A     R14,@119J@27
+         ST    R14,@119J@27
+         CL    R14,=F'19'
+         BL    @3L32
+@3L33    DC    0H'0'
+*
+*
+*   /* build decoding table for trees--single level, 7 bit lookup */
+*   bl = 7;
+         LA    R14,7
+         ST    R14,@122BL@33
+*   if ((i = huft_build(ll, 19, 19, NULL, NULL, &tl, &bl)) != 0)
+         LA    R14,@122BL@33
+         LA    R0,@123TL@31
+         LA    R2,@120LL
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R2,76(,R13)             #MX_TEMP3
+         LA    R2,19
+         ST    R2,80(,R13)             #MX_TEMP3
+         ST    R2,84(,R13)             #MX_TEMP3
+         LA    R2,0
+         ST    R2,88(,R13)             #MX_TEMP3
+         ST    R2,92(,R13)             #MX_TEMP3
+         ST    R0,96(,R13)             #MX_TEMP3
+         ST    R14,100(,R13)           #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@BUI
+         LR    R14,R15
+         ST    R14,@124I@26
+         LTR   R14,R14
+         BZ    @3L34
+*   {
+*     if (i == 1)
+         L     R14,@124I@26
+         CH    R14,=H'1'
+         BNE   @3L35
+*       huft_free(tl);
+         L     R14,@123TL@31
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+@3L35    DC    0H'0'
+*     return i;                   /* incomplete code set */
+         L     R15,@124I@26
+         B     @3L202
+@3L34    DC    0H'0'
+*   }
+*
+*
+*   /* read in literal and distance code lengths */
+*   n = nl + nd;
+         L     R14,@116NL
+         L     R15,@117ND
+         ALR   R14,R15
+         ST    R14,@125N@30
+*   m = mask_bitsÝbl¨;
+         LA    R14,MASKBITS
+         L     R15,@122BL@33
+         SLL   R15,1
+         ALR   R14,R15
+         LH    R14,0(,R14)             mask_bitsÝ¨0
+         N     R14,=X'0000FFFF'
+         ST    R14,@126M@29
+*   i = l = 0;
+         LA    R14,0
+         ST    R14,@127L@28
+         ST    R14,@124I@26
+*   while ((unsigned)i < n)
+         L     R15,@125N@30
+         CLR   R14,R15
+         BNL   @3L37
+@3L36    DC    0H'0'
+*   {
+*     NEEDBITS((unsigned)bl)
+         L     R14,@115K@36
+         L     R15,@122BL@33
+         CLR   R14,R15
+         BNL   @3L39
+@3L38    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         L     R15,@122BL@33
+         CLR   R14,R15
+         BL    @3L38
+@3L39    DC    0H'0'
+*     j = (td = tl + ((unsigned)b & m))->b;
+         L     R14,@123TL@31
+         L     R15,@114B@35
+         L     R0,@126M@29
+         NR    R15,R0
+         SLL   R15,3
+         LA    R14,0(R15,R14)          #AddressShadow
+         ST    R14,@128TD@32
+         SLR   R15,R15
+         IC    R15,1(,R14)             (*)huft.huft.b
+         ST    R15,@119J@27
+*     DUMPBITS(j)
+         L     R14,@114B@35
+         SRL   R14,0(R15)
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         L     R15,@119J@27
+         SLR   R14,R15
+         ST    R14,@115K@36
+*     j = td->v.n;
+         L     R14,@128TD@32
+         LH    R14,4(,R14)             (*)huft.n
+         N     R14,=X'0000FFFF'
+         ST    R14,@119J@27
+*     if (j < 16)                 /* length of code in bits (0..15) */
+         CL    R14,=F'16'
+         BNL   @3L40
+*       llÝi++¨ = l = j;          /* save last length in l */
+         L     R15,@119J@27
+         ST    R15,@127L@28
+         L     R14,@124I@26
+         SLL   R14,2
+         ST    R15,152(R14,R13)        ll___0
+         LA    R14,1
+         A     R14,@124I@26
+         ST    R14,@124I@26
+         B     @3L41
+@3L40    DC    0H'0'
+*     else if (j == 16)           /* repeat last length 3 to 6 times */
+         L     R14,@119J@27
+         CH    R14,=H'16'
+         BNE   @3L42
+*     {
+*       NEEDBITS(2)
+         L     R14,@115K@36
+         CL    R14,=F'2'
+         BNL   @3L44
+@3L43    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'2'
+         BL    @3L43
+@3L44    DC    0H'0'
+*       j = 3 + ((unsigned)b & 3);
+         L     R14,@114B@35
+         N     R14,=F'3'
+         AH    R14,=H'3'
+         ST    R14,@119J@27
+*       DUMPBITS(2)
+         L     R14,@114B@35
+         SRL   R14,2
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'2'
+         ST    R14,@115K@36
+*       if ((unsigned)i + j > n)
+         L     R15,@124I@26
+         L     R14,@119J@27
+         ALR   R14,R15
+         L     R15,@125N@30
+         CLR   R14,R15
+         BNH   @3L45
+*         return 1;
+         LA    R15,1
+         B     @3L202
+@3L45    DC    0H'0'
+*       while (j--)
+         L     R14,@119J@27
+         LTR   R14,R14
+         BZ    @3L47
+@3L46    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+*         llÝi++¨ = l;
+         L     R15,@127L@28
+         L     R14,@124I@26
+         SLL   R14,2
+         ST    R15,152(R14,R13)        ll___0
+         LA    R14,1
+         A     R14,@124I@26
+         ST    R14,@124I@26
+         L     R14,@119J@27
+         LTR   R14,R14
+         BNZ   @3L46
+@3L47    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+@3L48    DC    0H'0'
+         B     @3L49
+@3L42    DC    0H'0'
+*     }
+*     else if (j == 17)           /* 3 to 10 zero length codes */
+         L     R14,@119J@27
+         CH    R14,=H'17'
+         BNE   @3L50
+*     {
+*       NEEDBITS(3)
+         L     R14,@115K@36
+         CL    R14,=F'3'
+         BNL   @3L52
+@3L51    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'3'
+         BL    @3L51
+@3L52    DC    0H'0'
+*       j = 3 + ((unsigned)b & 7);
+         L     R14,@114B@35
+         N     R14,=F'7'
+         AH    R14,=H'3'
+         ST    R14,@119J@27
+*       DUMPBITS(3)
+         L     R14,@114B@35
+         SRL   R14,3
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'3'
+         ST    R14,@115K@36
+*       if ((unsigned)i + j > n)
+         L     R15,@124I@26
+         L     R14,@119J@27
+         ALR   R14,R15
+         L     R15,@125N@30
+         CLR   R14,R15
+         BNH   @3L53
+*         return 1;
+         LA    R15,1
+         B     @3L202
+@3L53    DC    0H'0'
+*       while (j--)
+         L     R14,@119J@27
+         LTR   R14,R14
+         BZ    @3L55
+@3L54    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+*         llÝi++¨ = 0;
+         L     R14,@124I@26
+         SLL   R14,2
+         LA    R15,0
+         ST    R15,152(R14,R13)        ll___0
+         LA    R14,1
+         A     R14,@124I@26
+         ST    R14,@124I@26
+         L     R14,@119J@27
+         LTR   R14,R14
+         BNZ   @3L54
+@3L55    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+@3L56    DC    0H'0'
+*       l = 0;
+         LA    R14,0
+         ST    R14,@127L@28
+         B     @3L57
+@3L50    DC    0H'0'
+*     }
+*     else                   /* j == 18: 11 to 138 zero length codes */
+*     {
+*       NEEDBITS(7)
+         L     R14,@115K@36
+         CL    R14,=F'7'
+         BNL   @3L59
+@3L58    DC    0H'0'
+         L     R2,@114B@35
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@115K@36
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@114B@35
+         LA    R14,8
+         A     R14,@115K@36
+         ST    R14,@115K@36
+         CL    R14,=F'7'
+         BL    @3L58
+@3L59    DC    0H'0'
+*       j = 11 + ((unsigned)b & 0x7f);
+         L     R14,@114B@35
+         N     R14,=X'0000007F'
+         AH    R14,=H'11'
+         ST    R14,@119J@27
+*       DUMPBITS(7)
+         L     R14,@114B@35
+         SRL   R14,7
+         ST    R14,@114B@35
+         L     R14,@115K@36
+         SH    R14,=H'7'
+         ST    R14,@115K@36
+*       if ((unsigned)i + j > n)
+         L     R15,@124I@26
+         L     R14,@119J@27
+         ALR   R14,R15
+         L     R15,@125N@30
+         CLR   R14,R15
+         BNH   @3L60
+*         return 1;
+         LA    R15,1
+         B     @3L202
+@3L60    DC    0H'0'
+*       while (j--)
+         L     R14,@119J@27
+         LTR   R14,R14
+         BZ    @3L62
+@3L61    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+*         llÝi++¨ = 0;
+         L     R14,@124I@26
+         SLL   R14,2
+         LA    R15,0
+         ST    R15,152(R14,R13)        ll___0
+         LA    R14,1
+         A     R14,@124I@26
+         ST    R14,@124I@26
+         L     R14,@119J@27
+         LTR   R14,R14
+         BNZ   @3L61
+@3L62    DC    0H'0'
+         L     R14,@119J@27
+         BCTR  R14,0
+         ST    R14,@119J@27
+@3L63    DC    0H'0'
+*       l = 0;
+         LA    R14,0
+         ST    R14,@127L@28
+@3L57    DC    0H'0'
+@3L49    DC    0H'0'
+@3L41    DC    0H'0'
+         L     R14,@124I@26
+         L     R15,@125N@30
+         CLR   R14,R15
+         BL    @3L36
+@3L37    DC    0H'0'
+*     }
+*   }
+*
+*
+*   /* free decoding table for trees */
+*   huft_free(tl);
+         L     R14,@123TL@31
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+*
+*
+*   /* restore the global bit buffer */
+*   bb = b;
+         L     R15,@114B@35
+         ST    R15,BB                  bb
+*   bk = k;
+         L     R15,@115K@36
+         ST    R15,BK                  bk
+*
+*
+*   /* build the decoding tables for literal/length and distance codes
+*   bl = lbits;
+         LA    R14,L_BITS              lbits
+         ST    R14,@122BL@33
+*   if ((i = huft_build(ll, nl, 257, cplens, cplext, &tl, &bl)) != 0)
+         L     R5,@116NL
+         LA    R14,@122BL@33
+         LA    R0,@123TL@31
+         LA    R2,CPLEXT
+         LA    R4,CPLENS
+         LA    R6,@120LL
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R6,76(,R13)             #MX_TEMP3
+         ST    R5,80(,R13)             #MX_TEMP3
+         LA    R5,257
+         ST    R5,84(,R13)             #MX_TEMP3
+         ST    R4,88(,R13)             #MX_TEMP3
+         ST    R2,92(,R13)             #MX_TEMP3
+         ST    R0,96(,R13)             #MX_TEMP3
+         ST    R14,100(,R13)           #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@BUI
+         LR    R14,R15
+         ST    R14,@124I@26
+         LTR   R14,R14
+         BZ    @3L64
+*   {
+*     if (i == 1) {
+         L     R14,@124I@26
+         CH    R14,=H'1'
+         BNE   @3L65
+*       fprintf(stderr, " incomplete literal tree\n");
+         LA    R1,MSG_LIT
+         LA    R0,L'MSG_LIT
+         TPUT  (1),(0),R
+*       huft_free(tl);
+         L     R14,@123TL@31
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+@3L65    DC    0H'0'
+*     }
+*     return i;                   /* incomplete code set */
+         L     R15,@124I@26
+         B     @3L202
+@3L64    DC    0H'0'
+*   }
+*   bd = dbits;
+         LA    R14,D_BITS              dbits
+         ST    R14,@134BD@34
+*   if ((i = huft_build(ll + nl, nd, 0, cpdist, cpdext, &td, &bd)) != 0
+         L     R15,@116NL
+         SLL   R15,2
+         L     R5,@117ND
+         LA    R14,@134BD@34
+         LA    R0,@128TD@32
+         LA    R2,CPDEXT
+         LA    R4,CPDIST
+         LA    R6,@120LL(R15)
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R6,76(,R13)             #MX_TEMP3
+         ST    R5,80(,R13)             #MX_TEMP3
+         LA    R5,0
+         ST    R5,84(,R13)             #MX_TEMP3
+         ST    R4,88(,R13)             #MX_TEMP3
+         ST    R2,92(,R13)             #MX_TEMP3
+         ST    R0,96(,R13)             #MX_TEMP3
+         ST    R14,100(,R13)           #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@BUI
+         LR    R14,R15
+         ST    R14,@124I@26
+         LTR   R14,R14
+         BZ    @3L66
+*   {
+*     if (i == 1) {
+         L     R14,@124I@26
+         CH    R14,=H'1'
+         BNE   @3L67
+*       fprintf(stderr, " incomplete distance tree\n");
+         LA    R1,MSG_DIS
+         LA    R0,L'MSG_DIS
+         TPUT  (1),(0),R
+* #ifdef PKZIP_BUG_WORKAROUND
+*       i = 0;
+*     }
+* #else
+*       huft_free(td);
+         L     R14,@128TD@32
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+@3L67    DC    0H'0'
+*     }
+*     huft_free(tl);
+         L     R14,@123TL@31
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+*     return i;                   /* incomplete code set */
+         L     R15,@124I@26
+         B     @3L202
+@3L66    DC    0H'0'
+* #endif
+*   }
+*
+*
+*   /* decompress until an end-of-block code */
+*   if (inflt_codes(tl, td, bl, bd))
+         L     R4,@123TL@31
+         L     R2,@128TD@32
+         L     R0,@122BL@33
+         L     R14,@134BD@34
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R4,76(,R13)             #MX_TEMP3
+         ST    R2,80(,R13)             #MX_TEMP3
+         ST    R0,84(,R13)             #MX_TEMP3
+         ST    R14,88(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,INFLT@CO
+         LR    R14,R15
+         LTR   R14,R14
+         BZ    @3L68
+*     return 1;
+         LA    R15,1
+         B     @3L202
+@3L68    DC    0H'0'
+*
+*
+*   /* free the decoding tables, return */
+*   huft_free(tl);
+         L     R14,@123TL@31
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+*   huft_free(td);
+         L     R14,@128TD@32
+         LA    R1,76(,R13)             #MX_TEMP3
+         ST    R14,76(,R13)            #MX_TEMP3
+         MVC   8(4,R13),#NAB_3
+         BAS   R14,HUFT@FRE
+*   return 0;
+         LA    R15,0
+         B     @3L202
+* }
+@3L27    DC    0H'0'
+@3L202   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@3
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R11,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflt_fixed()
+*
+IFIX_ID  DC    0F'0',CL4'@FIX'
+         SPACE
+INFLT@FI STM   R14,R10,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@4  DC    0H'0'
+         LA    R0,1280
+         ALR   R0,R13
+         ST    R0,#NAB_4-@@AUTO@4(,R13)
+         USING @@AUTO@4,R13
+         SPACE
+* /* decompress an inflated type 1 (fixed Huffman codes) block.
+*    We should either replace this with a custom decoder, or at least
+*    precompute the Huffman tables. */
+* {
+*   int i;                /* temporary variable */
+*   struct huft *tl;      /* literal/length code table */
+*   struct huft *td;      /* distance code table */
+*   int bl;               /* lookup bits for tl */
+*   int bd;               /* lookup bits for td */
+*   unsigned lÝ288¨;      /* length list for huft_build */
+*
+*
+*   /* set up literal table */
+*   for (i = 0; i < 144; i++)
+         LA    R14,0
+         ST    R14,@105I@19
+         CH    R14,=H'144'
+         BNL   @4L73
+@4L72    DC    0H'0'
+*     lÝi¨ = 8;
+         L     R14,@105I@19
+         SLL   R14,2
+         LA    R15,8
+         ST    R15,128(R14,R13)        l___0
+         LA    R14,1
+         A     R14,@105I@19
+         ST    R14,@105I@19
+         CH    R14,=H'144'
+         BL    @4L72
+@4L73    DC    0H'0'
+*   for (; i < 256; i++)
+         L     R14,@105I@19
+         CH    R14,=H'256'
+         BNL   @4L75
+@4L74    DC    0H'0'
+*     lÝi¨ = 9;
+         L     R14,@105I@19
+         SLL   R14,2
+         LA    R15,9
+         ST    R15,128(R14,R13)        l___0
+         LA    R14,1
+         A     R14,@105I@19
+         ST    R14,@105I@19
+         CH    R14,=H'256'
+         BL    @4L74
+@4L75    DC    0H'0'
+*   for (; i < 280; i++)
+         L     R14,@105I@19
+         CH    R14,=H'280'
+         BNL   @4L77
+@4L76    DC    0H'0'
+*     lÝi¨ = 7;
+         L     R14,@105I@19
+         SLL   R14,2
+         LA    R15,7
+         ST    R15,128(R14,R13)        l___0
+         LA    R14,1
+         A     R14,@105I@19
+         ST    R14,@105I@19
+         CH    R14,=H'280'
+         BL    @4L76
+@4L77    DC    0H'0'
+*   for (; i < 288; i++)      /* make a complete, but wrong code set */
+         L     R14,@105I@19
+         CH    R14,=H'288'
+         BNL   @4L79
+@4L78    DC    0H'0'
+*     lÝi¨ = 8;
+         L     R14,@105I@19
+         SLL   R14,2
+         LA    R15,8
+         ST    R15,128(R14,R13)        l___0
+         LA    R14,1
+         A     R14,@105I@19
+         ST    R14,@105I@19
+         CH    R14,=H'288'
+         BL    @4L78
+@4L79    DC    0H'0'
+*   bl = 7;
+         LA    R14,7
+         ST    R14,@108BL@22
+*   if ((i = huft_build(l, 288, 257, cplens, cplext, &tl, &bl)) != 0)
+         LA    R14,@108BL@22
+         LA    R0,@109TL@20
+         LA    R2,CPLEXT
+         LA    R4,CPLENS
+         LA    R5,@106L@24
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R5,76(,R13)             #MX_TEMP4
+         LA    R5,288
+         ST    R5,80(,R13)             #MX_TEMP4
+         LA    R5,257
+         ST    R5,84(,R13)             #MX_TEMP4
+         ST    R4,88(,R13)             #MX_TEMP4
+         ST    R2,92(,R13)             #MX_TEMP4
+         ST    R0,96(,R13)             #MX_TEMP4
+         ST    R14,100(,R13)           #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,HUFT@BUI
+         LR    R14,R15
+         ST    R14,@105I@19
+         LTR   R14,R14
+         BZ    @4L80
+*     return i;
+         L     R15,@105I@19
+         B     @4L201
+@4L80    DC    0H'0'
+*
+*
+*   /* set up distance table */
+*   for (i = 0; i < 30; i++)          /* make an incomplete code set */
+         LA    R14,0
+         ST    R14,@105I@19
+         CH    R14,=H'30'
+         BNL   @4L82
+@4L81    DC    0H'0'
+*     lÝi¨ = 5;
+         L     R14,@105I@19
+         SLL   R14,2
+         LA    R15,5
+         ST    R15,128(R14,R13)        l___0
+         LA    R14,1
+         A     R14,@105I@19
+         ST    R14,@105I@19
+         CH    R14,=H'30'
+         BL    @4L81
+@4L82    DC    0H'0'
+*   bd = 5;
+         LA    R14,5
+         ST    R14,@110BD@23
+*   if ((i = huft_build(l, 30, 0, cpdist, cpdext, &td, &bd)) > 1)
+         LA    R14,@110BD@23
+         LA    R0,@111TD@21
+         LA    R2,CPDEXT
+         LA    R4,CPDIST
+         LA    R5,@106L@24
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R5,76(,R13)             #MX_TEMP4
+         LA    R5,30
+         ST    R5,80(,R13)             #MX_TEMP4
+         LA    R5,0
+         ST    R5,84(,R13)             #MX_TEMP4
+         ST    R4,88(,R13)             #MX_TEMP4
+         ST    R2,92(,R13)             #MX_TEMP4
+         ST    R0,96(,R13)             #MX_TEMP4
+         ST    R14,100(,R13)           #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,HUFT@BUI
+         LR    R14,R15
+         ST    R14,@105I@19
+         CH    R14,=H'1'
+         BNH   @4L83
+*   {
+*     huft_free(tl);
+         L     R14,@109TL@20
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R14,76(,R13)            #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,HUFT@FRE
+*     return i;
+         L     R15,@105I@19
+         B     @4L201
+@4L83    DC    0H'0'
+*   }
+*
+*
+*   /* decompress until an end-of-block code */
+*   if (inflt_codes(tl, td, bl, bd))
+         L     R4,@109TL@20
+         L     R2,@111TD@21
+         L     R0,@108BL@22
+         L     R14,@110BD@23
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R4,76(,R13)             #MX_TEMP4
+         ST    R2,80(,R13)             #MX_TEMP4
+         ST    R0,84(,R13)             #MX_TEMP4
+         ST    R14,88(,R13)            #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,INFLT@CO
+         LR    R14,R15
+         LTR   R14,R14
+         BZ    @4L84
+*     return 1;
+         LA    R15,1
+         B     @4L201
+@4L84    DC    0H'0'
+*
+*
+*   /* free the decoding tables, return */
+*   huft_free(tl);
+         L     R14,@109TL@20
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R14,76(,R13)            #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,HUFT@FRE
+*   huft_free(td);
+         L     R14,@111TD@21
+         LA    R1,76(,R13)             #MX_TEMP4
+         ST    R14,76(,R13)            #MX_TEMP4
+         MVC   8(4,R13),#NAB_4
+         BAS   R14,HUFT@FRE
+*   return 0;
+         LA    R15,0
+         B     @4L201
+* }
+@4L71    DC    0H'0'
+@4L201   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@4
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R10,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflt_stored()
+*
+ISTO_ID  DC    0F'0',CL4'@STO'
+         SPACE
+INFLT@ST STM   R14,R11,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@5  DC    0H'0'
+         LA    R0,96
+         ALR   R0,R13
+         ST    R0,#NAB_5-@@AUTO@5(,R13)
+         USING @@AUTO@5,R13
+         SPACE
+* /* "decompress" an inflated type 0 (stored) block. */
+* {
+*   unsigned n;           /* number of bytes in block */
+*   unsigned w;           /* current window position */
+*   register ulg b;       /* bit buffer */
+*   register unsigned k;  /* number of bits in bit buffer */
+*
+*
+*   /* make local copies of globals */
+*   b = bb;                       /* initialize bit buffer */
+         L     R14,BB                  bb
+         ST    R14,@99B@16
+*   k = bk;
+         L     R14,BK                  bk
+         ST    R14,@100K@17
+*   w = wp;                       /* initialize window position */
+         L     R14,WP                  outcnt
+         ST    R14,@101W@15
+*
+*
+*   /* go to byte boundary */
+*   n = k & 7;
+         L     R15,@100K@17
+         N     R15,=F'7'
+         ST    R15,@102N@14
+*   DUMPBITS(n);
+         L     R14,@99B@16
+         SRL   R14,0(R15)
+         ST    R14,@99B@16
+         L     R14,@100K@17
+         L     R15,@102N@14
+         SLR   R14,R15
+         ST    R14,@100K@17
+*
+*
+*   /* get the length and its complement */
+*   NEEDBITS(16)
+         CL    R14,=F'16'
+         BNL   @5L87
+@5L86    DC    0H'0'
+         L     R2,@99B@16
+         MVC   8(4,R13),#NAB_5
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@100K@17
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@99B@16
+         LA    R14,8
+         A     R14,@100K@17
+         ST    R14,@100K@17
+         CL    R14,=F'16'
+         BL    @5L86
+@5L87    DC    0H'0'
+*   n = ((unsigned)b & 0xffff);
+         L     R14,@99B@16
+         N     R14,=X'0000FFFF'
+         ST    R14,@102N@14
+*   DUMPBITS(16)
+         L     R14,@99B@16
+         SRL   R14,16
+         ST    R14,@99B@16
+         L     R14,@100K@17
+         SH    R14,=H'16'
+         ST    R14,@100K@17
+*   NEEDBITS(16)
+         CL    R14,=F'16'
+         BNL   @5L89
+@5L88    DC    0H'0'
+         L     R2,@99B@16
+         MVC   8(4,R13),#NAB_5
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@100K@17
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@99B@16
+         LA    R14,8
+         A     R14,@100K@17
+         ST    R14,@100K@17
+         CL    R14,=F'16'
+         BL    @5L88
+@5L89    DC    0H'0'
+*   if (n != (unsigned)((~b) & 0xffff))
+         L     R14,@102N@14
+         L     R15,@99B@16
+         X     R15,=X'FFFFFFFF'
+         N     R15,=X'0000FFFF'
+         CLR   R14,R15
+         BE    @5L90
+*     return 1;                   /* error in compressed data */
+         LA    R15,1
+         B     @5L200
+@5L90    DC    0H'0'
+*   DUMPBITS(16)
+         L     R14,@99B@16
+         SRL   R14,16
+         ST    R14,@99B@16
+         L     R14,@100K@17
+         SH    R14,=H'16'
+         ST    R14,@100K@17
+@5L91    DC    0H'0'
+*
+*
+*   /* read and output the compressed data */
+*   while (n--)
+         L     R14,@102N@14
+         LTR   R14,R14
+         BZ    @5L94
+@5L93    DC    0H'0'
+         L     R14,@102N@14
+         BCTR  R14,0
+         ST    R14,@102N@14
+*   {
+*     NEEDBITS(8)
+         L     R14,@100K@17
+         CL    R14,=F'8'
+         BNL   @5L96
+@5L95    DC    0H'0'
+         L     R2,@99B@16
+         MVC   8(4,R13),#NAB_5
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@100K@17
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@99B@16
+         LA    R14,8
+         A     R14,@100K@17
+         ST    R14,@100K@17
+         CL    R14,=F'8'
+         BL    @5L95
+@5L96    DC    0H'0'
+*     slideÝw++¨ = (uch)b;
+         L     R0,@99B@16
+         N     R0,=F'255'
+         L     R14,SLIDEWIN            window
+         L     R15,@101W@15
+         STC   R0,0(R15,R14)           window.Ý¨0
+         LA    R14,1
+         A     R14,@101W@15
+         ST    R14,@101W@15
+*     if (w == WSIZE)
+         CL    R14,=X'00008000'
+         BNE   @5L97
+*     {
+*       flush_output(w);
+         L     R15,@101W@15
+         ST    R15,WP                  outcnt
+         LA    R15,FLUSH@WI
+         MVC   8(4,R13),#NAB_5
+         BASR  R14,R15
+*       w = 0;
+         LA    R14,0
+         ST    R14,@101W@15
+@5L97    DC    0H'0'
+*     }
+*     DUMPBITS(8)
+         L     R14,@99B@16
+         SRL   R14,8
+         ST    R14,@99B@16
+         L     R14,@100K@17
+         SH    R14,=H'8'
+         ST    R14,@100K@17
+         L     R14,@102N@14
+         LTR   R14,R14
+         BNZ   @5L93
+@5L94    DC    0H'0'
+         L     R14,@102N@14
+         BCTR  R14,0
+         ST    R14,@102N@14
+@5L98    DC    0H'0'
+*   }
+*
+*
+*   /* restore the globals from the locals */
+*   wp = w;                       /* restore global window pointer */
+         L     R15,@101W@15
+         ST    R15,WP                  outcnt
+*   bb = b;                       /* restore global bit buffer */
+         L     R15,@99B@16
+         ST    R15,BB                  bb
+*   bk = k;
+         L     R15,@100K@17
+         ST    R15,BK                  bk
+*   return 0;
+         LA    R15,0
+         B     @5L200
+* }
+@5L92    DC    0H'0'
+@5L200   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@5
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R11,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflt_block(e)
+*
+IBLK_ID  DC    0F'0',CL4'@BLK'
+         SPACE
+INFLT@BL STM   R14,R3,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@2  DC    0H'0'
+         LA    R0,96
+         ALR   R0,R13
+         ST    R0,#NAB_2-@@AUTO@2(,R13)
+         USING @@AUTO@2,R13
+         ST    R1,92(,R13)             #SR_PARM_2
+         SPACE
+* int *e;                 /* last block flag */
+* /* decompress an inflated block */
+* {
+*   unsigned t;           /* block type */
+*   register ulg b;       /* bit buffer */
+*   register unsigned k;  /* number of bits in bit buffer */
+*
+*
+*   /* make local bit buffer */
+*   b = bb;
+         L     R14,BB                  bb
+         ST    R14,@138B@40
+*   k = bk;
+         L     R14,BK                  bk
+         ST    R14,@139K@41
+*
+*
+*   /* read in last block bit */
+*   NEEDBITS(1)
+         CL    R14,=F'1'
+         BNL   @2L11
+@2L10    DC    0H'0'
+         L     R2,@138B@40
+         MVC   8(4,R13),#NAB_2
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@139K@41
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@138B@40
+         LA    R14,8
+         A     R14,@139K@41
+         ST    R14,@139K@41
+         CL    R14,=F'1'
+         BL    @2L10
+@2L11    DC    0H'0'
+*   *e = (int)b & 1;
+         L     R15,@138B@40
+         N     R15,=F'1'
+         L     R14,92(,R13)            #SR_PARM_2
+         USING @@PARMD@2,R14
+         L     R14,@136E
+         DROP  R14                     @@PARMD@2
+         ST    R15,0(,R14)             (*)int
+*   DUMPBITS(1)
+         L     R14,@138B@40
+         SRL   R14,1
+         ST    R14,@138B@40
+         L     R14,@139K@41
+         BCTR  R14,0
+         ST    R14,@139K@41
+*
+*
+*   /* read in block type */
+*   NEEDBITS(2)
+         CL    R14,=F'2'
+         BNL   @2L13
+@2L12    DC    0H'0'
+         L     R2,@138B@40
+         MVC   8(4,R13),#NAB_2
+         BAS   R14,GET@BYTE
+         LR    R14,R2
+         N     R15,=F'255'
+         L     R1,@139K@41
+         SLL   R15,0(R1)
+         OR    R14,R15
+         ST    R14,@138B@40
+         LA    R14,8
+         A     R14,@139K@41
+         ST    R14,@139K@41
+         CL    R14,=F'2'
+         BL    @2L12
+@2L13    DC    0H'0'
+*   t = (unsigned)b & 3;
+         L     R14,@138B@40
+         N     R14,=F'3'
+         ST    R14,@140T@39
+*   DUMPBITS(2)
+         L     R14,@138B@40
+         SRL   R14,2
+         ST    R14,@138B@40
+         L     R14,@139K@41
+         SH    R14,=H'2'
+         ST    R14,@139K@41
+*
+*
+*   /* restore the global bit buffer */
+*   bb = b;
+         L     R15,@138B@40
+         ST    R15,BB                  bb
+*   bk = k;
+         L     R15,@139K@41
+         ST    R15,BK                  bk
+*
+*
+*   /* inflate that block type */
+*   if (t == 2)
+         L     R14,@140T@39
+         CH    R14,=H'2'
+         BNE   @2L14
+*     return inflt_dynamic();
+         MVC   8(4,R13),#NAB_2
+         BAS   R14,INFLT@DY
+         B     @2L203
+@2L14    DC    0H'0'
+*   if (t == 0)
+         L     R14,@140T@39
+         LTR   R14,R14
+         BNZ   @2L15
+*     return inflt_stored();
+         MVC   8(4,R13),#NAB_2
+         BAS   R14,INFLT@ST
+         B     @2L203
+@2L15    DC    0H'0'
+*   if (t == 1)
+         L     R14,@140T@39
+         CH    R14,=H'1'
+         BNE   @2L16
+*     return inflt_fixed();
+         MVC   8(4,R13),#NAB_2
+         BAS   R14,INFLT@FI
+         B     @2L203
+@2L16    DC    0H'0'
+*
+*
+*   /* bad block type */
+*   return 2;
+         LA    R15,2
+* }
+@2L203   DC    0H'0'
+         SPACE
+         DROP  R13                     @@AUTO@2
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R3,24(R13)
+         BR    R14
+         DC    0F'0'
+         EJECT
+*
+* int inflate()
+*
+INFLT_ID DC    0F'0',CL8'INFLATE '
+         SPACE
+INFLATE  STM   R14,R12,12(R13)
+         LR    R7,R13
+         LA    R13,C_STACK
+         ST    R7,4(,R13)
+@@BGN@1  DC    0H'0'
+         LA    R0,96
+         ALR   R0,R13
+         ST    R0,#NAB_1-@@AUTO@1(,R13)
+         USING @@AUTO@1,R13
+         SPACE
+         MVI   UZFL_1ST,0              Reset first-time flag
+* /* decompress an inflated entry */
+* {
+*   int e;                /* last block flag */
+*   int r;                /* result code */
+*   unsigned h;           /* maximum struct huft's malloc'ed */
+*
+*
+*   /* initialize window, bit buffer */
+*   wp = 0;
+         LA    R14,0
+         ST    R14,WP                  outcnt
+*   bk = 0;
+         ST    R14,BK                  bk
+*   bb = 0;
+         ST    R14,BB                  bb
+*
+*
+*   /* decompress until the last block */
+*   h = 0;
+         ST    R14,@143H@45
+@1L1     DC    0H'0'
+*   do {
+@1L3     DC    0H'0'
+*     hufts = 0;
+         LA    R15,0
+         ST    R15,HUFTS               hufts
+*     if ((r = inflt_block(&e)) != 0)
+         LA    R14,@144E@43
+         LA    R1,76(,R13)             #MX_TEMP1
+         ST    R14,76(,R13)            #MX_TEMP1
+         MVC   8(4,R13),#NAB_1
+         BAS   R14,INFLT@BL
+         LR    R14,R15
+         ST    R14,@145R@44
+         LTR   R14,R14
+         BZ    @1L4
+*       return r;
+         L     R15,@145R@44
+         B     @1L204
+@1L4     DC    0H'0'
+*     if (hufts > h)
+         L     R15,HUFTS               hufts
+         L     R0,@143H@45
+         CLR   R15,R0
+         BNH   @1L5
+*       h = hufts;
+         ST    R15,@143H@45
+@1L5     DC    0H'0'
+*   } while (!e);
+         L     R14,@144E@43
+         LTR   R14,R14
+         BZ    @1L3
+@1L6     DC    0H'0'
+         SPACE
+         OI    UZFLAGS,$UZEOD          Flag no more zipped data
+         SPACE
+*
+*   /* Undo too much lookahead. The next read will be byte aligned so
+*      we can discard unused bits in the last meaningful byte. */
+*   while (bk >= 8) {
+         L     R14,BK                  bk
+         CL    R14,=F'8'
+         BL    @1L8
+@1L7     DC    0H'0'
+*     bk -= 8;
+         L     R15,BK                  bk
+         SH    R15,=H'8'
+         ST    R15,0(,R14)             bk
+*     inptr--;
+         LM    R15,R0,ZIPREC@#         Get unused data address and size
+         SH    R15,=H'1'               Back up one byte
+         AH    R0,=H'1'                Increment byte count
+         STM   R15,R0,ZIPREC@#         Save adjusted values
+         L     R14,BK                  bk
+         CL    R14,=F'8'
+         BNL   @1L7
+@1L8     DC    0H'0'
+*   }
+*
+*   /* flush out slide */
+*   flush_output(wp);
+***      L     R15,WP                  outcnt
+***      ST    R15,WP                  outcnt
+         LA    R15,FLUSH@WI
+         MVC   8(4,R13),#NAB_1
+         BASR  R14,R15
+*
+*
+*   /* return success */
+* #ifdef DEBUG
+*   fprintf(stderr, "<%u> ", h);
+* #endif /* DEBUG */
+*   return 0;
+         LA    R15,0
+         B     @1L204
+* }
+@1L2     DC    0H'0'
+@1L204   DC    0H'0'
+         DROP  R13                     @@AUTO@1
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R12,24(R13)
+         B     UZFL_EOD                Go output pending data
+***      BR    R14
+         DC    0F'0'
+         EJECT
+OUTLINECONC DS 0F
+         STM   R14,R9,12(R13)
+         LR    R15,R13
+         L     R13,8(,R13)
+         ST    R15,4(,R13)
+@@BGN@9  DC    0H'0'
+         USING @@AUTO@9,R13
+         L     R2,4(,1)                #MEMORY
+         L     R3,8(,1)                #MEMORY
+         L     R1,0(,1)                #MEMORY
+         LTR   R3,R3
+         LA    R1,0(,1)                #MEMORY
+         LA    R2,0(,2)                #MEMORY
+         BZ    @9L208
+         CLR   R2,R1
+         BE    @9L208
+         BCTR  R3,0
+         LR    R5,R3
+         SRA   R5,8
+         BE    @9L206
+@9L205   DC    0H'0'
+         MVC   0(256,1),0(2)
+         LA    R1,256(,1)              #MEMORY
+         LA    R2,256(,2)              #MEMORY
+         BCT   R5,@9L205
+@9L206   DC    0H'0'
+         EX    R3,MOVE2TO1
+@9L208   DC    0H'0'
+         DROP  R13                     @@AUTO@9
+         L     R13,4(,R13)
+         L     R14,12(,R13)
+         LM    R1,R9,24(R13)
+         BR    R14
+         DC    0F'0'
+         SPACE
+         EJECT
+*
+* get_byte
+*
+         DC    0F'0',CL8'GET@BYTE'
+         SPACE
+GET@BYTE STM   R14,R9,12(R13)          Save registers
+         LR    R15,R13                 Point to caller's save area
+         L     R13,8(,R13)             Point to new save area
+         ST    R15,4(,R13)             Chain save areas
+         SPACE
+         ICM   R0,15,PACKSIZE          Any zipped bytes left?
+         BNP   NO_BYTE                 No, end of zip data
+         LA    R2,CRNTBYTE             Point to extraction hold area
+         LA    R3,1                    Get the required byte count
+         LA    R1,UZFLRZSV             Point to new save area
+         BAS   R14,READZIP             Read in a zipped byte
+         TM    UZFLAGS,$UZEOF          Reached end of file?
+         BO    NO_BYTE                 Yes, nasty
+         BCTR  R0,0                    Decrement zipped data bytes left
+         ST    R0,PACKSIZE             Save the updated count
+         SR    R15,R15                 Clear for insert
+         IC    R15,CRNTBYTE            Load byte just read
+         SPACE
+         L     R13,4(,R13)             Point back to caller's save area
+         L     R14,12(,R13)            Restore return address
+         LM    R1,R9,24(R13)           Restore other registers
+         BR    R14                     Return to caller
+         SPACE
+NO_BYTE  LR    R13,R7                  Point to mainline's save area
+         TM    UZFLAGS,$UZEOF          Reached end of file?
+         BO    UZFL_EOF                Yes, report this
+         MVC   MSG(UZEODML),UZEODM     Unexpected End-Of-Data
+         B     UZFL_BEL                Go show error message
+         SPACE
+         DC    0F'0'
+         EJECT
+*
+* malloc()
+*
+         DC    0F'0',CL4'MALC'
+         SPACE
+MALLOC   STM   R14,R9,12(R13)          Save registers
+         SPACE
+         L     R14,0(,R1)              Get requested storage size
+         LA    R14,8(,R14)             Ensure not < 0 - add prefix size
+         LR    R0,R14                  Copy size request
+         GETMAIN RU,LV=(0),SP=4,LOC=(31,64)
+         LR    R15,R1                  Point to acquired storage
+         STM   R14,R15,0(R1)           Save FREEMAIN values in prefix
+         LA    R15,8(,R15)             Point past prefix
+         SPACE
+         L     R14,12(,R13)            Restore return address
+         LM    R1,R9,24(R13)           Restore other registers
+         BR    R14                     Return to caller
+         DC    0F'0'
+         EJECT
+*
+* free()
+*
+         DC    0F'0',CL4'FREE'
+         SPACE
+FREE     STM   R14,R9,12(R13)          Save registers
+         SPACE
+         L     R14,0(,R1)              Get address of storage to free
+         LA    R14,0(,R14)             Ensure address format
+         LA    R0,8                    Get prefix size
+         SR    R14,R0                  Point to prefix
+         LM    R0,R1,0(R14)            Load storage size and address
+         FREEMAIN RU,LV=(0),A=(1),SP=4 Free storage
+         SPACE
+         L     R14,12(,R13)            Restore return address
+         LM    R1,R9,24(R13)           Restore other registers
+         BR    R14                     Return to caller
+         DC    0F'0'
+         EJECT
+*
+* flush_window()
+*
+FLUSH_ID DC    0F'0',CL8'FLUSH@WI'
+         SPACE
+FLUSH@WI STM   R14,R12,12(R13)         Save registers
+         SPACE
+         ST    R13,C_STACK@            Save save area address
+         LR    R13,R7                  Point to mainline save area
+         SPACE
+         DROP  R7                      @UNZWORK
+         USING @UNZWORK,R13
+         SPACE
+*
+*    Update CRC-32 status
+*
+         L     R4,STRINGAD             Point to inflated data
+         L     R5,STRINGLN             Get inflated data length
+         L     R14,FULLSIZE
+         SR    R14,R5                  Reduce uncompressed bytes left
+         ST    R14,FULLSIZE
+         BAS   R14,UPDTCRC             Feed this data into CRC calcs
+         SPACE
+         B     UZOUTPUT                Go output data
+         SPACE
+         DC    C'IO'                   Inflate Output occurs here
+         SPACE
+*
+*    Resume Inflate processing after passing data back to caller
+*
+RESUME_I DC    0H'0'
+         SPACE
+         L     R13,C_STACK@            Point to caller's save area
+         LM    R14,R12,12(R13)         Restore registers
+         BR    R14                     Return to caller
+         SPACE
+         DROP  R13                     @UNZWORK
+         SPACE
+*
+*    Start of constants for Inflate
+*
+         SPACE
+MOVE2TO1 MVC   0(0,R1),0(R2)           <<< EXECUTED >>>
+         SPACE
+MASKBITS EQU   *,34
+         DC    X'0000,0001,0003,0007,000F,001F,003F,007F'
+         DC    X'00FF,01FF,03FF,07FF,0FFF,1FFF,3FFF,7FFF'
+         DC    X'FFFF'
+         SPACE
+*                               Copy lengths for literal codes 257..285
+CPLENS   DC    H'3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35'
+         DC    H'43,51,59,67,83,99,115,131,163,195,227,258'
+         SPACE
+*                               Extra bits for literal codes 257..285
+CPLEXT   DC    H'0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2'
+         DC    H'3,3,3,3,4,4,4,4,5,5,5,5,0,99,99'
+         SPACE
+*                               Copy offsets for distance codes 0..29
+CPDIST   DC    H'1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193'
+         DC    H'257,385,513,769,1025,1537,2049,3073,4097,6145'
+         DC    H'8193,12289,16385,24577'
+         SPACE
+*                               Extra bits for distance codes 0..29
+CPDEXT   DC    H'0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6'
+         DC    H'7,7,8,8,9,9,10,10,11,11'
+         DC    H'12,12,13,13'
+         SPACE
+*                               Order of the bit length code lengths
+BORDER   DC    F'16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15'
+         SPACE
+MSG_LIT  DC    C' incomplete literal tree'
+MSG_DIS  DC    C' incomplete distance tree'
+         SPACE
+         DC    0D'0'
+*    End of constants for Inflate

@@ -1,0 +1,944 @@
+/* rexx */
+/**********************************************************************/
+/* GET/PUT files from/to a FTP server.                                */
+/* Written: 1998 Rob Wunderlich                                       */
+/* Created to transfer files between MVS and MAXIMO server.           */
+/* See Lotus Notes "Plant Systems Knowledge Base" for doc.            */
+/*                                                                    */
+/* Changes:                                                           */
+/* 10/21/2005 RBW. Replaced server password lookup with NETRC.        */
+/*                 Added TOKEN function.                              */
+/*                                                                    */
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
+/**********************************************************************/
+/*    *    *    *    Establish Error Traps    *    *    *    *    *   */
+call on error name errproc
+signal on syntax name errproc
+signal on novalue name errproc
+/*    *    *    *    *    *    *    *    *    *    *    *    *    *   */
+
+/* Init variables */
+maxrc = 0
+logmsg.0 = 0                      /* Count of stacked messages*/
+logmsg.jobname = getjobn()        /* This jobname */
+counter.=0;                      /* sequence counter used in rexepr*/
+/* Check if logfile allocated */
+if listdsi("LOG FILE") = 16 & sysreason = 2
+  then logmsg.alloc = 0
+  else logmsg.alloc = 1
+
+call logmsg 'MAXITRAN V1.6.2 Started'
+
+/* Variables to be set by keyword input at sysin */
+server =''
+email_on_error_list = ''
+email_on_success_list = ''
+put.=''; putidx=0                 /* List of files to PUT */
+get.=''; getidx=0                 /* List of files to GET */
+getmask.=''; getmaskidx=0         /* List of files to GET with mask */
+putmask.=''; putmaskidx=0         /* List of files to PUT with mask */
+locsite = ''                      /* LOCSITE parms */
+fileexists.=''; feidx=0           /* List of FileExists to check */
+getLockMask='/*.lck'              /* Default lock mask for GET */
+putLockMask=''                    /* Default lock mask for PUT */
+flagGetDelete=1                   /* Delete files after GET */
+flagUseGetLock=1                  /* Default is use getlock */
+flagUsePutLock=1                  /* Default is use putlock */
+debug=0                           /* Debug off */
+
+/* Process parm string */
+arg $parm
+do i = 1 to words($parm)
+  select
+    when abbrev('DEBUG',word($parm,i),3)
+     then debug=1
+    otherwise do
+      call logmsg 'Error - Unknown parm "' || word($parm,i) || '"'
+      exit 24
+    end
+  end
+end
+
+/* * * * * * * Main routine * * * * * * */
+
+
+/* Read and process control cards */
+
+call read_control_cards
+if maxrc > 0                      /* If control card errors, */
+  then signal main_exit           /*  then exit now */
+
+call display_parms            /* Display the parms that we will use */
+
+/* Convert all GETMASK requests to GETs */
+if getmaskidx > 0                 /* If any GETMASK to do, */
+then do
+  call convert_getmask
+end
+if maxrc > 0                           /* If not rc 0, */
+  then signal main_exit                /*  then exit with error */
+
+/* Convert all PUTMASK requests to PUTs */
+if putmaskidx > 0                 /* If any GETMASK to do, */
+then do
+  call convert_putmask
+end
+if maxrc > 0                           /* If not rc 0, */
+  then signal main_exit                /*  then exit with error */
+
+/* Perform all FILEEXISTS */
+if feidx > 0
+then do i = 1 to feidx
+  maxrc = max(maxrc, check_fileexists(server, fileexists.i))
+end
+if maxrc > 0                           /* If not rc 0, */
+  then signal main_exit                /*  then exit with error */
+
+/* Perform all GETS */
+if getidx > 0                     /* If any GETs to do, */
+then do
+  if flagUseGetLock
+  then do
+    if \test_lock(server,get.dir,getLockMask)  /* Try for lock */
+    then do                         /* Couldn't get lock */
+      call logmsg 'Error-Unable to obtain lock for GET, dir' get.dir
+      maxrc = max(maxrc,12)
+      signal main_exit                /* Exit with error */
+    end
+  end
+
+  call get_files           /* Lock successful or not used */
+
+  if maxrc = 0 & flagGetDelete           /* If get_files was ok, */
+    then call delete_get_files           /*  then go delete the files*/
+  if maxrc > 0                           /* If not rc 0, */
+    then signal main_exit                /*  then exit with error */
+
+end
+
+
+/* Perform all PUTS */
+if putidx > 0                     /* If any PUTs to do, */
+then do
+  if flagUsePutLock
+  then do
+    if \test_lock(server,put.dir,putLockMask)  /* Try for lock */
+    then do                         /* Couldn't get lock */
+      call logmsg 'Error-Unable to obtain lock for PUT, dir' put.dir
+      maxrc = max(maxrc,12)
+      signal main_exit                /* Exit with error */
+    end
+  end
+
+  call put_files           /* Lock successful or not used */
+end
+
+main_exit:
+call logmsg 'Ending with Rc' maxrc
+
+if maxrc = 0 & email_on_success_list \= ''
+  then call sendmail email_on_success_list ',' ,
+            logmsg.jobname 'MAXITRAN ended normally'
+
+if maxrc > 4 & email_on_error_list \= ''
+  then call sendmail email_on_error_list ',' ,
+            logmsg.jobname 'MAXITRAN ended with ERROR'
+
+exit maxrc                        /*  EXIT for main routine */
+
+
+
+
+/**********************************************************************/
+/* Sub: Convert GETMASK request to GETs                               */
+/* Adds GET requests to the get. var                                  */
+/**********************************************************************/
+convert_getmask:
+do i = 1 to getmaskidx
+call logmsg 'Getmask conversion for: ' getmask.i
+  parse var getmask.i src rxexpr ftpparms   /* Parse next GETMASK */
+
+  parse value ftpdir(server,get.dir || '\' || src) with ,
+    ftprc count filelist      /* Get files that match mask */
+  if ftprc = 0
+  then do j= 1 to count                    /* Do for each file */
+    parse var filelist 'EZA2284I' . . . sfile filelist
+    sfile = strip(sfile,'B')
+
+    /* Form target file name by applying expression from SYSIN stmt */
+    interpret 'tfile=' rxexpr
+    upper tfile                   /* Insure name is upper case */
+
+    getidx = getidx + 1           /* Increment GET count */
+    get.getidx = sfile tfile ftpparms  /* Save as a GET request */
+    call logmsg '-- Generated stmt: GET' get.getidx
+  end
+  else do
+    call logmsg 'Error - Unable to access server "'server'"',
+                'dir "'src'" rc='ftprc
+    maxrc = max(maxrc, 12)     /* Set RC 12 */
+  end
+
+end
+
+return
+
+
+/**********************************************************************/
+/* Sub: Convert PUTMASK request to PUTs                               */
+/* Adds PUT requests to the put. var                                  */
+/**********************************************************************/
+convert_putmask:
+trace ?r
+do i = 1 to putmaskidx
+  call logmsg 'Putmask conversion for: ' putmask.i
+  /* getmask rxexpr does not allow imbedded spaces. */
+  /* Enforce same restriction here for compatability  */
+  parse var putmask.i src rxexpr rest /* Parse next PUTMASK */
+
+  if rest <> ''
+  then do
+    call logmsg '-- Invalid parameter:' rest
+    maxrc = max(maxrc, 20)     /* Set RC 20 */
+    signal main_exit
+  end
+
+  if isRelativeGds(src)
+  then do
+    dslist = rxdslist(basename(src),'B')   /* Get list for this mask */
+  end
+
+  else do  /* Not a relative GDS name */
+    dslist = rxdslist(src)   /* Get list for this mask */
+  end
+
+  do j = 1 to words(dslist) by 2
+    sfile = strip(word(dslist,j),'B')  /* Get next dsn */
+    /* Convert relative GDS to absolute */
+    sfile = resolve_gds_name(sfile, member_name(src))
+
+    /* Form target file name by applying expression from SYSIN stmt */
+    interpret 'tfile=' rxexpr
+
+    putidx = putidx + 1           /* Increment PUT count */
+    put.putidx = sfile tfile  /* Save as a PUT request */
+    call logmsg '-- Generated stmt: PUT' put.putidx
+  end
+
+end
+
+return
+
+/**********************************************************************/
+/* Sub: Check FILEEXISTS                                              */
+/* Returns 0 if file is found, 4 if not found                         */
+/**********************************************************************/
+check_fileexists: procedure expose logmsg.
+server = arg(1)
+file = arg(2)
+parse value ftpdir(server,file) with ,
+  ftprc count .
+if ftprc = 0
+then do
+  if count = 0                    /* File exists?    */
+
+  then do                         /* File not found */
+    subrc = 4                     /*  set rc to 4 */
+    call logmsg 'FileExists' file 'File not found:',
+                'ftprc='ftprc 'count='count 'rc=4'
+  end
+
+  else do                         /* File is found */
+    subrc = 0                     /*  set rc to 4 */
+    call logmsg 'FileExists' file 'File is found: rc=0'
+  end
+end
+
+else do
+  call logmsg 'Error - Unable to access server "'server'"',
+                'file "'file'" rc='ftprc
+  subrc = 12                    /* Set RC 12 */
+end
+
+return subrc                      /* Return to caller */
+
+
+/**********************************************************************/
+/* Sub: Send email messages                                           */
+/**********************************************************************/
+sendmail: procedure expose logmsg.
+parse arg recpt ',' subject       /* Get recipents and subject line */
+/* Allocate ds to spin to SMTP */
+wrkdd = '$SMTPWRK'
+ok='0 4';"ALLOC  FI("wrkdd") NEW DELETE REUSE" ,
+         "LRECL(200) RECFM(V B) SYSOUT(B) WRITER(SMTP)"
+
+/* Queue smtp commands on stack */
+ok='*';"MAKEBUF"
+queue 'HELO NJEUPI'
+queue ' MAIL FROM:<MAXIMO@NJEUPI.COM>'
+do i = 1 to words(recpt)
+  queue 'RCPT TO:<'word(recpt,i)'>'
+end
+queue 'DATA'
+queue 'FROM: MAXITRAN'
+queue 'TO: SUPPORT'
+queue 'SUBJECT:' subject
+queue '   '                       /* Queue a blank line - IMPORTANT*/
+do i = 1 to logmsg.0
+  queue logmsg.i                  /* Queue all logmsgs into body */
+end
+queue '.'                         /* SMTP end of data */
+queue 'QUIT'                      /* Smtp quit */
+queue ''                          /* Null for end-of-stack */
+
+ok='0 1';address tso "EXECIO * DISKW" wrkdd "(FINIS"
+ok=0;"DROPBUF"
+ok=0;"FREE FI("wrkdd")"
+
+call logmsg 'Email sent subject:' subject
+call logmsg 'Email sent to:' recpt
+
+return                            /* Return to caller */
+/**********************************************************************/
+/* Sub: GET files                                                     */
+/**********************************************************************/
+get_files:
+address tso
+ok=0;"PROFILE MSGID"                   /* Set MSGIDs on */
+/* Alloc FTP command dataset */
+ok='0 4';"ALLOC  FI(INPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+ok='0 4';"ALLOC  FI(OUTPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+
+
+do i = 1 to getidx                    /* Loop for all datasets to get*/
+  parse var get.i sourcedsn targetdsn ftpparms
+
+  /* Process APPEND keyword if present */
+  append =0                /* Default to GET, not APPEND */
+  kywd = '(APPEND'
+  if pos(kywd,ftpparms) > 0  /* Look for APPEND keyword */
+  then do
+    /* Remove kywd from ftpparms string */
+    ftpparms = delstr(ftpparms,pos(kywd,ftpparms),length(kywd))
+    ftpparms = strip(ftpparms,'B')
+    if sysdsn("'"targetdsn"'") = 'OK'   /* If target already exists,*/
+    then do
+      append=1               /* then use append logic */
+      ok=0;address tso "ALLOC FI(APPOUT) MOD DA('"targetdsn"')"
+    end
+  end
+
+  /* Process REPLACE keyword if present */
+  replace=''               /* Default to no replace */
+  kywd = '(REPLACE'
+  if pos(kywd,ftpparms) > 0  /* Look for REPLACE keyword */
+  then do
+    replace = '(REPLACE'     /* FTP GET operand */
+    /* Remove kywd from ftpparms string */
+    ftpparms = delstr(ftpparms,pos(kywd,ftpparms),length(kywd))
+    ftpparms = strip(ftpparms,'B')
+  end
+
+  /* Test for APPEND & REPLACE together which is not allowed */
+  if append & replace \= ''
+  then do
+    call logmsg "Error - (APPEND and (REPLACE may not be used together."
+    maxrc = max(maxrc, 20)     /* Set RC 12 */
+    signal main_exit           /*  and exit now */
+  end
+
+
+  /* Queue up the FTP commands */
+  ok=0;"NEWSTACK"                    /* Get a clean stack */
+  queue "LCD ''"                     /* Turn off prefix */
+  queue 'CD' get.dir
+  queue 'ASCII'                      /* ASCII transfer mode */
+  if locsite \= ''
+   then queue 'LOCSITE' locsite      /* Allocation parms */
+  if ftpparms \= ''
+   then queue ftpparms                /* LOCSITE Parms for this get */
+  if append
+    then queue 'GET' sourcedsn '//DD:APPOUT'  /* Trans using DD    */
+    else queue 'GET' sourcedsn targetdsn replace
+  queue 'QUIT'
+  queue ''
+  ok=0;"EXECIO * DISKW INPUT (FINIS"  /* Write FTP commands to file */
+  ok=0;"DELSTACK"                    /* Delete the stack */
+
+  ok='*';"FTP" server '(EXIT'              /* Invoke FTP */
+  ftprc = rc                        /* Save off return code */
+
+  fromtomsg =  'from "'get.dir'/'sourcedsn'" to "'targetdsn'"'
+
+  if ftprc = 0                      /* If rc=0, */
+    then if scan_output('EZA1617I') = 1 |, /* scan msgs for trns msg*/
+            scan_output('EZA2517I') = 1
+    then do                             /* GOOD completion */
+      if append
+        then call logmsg 'APPEND successful' fromtomsg
+        else call logmsg 'GET successful' fromtomsg
+      if debug                          /* If debug, */
+        then call list_output           /*  then display the sess msg*/
+    end
+
+    else do                             /* rc 0 but something BAD */
+      call logmsg 'Error-GET unexpected FTP message output',
+                  fromtomsg
+      call logmsg 'Review FTP session log to determine problem'
+      call list_output                /* Display the session msgs */
+      maxrc = max(maxrc,8)            /* Set return code */
+    end
+
+  else do                             /* BAD completion, rc not 0 */
+    call logmsg 'Error-GET ftprc' ftprc fromtomsg
+    maxrc = max(maxrc,8)            /* Set return code */
+    call list_output                /* Display the session msgs */
+  end
+
+end
+
+ok='*';"FREE FI(INPUT)"              /* Free the command file */
+ok='*';"FREE FI(OUTPUT)"             /* Free the msg file     */
+if append
+then do
+  ok='*';"FREE FI(APPOUT)"             /* Free the target file  */
+end
+
+return
+
+
+/**********************************************************************/
+/* Sub: Delete files that were GOT                                    */
+/**********************************************************************/
+delete_get_files:
+address tso
+ok=0;"PROFILE MSGID"                   /* Set MSGIDs on */
+/* Alloc FTP command dataset */
+ok='0 4';"ALLOC  FI(INPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+ok='0 4';"ALLOC  FI(OUTPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+
+/* Queue up the FTP commands */
+ok=0;"NEWSTACK"                    /* Get a clean stack */
+queue 'CD' get.dir
+if debug                          /* If debug, */
+  then queue 'DIR'                /*  then insert a DIR cmd */
+dellist.=0                       /* List to track dsns we delete */
+do i = 1 to getidx                    /* Loop for all datasets to get*/
+  parse var get.i sourcedsn .
+  if \dellist.sourcedsn          /* Have we already deleted this dsn?*/
+  then do                        /* No */
+    queue 'DELETE' sourcedsn     /* Add the delete command */
+    dellist.sourcedsn = 1        /* Add this dsn to list */
+  end
+end
+if debug                          /* If debug, */
+  then queue 'DIR'                /*  then insert a DIR cmd */
+queue 'QUIT'
+queue ''
+ok=0;"EXECIO * DISKW INPUT (FINIS"  /* Write FTP commands to file */
+ok=0;"DELSTACK"                    /* Delete the stack */
+
+ok='*';"FTP" server '(EXIT'              /* Invoke FTP */
+ftprc = rc                        /* Save off return code */
+if ftprc = 0
+then do
+  if debug                          /* If debug, */
+    then call list_output           /*  then display the sess msg*/
+  call logmsg 'DELETE of GET source files successful'
+end
+
+else do
+  call logmsg 'Error-DELETE of GET source files failed with ftprc' ,
+              ftprc'. See session log for details.'
+  maxrc = max(maxrc,8)            /* Set return code */
+  call list_output           /*  then display the sess msg*/
+end
+
+
+ok='*';"FREE FI(INPUT)"              /* Free the command file */
+ok='*';"FREE FI(OUTPUT)"             /* Free the msg file     */
+
+return
+
+
+
+/**********************************************************************/
+/* Sub: PUT files                                                     */
+/**********************************************************************/
+put_files:
+address tso
+ok=0;"PROFILE MSGID"                   /* Set MSGIDs on */
+/* Alloc FTP command dataset */
+ok='0 4';"ALLOC  FI(INPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+ok='0 4';"ALLOC  FI(OUTPUT) NEW DELETE REUSE" ,
+         "LRECL(80) RECFM(F B) UNIT(VIO)"
+
+
+do i = 1 to putidx                    /* Loop for all datasets to get*/
+  parse var put.i sourcedsn targetdsn ftpparms
+
+  /* Queue up the FTP commands */
+  ok=0;"NEWSTACK"                    /* Get a clean stack */
+  queue 'SENDSITE'                   /* Toggle off site data */
+  queue "LCD ''"                     /* Turn off prefix */
+  queue 'CD' put.dir
+  queue 'ASCII'                      /* ASCII transfer mode */
+  if ftpparms \= ''
+   then queue ftpparms                /* Parms for this get */
+  queue 'PUT' sourcedsn targetdsn     /* Transfer the dataset */
+  if debug                          /* If debug, */
+    then queue 'DIR'                /*  then insert a DIR cmd */
+  queue 'QUIT'
+  queue ''
+  ok=0;"EXECIO * DISKW INPUT (FINIS"  /* Write FTP commands to file */
+  ok=0;"DELSTACK"                    /* Delete the stack */
+
+  ok='*';"FTP" server '(EXIT'              /* Invoke FTP */
+
+  ftprc = rc                        /* Save off return code */
+
+  fromtomsg =  'from "'sourcedsn'" to "'put.dir'/'targetdsn'"'
+
+  if ftprc = 0                      /* If rc=0, */
+    then if scan_output('EZA1617I') = 1 |, /* scan msgs for trns msg*/
+            scan_output('EZA2517I') = 1
+    then do                             /* GOOD completion */
+      call logmsg 'PUT successful' fromtomsg
+      if debug                          /* If debug, */
+        then call list_output           /*  then display the sess msg*/
+    end
+
+    else do                             /* rc 0 but something BAD */
+      call logmsg 'Error-PUT unexpected FTP message output',
+                  fromtomsg
+      call logmsg 'Review FTP session log to determine problem'
+      maxrc = max(maxrc,8)            /* Set return code */
+      call list_output                /* Display the session msgs */
+    end
+
+  else do
+    call logmsg 'Error-PUT ftprc' ftprc fromtomsg
+    maxrc = max(maxrc,8)            /* Set return code */
+    call list_output                /* Display the session msgs */
+  end
+
+end
+
+ok='*';"FREE FI(INPUT)"              /* Free the command file */
+ok='*';"FREE FI(OUTPUT)"             /* Free the msg file     */
+
+return
+
+
+
+/**********************************************************************/
+/* Sub: Check directory lock status                                   */
+/**********************************************************************/
+/* For PUT, dir is locked if any files present, unlocked if empty */
+/* For GET, dir is locked if any *.lck files are present          */
+test_lock: procedure expose logmsg. maxrc debug
+gotlock = 0                       /* We have lock flag */
+server=arg(1)                     /* Server */
+dir = arg(2)                      /* Dir to test */
+mask = arg(3)                     /* File that represents a lock */
+lock_wait = 3                     /* seconds to wait for lock */
+lock_tries = 2                    /* How many times to try lock */
+
+
+try_lock:
+lock_tries = lock_tries - 1       /* Decrement counter */
+parse value ftpdir(server,dir||mask) with ,
+  ftprc count .
+select
+
+  when ftprc = 0 & count = 0      /* When ok and no lock found, */
+    then gotlock = 1              /*  the set flag we have lock */
+
+
+  when ftprc = 0 & count > 0 & ,  /* Lock was found */
+       lock_tries > 0             /*  and retries remain */
+  then do
+    if debug
+      then say 'Waiting for lock, lock_tries=' lock_tries
+    ok=0;address tso "WAIT" lock_wait*100   /* Wait 100ths secs */
+    signal try_lock               /* Go try the lock again */
+  end
+
+
+  when ftprc = 0 & count > 0 & ,  /* Lock was found */
+       lock_tries <= 0             /*  and no retries remain */
+    then nop                      /* Do nothing - just fall through*/
+
+
+  when ftprc = 14550              /* Directory not found */
+  then do
+    call logmsg 'Error-Invalid directory "'dir'".'
+    maxrc = max(maxrc,12)         /* Set return code */
+  end
+
+
+  otherwise do
+    call logmsg 'Error-Unexpected return from FTPDIR'
+    call logmsg 'ftprc='ftprc 'count='count 'server='server,
+                      'dir='dir 'mask='mask
+  end
+
+end
+
+return gotlock                    /* return lock status */
+
+
+
+/**********************************************************************/
+/* Sub: Copy ftp msg stream from OUTPUT dd to SAY                     */
+/**********************************************************************/
+list_output:
+say '--------FTP Session log follows--------'
+ok=0;"EXECIO * DISKR OUTPUT (STEM x. FINIS"
+do i = 1 to x.0
+  say strip(x.i,'T')
+end
+return                            /* Return to caller   */
+
+
+/**********************************************************************/
+/* Sub: Scan the ftp msg OUTPUT ds for a string                       */
+/**********************************************************************/
+scan_output: procedure
+str = arg(1)                      /* String to scan for */
+ok=0;"EXECIO * DISKR OUTPUT (STEM x. FINIS"
+/* Put all the messages into one var for parse */
+bigmsg =''
+do i = 1 to x.0
+  bigmsg = bigmsg strip(x.i,'B')
+end
+
+x = wordpos(str,bigmsg)           /* Scan for argument string */
+if x = 0                          /* If not found, */
+  then return 0                   /*  return not found */
+  else return 1                   /*  return found */
+
+
+
+/**********************************************************************/
+/* Sub: Read control cards                                            */
+/**********************************************************************/
+read_control_cards:
+ok=0;"EXECIO * DISKR SYSIN (STEM cardin. FINIS"
+
+do i = 1 to cardin.0
+
+  parse var cardin.i keyword keyparm
+  upper keyword;                    /* Make keyword uppercase */
+  keyparm = strip(keyparm,'B')
+
+  if right(keyparm,1) = ','       /* If continued, */
+  then do while right(keyparm,1) = ',' & i < cardin.0
+    i = i + 1
+    keyparm = delstr(keyparm,length(keyparm),1) || strip(cardin.i,'B')
+  end
+
+  select
+
+    when left(keyword,1) = '*'         /* Ignore comment lines */
+      then nop
+
+    when keyword = 'EMAIL-ON-ERROR'    /* Email address for error */
+      then email_on_error_list = ,
+           email_on_error_list keyparm  /* Add to list */
+
+    when keyword = 'EMAIL-ON-SUCCESS'    /* Email address for success*/
+      then email_on_success_list = ,
+           email_on_success_list keyparm  /* Add to list */
+
+    when keyword = 'FILEEXISTS'
+    then do
+      feidx = feidx + 1             /* Increment count */
+      fileexists.feidx = keyparm    /* Save filename to test  */
+    end
+
+    when keyword = 'NOTFILEEXISTS'
+    then do
+      nfeidx = nfeidx + 1             /* Increment count */
+      notfileexists.nfeidx = keyparm    /* Save filename to test  */
+    end
+
+    when keyword = 'GET'
+    then do
+      getidx = getidx + 1           /* Increment count */
+      get.getidx = keyparm          /* Save get parms         */
+    end
+
+    when keyword = 'GETLOCK'
+    then do
+      if translate(strip(keyparm,'B')) = 'NO'
+        then flagUseGetLock = 0          /* If no lock, turn off flag */
+        else getLockMask = strip(keyparm,'B')
+    end
+
+    when keyword = 'GETMASK'
+    then do
+      getmaskidx = getmaskidx + 1   /* Increment count */
+      getmask.getmaskidx = keyparm          /* Save get parms         */
+    end
+
+    when keyword = 'PUTMASK'
+    then do
+      putmaskidx = putmaskidx + 1   /* Increment count */
+      putmask.putmaskidx = keyparm          /* Save get parms         */
+    end
+
+    when keyword = 'GETDELETE'
+    then do
+      keyparm = strip(keyparm,'B')
+      upper keyparm
+      select
+        when keyparm = 'NO'
+          then flagGetDelete = 0
+        when keyparm = 'YES'
+          then flagGetDelete = 1
+        otherwise do
+          call logmsg ,
+          'Error- SYSIN card' i '- invalid value for GETDELETE. Must' ,
+          'be YES or NO'
+          maxrc = max(maxrc,20)
+        end
+      end
+    end
+
+    when keyword = 'GETDIR'
+      then get.dir = keyparm
+
+    when keyword = 'LOCSITE'        /* Allocation parms */
+      then locsite = keyparm
+
+    when keyword = 'PUT'
+    then do
+      putidx = putidx + 1           /* Increment count */
+      put.putidx = keyparm          /* Save put parms         */
+    end
+
+    when keyword = 'PUTLOCK'
+    then do
+      if translate(strip(keyparm,'B')) = 'NO'
+        then flagUsePutLock = 0          /* If no lock, turn off flag */
+        else putLockMask = strip(keyparm,'B')
+    end
+
+    when keyword = 'PUTDIR'
+      then put.dir = keyparm
+
+    when keyword = 'SERVER'
+      then server = keyparm
+
+
+    otherwise do
+      call logmsg ,
+      'Error- SYSIN card' i '- unrecognized keyword' keyword
+      maxrc = max(maxrc,20)
+    end
+
+  end                           /* End select */
+end
+return                          /* * return to caller * */
+
+/*********************************************************************/
+/**   Translate a boolen to YES or NO                               **/
+/*********************************************************************/
+flagYN: procedure
+arg flag
+if flag
+  then return 'YES'
+  else return 'NO'
+
+/*********************************************************************/
+/**   Display and save log messages                                 **/
+/*********************************************************************/
+logmsg: procedure expose logmsg.
+parse arg xmsg
+/* Add date, time, jobname to msg */
+xmsg = right(date('S'),6),
+       space(translate(time('N'),'',':'),0),
+       logmsg.jobname xmsg
+
+logmsg.0 = logmsg.0 + 1; x = logmsg.0
+logmsg.x = xmsg                    /* Add msg to array  */
+say xmsg                           /* Display the message */
+
+if logmsg.alloc                    /* If logfile allocated, */
+then do                            /*  then write msg to logfile */
+  push xmsg                          /* Put msg on stack */
+  ok='0 1';address tso "EXECIO 1 DISKW LOG"
+end
+
+return                            /* Return to caller */
+
+/*********************************************************************/
+/**   Display parms for this run                                    **/
+/*********************************************************************/
+display_parms:
+call logmsg 'The following parameters will be used -----------'
+call logmsg 'SERVER='server 'PUTDIR='put.dir 'GETDIR='get.dir
+call logmsg 'DELETE AFTER GET=' flagYN(flagGetDelete)
+if flagUseGetLock
+  then call logmsg 'USING GET LOCK=' getLockMask
+  else call logmsg 'NO GET LOCK'
+if flagUsePutLock
+  then call logmsg 'USING PUT LOCK=' putLockMask
+  else call logmsg 'NO PUT LOCK'
+call logmsg 'LOCSITE='locsite
+call logmsg 'EMAIL-ON-ERROR=' email_on_error_list
+call logmsg 'EMAIL-ON-SUCCESS=' email_on_success_list
+call logmsg '---------- End of parameter list'
+return                            /* Return to caller */
+
+
+/*********************************************************************/
+/**   Convert a relative GDS name to abslute name                   **/
+/*********************************************************************/
+resolve_gds_name: procedure expose logmsg. maxrc
+base = arg(1)
+relgen = arg(2)
+select
+  /* No (..) suffix on dsn */
+  when relgen = ''
+  then do
+    return base
+  end
+
+  /* A (nn) suffix on dsn - must be gdg */
+  when datatype(relgen, 'NUM')
+  then do
+    fulldsname = base'('relgen')'
+    /*TODO: replace with more robust getgdg function */
+    parse value getgdg(fulldsname) with fulldsname .
+    /* Some error from getgdg()? */
+    if datatype(fulldsname,'NUM') | left(fulldsname,1) = '*'
+    then do
+      call logmsg 'Error-Resolving GDS' base'('relgen')'
+      call logmsg 'Error return from getgdg(): ' fulldsname
+      maxrc = max(maxrc,8)
+    end
+    return fulldsname
+  end
+
+  /* some (aaaa) suffix - must be pds */
+  otherwise do
+    return base'('relgen')'
+  end
+
+end
+
+/*********************************************************************/
+/**   Returns the dsname without paren portion                      **/
+/*********************************************************************/
+basename: procedure
+parse arg base '(' .
+return base
+/*********************************************************************/
+/**   Returns the portion of the name in parens                     **/
+/*********************************************************************/
+member_name: procedure
+parse arg . '(' mem ')' .
+return mem
+/*********************************************************************/
+/**   Tests if the dsname appears to be a relative GDG name         **/
+/*********************************************************************/
+isRelativeGds: procedure
+/* If "member name" portion is a number, then it's a relative gds */
+if datatype(member_name(arg(1)), 'NUM')
+  then return 1
+  else return 0
+
+/*********************************************************************/
+/**   A group of special rexx expressions to use in filenames       **/
+/*********************************************************************/
+/*********************************************************************/
+/**   Convience function to get GDS G0000V00 portion of name        **/
+/*********************************************************************/
+gdsversion: procedure
+dsname = arg(1)
+/* Find last node in dsn */
+lastdot = lastpos('.',dsname)
+/* No node, return empty */
+if lastdot = 0
+  then return ''
+/* Get the assumed G0000V00 node */
+gv = substr(dsname,lastdot+1)
+/* Break out the numbers */
+parse var gv 'G' gen 'V' ver
+/* Validate that it looks like a G0000V00 */
+if datatype(gen || ver,'NUM')
+  then return gv
+else return ""   /* Couldn't find it - return empty */
+/*********************************************************************/
+/**   Convience function to get HHMMSS time stamp                   **/
+/*********************************************************************/
+hhmmss: procedure
+return space(translate(time('n'),'',':'),0)
+/*********************************************************************/
+/**   Convience function to get YYMMDD date stamp                   **/
+/*********************************************************************/
+yyyymmdd: procedure
+return date('S')
+/*********************************************************************/
+/**   Convienence function to return a token from a string           **/
+/*********************************************************************/
+token: procedure
+str = arg(1)       /* The string to parse */
+pos = arg(2)       /* Which token to return */
+delim = arg(3)     /* Delimiter that seperates tokens */
+maxlen = arg(4)    /* Max length of returned token */
+if delim = ''      /* If no delim provided, use default */
+  then delim = '.'
+do pos
+  parse var str retToken (delim) str
+end
+if maxlen <>  ''   /* If a maxlength was specified, then truncate */
+  then parse var retToken 1 retToken +(maxlen)
+return retToken
+/*********************************************************************/
+/**   Returns incremented counter value                             **/
+/*********************************************************************/
+counter:
+sfx = arg(1)
+counter.sfx = counter.sfx + 1;
+return right(counter.sfx,4,'0')
+
+/*********************************************************************/
+/**   Cleanup after error                                           **/
+/*********************************************************************/
+cleanup_after_error:
+address tso "FREE FI(INPUT)"
+address tso "FREE FI(OUTPUT)"
+address tso "FREE FI(APPOUT)"
+exit 20
+
+/*********************************************************************/
+/**   standard error handling routine                               **/
+/*********************************************************************/
+errproc:
+if condition('c') = 'ERROR' & symbol('OK') = 'VAR'
+  then if wordpos(rc,ok) > 0 | ok = '*' then return;   /* Not an error*/
+/* Cancel error traps to prevent recursion */
+signal off syntax
+signal off novalue
+call off error
+/* error presentation code */
+error_type = condition('c')
+say error_type 'at line' sigl ':' condition('d')
+if error_type = 'SYNTAX'
+  then say errortext(rc)
+if error_type = 'ERROR' & symbol('zerrlm') = 'VAR'
+  then say zerrlm
+if error_type = 'ERROR'
+  then say 'Return code = ' rc
+call cleanup_after_error

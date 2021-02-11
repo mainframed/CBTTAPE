@@ -1,0 +1,905 @@
+/* REXX - DBRCINIT ***************************************************/
+/* TITLE    : Generate DBRC DB Registration Statements               */
+/*
+ this process is jcl driven: see job in jcldbrc(dbrcinit).
+ If the TIME parm is required to be used to run your jobs, note that
+ I have had to use time=(5) to get the batch job to complete w/cc=0.
+
+ Using the output of LIST.RECON will cause problems.
+       The program is coded to only use the commands below:
+
+      READ OUTPUT OF THE FOLLOWING LIST COMMANDS:
+               LIST.RECON STATUS
+               LIST.DB ALL DBDS
+               LIST.DBDSGRP ALL
+               LIST.CAGRP ALL
+      GENERATE THE FOLLOWING INIT COMMANDS:
+               INIT.RECON
+               INIT.DB
+               INIT.DBDS
+               INIT.DBDSGRP
+               INIT.CAGRP
+
+Larry Prestosa (USA)
+c Xephon 1996
+
+    modified by Larry Altman(lda) 8,9/2004 (generally lower case char)
+          - run against IMS V6.1 recons to produce command output.
+          - run against IMS V7.1 recons to produce command output.
+          - i added change.dbds icoff stmts as comments, since the
+            the dba has the option to take full images or not after
+            registration.
+          - i added delete.db stmts as comments, to be uncommented as
+            needed.
+          - the change.dbds stmts are easily deleted if desired:
+            - edit the listcmd dataset,
+            - only change.dbds,
+            - delete nx all
+            - save.
+    modified by Larry Altman(lda) 3/2005   (generally lower case char)
+          - made ALL code conform to my liking:
+            - aka lower case chars except for literals
+            - removed space surrounding operators, e.g. =, >, \=.
+            - changed all use of the INDEX function to the POS function
+          - for each init.db/dbds & if 'i' passed to the program
+            - generate NOTIFY.IC stmts with keyword values
+              collected from the recon
+          - removed all code for FP Areas/ADS
+          - added code to support registered HALDBs.
+            - generate INIT.DB,INIT.PART, and NOTIFY.IC when 'I' passed
+              to the program.
+          - changed all use of '.' in variable names to '_' to prevent
+            variable substitution.
+          - renamed to be dbrcinit(DBRC INIT statement generator)
+          - replaced the me() func with standard rexx func: userid()
+*/
+signal on halt                         /*lda: 08/29/04*/
+call on error                          /*lda: 08/29/04*/
+
+parse upper arg generate_ic_stmts
+strt_comment='  /*'
+end_comment='  */'
+/*********************************** ALLOCATE FORGROUND FILES USED ***/
+x=msg('off')
+if sysvar(sysenv)='FORE' then
+  do
+    sysut1=userid()'.recon.listing'             /*lda: 08/29/04*/
+    sysut2=userid()'.recon.initcmd'             /*lda: 08/29/04*/
+    say "allocating foreground datasets..."     /*lda: 08/29/04*/
+    "free fi(sysut1,sysut2)"                    /*lda: 08/29/04*/
+    "alloc fi(sysut1) da('"sysut1"') shr"       /*lda: 08/29/04*/
+    "del '"sysut2"'"
+    "alloc fi(sysut2) da('"sysut2"') new catalog unit(sysda) lrecl(80)",
+    "recfm(f b) space(1 1) cylinders"
+  end
+/************************************* READ INPUT FILE   *****/
+/* this forever loop reads the recon rec by record and processes the
+ recon record it found. it's purpose is to pickup the "header" record
+ for each record type, e.g. DB, DBDS, DBDSGRP, ... .
+ it does NOT process all DB,
+ then all DBDS, then all ... records.  therefore when it hits IMAGE
+ records they are being processed just after the preceeding DBDS record.
+*/
+"delstack"
+do forever
+   "execio 1 diskr sysut1"
+   pull inrecord
+   inrecord_type=word(inrecord,1)               /*lda: 08/29/04*/
+   select
+     when inrecord_type='RECON' then
+       call process_recon_record
+     when inrecord_type='DB'      then
+       do
+         "execio 1 diskr sysut1"
+         pull inrecord
+         select
+         when pos('=HALDB',inrecord)>0 then
+           call process_typehal_dbrcn_recs
+         when pos('=PART',inrecord)>0 then
+           call process_typepart_dbrcn_recs
+         when pos('=IMS',inrecord)>0 then
+           call process_typeims_dbrcn_recs
+         otherwise nop
+         end /* of select */
+       end
+     when inrecord_type='DBDS'  then
+       do
+        "execio 1 diskr sysut1"/* get the dsn data in the DBDS rec  */
+        pull inrecord          /* which also has the type=.         */
+        if pos('=PART',inrecord)>0 then
+          do
+            call process_typepart_dbdsrcn_recs
+            if dataset_type='NON-L-NON-X' then
+              do
+                call decompose_key
+                call write_init_part_stmt
+              end
+          end
+        else call process_typeims_dbdsrcn_recs
+       end
+/* this will be the 1st IMAGE record following a DBDS record. */
+     when inrecord_type='IMAGE' & generate_ic_stmts='I' then
+       call process_image_record
+     when inrecord_type='DBDSGRP' then
+       call process_dbdsgrp_record
+     when inrecord_type='CAGRP' then
+       call process_cagrp_record
+     otherwise
+       nop
+   end /* of select */
+end
+
+done:
+"execio 0 diskw sysut2(finis"
+"execio 0 diskr sysut1(finis"
+if sysvar(sysenv)='FORE' then                 /*lda: 08/29/04*/
+  do
+    "free fi(sysut1,sysut2)"
+    address ispexec "edit dataset('"sysut2"')"
+  end
+exit rc
+
+process_recon_record:
+   inrecord=' '
+   initrecon_command='INIT.RECON'
+   initrecon_control=''                 /* default - lda: 3/25/05 */
+   do until pos('CATALOGED',inrecord)\=0
+     "execio 1 diskr sysut1"
+     pull inrecord
+     if pos('CATALOGED=',inrecord)>0 then
+     do
+       separator='CATALOGED='
+       parse var inrecord . (separator) wk.catds .
+       if wk.catds='YES' then
+         initrecon_catds='CATDS'
+       else
+         initrecon_catds='NOCATDS'
+     end
+     if pos('FORCER',inrecord)>0 then
+       initrecon_forcer='FORCER'
+     if pos('NOFORCER',inrecord)>0 then
+       initrecon_forcer='NOFORCER'
+     if pos('DASD UNIT=',inrecord)>0 then
+     do
+       separator='DASD UNIT='
+       parse var inrecord . (separator) wk.dasdunit .
+       initrecon_dasdunit='DASDUNIT('||wk.dasdunit||')'
+     end
+     if pos('CHECK=',inrecord)>0 then
+     do
+       separator='CHECK='
+       parse var inrecord . (separator) initrecon_check .
+     end
+     if pos('TAPE UNIT=',inrecord)>0 then
+     do
+       separator='TAPE UNIT='
+       parse var inrecord . (separator) wk.tapeunit .
+       initrecon_tapeunit='TAPEUNIT('||wk.tapeunit||')'
+     end
+     if pos('SSID=',inrecord)>0 then
+     do
+       separator='SSID='
+       parse var inrecord . (separator) wk.ssid .
+       initrecon_ssid='SSID('||wk.ssid||')'
+     end
+     if pos('CONTROL=',inrecord)>0 then
+     do
+       separator='CONTROL='
+       parse var inrecord . (separator) wk.control .
+       if wk.control= 'SHARE' then
+         initrecon_control='SHARECTL'
+       else
+         initrecon_control='RECOVCTL'
+     end
+     if pos('STARTNEW=',inrecord)>0 then
+     do
+       separator='STARTNEW='
+       parse var inrecord . (separator) wk.startnew .
+       if wk.startnew= 'YES' then
+         initrecon_startnew='STARTNEW'
+       else
+         initrecon_startnew='NONEW'
+     end
+   end
+   queue initrecon_command,
+         initrecon_catds,
+         initrecon_dasdunit,
+         initrecon_forcer,
+         initrecon_check,
+         '-'
+   queue '          ',
+         initrecon_control,
+         initrecon_ssid,
+         initrecon_startnew,
+         initrecon_tapeunit
+   "execio * diskw sysut2"
+return
+
+process_typeims_dbrcn_recs:
+/* inrecord='' */
+   initdb_command='INIT.DB  '
+   deldb_command ='DELETE.DB '
+   dbd=''
+   initdb_recov='        '    /* defaults             */
+   shrlevel='0'               /* defaults             */
+   imstype='IMS'              /* defaults             */
+   psname=''                  /* defaults             */
+/* process the recon DB record. */
+/*
+do until pos('RECOVERABLE',inrecord)>0
+  if pos('RECOVERABLE',inrecord)=0 then
+*/
+    do
+/*    "execio 1 diskr sysut1"/* coming in with the DBD= record */
+      pull inrecord
+*/
+      trnslated_rec=translate(inrecord,' ','=')
+      if word(trnslated_rec,1)='DBD' then parse var inrecord '=' dbd .
+      "execio 1 diskr sysut1";pull inrecord /* get the sharelvl rec */
+      if word(inrecord,1)='SHARE' then parse var inrecord '=' shrlevel .
+      "execio 1 diskr sysut1";pull inrecord
+    /* read until i get there. */
+      do until pos('RECOVERABLE           =',inrecord)>0
+        "execio 1 diskr sysut1"
+        pull inrecord
+      end
+      parse var inrecord '=' recovyesno .
+      if recovyesno='YES' then recov ='RECOVABL'
+      else if recovyesno='NO' then recov ='NONRECOV'
+    end
+/*end*/
+   /*lda: 09/07/04: added next 2 stmts */
+   queue strt_comment delete.db 'DBD('dbd')' end_comment
+   "execio 1 diskw sysut2"
+
+   initdb=initdb_COMMAND,
+         'DBD('dbd')',
+         'SHARELVL('shrlevel')',
+         imstype
+         queue initdb recov
+         queue
+   "execio * DISKW SYSUT2"
+return
+
+process_typeims_dbdsrcn_recs:
+   initdbds_cmd='INIT.DBDS'
+   changedbds  ='CHANGE.DBDS'        /*lda: 08/29/04*/
+   initdbds_defltjcl=''              /* default              */
+   initdbds_icjcl=''                 /* default              */
+   initdbds_oicjcl=''                /* default              */
+   initdbds_recovjcl=''              /* default              */
+   initdbds_recovpd='0'              /* default              */
+   initdbds_reuse=''                 /* default              */
+   initdbds_dbd=''                   /* initialize           */
+   initdbds_dsn=''                   /* initialize           */
+   dbd=''                            /* initialize           */
+   ddn=''                            /* initialize           */
+   initdbds_genmax=''                /* initialize           */
+/* do until pos('---------',inrecord) \= 0
+     "execio 1 diskr sysut1"
+     pull inrecord */
+    parse var inrecord 'DSN=' dsn .
+    "execio 1 diskr sysut1";pull inrecord
+    parse var inrecord . 'DBD=' dbd . 'DDN=' ddn .
+    "execio 1 diskr sysut1";pull inrecord
+    parse var inrecord . 'GENMAX=' genmax .
+    "execio 1 diskr sysut1";pull inrecord
+    parse var inrecord reuse_noreuse . 'RECOVPD=' recovpd .
+    reuse_noreuse=strip(reuse_noreuse,'l')
+    "execio 1 diskr sysut1";pull inrecord
+    parse var inrecord 'DEFLTJCL=' defltjcl . 'ICJCL=' icjcl .,
+      'OICJCL=' oicjcl . 'RECOVJCL=' recovjcl .
+    "execio 1 diskr sysut1"
+    pull inrecord
+    parse var inrecord 'RECVJCL=' icrcvjcl .
+    if   defltjcl='**NULL**' then defltjcl=''
+    else defltjcl='DEFLTJCL('defltjcl')'
+   queue initdbds_cmd 'DBD('dbd') DDN('ddn') -'
+   queue '          DSN('dsn') -'
+   queue '          GENMAX('genmax')',
+         'RECOVPD('recovpd')' reuse_noreuse '-'
+   if defltjcl\='' then
+     do
+       queue '          ICJCL('icjcl') OICJCL('oicjcl')',
+             'RECOVJCL('recovjcl') -'
+       queue '          'defltjcl
+     end
+   else queue '          ICJCL('icjcl') OICJCL('oicjcl')',
+              'RECOVJCL('recovjcl')'
+   /*lda: 08/29/04: next 3 stmts */
+   queue strt_comment changedbds initdbds_dbd ddn 'ICOFF',
+         end_comment
+   if generate_ic_stmts='' then queue strt_comment end_comment
+   queue
+   "execio * diskw sysut2"
+return
+
+/*
+>>__NOTIFY.IC__DBD(name)__ _DDN(name)__ __ICDSN(name)___________________
+                             |_AREA(name)_|
+   >__RUNTIME(timestamp)__ ______________________ ______________________
+                          |           _1_____    |
+                          |_FILESEQ(_|_value_|_)_|
+                                                    _BATCH____
+   >__ _______________________ __ ______________ __|__________|_________
+      |            _1_____    |  |_ICDSN2(name)_|  |_ONLINE___|
+      |_FILESEQ2(_|_value_|_)_|                    |_CIC______|
+                                                   |_SMSCIC___|
+                                                   |_SMSNOCIC_|
+   >__ ______________________ __ _______________________ _______________
+      |_RECDCT(value)_|  |_STOPTIME(timestamp)_|
+>__ ______________________ __ _______________________ __________________
+      |        _3400_____    |  |         _3400_____    |
+      |_UNIT(_|_unittype_|_)_|  |_UNIT2(_|_unittype_|_)_|
+   >__ _______________________ __ ________________________ _____________
+      |          <_,______    |  |           <_,______    |
+      |_VOLLIST(___volser_|_)_|  |_VOLLIST2(___volser_|_)_|
+   >__ _____________ ___________________________________________________
+      |_USID(value)_|
+*/
+process_image_record:
+   inrecord=''
+   notifyic_stmt=''
+   notifyic_cmd='NOTIFY.IC'
+   notifyic_vollist=''
+   icdsn=''
+   fileseq=''
+   vollist=
+   unit=''
+   icdsn2=''
+   fileseq2=''
+   vollist2=
+   unit2=''
+   do until pos('---------',inrecord)\= 0
+     "execio 1 diskr sysut1"
+       pull inrecord
+       if pos('REORG',inrecord)>0 then /* when i find a reorg rec. */
+         do
+           "execio 1 diskr sysut1" /* get the reorg run rec and */
+           pull inrecord    /* then goback to loop top for next rec.*/
+           iterate
+         end
+     do until pos('IMAGE',inrecord)\= 0 | pos('DSP0180I',inrecord)\=0
+       select
+         when pos('RUN',inrecord)> 0 then call collect_icrun_record_data
+         when pos('IC1',inrecord)>0 then call collect_ic1_data
+         when pos('IC2',inrecord)>0 then call collect_ic2_data
+         otherwise leave
+       end /* of select */
+     end
+     if snglic='yes' | dualic='yes' then call write_notifyic_stmt
+   end
+return
+
+collect_icrun_record_data:
+parse var inrecord '= ' icdate ictime . . 'COUNT =' reccnt .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord '= ' stopdate stoptime ictype 'USID=' usid .
+ictype=strip(ictype)
+"execio 2 diskr sysut1"
+do 2;pull inrecord;end
+return
+
+collect_ic1_data:
+snglic='yes'
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord 'DSN=' icdsn . 'SEQ=' fileseq .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord '=' unittype .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord '=' vollist .
+notifyic_vollist=vollist
+/*
+this loop will get the remaining list of volumes on subsequent
+lines, if any.
+*/
+do until inrecord=''
+  if right(vollist,1)\=',' then
+    do
+      "execio 1 diskr sysut1"
+      pull inrecord
+    end
+  else
+  if right(vollist,1)=',' then
+    do
+      "execio 1 diskr sysut1"
+      pull inrecord
+      if inrecord\='' then
+        do
+          parse var inrecord '=' vollist .
+          notifyic_vollist=notifyic_vollist||vollist
+        end
+    end
+end
+/*
+the volumes have been collected and their collection has been
+stopped by the retrieval of a blank line.  to determine what should
+happen next, we get another line.
+*/
+  "execio 1 diskr sysut1";pull inrecord
+return
+
+/*
+*/
+collect_ic2_data:
+dualic='yes'
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord 'DSN=' icdsn2 . 'SEQ=' fileseq2 .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord '=' unittype2 .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord '=' vollist2 .
+notifyic_vollist2=vollist2
+do until inrecord=''
+  if right(vollist2,1)\=',' then
+    do
+      "execio 1 diskr sysut1"
+      pull inrecord
+    end
+  else
+  if right(vollist2,1)=',' then
+    do
+      "execio 1 diskr sysut1"
+      pull inrecord
+      if inrecord\='' then
+        do
+          parse var inrecord vollist2 .
+          notifyic_vollist2=notifyic_vollist2||vollist2
+        end
+    end
+end
+/*
+the volumes have been collected and their collection has been
+stopped by the retrieval of a blank line.  to determine what should
+happen next, we get another line.
+*/
+"execio 1 diskr sysut1";pull inrecord
+return
+
+/*
+code to split the completed vollist(s) into multiple lines
+if it is>41 chars long.
+   unit(3480) vollIST2(-
+   W69838,W13819,E73739,W51399,356394,X92161,X92161,X92161,X92161,-
+   W69838,W13819,E73739,W51399)
+*/
+write_notifyic_stmt:
+queue notifyic_cmd 'DBD('dbd') DDN('ddn') -'
+/*queue notifyic_cmd initdbds_dbd initdbds_ddn '-'*/
+queue '   ICDSN('icdsn') FILESEQ('fileseq') -'
+queue "   RUNTIME('"icdate ictime"')" ictype "USID("usid") -"
+queue "   STOPTIME('"stopdate stoptime"') RECDCT("reccnt") -"
+if dualic='yes' then call dualic_notify
+else call snglic_notify
+queue strt_comment end_comment
+queue
+"execio * diskw sysut2"
+snglic=''
+dualic=''
+return
+
+/*
+*/
+dualic_notify:
+if length(notifyic_vollist)<=41 then
+  queue '   UNIT('unittype') VOLLIST('notifyic_vollist') -'
+else
+  do
+    queue '   UNIT('unittype') -'
+    queue '   VOLLIST( -'
+    queue '   'notifyic_vollist')'
+  end
+queue '   ICDSN2('icdsn2') FILESEQ2('fileseq2') -'
+if length(notifyic_vollist2)<=41 then
+  queue '   UNIT2('unittype2') VOLLIST2('notifyic_vollist2')'
+else
+  do
+    queue '   UNIT2('unittype') -'
+    queue '   VOLLIST2( -'
+    queue '   'notifyic_vollist2')'
+  end
+return
+
+/*
+*/
+snglic_notify:
+/* only line and all volumes can fit on one line. */
+if length(notifyic_vollist)<=41 then
+  queue '   UNIT('unittype') VOLLIST('notifyic_vollist')'
+else
+/* only line and we force all volumes to be on one line. */
+/* by moving the vollist to it's own line.               */
+  if length(notifyic_vollist)>=42 & length(notifyic_vollist)<=62 then
+  do
+    queue '   UNIT('unittype') -'
+    queue '   VOLLIST(-'
+    queue '   'notifyic_vollist')'
+  end
+else
+/* the vollist cannot even be forced to it's own line as above due to
+length,
+so we split it up into multiple lines.
+the 1st line must end in a comma since the max=63 has odd # of vols and
+odd # of commas. */
+  if length(notifyic_vollist)>=63 then
+  do
+    queue '   UNIT('unittype') -'
+    queue '   VOLLIST(-'
+    old_vollist=notifyic_vollist
+    do until length(old_vollist)<=63
+      if length(old_vollist)>63 then
+        do
+          call split_vollist
+          queue '   '1stline_of_volumes '-'
+        end
+      else queue '   'old_vollist
+    end
+  end
+return
+
+split_vollist:
+  parse var old_vollist 1stline_of_volumes 64 old_vollist
+return
+
+process_dbdsgrp_record:
+   inrecord=' '
+   initdbdsgrp_command='INIT.DBDSGRP'
+   initdbdsgrp_grpname=''
+   "execio 1 diskr sysut1"
+   pull inrecord
+   if pos('GRPNAME=',inrecord)>0 then
+   do
+     separator='GRPNAME='
+     parse var inrecord . (separator) wk.grpname .
+     initdbdsgrp_grpname='GRPNAME('||wk.grpname||')'
+   end
+   if pos('MEMBERS=',inrecord)>0 then
+   do
+     separator='MEMBERS='
+     parse var inrecord . (separator) wk.members .
+   end
+   queue initdbdsgrp_command,
+         initdbdsgrp_grpname,
+         '-'
+   "execio 1 diskw sysut2"
+   queue '           GRPMEM(            -'
+   "execio 1 diskw sysut2"
+   do wk.members
+     "execio 1 diskr sysut1"
+     pull inrecord
+     parse var inrecord wk.dbd,
+                        wk.ddn,
+                        .
+     /* page breaks can cause problem. */
+     /* this code will handle it.      */
+     if pos('LISTING OF RECON',inrecord)>0 then
+     do
+       "execio 1 diskr sysut1"
+       pull inrecord
+       parse var inrecord wk.dummy,
+                          wk.dbd,
+                          wk.ddn,
+                          .
+     end
+     initdbdsgrp_member='             ('||wk.dbd||','||wk.ddn') -'
+     queue initdbdsgrp_member
+     "execio 1 diskw sysut2"
+   end
+   queue ')'
+   "execio 1 diskw sysut2"
+return
+
+process_cagrp_record:
+   inrecord=' '
+   initcagrp_command='INIT.CAGRP'
+   initcagrp_grpname=''
+   initcagrp_grpmax =''
+   initcagrp_cajcl  ='CAJCL'         /* defaults             */
+   initcagrp_defltjcl= 'DEFLTJCL'    /* defaults             */
+   initcagrp_reuse  ='NOREUSE'       /* defaults             */
+   do 3
+     "execio 1 diskr sysut1"
+     pull inrecord
+     if pos('GRPNAME=',inrecord)>0 then
+     do
+       separator='GRPNAME='
+       parse var inrecord . (separator) wk.grpname .
+       initcagrp_grpname='GRPNAME('||wk.grpname||')'
+     end
+     if pos('GRPMAX=',inrecord)>0 then
+     do
+       separator='GRPMAX='
+       parse var inrecord . (separator) wk.grpmax .
+       initcagrp_grpmax='GRPMAX('||wk.grpmax||')'
+     end
+     if pos('CAJCL=',inrecord)>0 then
+     do
+       separator='CAJCL='
+       parse var inrecord . (separator) wk.cajcl .
+       initcagrp_cajcl='CAJCL('||wk.cajcl||')'
+     end
+     if pos('MEMBERS=',inrecord)>0 then
+     do
+       separator='MEMBERS='
+       parse var inrecord . (separator) wk.members .
+     end
+     if pos('DFLTJCL=',inrecord)>0 then
+     do
+       separator='DFLTJCL='
+       parse var inrecord . (separator) wk.dfltjcl .
+       if wk.dfltjcl='**NULL**' then
+         initcagrp_dfltjcl=''
+       else
+         initcagrp_dfltjcl='DFLTJCL('||wk.dfltjcl||')'
+     end
+     if pos('REUSE',inrecord)>0 then
+       initcagrp_reuse ='REUSE'
+     if pos('NOREUSE',inrecord)>0 then
+       initcagrp_reuse ='NOREUSE'
+   end
+   queue initcagrp_command,
+         initcagrp_grpname,
+         initcagrp_grpmax,
+         initcagrp_cajcl,
+         initcagrp_reuse,
+         '-'
+   "execio 1 diskw sysut2"
+   queue '           grpmem(            -'
+   "execio 1 diskw sysut2"
+   do wk.members
+     "execio 1 diskr sysut1"
+     pull inrecord
+     parse var inrecord wk.dbd,
+                        wk.ddn,
+                        .
+     /* page breaks can cause problem. */
+     /* this code will handle it.      */
+     if pos('LISTING OF RECON',inrecord)>0 then
+     do
+       "execio 1 diskr sysut1"
+       pull inrecord
+       parse var inrecord wk.dummy,
+                          wk.dbd,
+                          wk.ddn,
+                          .
+     end
+     initcagrp_member='             ('||wk.dbd||','||wk.ddn') -'
+     queue initcagrp_member
+     "execio 1 diskw sysut2"
+   end
+   queue ')'
+   "execio 1 diskw sysut2"
+return
+
+process_typehal_dbrcn_recs:
+initdb_command='INIT.DB  '
+deldb_command ='DELETE.DB '
+dbd=''
+initdb_recov='        '           /* defaults             */
+shrlevel='0'               /* defaults             */
+psname=''                  /* defaults             */
+psname_fnd='0'             /* defaults             */
+/* process the recon DB record. */
+parse var inrecord 'DBD=' dbd . . 'TYPE=' imstype .
+"execio 1 diskr sysut1";pull inrecord
+parse var inrecord '=' shrlevel .
+"execio 1 diskr sysut1";pull inrecord
+parse var inrecord 'PSNAME=' psname . 'DBORG=' haldborg .,
+    'DSORG=' haldsorg .
+if psname\='**NULL**' then
+  do
+    psname_fnd='1'
+    psname='PARTNAME('psname')'
+  end
+/* read until i get there. */
+      do until pos('RECOVERABLE           =',inrecord)>0
+        "execio 1 diskr sysut1"
+        pull inrecord
+      end
+      parse var inrecord '=' recovyesno .
+      if recovyesno='YES' then recov ='RECOVABL'
+      else if recovyesno='NO' then recov ='NONRECOV'
+queue strt_comment delete.db 'DBD('dbd')' end_comment
+
+initdb=initdb_command 'DBD('dbd') SHARELVL('shrlevel')' imstype
+if psname_fnd='1' then
+  do
+    queue initdb recov '-'
+    queue '          'psname
+  end
+else if haldborg\='PSINDEX' then queue initdb recov 'HIKEY'
+else queue initdb recov
+queue
+"execio * DISKW SYSUT2"
+return
+
+process_typepart_dbrcn_recs:
+init_part_cmd='INIT.PART'
+dsgchars='ABCDEFGHIJ'
+partdbd=''
+keystrng=''
+full_keystrng=''
+dsnprefix=''
+randomzr='';raps='';hiblock='';fbff='';fspf='';blocksze='';genmax=''
+recovpd='';reuse_noreuse=''
+parse var inrecord 'DBD=' partdbd . . . 'TYPE=' imstype .
+"execio 4 diskr sysut1";do 4;pull inrecord;end
+parse var inrecord 'PREFIX=' dsnprefix .
+if haldborg='PHDAM' then
+  do
+    "execio 4 diskr sysut1";do 4;pull inrecord;end
+    parse var inrecord 'NAME=' randomzr . 'ANCHOR=' raps .,
+     'BLOCK#=' hiblock . 'BYTES=' bytes .
+    "execio 2 diskr sysut1";do 2;pull inrecord;end
+      parse var inrecord 'FACTOR=' fbff . 'PERCENTAGE=' fspf .
+  end
+else
+  do
+    "execio 4 diskr sysut1";do 4;pull inrecord;end
+      parse var inrecord 'FACTOR=' fbff . 'PERCENTAGE=' fspf .
+  end
+"execio 2 diskr sysut1";do 2;pull inrecord;end
+/* the max keystrng is 256 non-hex bytes. */
+/* bld the full keystrng. then later decompose it to shorter pieces.
+   method for getting all the rows of the key, including embedded blank
+and hex chars:
+  1. get the key length(var hikeylen),
+*/
+i=0;keystrng_len=0
+parse var inrecord 'LENGTH=' hikeylen .
+hikeylen=strip(hikeylen,'t',')')   /* for keys of 3 digit length. */
+if imstype='PART' & partdbd='LCR0101'   then trace
+
+/* this loop collects the hi root-key values specified as keystrng */
+
+do until pos('HEX',inrecord)>0 | inrecord=''
+  noremainder='0';i=0
+  "execio 1 diskr sysut1";pull inrecord
+  if pos('HEX',inrecord)=0 then
+    do until noremainder | keystrng_len=hikeylen
+      i=i+1
+      keystrng=keystrng||substr(inrecord,5+i,1)
+      keystrng_len=length(keystrng)
+/*int_multiple_of_64 denotes the end of all 64 byte lines.     */
+/*if the last line is short, it is read till hikeylen reached. */
+      int_multiple_of_64=i//64  /* remainder divide. */
+      if int_multiple_of_64=0 then noremainder='1'
+    end
+end
+/* this piece is not tested for multiple DSGs in the HALDBD.    */
+/*               ----------   it works for 1 dsg                */
+/* each one would have a separate line for it's block size in   */
+/* recon listing.                                               */
+/* e.g. A=8192                                                  */
+/*      B=6144                                                  */
+if haldsorg='OSAM' then
+  do
+    do until word(inrecord,1)='OSAM'
+      "execio 1 diskr sysut1"
+      pull inrecord
+    end
+    do until word(inrecord,1)=''
+      if word(inrecord,1)='A' |,
+         word(inrecord,1)='B' |,
+         word(inrecord,1)='C' |,
+         word(inrecord,1)='D' |,
+         word(inrecord,1)='E' |,
+         word(inrecord,1)='F' |,
+         word(inrecord,1)='G' |,
+         word(inrecord,1)='I' |,
+         word(inrecord,1)='J'  then
+        do
+          parse var inrecord . . dsgblksze .
+          blocksze=blocksze dsgblksze','
+        end
+      "execio 1 diskr sysut1";pull inrecord
+    end
+    blocksze=strip(blocksze)
+    blocksze=strip(blocksze,'t',',')
+  end
+return
+
+/*
+get GENMAX reuse/noreuse and RECOVPD
+do not process any .L(ILDS) datasets in DBDS TYPE=PART records.
+do not process any .X(primary index) datasets in DBDS TYPE=PART records.
+*/
+process_typepart_dbdsrcn_recs:
+genmax=''
+dataset_type=''
+translated_haldbdsn=''
+
+parse var inrecord 'DSN=' haldb_dsn .
+translated_haldbdsn=translate(haldb_dsn,' ','.')
+numwords=words(translated_haldbdsn)
+if left(subword(translated_haldbdsn,numwords),1)='A' then
+   dataset_type='NON-L-NON-X'
+"execio 1 diskr sysut1";pull inrecord
+parse var inrecord . 'DDN=' ddn .
+if dataset_type='NON-L-NON-X' then
+  do
+do until pos('GENMAX',inrecord)>0
+  "execio 1 diskr sysut1";pull inrecord
+end
+parse var inrecord 'GENMAX=' genmax .
+"execio 1 diskr sysut1";pull inrecord
+parse var inrecord reuse_noreuse . 'RECOVPD=' recovpd .
+reuse_noreuse=strip(reuse_noreuse,'l')
+"execio 1 diskr sysut1";pull inrecord
+parse var inrecord 'DEFLTJCL=' defltjcl . 'ICJCL=' icjcl .,
+  'OICJCL=' oicjcl . 'RECOVJCL=' recovjcl .
+"execio 1 diskr sysut1"
+pull inrecord
+parse var inrecord 'RECVJCL=' icrcvjcl .
+if   defltjcl='**NULL**' then defltjcl=''
+else defltjcl='DEFLTJCL('defltjcl')'
+  end
+return
+
+decompose_key:
+keypieces.='';i=0;j=0;len_all_keypieces=0
+keypiece_size=44
+/* what if the key has spaces in it????? will this have to be a substr?
+   of each byte???
+   or at the end???
+else*/
+  do until keystrng=''
+    i=i+1
+/*split at ea. 44 bytes */
+    parse var keystrng 1 keypieces.i 45 keystrng
+  end
+num_keypieces=i
+return
+
+write_init_part_stmt:
+queue init_part_cmd 'DBD('dbd') PART('partdbd') -'
+queue '          DSNPREFX('dsnprefix') -'
+if num_keypieces=1 then
+  queue "          KEYSTRNG('"keypieces.1"') -"
+else
+do j=1 to num_keypieces
+  if j=1 then queue "          KEYSTRNG('"keypieces.1"-"
+  else if j<num_keypieces then queue keypieces.j'-'
+       else queue keypieces.j"') -"
+end
+if haldborg='PHDAM' then
+  do
+    queue '          RANDOMZR('randomzr') ANCHOR('raps') -'
+    queue '          HIBLOCK('hiblock') BYTES('bytes') -'
+  end
+queue '          FBFF('fbff') -'
+queue '          FSPF('fspf') -'
+if haldsorg='OSAM' then queue '          BLOCKSZE('blocksze') -'
+queue '          GENMAX('genmax') RECOVPD('recovpd')' reuse_noreuse '-'
+if defltjcl\='' then
+do
+queue '          ICJCL('icjcl') OICJCL('oicjcl') RECOVJCL('recovjcl')-'
+queue '          'defltjcl
+end
+else
+queue '          ICJCL('icjcl') OICJCL('oicjcl') RECOVJCL('recovjcl')'
+
+queue
+"execio * diskw sysut2"
+return
+
+halt: signal done                      /*lda: 08/29/04*/
+
+error:                                 /*lda: 08/29/04*/
+stmt=condition('d')
+cmdrc=rc
+if word(stmt,1)='execio' & rc=2 then
+  do;say 'END-OF-FILE';rc=0;signal done;end
+if word(stmt,1)='del'         then return
+if word(stmt,1)='free'        then return
+if word(stmt,1)='edit' & rc=4 then do;rc=0;return;end
+say rc sigl stmt
+"delstack"
+signal done

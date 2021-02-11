@@ -1,0 +1,764 @@
+/* REXX */
+/*----------------------------------------------------------------------------*/
+/* Enlarge a dataset -                                                        */
+/* DSORGs supported are : PS, PDS, PDSE                                       */
+/*                        VS(KSDS, ESDS, RRDS, LINEAR)                        */
+/*----------------------------------------------------------------------------*/
+/* How-To call                                                                */
+/* 1. "ENL  MYDSNAME.XYZ"     (A la 3.4)                                      */
+/* 2. "TSO ENL MYDSNAME.XYZ"  (TSO CMD)                                       */
+/*                                                                            */
+/* It does the following to the dataset being enlarged:                       */
+/*     (NON-VSAM)                                                             */
+/*  1) Create "*.NEW" version                                                 */
+/*  2) Copy   the DS to "*.NEW"                                               */
+/*  3) Rename the DS to ".OLD"                                                */
+/*  4) Rename the ".NEW" to DS                                                */
+/*  5) Delete the ".OLD" (if no errors)                                       */
+/*                                                                            */
+/*     (VSAM)                                                                 */
+/*  1) Create "*.NEW" version                                                 */
+/*  2) REPRO  the DS to "*.NEW"                                               */
+/*  3) Rename the DS to ".OLD"                                                */
+/*  4) Rename the ".NEW" to DS                                                */
+/*  5) Delete the ".OLD" (if no errors)                                       */
+/*                                                                            */
+/* Dataset ALIASES:                                                           */
+/*  If any are detected, the user is alerted and must                         */
+/*  decide whether to continue or not. Continuing always                      */
+/*  DELETES the affected aliases (ALL of them!). If done,                     */
+/*  the user MUST redefine them.                                              */
+/*                                                                            */
+/* NOTES:                                                                     */
+/* =====                                                                      */
+/* > Routine "CHECK_SECURITY" calls a RACF facility to determine              */
+/*   ALTER authority. This may need changing to fit your                      */
+/*   environment.                                                             */
+/*                                                                            */
+/* > Any significant error causes the rest of the rtns to be                  */
+/*   bypassed, along with an error message.                                   */
+/*============================================================================*/
+/*                     WHEN MYRC/MYRCV <> 0                                   */
+/*                                                                            */
+/* If RC <> 0 we cannot count on the final product being correct              */
+/*  and so the following grid recommends what to do if these cases arise      */
+/* All recovery actions should be thoroughly investigated before actions      */
+/*                                                                            */
+/*                    RECOVERY DECISION MATRIX                                */
+/*                                                                            */
+/* YES(exists); NO(no exists)                                                 */
+/* DSN (Original ds); .NEW (Enlarged version); .OLD (Original renamed)        */
+/* ------------------------------ C A S E 1 ----------------------------------*/
+/* |  DSN YES | Delete *.NEW to keep original                                 */
+/* | .NEW YES |                                                               */
+/* | .OLD NO  |                                                               */
+/* ---------------------------------------------------------------------------*/
+/* ------------------------------ C A S E 2 ----------------------------------*/
+/* |  DSN YES | Delete DSN, rename *.OLD to get back to original              */
+/* | .NEW NO  |                                                               */
+/* | .OLD YES |                                                               */
+/* ---------------------------------------------------------------------------*/
+/* ------------------------------ C A S E 3 ----------------------------------*/
+/* |  DSN YES | No action, original is unchanged                              */
+/* | .NEW NO  |                                                               */
+/* | .OLD NO  |                                                               */
+/* ---------------------------------------------------------------------------*/
+/* ------------------------------ C A S E 4 ----------------------------------*/
+/* |  DSN No  | Delete *.NEW & rename *.OLD to get back to original           */
+/* | .NEW YES |                                                               */
+/* | .OLD YES |                                                               */
+/* ---------------------------------------------------------------------------*/
+/*----------------------------------------------------------------------------*/
+
+parse arg dsn
+
+MAINLINE:
+  Call HOUSEKEEP                    /* The usual                   */
+/*-------------------------*/
+/* You can un-comment the  */
+/* "CHECK_SECURITY" call if*/
+/* you want RACF checking  */
+/* ahead of time.          */
+/*                         */
+/*Call CHECK_SECURITY      */       /* Check for ALTER authority   */
+/*-------------------------*/
+  Call CLEAN_UP                     /* Clean up residual stuff     */
+  Call ALLOC_LISTCAT                /* Free/ALLOC LISTCAT FILES    */
+  Call CREATE_SYSIN                 /* Create LISTCAT Input STMNTS */
+  Call LISTCAT                      /* Run LISTCAT on dataset      */
+  Call PROCESS_LISTCAT              /* Analyze LISTCAT output      */
+  Call ALERT_USER                   /* Inform User of DS ALIASes   */
+  Call GET_DSINFO                   /* Find out about the dataset  */
+  Call CLEAN_UP                     /* Clean up residual stuff     */
+  Call ALLOC_GENERAL                /* Alloc general wrk Datasets  */
+  Call USER_CHANGES                 /* Request changes from user   */
+  Call ALLOC_SPECIFIC               /* Alloc specific wrk datasets */
+  Call USER_APPROVAL                /* Give user "GO-NOGO"         */
+  Call COPY_IT                      /* Run the copy                */
+  Call RENAME_IT                    /* Run the renames             */
+  Call CLEAN_UP                     /* Clean one last time         */
+  Call ADIOS                        /* Parting msgs                */
+  address ispexec
+   ZISPFRC = MYRC
+   " VPUT (ZISPFRC) SHARED "
+return MYRC
+
+HOUSEKEEP:
+  if dsn='' then
+    do forever
+      say 'Enter DSname to be enlarged or "EXIT"'
+      parse upper pull dsn
+      if dsn = 'EXIT' then exit
+      if dsn <> '' then leave
+    end
+  dsn=strip(dsn,b,"'")
+  valid='YES'
+  mydsn=translate(dsn,' ','.')
+  #levels=words(mydsn)
+  if length(mydsn) > 44 | #levels < 1 then
+    valid='NO'
+  if valid='YES' then
+    do x1=1 to #levels
+      hotlev=word(mydsn,x1)
+      if length(hotlev) > 8 then
+        do
+          valid='NO'
+          leave
+        end
+      sc=substr(hotlev,1,1)
+      if sc > 'Z' then
+        do
+          valid='NO'
+          leave
+        end
+      if sc < 'A' then
+        if sc <> '@' then
+          if sc <> '#' then
+            if sc <> '$' then
+              do
+                valid='NO'
+                leave
+              end
+    end
+  if valid='NO' then
+    do
+      say 'DSNAME of '''dsn''' is invalid'
+      say 'REXX ends'
+      myrc=20
+      exit
+    end
+  eldsn=dsn
+  myid=SYSVAR(SYSUID)
+  dashes=right('-',80,'-')
+  myrc=0
+  myrcv=0
+return
+
+CHECK_SECURITY:
+  if myrc <> 0 then return
+  stuff = msg(on)
+  TSOCMD='LD DA('||dsn||') GEN ALL'
+  address tso
+  stuff=outtrap(line.)                  /* set the trap          */
+  TSOCMD
+  stuff=outtrap('off')                  /* close trap            */
+  checkon = 0
+
+  READLU:
+    do i = 1 to line.0
+        IF SUBSTR(LINE.I,1,19) = "NO RACF DESCRIPTION" THEN
+          do
+            access = 'NONE'
+            leave
+          end
+        if substr(line.i,1,14) = "NOT AUTHORIZED" then
+          do
+            access = 'NONE'
+            leave
+          end
+        if substr(line.i,1,15) = "INFORMATION FOR" then
+          do
+          end
+        if substr(line.i,1,13) = "YOUR ACCESS  " then
+          do
+            checkon = 1
+          end
+        if checkon = 1 & substr(line.i,1,11) = "-----------" then
+          do
+            checkon = 2
+          end
+        if checkon = 2 & substr(line.i,1,5) = "     " then
+          do
+            checkon = 0
+          end
+        IF CHECKON = 2 & SUBSTR(LINE.I,1,11) ¬= "-----------" THEN
+          do
+            access = substr(line.i,1,10)
+            access = strip(access,'B')
+          end
+    end
+    stuff = msg(off)
+    if access <> 'ALTER' then
+      do
+        say 'You do not have RACF "ALTER" authority to 'dsn
+        say 'REXX ends'
+        myrc=16
+        return
+      end
+return
+
+ALLOC_LISTCAT:
+  if myrc <> 0 then return
+  address tso
+    "FREE FI(SYSIN,SYSPRINT)"
+    "DELETE ('"myid".ENL.SYSIN')"
+    "DELETE ('"myid".ENL.SYSPRINT')"
+    "ALLOCATE FI(SYSIN) DA('"myid".ENL.SYSIN') NEW CATALOG
+                 SPACE(1,1) TRACKS RECFM(F B) LRECL(80) BLKSIZE(27920)"
+    if rc /= 0 then
+      do
+        say myid'.ENL.SYSIN allocation error'
+        say ' Reason follows:'
+        say ' '
+        x=MSG(ON)
+        xx=OUTTRAP(BADALLOC.)
+        "ALLOCATE FI(SYSIN) DA('"myid".ENL.SYSIN') NEW CATALOG
+                     SPACE(1,1) TRACKS RECFM(F B) LRECL(80) BLKSIZE(27920)"
+        xx=OUTTRAP(OFF)
+        do x2=1 to badalloc.0
+          say badalloc.x2
+        end
+        say 'Rexx ends'
+        myrc=16
+        return
+      end
+    "ALLOCATE FI(SYSPRINT) DA('"myid".ENL.SYSPRINT') NEW CATALOG REUSE
+                 SPACE(2,2) TRACKS RECFM(F B) LRECL(133) BLKSIZE(27930  )"
+    IF RC /= 0 THEN
+      do
+        say myid'.ENL.SYSPRINT allocation error'
+        say ' Reason follows:'
+        say ' '
+        x=MSG(ON)
+        xx=OUTTRAP(BADALLOC.)
+        "ALLOCATE FI(SYSPRINT) DA('"myid".ENL.SYSPRINT') NEW CATALOG REUSE
+                     SPACE(2,2) TRACKS RECFM(F B) LRECL(133) BLKSIZE(27930)"
+        xx=OUTTRAP(OFF)
+        do x2=1 to badalloc.0
+          say badalloc.x2
+        end
+        say 'Rexx ends'
+        myrc=16
+        return
+      end
+return
+
+CREATE_SYSIN:
+  if myrc <> 0 then return
+  sysin.1 = '  LISTC ENT('ELDSN') ALL'
+  address tso
+  "execio * diskw sysin (stem sysin. finis)"
+return
+
+LISTCAT:
+  if myrc <> 0 then return
+  address tso "call 'sys1.linklib(idcams)'"
+  if rc > 4 then
+    do
+      say sysin.1 ' LISTCAT error,RC='rc
+      say ' Reason follows:'
+      "ISPEXEC BROWSE DATASET('"myid".ENL.SYSPRINT')"
+      myrc=16
+      return
+    end
+return
+
+PROCESS_LISTCAT:
+  if myrc <> 0 then return
+  alias_sw=0
+  alias_delete_sw=0
+  alias_cnt=0
+  "execio * diskr SYSPRINT (stem lc. FINIS"
+  do X=1 to lc.0                         /* loop until eof          */
+    if pos('ASSOCIATIONS',lc.x) > 0 then
+      do
+        x=x+1
+        if pos('NONVSAM--',lc.x) > 0 then
+          do y=x to lc.0
+            if pos('NONVSAM--',lc.y) > 0 then
+              do
+                alias_sw=1
+                startpos=pos('NONVSAM--',lc.y) + 9
+                alias_cnt=alias_cnt + 1
+                alias_table.alias_cnt=strip(substr(lc.y,startpos,44))
+              end
+            leave
+          end
+        if pos('ALIAS----',lc.x) > 0 then
+          do y=x to lc.0
+            if pos('ALIAS----',lc.y) > 0 then
+              do
+                alias_delete_sw=1
+                startpos=pos('ALIAS----',lc.y) + 9
+                alias_cnt=alias_cnt + 1
+                alias_table.alias_cnt=strip(substr(lc.y,startpos,44))
+              end
+          end
+      end
+  end
+return
+
+ALERT_USER:
+  if myrc <> 0 then return
+  if alias_sw=1 then
+    do
+      say ' '
+      say '*********************************************'
+      say '* 'eldsn 'is an ALIAS of Dataset 'alias_table.1
+      say '*'
+      say '* You CANNOT enlarge an ALIAS!'
+      say '*'
+      say '* Re-launch against a legitimate dataset'
+      say '*********************************************'
+      say ' '
+      myrc=16
+      return
+    end
+  if alias_cnt > 0 then
+  do
+    say ' '
+    say ' '
+    say ' '
+    say ' '
+    say ' '
+    leneldsn=length(eldsn)
+    mydashes=substr(dashes,1,leneldsn)
+    say ' Dataset ' eldsn 'has 'alias_cnt' ALIASES:'
+    say '*---------------------------------------------------*'
+    say '*  (D) 'eldsn
+    say '*  --- 'mydashes
+    do x=1 to alias_cnt
+      say '*  (A) 'alias_table.x
+    end
+    say '*---------------------------------------------------*'
+    say '                                               '
+    say '**************************************************'
+    say 'Proceeding will cause all ALIASes to be DELETED  *'
+    say '                                        =======  *'
+    say 'If deleted you must redefine them!!!             *'
+    say '**************************************************'
+    do forever
+      say 'ARE YOU SURE (Y/N) ?'
+      parse upper pull YN
+      if YN = 'N' then
+        do
+          say 'Enlarge Cancelled'
+          myrc=8
+          return
+        end
+      if YN = 'Y' then
+        do
+          say 'Proceeding with Operation...'
+          say ' '
+          return
+        end
+    end
+  end
+return
+
+GET_DSINFO:
+  if myrc <> 0 then return
+  dir='directory'
+  x=listdsi(''''ELDSN'''' dir)
+    if x = 4 then
+    do
+      if sysdsorg = 'VS' then
+        do
+          call ENLVSAM eldsn  /* -> VSAM */
+          myrcv=result        /* <- VSAM */
+          myrc=myrcv
+          call clean_up
+          call adios
+          exit
+        end
+    end
+  if x > 4 then
+    do
+      say 'LISTDSI err, RC='RC',REASON='sysreason
+      say 'for dataset 'ELDSN
+      myrc=16
+      return
+    end
+  ELVOL=sysvolume
+  ELDSO=sysdsorg
+  ELRCF=sysrecfm
+  ELRCL=syslrecl
+  ELBLK=sysblksize
+  ELUNI=sysunits
+  ELPRI=sysprimary
+  ELSEC=sysseconds
+  ELDIR=sysadirblk
+  ELXTN=sysextents
+  address ispexec
+  "VPUT (ELDSN) PROFILE"
+  "VPUT (ELVOL) PROFILE"
+  "VPUT (ELDSO) PROFILE"
+  "VPUT (ELRCF) PROFILE"
+  "VPUT (ELRCl) PROFILE"
+  "VPUT (ELBLK) PROFILE"
+  "VPUT (ELUNI) PROFILE"
+  "VPUT (ELPRI) PROFILE"
+  "VPUT (ELSEC) PROFILE"
+  "VPUT (ELDIR) PROFILE"
+  "VPUT (ELXTN) PROFILE"
+return
+
+ALLOC_GENERAL:
+  if myrc <> 0 then return
+  address TSO
+  "ALLOC DA('"ELDSN"') DDN(SYSUT1) OLD"
+  if rc ¬= 0 then
+    do
+      say ELDSN' Allocation error:'
+      say ' Reason follows:'
+      say ' '
+      x=MSG(ON)
+      xx=OUTTRAP(BADALLOC.)
+      "ALLOC DA('"ELDSN"') DDN(SYSUT1) OLD"
+      xx=OUTTRAP(OFF)
+      do x2=1 to badalloc.0
+        say badalloc.x2
+      end
+      say 'Rexx ends'
+      myrc=16
+      return
+    end
+  "ALLOC F(SYSPRINT) DA('"myid".ENL.SYSPRINT') SPACE(5,5) TRACKS NEW
+         CATALOG REUSE RECFM(F) BLKSIZE(121)"
+  if RC ¬= 0 then
+    do
+      say myid'.ENL.SYSPRINT Allocation error:'
+      say ' Reason follows:'
+      say ' '
+      x=MSG(ON)
+      xx=OUTTRAP(BADALLOC.)
+      "ALLOC F(SYSPRINT) DA('"MYID".ENL.SYSPRINT') SPACE(5,5) TRACKS NEW
+             CATALOG REUSE RECFM(F) BLKSIZE(121)"
+      xx=OUTTRAP(OFF)
+      do x2=1 to badalloc.0
+        say badalloc.x2
+      end
+      say 'Rexx ends'
+      myrc=16
+      return
+    end
+  "ALLOC F(SYSIN) DA('"myid".ENL.SYSIN') SPACE(1,1) TRACKS NEW CATALOG
+         RECFM(F) BLKSIZE(80) REUSE"
+  if RC ¬= 0 then
+    do
+      say myid'.ENL.SYSIN Allocation error:'
+      say ' Reason follows:'
+      say ' '
+      x=MSG(ON)
+      xx=OUTTRAP(BADALLOC.)
+      "ALLOCATE F(SYSIN) DA('"myid".ENL.SYSIN') SPACE(1,1) TRACKS NEW CATALOG
+                RECFM(F) BLKSZIE(80) REUSE"
+      xx=OUTTRAP(OFF)
+      do x2=1 to badalloc.0
+        say badalloc.x2
+      end
+      say 'Rexx ends'
+      myrc=16
+      return
+    end
+return
+
+USER_CHANGES:
+  if myrc <> 0 then return
+  address ispexec
+  "DISPLAY PANEL(ENLPANNV)"
+  "VGET (ELVOL2) PROFILE"
+  "VGET (ELPRI2) PROFILE"
+  "VGET (ELUNI2) PROFILE"
+  "VGET (ELSEC2) PROFILE"
+  "VGET (ELDIR2) PROFILE"
+  if ELVOL2='' then ELVOL2=ELVOL1
+  x1=wordlength(ELRCF,1)
+  select
+    when x1=1 then call RCF1
+    when x1=2 then call RCF2
+    when x1=3 then call RCF3
+    otherwise
+      do
+        say ' '
+        say ELDSN' has invalid RECFM of 'ELRCF
+        myrc=16
+        return
+      end
+  end
+  /* =============  allocate target dataset ============ */
+  if pos('BL',ELUNI2) <> '0' then
+    final_unit='BLOCK('ELPRI2')'
+  else
+    final_unit=ELUNI2
+/*-----------------------------------------------*/
+/*   V A L I D A T E   U S E R   R E Q U E S T   */
+/*-----------------------------------------------*/
+  if substr(ELDSO,1,2) = 'PS' then
+    do
+      DSNTYPE='PS'
+      utility='IEBGENER'
+    end
+  else
+  if ELDIR2='NO_LIM' then
+    do
+      DSNTYPE='LIBRARY'
+      utility='IEBCOPY'
+    end
+  else
+    do
+      DSNTYPE='PDS'
+      utility='IEBCOPY'
+    end
+    type_is='# Dataset type is 'dsntype' #'
+    len=length(type_is)
+    pounds=right('#',len,'#')
+    say pounds
+    say type_is
+    say pounds
+  if ELPRI2=0 then
+    do
+      say 'ZERO value for a new primary is invalid'
+      say' REXX ends'
+      myrc=16
+      return
+    end
+  if DSNTYPE='PS' & datatype(ELDIR2,'N') = 1 then
+    do
+      say 'Cannot assign a Directory value to a DSORG=PS dataset'
+      say' REXX ends'
+      myrc=16
+      return
+    end
+
+  if DSNTYPE='LIBRARY' & ELDIR2 <> 'NO_LIM' then
+    do
+      say ' '
+      say 'PDSE ignores user DIR value of 'ELDIR2', "NO_LIM" is assumed'
+      say ' '
+    end
+
+  if DSNTYPE='LIBRARY' & ELDIR2 = 'NO_LIM' then
+     ELDIR2=99999   /* Needed for next rtn */
+return
+
+ALLOC_SPECIFIC:
+  if myrc <> 0 then return
+  if substr(ELDSO,1,2) = 'PO' then
+    "ALLOC DA('"ELDSN".NEW') VOL("ELVOL2") BLKSIZE("ELBLK") LRECL("ELRCL")
+     RECFM("ELRCF") SPACE("ELPRI2","ELSEC2") "FINAL_UNIT" DIR("ELDIR2")
+     DSNTYPE("DSNTYPE") DDN(SYSUT2) NEW CATALOG"
+  else
+    "ALLOC DA('"ELDSN".NEW') VOL("ELVOL2") BLKSIZE("ELBLK") LRECL("ELRCL")
+           RECFM("ELRCF") SPACE("ELPRI2","ELSEC2") "FINAL_UNIT" DDN(SYSUT2)
+           NEW CATALOG"
+  if RC ¬= 0 then
+    do
+      myrc=rc
+      x=MSG(ON)
+      say ELDSN'.NEW allocation error'
+      say ' Reason follows:'
+      say ' '
+      x=MSG(ON)
+      xx=OUTTRAP(BADALLOC.)
+      if substr(ELDSO,1,2) = 'PO' then
+        "ALLOC DA('"ELDSN".NEW') VOL("ELVOL2") BLKSIZE("ELBLK") LRECL("ELRCL")
+         RECFM("ELRCF") SPACE("ELPRI2","ELSEC2") "FINAL_UNIT" DIR("ELDIR2")
+         DSNTYPE("DSNTYPE") DDN(SYSUT2) NEW CATALOG"
+      else
+        "ALLOC DA('"ELDSN".NEW') VOL("ELVOL2") BLKSIZE("ELBLK") LRECL("ELRCL")
+               RECFM("ELRCF") SPACE("ELPRI2","ELSEC2") "FINAL_UNIT" DDN(SYSUT2)
+               NEW CATALOG"
+      do x2=1 to badalloc.0
+        say badalloc.x2
+      end
+      say 'REXX ends'
+      myrc=16
+      return
+    end
+  x=listdsi(''''ELDSN'.NEW''' dir)
+  if x ¬= 0 then
+    do
+      myrc=rc
+      say 'LISTDSI err for 'ELDSN'.NEW,RC='myrc',reason='sysreason
+      myrc=16
+      return
+    end
+return
+
+USER_APPROVAL:
+  if myrc <> 0 then return
+  do forever
+    say ' '
+    say '*** 'eldsn' ***'
+    say ' '
+    say 'Target volume  for enlarged dataset is ' sysvolume
+    say 'Number extents for enlarged dataset is ' sysextents
+    say '----------------------------------------------'
+    say 'Input UNIT='right(ELUNI1,8)', Output UNIT='right(ELUNI2,8)
+    say 'Input PRI ='right(ELPRI1,8)', Output PRI ='right(ELPRI2,8)
+    say 'Input SEC ='right(ELSEC1,8)', Output SEC ='right(ELSEC2,8)
+    if DSNTYPE = 'LIBRARY' then
+      say 'Input DIR ='right(ELDIR1,8)', Output DIR =  NO_LIM'
+    else
+    if DSNTYPE='PDS' then
+      say 'Input DIR ='right(ELDIR1,8)', Output DIR ='right(ELDIR2,8)
+    if alias_delete_sw=1 then
+      do
+        say '-------------------------------------------'
+        say right(alias_cnt,10)' DATASET ALIASES will be deleted '
+        say '-------------------------------------------'
+      end
+    say ' '
+    say 'OK to proceed (Y/N) ?'
+    parse upper pull YN
+    if YN = 'N' then
+      do
+        say 'REXX ends'
+        myrc=8
+        return
+      end
+    if YN = 'Y' then
+      leave
+  end
+return
+
+COPY_IT:
+  if myrc <> 0 then return
+  address tso
+  jcl.1 = '     COPY INDD=SYSUT1,OUTDD=SYSUT2'
+  'EXECIO  *  DISKW SYSIN (STEM jcl. FINIS)'
+  say 'ENLARGING 'ELDSN' ... PLEASE WAIT'
+  if substr(ELDSO,1,2) = 'PO' then
+    ADDRESS TSO "CALL 'SYS1.LINKLIB(IEBCOPY)'"
+  else
+    do
+      "FREE FI(SYSIN)"
+      "ALLOC DDN(SYSIN) DUMMY"
+       ADDRESS TSO "CALL 'SYS1.LINKLIB(IEBGENER)'"
+    end
+  if rc ¬= 0 then
+    do
+      say 'ERROR WHILE RUNNING 'utility
+      say ' Reason follows:'
+      "ISPEXEC BROWSE DATASET('"myid".ENL.SYSPRINT')"
+      say ' '
+      say ' If no error msg appears, check your alloc values'
+      say 'Rexx ends'
+      myrc=16
+      return
+    end
+  "FREE F(SYSIN,SYSPRINT)"
+  "DELETE ('"myid".ENL.SYSIN')"
+  "DELETE ('"myid".ENL.SYSPRINT')"
+  "ALLOC F(SYSPRINT) DA('"myid".ENL.SYSPRINT') SPACE(2,1) TRACKS NEW CATALOG
+         REUSE RECF(F) BLKSIZE(133)"
+   IF RC /= 0 THEN
+     do
+       say MYID'.ENL.SYSPRINT allocation error'
+       say ' Reason follows:'
+       say ' '
+       x=MSG(ON)
+       xx=OUTTRAP(BADALLOC.)
+       "ALLOCATE FI(SYSPRINT) DA('"myid".ENL.SYSPRINT') SPACE(2,1) TRACKS NEW
+                    CATALOG REUSE RECFM(F) BLKSUZE(133)"
+       xx=OUTTRAP(OFF)
+       do x2=1 to badalloc.0
+         say badalloc.x2
+       end
+       say 'Rexx ends'
+       myrc=16
+       return
+     end
+  "ALLOC F(SYSIN) DA('"myid".ENL.SYSIN') SPACE(1,1) TRACKS NEW CATALOG
+           RECFM(F) BLKSIZE(80) REUSE"
+  if RC <> 0 then
+    do
+       say MYID'.ENL.SYSIN allocation error'
+       say ' Reason follows:'
+       say ' '
+       x=MSG(ON)
+       xx=OUTTRAP(BADALLOC.)
+       "ALLOCATE FI(SYSIN) DA('"myid".ENL.SYSIN') TRACKS NEW CATALOG
+                    RECFM(F) BLKSIZE(80) REUSE"
+       xx=OUTTRAP(OFF)
+       do x2=1 to badalloc.0
+         say badalloc.x2
+       end
+       say 'Rexx ends'
+       myrc=16
+       return
+     end
+return
+
+RENAME_IT:
+  if myrc <> 0 then return
+  newstack
+  jcl.1=' ALTER -'
+  jcl.2='       'ELDSN' -'
+  jcl.3='        NEWNAME('ELDSN'.OLD)'
+  jcl.4=' ALTER -'
+  jcl.5='       'ELDSN'.NEW -'
+  jcl.6='        NEWNAME('ELDSN')'
+  jcl.7=' DELETE -'
+  jcl.8='       'ELDSN'.OLD -'
+  jcl.9='        NONVSAM'
+  'EXECIO  *  DISKW SYSIN (STEM jcl. FINIS)'
+   ADDRESS TSO "CALL 'SYS1.LINKLIB(IDCAMS)'"
+  if rc <> 0 then
+    do
+      say 'IDCAMS dataset RENAME -or- DELETE error'
+      say '  check 'ELDSN', 'ELDSN'.NEW, and 'ELDSN'.OLD '
+      say ' Reason follows:'
+      "ISPEXEC BROWSE DATASET('"myid".ENL.SYSPRINT')"
+      myrc=16
+      call clean_up
+      return
+    end
+return
+
+CLEAN_UP:
+  X=MSG('OFF')
+  address TSO
+  "FREE FI(SYSIN,SYSPRINT,SYSUT1,SYSUT2)"
+  "DELETE ('"myid".ENL.SYSIN')"
+  "DELETE ('"myid".ENL.SYSPRINT')"
+  "DELETE ('"ELDSN".NEW')"
+  if myrc < 16 then
+    "DELETE ('"ELDSN".OLD')"
+return
+
+ADIOS:
+  if myrc=0 then
+    say 'Dataset 'dsn' was enlarged, RC='myrc
+  else
+    say 'Dataset 'dsn' enlarge process ABNORMAL end; INVESTIGATE'
+return
+
+RCF1:
+  x2=substr(ELRCF,1,1)
+  ELRCF=x2
+return
+
+RCF2:
+  x2=substr(ELRCF,1,1)
+  x3=substr(ELRCF,2,1)
+  ELRCF=x2||','||x3
+return
+
+RCF3:
+  x2=substr(ELRCF,1,1)
+  x3=substr(ELRCF,2,1)
+  x4=substr(ELRCF,3,1)
+  ELRCF=x2||','||x3||','||x4
+return

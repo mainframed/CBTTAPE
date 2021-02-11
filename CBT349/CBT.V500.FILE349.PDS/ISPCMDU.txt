@@ -1,0 +1,224 @@
+/* ------------------------------------------------------- rexx
+  Add commands to ISPF in-storage command table ISPCMDS.
+
+  Parameters:
+
+   DA(dsname(member))   Both dataset and membername are
+                        optional. Default datasets is the
+                        ISPPROF dataset, default membername
+                        is 'ISPCOMND'.
+                        If dsname is PARMLIB or .PARMLIB, then the
+                        parmlib concatenation is searched.
+   QUIET                Do not show confirmation and statistics.
+   ID(id)               set 'desc' field to id.
+
+  History:
+
+   2018.10.09 da(PARMLIB(mbr)) locate mbr in parmlibs
+   2016.10.25 Support long split lines
+              da(.parmlib) locate ISPCOMND in parmlibs
+   2016.02.17 Fix error in load in an edit macro
+   2016.01.31 Retain aliases at top
+              Use BPXWDYN instead of ALLOCATE
+   2005.04.18 Initial
+
+   ------------------------------------------------------------ */
+
+ $table=''
+ parse value ' 'translate(arg(1)) with p1 'DA('pmda')' p2
+ if right(p2,1)=')' then p2=substr(p2,2)
+ parse value p1 p2 with p1 'ID('pmid')' p2
+ parse value p1 p2 with p1 ' QUIET ' +0 pmquiet p2
+ if p1 p2<>'' then call close 8 'Invalid parm:' space(p1 p2)
+ address isredit "MACRO NOPROCESS"
+ Select
+   when rc = 0 then call Edit_load /* edit macro */
+   when pmda ¬= "" then call Dsn_Load pmda
+   otherwise call Dsn_Load Locate_Ispprof()
+ end
+
+ Address IspExec
+ "control errors return"
+
+ Call MakeWorkTable
+
+ added=0
+ updated=0
+ deleted=0
+ rec=''
+ do i=1 to r.0
+   if r.i='' | word(r.i,1) = '/*' | left(r.i,1)='*' then iterate
+   rec=rec''strip(r.i)
+   if right(rec,1)='-' then rec=left(rec,length(rec)-1)
+   else do
+     parse var rec c +1 verb . (c) trunc . (c) act  (c) desc
+     act =strip(act)
+     desc=strip(desc)
+     upper verb act
+     if dlm = '-' then call tbldel
+     else call tblupd
+     rec=''
+   end
+ end
+
+ Call RebuildTable    /* rewrite ISPCMDS */
+
+ Call Close 0 'added('added') updated('updated') deleted('deleted')'
+
+Close:
+ parse arg _rc _msg
+ Address TSO "delstack"
+ if $table<>'' then Address IspExec "tbend" $table
+ parse arg _rc _msg
+ if _msg<>'' then call XMsg _msg
+ Exit word(_rc 0,1)
+
+TblUpd:
+ if locate(verb) = 0 then do
+   call updvars
+   "tbput" $table
+   updated=updated+1
+   return
+ end
+ /* verb not found, add it */
+ "tbtop" $table
+ call updvars
+ "tbadd" $table
+ added=added+1
+ return
+
+TblDel:
+ if Locate(verb) > 0 then return
+ "tbdelete" $table
+ deleted=deleted+1
+ return
+
+UpdVars:
+ zctverb=verb
+ zcttrunc=trunc
+ zctact=act
+ rtype='C'
+ if desc = "" then desc = "*"pmid"*"
+ zctdesc=desc
+ return
+
+Locate:
+ "tbtop" $table
+ "tbvclear" $table
+ arg zctverb .
+ "tbscan" $table "arglist(zctverb)"
+ return rc
+
+XMsg:
+ if pmquiet<>'' then return 0
+ parse arg zedlmsg
+ if zedlmsg = '' then return 0
+ zedlmsg= 'ISPCMDU' zedlmsg
+ address ispexec "Vput (zedlmsg)"
+ address ispexec "setmsg msg(isrz000)"
+ return 0
+
+Edit_Load:   /* load data to stem from edit session */
+ address isredit "(ln) = linenum .zlast"
+ do i=1 to ln
+   address isredit '(l) = line' i
+   r.i = strip(l,t)
+ end
+ r.0=ln
+ return
+
+Dsn_Load:   /* load from library */
+ arg d m .
+ d = strip(d,"b","'")
+ if m = '' then m = 'ISPCOMND'
+ if d='PARMLIB' | d='.PARMLIB' then do
+   d=Locate_Parmlib(m)
+   if d='' then call close 8 'Could not find member' m 'in parmlib'
+ end
+ d = "'"d"("m")'"
+ address tso
+ if sysdsn(d)<>'OK' then ,
+   call close 8 'Could not locate file' d
+ if BpxWdyn('alloc da('d') shr rtddn(xdd)')<>0 then,
+   call close 8 'Allocate' d 'failed'
+ "execio * diskr" xdd "(stem r. finis)"
+ cc = rc
+ zz=BpxWdyn('free dd('xdd')')
+ if cc<>0 then call close 8 'Reading' d 'failed rc' cc
+ return 0
+
+MakeWorkTable:  /* copy system ISPCMDS */
+ $table='T'left(space(translate(time('l'),' ','.:'),0),7)
+ Address IspExec
+ "tbcreate" $table "names(rtype zctverb zcttrunc zctact zctdesc)"
+ "tbtop ispcmds"
+ do forever
+   "tbskip ispcmds"
+   if rc<>0 then leave
+   if word(zctact,1)='ALIAS' then rtype='A'  /* alias   */
+   else rtype='C'                     /* command */
+   "tbadd" $table
+ end
+ "tbtop" $table
+ return 0
+
+RebuildTable:  /* rewrite system ISPCMDS */
+ Address IspExec
+ /* clear system table */
+ "tbbottom ispcmds"
+ do forever
+   "tbdelete ispcmds"
+   if rc<>0 then leave
+ end
+ /* build system table */
+ "tbsort" $table "FIELDS(RTYPE,C,A,ZCTVERB,C,A) "
+ "tbtop"  $table
+ do forever
+   "tbskip" $table
+   if rc<>0 then leave
+   "tbadd ispcmds"
+ end
+ "tbtop ispcmds"
+ return 0
+ Call ListTable 'ispcmds'
+ return 0
+
+ListTable: Procedure   /* list in-storage command table */
+ arg name
+ address ispexec
+ 'tbtop' name
+ i=1
+ r.i='T' left("Verb",8,".") left("Len",3,"."),
+     left("Action",50,".") left("Desc",15".")
+ do forever
+   'tbskip' name
+   if rc > 0 then leave
+   i=i+1
+   r.i=left(rtype,1) left(zctverb,8) left(zcttrunc,3),
+       left(zctact,50) left(zctdesc,15)
+ end
+ r.0=i
+ Address TSO
+ CALL STEMEDIT 'BROWSE','R.',,,'Command table' name
+ return 0
+
+Locate_Ispprof:   /* locate profile dataset */
+ cc=Listdsi('ispprof file')
+ if cc=0 then return sysdsname
+ return ''
+
+Locate_Parmlib: Procedure /* locate member in parmlib concatenation */
+ arg mbr
+ /* go through list of parmlibs*/
+ cvt      = Storage(10,4)                    /* get the CVT address   */
+ cvtecvt  = Storage(D2x(C2d(cvt)+140),4)     /* get the ECVT address  */
+ ecvtipa  = Storage(D2x(C2d(cvtecvt)+392),4) /* get the ihaipa Address*/
+ Do loop = 0 to 10                           /* loop for parmlibs    */
+  ipaplib = Storage(D2x(c2d(ecvtipa)+416+(loop*64)),64) /*           */
+  ipapldsn = Substr(ipaplib,1,44)            /* parmlib dsname       */
+  ipaplvol = Substr(ipaplib,46,6)            /* parmlib volume       */
+  ipaplflg = X2b(C2x(Substr(ipaplib,64,1)))  /* parmlib flags        */
+  if Strip(ipapldsn) = '' then iterate       /*                      */
+  if sysdsn("'"strip(ipapldsn)"("mbr")'")='OK' then return strip(ipapldsn)
+ End
+ return ''

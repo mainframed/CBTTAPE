@@ -1,0 +1,458 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; "ZCCFAST"
+;;;
+;;; This routine compiles functions which may be coded inline in
+;;; certain cases (or even in all cases).
+;;;
+;;;  F is the function name.
+;;;  A is the list of args to the function.
+;;;  V, S and E have their usual P-code-phase meanings.
+;;;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/22/88 - Support for fast inline ASSQ and MEMQ.                   *
+;* 04/25/88 - Support for determination of superfluous initializations *
+;*            of PROG and &AUX variables to NIL.  This involves two    *
+;*            new fields in the contour that are used to detect cases  *
+;*            of a variable unconditionally being set before it is     *
+;*            ever referenced.  This is an extension of, and replaces, *
+;*            the SETQ-initialization-hacking scheme used in ZCCPROG.  *
+;*            This also requires a new P-code form, CSETNIL, and a new *
+;*            code generator module, ZCGCSNIL.                         *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(declare (special *unbound-thing*))
+
+(defun zccfast (f a v s e &aux (l (length a))
+                               (*unbound-thing* (gensym)))
+ (case f
+  (eq     (if (eql l 2) (zccfast-eq     a v s e) (zccfastbug f)))
+  (eql    (if (eql l 2) (zccfast-eql    a v s e) (zccfastbug f)))
+  (cons   (if (eql l 2) (zccfast-cons   a v s e) (zccfastbug f)))
+  (rplaca (if (eql l 2) (zccfast-rplaca a v s e) (zccfastbug f)))
+  (rplacd (if (eql l 2) (zccfast-rplacd a v s e) (zccfastbug f)))
+  (assq   (if (eql l 2) (zccfast-assq   a v s e) (zccfastbug f)))
+  (memq   (if (eql l 2) (zccfast-memq   a v s e) (zccfastbug f)))
+  (vref   (if (eql l 2) (zccfast-vref   a v s e) (zccfastbug f)))
+  (vset   (if (eql l 3) (zccfast-vset   a v s e) (zccfastbug f)))
+  (t      (zerror "Invalid caller of ZCCFAST" f))))
+
+;=======================================================================
+
+(defun zccfast-eq (a v s e)
+
+ (let* ((arg1 (zilcomex (car a) nil))
+        (arg2 (zilcomex (cadr a) nil))
+        (con1 (zilcocon arg1 e))
+        (con2 (zilcocon arg2 e))
+       )
+
+  (cond
+   ;
+   ; At least one of the args to EQ is a constant.
+   ; Without worrying about the case where both are constant for now,
+   ; try to get the constant one to be arg2.
+   ;
+   ((and con1 (not con2))
+    ;
+    ; (EQ 'foo (form)) ---> (EQ (form) 'foo)
+    ;
+    (or (zccfast-eq-doit arg2 (car con1) v s e)
+        (zcceval 'eq (list arg1 arg2) v s e)))
+   ;
+   ; Arg 2 to EQ is the form (ZILUNBND), which represents the
+   ; "unbound" marker.
+   ;
+   ((and (equal arg2 '(zilunbnd))
+         (get 'zilunbnd 'inline)) ; Only if it's being compiled inline
+    (or (zccfast-eq-doit arg1 *unbound-thing* v s e)
+        (zcceval 'eq (list arg1 arg2) v s e)))
+   ;
+   ; If neither argument to EQ is a constant, can't do a fast compile.
+   ; Therefore, in that case do a normal compile.
+   ;
+   ((and (not con1) (not con2))
+    (zcceval 'eq (list arg1 arg2) v s e))
+   (t
+   ;
+   ; Arg 2 must be a constant.
+   ;
+    (or (zccfast-eq-doit arg1 (car con2) v s e)
+        (zcceval 'eq (list arg1 arg2) v s e))))))
+
+;;;
+;;; Fast compile of EQ is supported for:
+;;;
+;;; self-evaluating and quoted symbols
+;;;
+
+(defun zccfast-eq-doit (arg con v s e)
+ (cond
+  ((not (symbolp con)) ; This is why *unbound-thing* must be a gensym.
+   (warn "Probably incorrect use of EQ. Maybe you mean EQL or EQUAL?"
+         `(eq ,arg ',con))
+   nil)
+  (t
+   (modq body `(begininline eq 1 ,v ,s))
+   (zccevcom arg nil '(arg (1 eq)) e)
+   (modq body `(inline (eq ,(zccfast-thing con)) 1 ,v ,s))
+   t
+  )))
+
+;=======================================================================
+
+(defun zccfast-eql (a v s e)
+
+ (let* ((arg1 (zilcomex (car a) nil))
+        (arg2 (zilcomex (cadr a) nil))
+        (con1 (zilcocon arg1 e))
+        (con2 (zilcocon arg2 e))
+       )
+
+  (cond
+   ;
+   ; If neither argument to EQL is a constant, can't do a fast compile.
+   ; Therefore, in that case do a normal compile.
+   ;
+   ((and (not con1) (not con2))
+    (zcceval 'eql (list arg1 arg2) v s e))
+   ;
+   ; At least one of the args to EQL is a constant.
+   ; Without worrying about the case where both are constant for now,
+   ; try to get the constant one to be arg2.
+   ;
+   ((and con1 (not con2))
+    ;
+    ; (EQL 'foo (form)) ---> (EQL (form) 'foo)
+    ;
+    (or (zccfast-eql-doit arg2 (car con1) v s e)
+        (zcceval 'eql (list arg1 arg2) v s e)))
+   (t
+    (or (zccfast-eql-doit arg1 (car con2) v s e)
+        (zcceval 'eql (list arg1 arg2) v s e))))))
+
+;;;
+;;; Fast compile of EQL is supported for:
+;;;
+;;; fixnums and single-floats
+;;;
+;;; Note that for self-evaluating and quoted symbols, the EQL is
+;;; converted to EQ, since that's equivalent.
+;;;
+
+(defun zccfast-eql-doit (arg con v s e)
+ (cond
+  ((symbolp con)
+   (warn "EQL used with constant symbol.  Converting to equivalent EQ"
+         `(eql ,arg ',con))
+   (zccfast-eq-doit arg con v s e) ; Compile as fast (EQ arg1 arg2)
+  )
+  ((or (bigp con) (stringp con) (dfloatp con))
+   ; Have to do "slow" compile for these types
+   nil)
+  ((or (fixnump con) (sfloatp con))
+   (modq body `(begininline eql 1 ,v ,s))
+   (zccevcom arg nil '(arg (1 eql)) e)
+   (modq body `(inline (eql ,(zccfast-thing con)) 1 ,v ,s))
+   t)
+  (t
+   (warn "Probably incorrect use of EQL. Maybe you mean EQUAL?"
+         `(eql ,arg ',con))
+   nil)))
+
+;=======================================================================
+
+(defmacro zccfast-cons   (a v s e) `(zccfast-c-r-r 'cons   ,a ,v ,s ,e))
+(defmacro zccfast-rplaca (a v s e) `(zccfast-c-r-r 'rplaca ,a ,v ,s ,e))
+(defmacro zccfast-rplacd (a v s e) `(zccfast-c-r-r 'rplacd ,a ,v ,s ,e))
+
+(defun zccfast-c-r-r (f a v s e)
+
+ ;
+ ; We can do a "fast" compile for CONS/RPLACA/RPLACD
+ ; if the second argument is a
+ ; constant or a locally bound variable.
+ ;
+ ; It doesn't matter what the first argument is.
+ ;
+
+ (let ((arg1 (car a))  ; Don't have to macroexpand, we don't care
+       (arg2 (zilcomex (cadr a) nil))
+       (temp)
+      )
+
+  (cond
+   ;
+   ; If arg 2 to C/R/R is a constant, we can do the "fast" compile.
+   ;
+   ((setq temp (zilcocon arg2 e))
+    (zccfast-c-r-r-doit f arg1 (car temp) nil v s e))
+   ;
+   ; If arg 2 to C/R/R is a locally bound variable, we can also do
+   ; a "fast" compile.
+   ;
+   ((setq temp (zccfast-locally-bound-variable arg2 e))
+    (zccfast-c-r-r-doit f arg1 temp t v s e))
+   ;
+   ; Otherwise we have to go with a "normal" compile.
+   ;
+   (t
+    (zcceval f (list arg1 arg2) v s e)))))
+
+(defun zccfast-c-r-r-doit (f arg con variablep v s e)
+ (let ((thing (if variablep con (zccfast-thing con))))
+  (modq body `(begininline ,f 1 ,v ,s))
+  (zccevcom arg nil `(arg (1 ,f)) e)
+  (when variablep (zccfast-mark-used thing))
+  (modq body `(inline (,f ,thing) 1 ,v ,s))
+ )
+)
+
+;=======================================================================
+
+(defun zccfast-assq (a v s e &aux temp)
+ (let* ((arg1 (zilcomex (car a) nil))
+        (arg2 (zilcomex (cadr a) nil))
+        (con2 (zilcocon arg2 e)))
+  (cond
+    ;
+    ; ASSQ something NIL?
+    ;
+   ((null arg2)
+    (warn "Argument 2 to ASSQ is nil, suppressing call to ASSQ"
+          `(assq ,arg1 ,arg2))
+    (zccevcom (zilcotrn `(progn ,arg1 nil) debug) v s e)
+   )
+   ((not con2)
+    ;
+    ; Arg 2 to ASSQ not a constant, but might be a local variable
+    ;
+    (cond
+     ;
+     ; ASSQ something variablename?
+     ;
+     ((setq temp (zccfast-locally-bound-variable arg2 e))
+      (zccfast-assq-doit arg1 temp t v s e))
+     ;
+     ; ASSQ something (SALIST) / (SPECIAL-ALIST)?
+     ;
+     ((and (consp arg2)
+           (null (cdr arg2))
+           (or (eq (car arg2) 'salist)
+               (eq (car arg2) 'special-alist))
+           (get 'salist 'inline)) ; Only if it's being compiled inline
+      (zccfast-assq-doit arg1 'salist nil v s e))
+     (t
+      ;
+      ; ASSQ something (not-a-variablename)
+      ;
+      (zccfast-assq-punt arg1 arg2 v s e))))
+   ;
+   ; Arg 2 to ASSQ is a constant.  Now is it a valid association list?
+   ;
+   ((not (do ((l (car con2) (cdr l)))
+             ((null l) t)
+             (when (atom l) (return nil))
+             (unless (or (null (car l))
+                         (and (consp (car l))
+                              (symbolp (caar l))))
+                     (return nil))))
+    (warn "Argument 2 to ASSQ not a proper association list for ASSQ"
+          `(assq ,arg1 ,arg2))
+    (zccfast-assq-punt arg1 arg2 v s e))
+   ;
+   ; Otherwise fast call OK.
+   ;
+   (t
+    (zccfast-assq-doit arg1 (zccfast-thing (car con2)) nil v s e)))))
+
+(defun zccfast-assq-doit (arg1 thing variablep v s e)
+ (modq body `(begininline assq 1 ,v ,s))
+ (zccevcom arg1 nil '(arg (1 assq)) e)
+ (when variablep (zccfast-mark-used thing))
+ (modq body `(inline (assq ,thing) 1 ,v ,s))
+)
+
+(defun zccfast-assq-punt (arg1 arg2 v s e)
+ (zcceval 'assq (list arg1 arg2) v s e))
+
+;=======================================================================
+
+(defun zccfast-memq (a v s e &aux temp)
+ (let* ((arg1 (zilcomex (car a) nil))
+        (arg2 (zilcomex (cadr a) nil))
+        (con2 (zilcocon arg2 e)))
+  (cond
+    ;
+    ; MEMQ something NIL?
+    ;
+   ((null arg2)
+    (warn "Argument 2 to MEMQ is nil, suppressing call to MEMQ"
+          `(memq ,arg1 ,arg2))
+    (zccevcom (zilcotrn `(progn ,arg1 nil) debug) v s e)
+   )
+   ((not con2)
+    ;
+    ; Arg 2 to MEMQ not a constant, but might be a local variable
+    ;
+    (cond
+     ;
+     ; MEMQ something variablename?
+     ;
+     ((setq temp (zccfast-locally-bound-variable arg2 e))
+      (zccfast-memq-doit arg1 temp t v s e))
+     (t
+      ;
+      ; MEMQ something (not-a-variablename)
+      ;
+      (zccfast-memq-punt arg1 arg2 v s e))))
+   ;
+   ; Arg 2 to MEMQ is a constant.  Now is it a valid list of symbols?
+   ;
+   ((not (do ((l (car con2) (cdr l)))
+             ((null l) t)
+             (when (atom l) (return nil))
+             (unless (symbolp (car l))
+                     (return nil))))
+    (warn "Argument 2 to MEMQ not a proper list of symbols"
+          `(memq ,arg1 ,arg2))
+    (zccfast-memq-punt arg1 arg2 v s e))
+   ;
+   ; Otherwise fast call OK.
+   ;
+   (t
+    (zccfast-memq-doit arg1 (zccfast-thing (car con2)) nil v s e)))))
+
+(defun zccfast-memq-doit (arg1 thing variablep v s e)
+ (modq body `(begininline memq 1 ,v ,s))
+ (zccevcom arg1 nil '(arg (1 memq)) e)
+ (when variablep (zccfast-mark-used thing))
+ (modq body `(inline (memq ,thing) 1 ,v ,s))
+)
+
+(defun zccfast-memq-punt (arg1 arg2 v s e)
+ (zcceval 'memq (list arg1 arg2) v s e))
+
+;=======================================================================
+
+(defun zccfast-vref (a v s e)
+
+ (let ((arg1 (zilcomex (car a) nil))
+       (arg2 (zilcomex (cadr a) nil))
+      )
+
+  (if (and (fixnump arg2) (< arg2 1024))
+   then
+      (if (minusp arg2)
+       then
+          (modq body `(error "Invalid second arg to VREF" ,arg2))
+       else
+          (modq body `(begininline vref 1 ,v ,s))
+          (zccevcom arg1 nil '(arg (1 vref)) e)
+          (modq body `(inline (vref ,arg2) 1 ,v ,s))
+       endif
+      )
+   else
+    (modq body `(begininline vref 2 ,v ,s)) ; compile as inline call
+    (zccevcom arg1 nil '(arg (1 vref)) e)   ; compile load of argument
+    (zccevcom arg2 nil '(arg (2 vref)) e)   ; compile load of argument
+    (modq body `(inline vref 2 ,v ,s))      ; compile inline code
+   endif
+  )
+ )
+)
+
+;=======================================================================
+
+(defun zccfast-vset (a v s e)
+
+ (let ((arg1 (zilcomex (car a) nil))
+       (arg2 (zilcomex (cadr a) nil))
+       (arg3 (zilcomex (caddr a) nil))
+      )
+
+  (if (and (fixnump arg2) (< arg2 1024))
+   then
+      (if (minusp arg2)
+       then
+          (modq body `(error "Invalid second arg to VSET" ,arg2))
+       else
+          (modq body `(begininline vset 2 ,v ,s))
+          (zccevcom arg1 nil '(arg (1 vset)) e)
+          (zccevcom arg3 nil '(arg (2 vset)) e)
+          (modq body `(inline (vset ,arg2) 2 ,v ,s))
+       endif
+      )
+   else
+    (modq body `(begininline vset 3 ,v ,s)) ; compile as inline call
+    (zccevcom arg1 nil '(arg (1 vset)) e)   ; compile load of argument
+    (zccevcom arg2 nil '(arg (2 vset)) e)   ; compile load of argument
+    (zccevcom arg3 nil '(arg (3 vset)) e)   ; compile load of argument
+    (modq body `(inline vset 3 ,v ,s))      ; compile inline code
+   endif
+  )
+ )
+)
+
+;======================================================================
+
+(defun zccfast-thing (x)
+ (cond
+  ((or (null x)
+       (eq x t)
+       (and (fixnump x) (>= x -1) (<= x 255))
+   )
+   x)
+  ((eq x *unbound-thing*)
+   'unbound)
+  (t
+   (let ((q (zilcoadd x (consp x))))
+        (putprop (cdr q) t 'real)
+        q))))
+
+;======================================================================
+
+; This function tells whether a given argument is a locally bound
+; variable (a lexically bound one, not a dynamically bound one)
+; for the purpose of seeing if fast code can be generated, based
+; on the fact that a one-or-two-instruction sequence will be
+; generated to load it that doesn't clobber any important registers.
+;
+; Note that we have to assign properties to the binding the same
+; way that ZCCATOM would have done.
+;
+
+(defun zccfast-locally-bound-variable (arg e)
+ (when (symbolp arg)
+       (assq arg (zilcec-bindings (car e)))))
+
+(defun zccfast-mark-used (z)
+ (putprop (cdr z) t 'used)
+ (unless (get (cdr z) 'set)
+         (putprop (cdr z) t 'mustinit)))
+
+;======================================================================
+
+(defun zccfastbug (f)
+ (modq body `(error "Wrong number of args to function" ,f)))
+

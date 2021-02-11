@@ -1,0 +1,1124 @@
+U370STAE TITLE 'ESTAE support'
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do:
+*  1) verify SXZERO (rename field) = some value in TGD
+*     change UPROC to support it
+*----------------------------------------------------------------------
+         U#SET FUNC=UTIL
+*
+*----------------------------------------------------------------------
+* Function: ESTAE support
+*
+* Contents:
+*
+*         U370STAE - setup & tear down ESTAE environment
+*
+*         SUPPORT  - ESTAE exit routine, which either decides to
+*                    invoke the RETRY routine, or percolate the ABEND
+*
+*         RETRYx   - local ESTAE retry routine, which will attempt
+*                    to invoke a "remote" ESTAE retry routine if it
+*                    can find one.  Remote ESTAE retry routines are
+*                    typically provided on a CSECT-basis.
+*
+*                    RETRY1 - no SDWA
+*                    RETRY2 - SDWA
+*
+*         Miscellaneous additional low-level subroutines
+*
+* Abbreviations used in the code:
+*
+*         RRR - remote retry routine
+*         LRR - local  retry routine
+*
+* Entry:  AMODE=24, ASC=PRIMARY, KEY=*, STATE=*
+*
+*         TGDFLG4.TGD4NSTA    don't establish any ESTAEs
+*
+*         R0(00:22)           ignored
+*         R0(23:23)           UESTAE TERM=YES flag
+*         R0(24:31) CPDEFLG1  ESTAE processing options
+*                             UESTAE TERM=YES overrides all other opts
+*
+*         R1  = retry addr  - initialize ESTAE environment (as needed),
+*                             set retry routine address
+*                             caller's regs are stored in SX
+*
+*               X'00000000' - terminate ESTAE environment (CSECT only)
+*
+* Exit:   R15 = return code
+*         R15 = 00 success
+*
+*----------------------------------------------------------------------
+*
+* Entry to RRR:
+*
+*         R0     = 0 - reserved for future use
+*         R1     = @ SDWA (RRR responsible for freeing SDWA) or zero
+*         R2-R12 = as provided by RRR in U370STAE setup call
+*         R13    = addr of RRR SA (@ SXBASE)
+*         R14    = addr of supervisor-assisted return linkage
+*                  (returning there will end application, assuming
+*                  a simple RB structure consisting of one PRB;
+*                  other situations requires additional research)
+*         R15    = addr of RRR
+*
+*----------------------------------------------------------------------
+*
+* Diagnostics:
+*
+*         1 - RETRY2   ABENDing SX prefix
+*             RETRY2   SDWA
+*             RETRY2   RRR SX (prefix only)
+*         2 - MAINLINE INIT message w/ RRR addr
+*             RETRY2   ABENDing CSECT DSA
+*         3 - RETRY2   All UWTOs
+*         4 - RETRY2   RRR DSA (whole DSA)
+*         5 - FINDRETY SA chain - SX prefix
+*             FINDRETY SA chain - CPD prefix
+*         6 - RETRY2   TCB
+*         7 - RETRY2   TGD
+*             RETRY2   DSA2 after ALLOCDSA call
+*             RETRY2   ASCB
+*         8 - FINDRETY SA chain - whole DSA
+*             FINDRETY SA chain - whole CPD
+*         9 - RETRY2   whole DSA pool
+*             RETRY2   ALLOCDSA (UWTO)
+*             MAINLINE exit message
+*
+* Abends: U370STAE ABENDs if ESTAE fails, see ERR#nn
+*
+* Notes:  We refer to RETRYx routines as "local retry routines",
+*         and the (caller's) CSECT-specific retry routines as
+*         "remote retry routines".
+*
+*         Refer to OS/VS2 System Programming Library (SPL):
+*         Supervisor for an overview of ESTAE processing, including
+*         such details as register contents upon entry & return
+*         codes.
+*
+*         Refer to OS/VS2 MVS Supervisor Services and Macro
+*         Instructions for specifics on the ESTAE & SETRP macros.
+*
+*         Retry routines are the code MVS calls when an ABEND is
+*         encountered in code that has established an ESTAE
+*         environment.  An SDWA (and savearea) may or may not
+*         be provided by MVS.  A retry routine may elect to either
+*            a) percolate the ABEND or
+*            b) attempt retry by scheduling a "retry exit routine".
+*         A retry routine may also elect to free the SDWA, or
+*         preserve it for the retry exit routine's use (in which
+*         case it's the retry exit routine's responsibility to
+*         free the SDWA).
+*
+*         Retry exit routines are the code MVS calls when a
+*         "retry routine" requests that one be scheduled.
+*         Retry exit routines are called only after MVS has
+*         trimmed the RB chain back to where it was when the
+*         ESTAE request was made.  Examples of RBs: PRB, SVRB, IRB.
+*
+*         Trivia:
+*         RTM2 (task recovery/termination) doesn't appear to care
+*         if we wipe out it's registers in SUPPORT.  IEAVTAS1 uses
+*         SYNCH to call SUPPORT, and then chases control blocks to
+*         find it's regs, which it restores from the RTM2WA.
+*         See IEAVTAS1 labels PRESYNCH & POSTSYNC
+*
+*         Whenever this code wants to call another CSECT (such as
+*         U370LOG), it needs to first assure that the standard
+*         xxxx370 register conventions are observed.  The UPROC
+*         macro in the called CSECT depends on them being right.
+*         See UPROC macro for register conventions.
+*
+*         U370STAE has some intimate knowledge of UPROC's workings,
+*         particulary when U370STAE calls other U370* code.
+*
+*         INIT call:
+*         ----------
+*         The caller's regs (stored in caller's SA) are copied into
+*         the CPDEREGS fields, for restoration at ABEND time.
+*         CPDE@RRR will contain the caller's remote retry address.
+*         If an ESTAE is not active, one will be activated.
+*
+*         UESTAE TERM=YES call:
+*         ---------------------
+*         The caller's remote retry address is cleared, and the ESTAE
+*         environment is brought down.
+*         It is not necessary to TERM prior to exit in every CSECT,
+*         the CSECT's retry routine won't be driven unless the CSECT
+*         is active.  You can expect your RRR code to be called if
+*         a lower-level CSECT ABENDs without an active RRR.
+*         However, it's a good idea to TERM prior to exiting xxxx370,
+*         there may be some cleanup done at that time.
+*
+*         See U370QENV for some handy reference stuff coded in
+*         it's RETRY routines (changing retry addrs, SNAP,
+*         catastrophic failure, etc.).
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (mainline only)
+*----------------------------------------------------------------------
+* R2            R1 at entry (0 or "remote retry exit" address)
+* R3            address of ESTAE exit routine (SUPPORT)
+* R4
+* R5            zap reg
+* R6            INIT call R0 - ESTAE processing options - CPDEFLG1
+* R7   SX       address of caller's SX
+* R8            address of caller's SA
+* R9            address of caller's CPD
+* R10
+* R11           common
+* R12           base reg
+* R13  SAVEAREA savearea
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (MAINLINE only)
+*----------------------------------------------------------------------
+ERR#1    EQU   1        CPD can't be located
+ERR#2    EQU   2        ESTAE setup call rc non-zero
+ERR#3    EQU   3        ESTAE termination call rc non-zero
+         TITLE ' '
+*----------------------------------------------------------------------
+*  MAINLINE
+*----------------------------------------------------------------------
+U370STAE UPROC ID=USTA,L=L$SA,CPD=(Y,0,ESTAE) generate ESTAE fields
+*----------------------------------------------------------------------
+MAINLINE DS    0H
+         STM   R0,R1,SAENTRY           save entry regs
+         LR    R2,R1                   save RRR addr in safe reg
+         LR    R6,R0                   save flags    in safe reg
+*----------------------------------------------------------------------
+*  Locate caller's SA & SX
+*----------------------------------------------------------------------
+         L     R8,SX@BACK-SXBASE(,R13)      @ caller's SA
+         U@SX  R7,SAREG=R8                  @ caller's SX
+*----------------------------------------------------------------------
+*  Determine call type: INIT or TERM
+*----------------------------------------------------------------------
+         TM    SAR0B2,CPDETERM/256          check entry parm
+         BO    TERM                         terminate request
+         EJECT ,
+*----------------------------------------------------------------------
+*  Set up caller's RRR environment
+*----------------------------------------------------------------------
+INIT     DS    0H
+         ICM   R9,15,SX@CPD            @ CPD
+         BNZ   INITINIT
+*
+         WTO   'STAE ESTAE without CPD; check caller UPROC'
+         ABEND 370                     caller UPROC coding error
+*
+         USING CPD,R9
+INITINIT ICM   R1,15,=C'INIT'
+         BAL   R10,MAINMSG1            issue msg w/ caller's CSECT
+         STC   R6,CPDEFLG1             set ESTAE processing options
+         OI    CPDEFLG2,CPDE2RRV       RRR addr valid
+         ST    R2,CPDE@RRR             set retry address
+         MVC   CPDEREGS(13*4),SXR0     copy caller's R0:R12 (only)
+*
+         TM    TGDFLG3,TGD3RETY
+         BO    RCZERO                  ESTAE already activated
+*----------------------------------------------------------------------
+*  Activate ESTAE environment
+*----------------------------------------------------------------------
+         TM    TGDFLG4,TGD4NSTA        bypass ESTAE CT?
+         BO    RCZERO                  yes, br
+*
+*  Provide WAREG to the ESTAE exit routine via PARAM=
+*
+         MVI   SAREASON,ERR#2
+         MVC   SAESTAE(L$ESTAE),MDLESTAE
+         LA    R3,SUPPORT
+         ESTAE (R3),CT,PARAM=(WAREG),MF=(E,SAESTAE)
+         LTR   R15,R15
+         BNZ   DIE
+*
+         OI    TGDFLG3,TGD3RETY        ESTAE now active
+         B     RCZERO
+*
+DIE      DS    0H
+         WTO   'STAE ESTAE fail; exiting'
+         UABEND SAREASON,SVC=3
+         EJECT ,
+*----------------------------------------------------------------------
+*  Terminate ESTAE environment
+*----------------------------------------------------------------------
+TERM     DS    0H
+         ICM   R1,15,=C'TERM'
+         BAL   R10,MAINMSG1
+         TM    TGDFLG4,TGD4NSTA        ESTAE not desired?
+         BO    TERMOFF                 yes, br
+         TM    TGDFLG3,TGD3RETY        ESTAE established?
+         BNO   TERMOFF                 yes, br
+         MVI   SAREASON,ERR#3
+         MVC   SAESTAE(L$ESTAE),MDLESTAE
+         ESTAE 0,MF=(E,SAESTAE)
+         LTR   R15,R15
+         BNZ   DIE
+*
+TERMOFF  NI    TGDFLG3,255-TGD3RETY    U370STAE ESTAE no longer active
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+RCZERO   DS    0H
+         UDIAG 9,'STAE main exit'
+         UPEND RC=0
+*----------------------------------------------------------------------
+*  MAINMSG1 - issue INIT/TERM msg with caller's CSECT, RRR addr
+*----------------------------------------------------------------------
+MAINMSG1 DS    0H
+         MVI   SAMSG1,C' '
+         MVC   SAMSG1+1(L$MSG1-1),SAMSG1
+         MVC   SAM1LIT1,=C'<2> STAE main'
+         STCM  R1,15,SAM1TXT1
+         MVC   SAM1TXT2,SXID
+         L     R0,SAR0                           R0 entry parm
+         LA    R1,SAM1TXT3                       display hex dest addr
+         UCALL U370HEX                           convert to display hex
+         L     R0,SAR1                           R1 entry parm
+         LA    R1,SAM1TXT4                       display hex dest addr
+         UCALL U370HEX                           convert to display hex
+         UDIAG 2,SAMSG1,L$MSG1
+         BR    R10
+*----------------------------------------------------------------------
+*  END OF MAINLINE
+*----------------------------------------------------------------------
+         EJECT ,
+*----------------------------------------------------------------------
+*  SUPPORT - U370STAE retry routine
+*----------------------------------------------------------------------
+*  ESTAE retry routine - select RETRYx based on entry environment
+*  It is necessary to return to RTM2 before the retry exit routine
+*  (RETRYx) is scheduled so RTM2 can trim the RB chain.
+*  We may be called either with or without an SDWA (and system-
+*  provided savearea that comes with the SDWA).
+*
+*  It does not appear to be necessary to restore RTM2's registers
+*  before returning (based on examination of MVS38j IEAVTAS1 source).
+*  This greatly simplifies things, especially when no SDWA
+*  has been provided (hence no system-provided savearea).
+*
+*  Upon return to RTM2, RTM2 will trim the RB queue back to the
+*  point of the ESTAE issuer associated with the SCB under which
+*  we were invoked.
+*
+*  OS/VS2 SPL: Supervisor says it does this by pointing the RB
+*  old PSW at an SVC 3 (EXIT) instruction.
+*
+*  Additionally, open DCBs that can be associated with the
+*  purged RBs are closed and queued I/O associated with such
+*  DCBs are deleted from the I/O restore chain.
+*
+*  For our environment, with only one PRB, this should have no
+*  impact on us.  Other situations may be impacted.
+*
+*  SUPPORT always attempts to schedule a retry routine.  The RETRYx
+*  code will attempt to perform some diagnostics, even if no
+*  remote retry code can be found.
+*
+*  In terms of the documentation, NOSDWA, HVSDWA and SUBAIL should
+*  be considered components of SUPPORT.
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (SUPPORT)
+*----------------------------------------------------------------------
+* R0            scratch
+* R1            scratch
+* R2            SUPPORT - NOSDWA, HVSDWA
+* R3            SUPPORT - NOSDWA, HVSDWA
+* R4            SUPPORT - RTM2 return addr
+* R5            zap reg
+* R6            subroutine reserved
+* R7   SX       subroutine SX
+* R8   SA       subroutine SA (SXBASE)
+* R9   CPD      subroutine CPD
+* R10           subroutine internal linkage
+* R11  TGDWA
+* R12           U370STAE basereg
+* R13           SUPPORT - NOSDWA, HVSDWA
+* R14           scratch
+* R15           scratch
+*----------------------------------------------------------------------
+         PUSH  USING              <SUPPORT>
+         DROP  ,
+SUPPORT  DS    0H
+         USING *,R15
+         C     R0,=F'12'               SDWA provided?
+         BNE   HVSDWA
+         POP   USING              <SUPPORT>
+         EJECT ,
+*----------------------------------------------------------------------
+*  NOSDWA - ESTAE retry routine - no SDWA provided
+*----------------------------------------------------------------------
+*
+*  When no SDWA is provided, entry regs are:
+*
+*  R0    = 12 (no SDWA provided)
+*  R1    abend completion code
+*  R2    address of user-supplied parm list (ESTAE PARAM=(WAREG))
+*  R13   unpredictable (no savearea provided)
+*  R14   return address to RTM2 (task termination)
+*  R15   entry point address of ESTAE recovery routine (SUPPORT)
+*
+*  SETRP macro may not be issued (modifies SDWA)
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (NOSDWA)
+*----------------------------------------------------------------------
+* R0            RETRY1 address passed to RTM2
+* R2            reserved for SUBAIL
+* R3            SUBAIL: 0 = no SDWA
+* R4            RTM2 return addr
+* R10           internal linkage
+* R11  TGD
+* R12           U370STAE base
+* R13           spare
+*
+         PUSH  USING              <NOSDWA>
+         DROP  ,
+         USING SUPPORT,R15
+NOSDWA   DS    0H
+         LR    WAREG,R2                SUBAIL requires
+         USING TGDWA,WAREG
+         LR    R4,R14                  save RTM2 return addr
+         L     R12,=A(U370STAE)        set standard base reg
+         USING U370STAE,R12
+         DROP  R15
+         UDIAG 2,SKIP=NOSDWTOX
+         WTO   'STAE no SDWA'
+NOSDWTOX DS    0H
+*
+*  We don't set TGD3SUPT when we have no SDWA; our code path
+*  is almost nothing.  SUBAIL will percolate the ABEND for us.
+*  About all we get out of SUBAIL is it's WTO and probably a dump.
+*
+         TM    TGDFLG3,TGD3SUPT        SUPPORT already active?
+         BNO   NOSDSCHD                no, safe to sched retry
+*
+         SLR   R3,R3                   no SDWA (RTM short on storage)
+         BAL   R10,SUBAIL              attempt graceful shutdown
+*
+*  Schedule RETRY1 (no-SDWA) retry exit routine
+*
+NOSDSCHD DS    0H
+         OI    TGDFLG3,TGD3SCHD        RETRY1 (no-SDWA) scheduled
+         LA    R0,RETRY1               local (no SDWA) retry routine
+         LA    R15,4                   rc = schedule retry routine
+         BR    R4                      return to RTM2
+         POP   USING              <NOSDWA>
+         EJECT ,
+*----------------------------------------------------------------------
+*  HVSDWA - ESTAE retry routine - SDWA provided
+*----------------------------------------------------------------------
+*
+*  When SDWA is provided, entry regs are:
+*
+*  R0    I/O processing code
+*
+*        00 = active I/O quiesced & restorable
+*        04 = active I/O halted, not restorable
+*        08 = no active I/O at time of ABEND
+*        16 = no I/O processing performed
+*
+*  R1    SDWA address
+*  R13   RTM2-provided save area address
+*  R14   RTM2-provided return address
+*  R15   entry point address of ESTAE recovery routine (SUPPORT)
+*
+*  SETRP macro sets up SDWA for retry or percolation
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (HVSDWA)
+*----------------------------------------------------------------------
+* R2            reserved for SUBAIL, scratch in HVSDWA
+* R3   SDWA     SUBAIL: SDWA
+* R4            RTM2 return addr
+* R9   CPD      projected RRR's CPD (FINDCPD)
+* R10           internal linkage, scratch in HVSDWA
+* R11  TGD
+* R12           U370STAE base
+* R13           RTM2 savearea, scratch in HVSDWA
+*
+         PUSH  USING              <HVSDWA>
+         DROP  ,
+         USING SUPPORT,R15
+HVSDWA   DS    0H
+         STM   R14,R12,12(R13)         save RTM2's regs (debug aid)
+         L     R12,=A(U370STAE)
+         USING U370STAE,R12
+         DROP  R15
+         LR    R4,R14                  save RTM2 return addr
+         LR    R3,R1                   save SDWA ptr
+         USING SDWA,R3
+         L     WAREG,SDWAPARM          @ TGD
+         USING TGDWA,WAREG
+*
+         TM    TGDFLG3,TGD3SUPT        SUPPORT already active?
+         BNO   HVSAFE                  no, safe to sched retry
+*
+         BAL   R10,SUBAIL              attempt graceful shutdown
+*
+HVSAFE   DS    0H
+         OI    TGDFLG3,TGD3SUPT        SUPPORT active
+         LA    R2,RETRY2               retry routine
+*
+         BAL   R10,FINDCPD             attempt to find RRR's CPD
+         LTR   R9,R9                   found RRR's CPD?
+         BZ    HVNOSNAP                no, can't check SNAP request
+         USING CPD,R9
+         TM    CPDEFLG1,CPDE1SNP       RRR wants SNAP?
+         BNO   HVNOSNAP                no, select quiet SETRP
+         ICM   R10,15,CPDE@SNP         RRR's SNAP parmlist
+         BZ    HVNOSNAP                Oops, no parmlist
+         DROP  R9
+*
+HVSNAP   DS    0H
+         SETRP WKAREA=(R3),            SDWA                            +
+               DUMP=YES,               SNAP requested                  +
+               DUMPOPT=(R10),          SNAP parmlist                   +
+               RC=4,                   schedule RETRYx routine         +
+               RETADDR=(R2),           RETRY2 address                  +
+               FRESDWA=NO,             preserve SDWA for RETRYx        +
+               RETREGS=NO              RETRY2 figures out regs
+         B     HVSCHED                 schedule RETRY2
+*
+HVNOSNAP DS    0H
+         SETRP WKAREA=(R3),            SDWA                            +
+               DUMP=NO,                no SNAP                         +
+               RC=4,                   schedule RETRYx routine         +
+               RETADDR=(R2),           RETRY2 address                  +
+               FRESDWA=NO,             preserve SDWA for RETRYx        +
+               RETREGS=NO              RETRY2 figures out regs
+*
+HVSCHED  DS    0H
+         NI    TGDFLG3,255-TGD3SUPT    SUPPORT inactive
+         LA    R15,4                   rc = schedule retry routine
+         BR    R4                      return to RTM2
+         POP   USING              <HVSDWA>
+         EJECT ,
+*----------------------------------------------------------------------
+*  SUBAIL - SUPPORT bail (will not return to caller)
+*----------------------------------------------------------------------
+* Entry:
+* R3     zero or SDWA addr
+* R4     RTM2 return addr
+* R10    return to caller (debug aid)
+* R11    TGD
+* R12    U370STAE base
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (SUBAIL)
+*----------------------------------------------------------------------
+* R2            reserved for SUBAIL
+* R10           internal linkage
+* R11  TGD
+* R12           U370STAE base
+*----------------------------------------------------------------------
+*
+*  ABEND detected while SUPPORT active
+*
+         PUSH  USING              <SUBAIL>
+         DROP  ,
+SUBAIL   DS    0H
+         USING TGDWA,WAREG             <required of caller>
+         USING U370STAE,R12            <required of caller>
+*
+         TM    TGDFLG3,TGD3EXIT        stop the madness?
+         BO    SBEXIT                  yes, and I mean NOW
+*
+         OI    TGDFLG3,TGD3EXIT        one dump will be sufficient
+         WTO   'STAE recursive SUPPORT ABEND'
+*
+*  If we have an SDWA, generate diagnostic SNAP
+*
+         LTR   R3,R3                   SDWA?
+         BZ    SBPERC                  no, just percolate ABEND
+*
+*  SUBAIL ignores CPDEFLG1.CPDE1SNP & CPED@SNP for these basic reasons:
+*
+*  1) We want the SNAP parms we want, not someone else's
+*
+*  2) We've already died once in SUPPORT, let's get a dump
+*     and percolate back to a hopefully more graceful state
+*     (even - or perhaps especially - if it means we're done running).
+*     The dump is what we really want, and it could be that we've
+*     died due to some external influence brought on by a RRR.
+*     Don't give the RRRs a chance to kill us & get the dump.
+*
+SBSETRP  DS    0H
+         LA    R2,SBSNAPL              provide SNAP parms
+         SETRP WKAREA=(R3),            SDWA                            +
+               DUMP=YES,               merge dump options              +
+               DUMPOPT=(R2),           SNAP  dump options              +
+               RC=0                    percolate ABEND
+*
+*  Percolate the ABEND
+*
+SBPERC   DS    0H
+         SLR   R15,R15                 rc = percolate ABEND
+         BR    R4                      return to RTM2
+*
+*  I have to admit the SVC3 is a bit of experimentation
+*  For now, it puts a quick end to our misery
+*  MVS38j SVC3 source: SYM12 - IEAVEOR
+*
+SBEXIT   DS    0H
+         SVC   3                       EXIT our PRB
+*
+*  SNAP macro parm list
+*  TCB, DCB, and STRHDR options ignored by RTM2
+*
+SBSNAPL  SNAP  MF=L,                                                   +
+               SDATA=(CB,ERR,DM),                                      +
+               PDATA=ALL
+L$SNAPL  EQU   *-SBSNAPL
+         POP   USING              <SUBAIL>
+         EJECT ,
+*----------------------------------------------------------------------
+*  ESTAE retry exit routine (local) - no SDWA
+*
+*  Entry parms:
+*  R0    = 12 (no SDWA)
+*  R1    address of user parm list (ESTAE PARAM=(WAREG))
+*  R2    0 or address of PIRL (if I/O was quiesced and restorable)
+*  R14   address of supervisor-assisted exit linkage
+*  R15   entry point address of retry routine (RETRY1)
+*
+*----------------------------------------------------------------------
+         PUSH  USING              <RETRY1>
+         DROP  ,
+RETRY1   DS    0H
+         USING *,R15
+         LA    R15,RETRY2              pretend we're RETRY2
+         SLR   R1,R1                   but without an SDWA
+         BR    R15
+*
+         POP   USING              <RETRY1>
+         EJECT ,
+*----------------------------------------------------------------------
+*  ESTAE retry routine (local) - SDWA (not yet freed), RETREGS=NO
+*
+*  Entry:
+*
+*  PSW key = PSW key of ESTAE issuer
+*  RB under which we're running is same as ESTAE issuer
+*
+*  R0    = 0
+*  R1    address of SDWA
+*  R2    unpredictable
+*  R14   address of supervisor-assisted exit linkage
+*  R15   entry point address of retry routine (RETRY2)
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage (RETRYx & it's called subroutines)
+*----------------------------------------------------------------------
+* R0            subroutine scratch
+* R1            subroutine scratch
+* R2
+* R3   SDWA     or 0 if called from RETRY1
+* R4            return addr to RTM2 supervisor-assisted linkage
+* R5            zap reg
+* R6            subroutine reserved; scratch
+* R7   SX       subroutine SX
+* R8   SA       subroutine SA (SXBASE)
+* R9   CPD      subroutine CPD
+* R10           subroutine internal linkage
+* R11  TGDWA    subroutine TGDWA (WAREG)
+* R12           RETRYx basereg
+* R13           RETRYx ABENDing CSECT's SA
+* R14           subroutine scratch, return to RMT2
+* R15           subroutine scratch, RETRYx entry point
+*----------------------------------------------------------------------
+         PUSH  USING              <RETRY2>
+         DROP  ,
+RETRY2   DS    0H
+         USING *,R15
+         L     R12,=A(U370STAE)        standard base reg
+         DROP  R15
+         USING U370STAE,R12
+         LR    R4,R14                  supervisor-assisted return addr
+         LR    R3,R1                   SDWA (or zero)
+         USING SDWA,R3
+         BAL   R10,FINDSX              find ABENDing SX, TGD
+         USING TGDWA,WAREG
+         USING SX,R7
+         TM    TGDFLG3,TGD3DIE
+         BOR   R4                      stop the madness
+*
+         NI    TGDFLG3,255-TGD3SCHD    scheduled exit now running
+         UWTO  3,'STAE RETRY'
+         ST    R7,TGDES@AX             note in TGD as debug aid
+         LTR   R8,R8                   found SA?
+         BZ    RE2DIE                  no, badness
+*
+*  We need a DSA so we can call some U370* CSECTs prior to giving
+*  control to the remote retry routine
+*
+         OI    TGDFLG3,TGD3LOCL        local retry exit active (RETRY2)
+         BAL   R10,ALLOCDSA            allocate DSA
+         USING SAVEAREA,R13
+         LH    R14,SXLDSA              ABENDing CSECT's DSA length
+         UDIAG 2,'STAE ABENDing DSA',(R7),(R14)
+         U@SX  R14,USING=NO
+         UDIAG 7,'STAE RETRY DSA2',(R14),L$SXPFX+L$SA
+*
+*  Display diagnostics
+*
+*        UDIAGs labeled with 'Data Areas' documented in
+*        OS/VS2 SPL: Debugging Handbook
+*
+         UDIAG 1,'STAE RETRY ABENDing SX',(R7),L$SXPFX           DSAEX
+*
+         LTR   R1,R3                   set SDWA parm
+         BZ    RE2NOSDW
+         UCALL U370SDWA                analyse RTM's SDWA
+         SLR   R0,R0
+         SLR   R1,R1
+         UCALL U370QTCB                display TCB structure, etc
+RE2NOSDW DS    0H
+*
+         L     R10,TGDLDSA                     length of whole DSA pool
+         UDIAG 9,'STAE RETRY DSA pool',(WAREG),(R10),FIN=RE2DIAGX
+         UDIAG 7,'STAE RETRY TGD',(WAREG),L$TGD                  WATGD
+RE2DIAGX DS    0H
+*
+         L     R10,PSAAOLD-PSA
+         UDIAG 7,'STAE RETRY ASCB',(R10),L$ASCB       Data Areas ASCB
+*
+         L     R10,PSATOLD-PSA
+         UDIAG 6,'STAE RETRY TCB',(R10),L$TCB         Data Areas TCB
+*----------------------------------------------------------------------
+*  Note: this would be the place to handle quiesced I/O, if any
+*----------------------------------------------------------------------
+*
+*  Attempt to locate a RRR in the SA chain
+*
+         BAL   R10,FINDRETY            find lowest RRR (R7 @ RRR SX/0)
+*
+         LTR   R3,R3                   SDWA present?
+         BZ    RE2FREED
+         LTR   R7,R7                   found RRR?
+         BZ    RE2FREE                 no, free SDWA
+         USING CPD,R9
+         TM    CPDEFLG1,CPDE1SDW       RRR wants SDWA?
+         BO    RE2FREED                ok, but RRR must free SDWA
+*
+*  Free SDWA
+*
+RE2FREE  SLR   R0,R0
+         ICM   R0,8,SDWASPID           SDWA subpool
+         ICM   R0,3,SDWALNTH           SDWA length
+         FREEMAIN R,LV=(0),A=(R3)      release SDWA storage
+         SLR   R3,R3                   SDWA gone
+RE2FREED DS    0H
+         DROP  R3
+         LTR   R7,R7                   found RRR?
+         BZ    RE2PUNT2                none provided, skip
+*
+*  Call remote retry routine
+*  The supervisor-assisted return address is provided in case the
+*  retry routine decides to abandon hope
+*
+RE2RMT   DS    0H
+         SLR   R0,R0
+         ST    R0,CPDEREGS+(R0*4)      RRR R0=0 (reserved for future)
+         ST    R3,CPDEREGS+(R1*4)      RRR R1@SDWA or zero
+         ST    R7,TGDES@RX             @ RRR SX
+         SLR   R10,R10
+         ICM   R10,3,CPDL              RRR CPD length
+         UDIAG 6,'STAE RETRY RRR CPD',(R9),(R10),FIN=RE2RRRD
+         UDIAG 1,'STAE RETRY RRR CPD',(R9),L$CPDPFX
+RE2RRRD  SLR   R10,R10
+         ICM   R10,3,SXLDSA            RRR DSA length
+         UDIAG 4,'STAE RETRY RRR DSA',(R7),(R10),FIN=RE2CALL
+         UDIAG 1,'STAE RETRY RRR SX ',(R7),L$SXPFX
+*
+RE2CALL  DS    0H
+         L     R10,CPDE#RUN           # times RRR run
+         LA    R10,1(,R10)
+         ST    R10,CPDE#RUN
+*
+         LA    R13,SXBASE              @ remote retry rtn's SA
+         LR    R14,R4                  supervisor return addr
+         L     R15,CPDE@RRR            RRR entry point
+         NI    TGDFLG3,255-TGD3LOCL    RETRY2 no longer active
+         OI    TGDFLG3,TGD3RMT         RRR active
+         OI    CPDEFLG2,CPDE2RRR       RRR being called
+         LM    R0,R12,CPDEREGS         restore RRR regs
+         BR    R15                     call RRR
+*
+*  no RRR to call, abandon
+*
+RE2PUNT2 DS    0H
+         UWTO  0,'STAE RETRY - no RRR'
+*
+RE2DIE   DS    0H
+         OI    TGDFLG3,TGD3DIE         c'ya
+         MVC   SAESTAE(L$ESTAE),MDLESTAE
+         ESTAE 0,MF=(E,SAESTAE)        cancel ESTAE environment
+         UWTO  0,'STAE RE2DIE'
+         ABEND 370,DUMP                leave DSA pool for DUMP
+*
+         POP   USING              <RETRY2>
+         EJECT ,
+*----------------------------------------------------------------------
+*  Find CPD - called by SUPPORT (HVSDWA)
+*  Duplicates lots of RETRYx subrtns, in a very abbreviated manner
+*  The whole point of this routine is to find the RRR's CPD for
+*  SUPPORT (HVSDWA) so it can check the SNAP options
+*  Calls no one; has no savearea
+*----------------------------------------------------------------------
+* Entry:
+* R10    return addr
+* R11    @ TGDWA (WAREG)
+* R12    @ U370STAE
+*
+* Returns:
+* R9     0 or @ RRR's CPD
+*
+* Uses:
+* R0     SX prefix length
+* R1     @ SX
+* R9     @ selected CPD
+* R14    @ trial CPD
+* R15    @ SA
+*
+         PUSH  USING              <FINDCPD>
+         DROP  ,
+         USING PSA,0
+         USING TGDWA,R11
+         USING U370STAE,R12
+FINDCPD  DS    0H
+*
+*  Run the SA chain forward, reviewing SXs & CPDs as we go
+*  The ABENDing CSECT's SA is at the end of the chain
+*  The CPD we're interested in is associated with the lowest
+*  level SA which has an active RRR; that will be the one that
+*  RETRYx calls to perform recovery
+*
+         LA    R0,L$SXPFX         SX prefix length
+         SLR   R9,R9              clear CPD ptr
+         LA    R15,TGDSA1         @ 1st SA
+FCLOOP   DS    0H
+         LA    R1,0(,R15)         clear hi (might not be ours)
+         SR    R1,R0
+         USING SX,R1
+         CLC   SXVER,TGDSAVER     one of our saveareas?
+         BNER  R10                no, look no further
+         ICM   R14,15,SX@CPD      CPD present?
+         BZ    FCNEXT             no, ignore
+         USING CPD,R14
+         CLC   CPDID,SXID         better match
+         BNE   FCHOSED
+         TM    CPDEFLG2,CPDE2RRV  RRR valid?
+         BNO   FCNEXT
+         LR    R9,R14             found CPD w/ valid ESTAE fields
+FCNEXT   DS    0H
+         ICM   R15,15,8(R15)      @ next lower SA
+         BNZ   FCLOOP             scan to end of SA chain
+         BR    R10                return to caller
+*
+FCHOSED  SLR   R9,R9              CPD/SX damaged, don't sched RRR
+         UWTO  0,'STAE FC CPD/SX corrupt'
+         BR    R10
+         POP   USING              <FINDCPD>
+         EJECT ,
+*----------------------------------------------------------------------
+*  Find SX, verify validity
+*----------------------------------------------------------------------
+* Entry:
+* R10    return addr
+* R12    @ U370STAE
+*
+* Returns:
+* R7     SX (prefix) - invalid when R8=0
+* R8     SA (basic section)  = 0 when FINDSX had problem
+* R11    TGDWA (WAREG)
+*
+* Uses:
+* R0     scratch
+* R1     scratch
+* R6     reserved
+* R7     SX
+* R8     SA
+* R10    return addr
+* R11    TGDWA (WAREG)
+* R14    scratch
+* R15    scratch
+*----------------------------------------------------------------------
+*  Find SX
+*----------------------------------------------------------------------
+         PUSH  USING              <FINDSX>
+         DROP  ,
+         USING U370STAE,R12
+FINDSX   DS    0H
+         SLR   R8,R8                        assume bad news
+         L     R14,PSATOLD-PSA              my TCB addr
+         LA    R14,0(,R14)                  clear hi byte
+*
+         SLR   WAREG,WAREG
+         ICM   WAREG,7,TCBFSAB-TCB(R14)     @ MVS-provided savearea
+         L     WAREG,SX@FWD-SXBASE(,WAREG)  @ xxxx370 1st SA
+         LTR   R0,WAREG
+         BZ    FSNOWA
+*
+         LA    R15,TGDSA1-TGDWA             offset adjustment
+         SR    WAREG,R15
+         USING TGDWA,WAREG
+*
+         CLC   =C'DSA ',TGDEYE+4            verify eyecatcher
+         BE    FSLOOP
+*
+FSBADEYE WTO   'STAE FINDSX bad TGDEYE'
+         BR    R10                          return w/ bad news
+*
+FSNOWA   WTO   'STAE FINDSX no TGDWA'
+         BR    R10                          return w/ bad news
+*
+*  Run savearea chain to end
+*
+FSLOOP   DS    0H
+         LR    R8,R0
+         CLC   SXVER-SXBASE(L'SXVER,R8),TGDSAVER    one of our SAs?
+         BNE   FSFINI                               no, br
+         ICM   R0,15,SX@FWD-SXBASE(R8) @ next lower SA
+         BNZ   FSLOOP                  last SA has fwd ptr = 0
+*
+FSFINI   DS    0H
+         LR    R7,R8
+         LA    R0,L$SXPFX              length of SX prefix
+         SR    R7,R0                   back up to SX (prefix)
+         BR    R10
+*
+         POP   USING              <FINDSX>
+         EJECT ,
+*----------------------------------------------------------------------
+*  FINDRETY - Find RRR - scan SA chain
+*  Side effect: prints SA chain (diag level 4)
+*  Caller's regs restored except R7, R9
+*----------------------------------------------------------------------
+* Entry:
+* R10    return addr
+* R11    TGDWA
+* R12    U370STAE
+* R13    SAVEAREA
+*
+* Returns:
+* R7     zero or lowest level SX  with CPDE@RRR
+* R9     zero or lowest level CPD with CPDE@RRR
+*
+* Uses:
+* R0     scratch
+* R1     scratch
+* R5     SX prefix length
+* R6     SX to be returned
+* R7     SX
+* R8     CPD to be returned
+* R9     CPD
+* R10    DSA length
+* R14    scratch
+* R15    scratch
+*----------------------------------------------------------------------
+         PUSH  USING              <FINDRETY>
+         DROP  ,
+         USING PSA,0
+         USING TGDWA,WAREG
+         USING U370STAE,R12
+         USING SAVEAREA,R13
+FINDRETY DS    0H
+         STM   R0,R15,SALOWSA          save caller's regs
+         LA    R5,L$SXPFX              SX prefix length
+         SLR   R6,R6                   SX returned
+         SLR   R8,R8                   CPD returned
+         LA    R7,TGDSA1-L$SXPFX       @ 1st application SA
+         USING SX,R7
+*
+FRLOOP   DS    0H
+         CLC   SXVER,TGDSAVER          one of our SAs?
+         BNE   FRLAST                  no, br
+         ICM   R7,15,SX@FWD            @ next lower SA
+         BZ    FRLAST                  last active SA, br
+         SR    R7,R5                   @ SX prefix
+*
+*  Display CPD
+*
+         ICM   R9,15,SX@CPD            @ CPD
+         BZ    FRCP2                   no CPD = no retry routine
+         USING CPD,R9
+         SLR   R10,R10
+         ICM   R10,3,CPDL              CPD length
+         BZ    FRCP1
+         UDIAG 8,'STAE FINDRETY SA chain CPD',(R9),(R10),FIN=FRCP2
+FRCP1    UDIAG 5,'STAE FINDRETY SA chain CPD',(R9),L$CPDPFX
+FRCP2    DS    0H
+*
+*  Display DSA/SX
+*
+         SLR   R10,R10
+         ICM   R10,3,SXLDSA            DSA length
+         BZ    FRSX1
+         UDIAG 8,'STAE FINDRETY SA chain DSA',(R7),(R10),FIN=FRSX1
+         UDIAG 5,'STAE FINDRETY SA chain SX',(R7),L$SXPFX
+FRSX1    DS    0H
+         LTR   R9,R9                   no CPD?
+         BZ    FRLOOP                  yes, nothing to check
+         CLC   CPDID,SXID              better match
+         BNE   FRHOSED
+*
+*  Exercise a little caution here, the CPDE@RRR field isn't
+*  present if CSECT didn't request ESTAE support
+*
+         TM    CPDEFLG2,CPDE2RRV       retry routine present?
+         BNO   FRLOOP                  no, leave retry reg alone
+         ICM   R0,15,CPDE@RRR          really present?
+         BZ    FRLOOP                  no, leave retry reg alone
+         LR    R6,R7                   lowest level SX w/ retry
+         LR    R8,R9                   lowest level CPD w/ retry
+         B     FRLOOP
+*
+FRHOSED  DS    0H
+         UWTO  0,'STAE FR CPD/SX corrupt'
+         UDIAG 0,'STAE FR corrupt CPD',(R9),L$CPDPFX
+         UDIAG 0,'STAE FR corrupt SX',(R7),L$SXPFX
+         SLR   R8,R8                   run RRR? no way!
+*
+FRLAST   DS    0H
+         XC    SALOWSA+(R7*4)(4),SALOWSA+(R7*4)   clear caller R7
+         XC    SALOWSA+(R9*4)(4),SALOWSA+(R9*4)   clear caller R9
+         LTR   R8,R8                   found RRR?
+         BZ    FREXIT                  no, return w/o RRR
+*
+*  Trim SA chain at the RRR's SA, return R7 & R9 to caller
+*
+         XC    SX@FWD-SX(L'SX@FWD,R6),SX@FWD-SX(R6)
+         ST    R6,SALOWSA+(R7*4)       modify return R7 @ SX
+         ST    R8,SALOWSA+(R9*4)       modify return R9 @ CPD
+*
+FREXIT   DS    0H
+         LM    R0,R15,SALOWSA          restore caller regs + R7, R9
+         BR    R10
+         POP   USING              <FINDRETY>
+         EJECT ,
+*----------------------------------------------------------------------
+*  ALLOCDSA - allocate DSA, set R13
+*----------------------------------------------------------------------
+* Entry:
+* R10    return addr
+* R11    TGD
+* R12    U370STAE
+*
+* Returns:
+* R13    @ SXBASE (SA)
+*
+* Uses:
+* R0     scratch
+* R1     scratch
+* R13    DSA
+* R14    scratch
+* R15    scratch
+*----------------------------------------------------------------------
+         PUSH  USING              <ALLOCDSA>
+         DROP  ,
+         USING TGDWA,WAREG
+         USING U370STAE,R12
+*
+ALLOCDSA DS    0H
+*
+*  Allocate copy of our SAVEAREA via QDSA2
+*
+         UPRLOC QDSA2,R13              address new DSA
+         USING SX,R13
+*
+         LR    R0,R13                  dest addr
+         L     R1,=A(L$SXPFX+L$SA)     dest len
+         SLR   R15,R15                 source len
+         MVCL  R0,R14                  clear borrowed DSA
+*
+*  Finish initializing DSA
+*  Highly dependent on current UPROC & U370AP00 implementations
+*
+         MVC   SXID,=CL8'ESTAEDSA'     identify funky DSA
+         LA    R0,L$SA                 SA  length
+         STH   R0,SXLSA
+         LA    R0,L$SXPFX+L$SA         DSA length
+         STH   R0,SXLDSA
+*
+*  Leave new DSA out of the SA chain, in case of trouble
+*  in whatever CSECTs RETRY2 calls.
+*
+         LA    R13,SXBASE              @ our borrowed SA
+         BR    R10
+*
+         POP   USING              <ALLOCDSA>
+         EJECT ,
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+MDLESTAE ESTAE MF=L                    model ESTAE
+L$ESTAE  EQU   *-MDLESTAE
+*
+         PRINT DATA
+PATCH2   DC    32S(*)                  additional patch space
+         LTORG ,
+         EJECT ,
+*----------------------------------------------------------------------
+*  Savearea/workarea
+*  Layout common to both U370STAE mainline and RETRY2
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F
+SALOWSA  DS    16F                internal subroutine usage
+*
+SAENTRY  DS    2F                 entry regs (mainline)
+SAR0     EQU   SAENTRY+0,4        entry flags
+SAR0B2   EQU   SAENTRY+2,1        entry flags
+SAR0B3   EQU   SAENTRY+3,1        entry flags
+SAR1     EQU   SAENTRY+4,4        RRR addr
+*
+SAESTAE  ESTAE MF=L
+SAREASON DS    C
+*
+SAMSG1   DS    0C
+SAM1LIT1 DS    C'<x> STAE main'
+         DS    C' '
+SAM1TXT1 DS    C'xxxx'                 init, term
+         DS    C' '
+SAM1TXT2 DS    CL8                     CSECT
+         DS    C' '
+SAM1TXT3 DS    CL8                     entry parms
+         DS    C' '
+SAM1TXT4 DS    CL8                     RRR addr
+L$MSG1   EQU   *-SAMSG1
+*
+         DS    0D
+L$SA     EQU   *-SAVEAREA
+*
+         WATGD ,
+*
+         EJECT ,
+         PRINT NOGEN
+*
+         IHAPSA DSECT=YES
+*
+         IHAASCB ,
+L$ASCB   EQU   *-ASCB
+*
+         IKJTCB DSECT=YES,LIST=NO
+L$TCB    EQU    TCBMNLEN
+*
+         IKJRB  DSECT=YES
+*
+         IHASDWA ,
+L$SDWA   EQU    *-SDWA
+*
+**       IHARTM2A ,                    can't find DSECT source
+*
+         IHARTCT ,
+L$RTCT   EQU    *-RTCT
+*
+         PRINT ON,GEN
+U370STAE UFINI DXDUSTAE,L$SA
+*
+DXDUSTA2 U#DPR QDSA2,L$SXPFX+L$SA      DSA for RETRY code
+         END   ,

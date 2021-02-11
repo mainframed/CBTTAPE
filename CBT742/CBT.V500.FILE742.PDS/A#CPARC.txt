@@ -1,0 +1,424 @@
+/* Rexx program to copy members from a source PDS to a target PDS.
+*  Usage: Batch only: use proc #CPARC.
+*  Supply the OLDDD, NEWDD and CNTL DDs.
+*  The OLDDD DD identifies the PDS/archive to copy members from.
+*  The NEWDD DD identifies the PDS/archive to copy members to.
+*  The format of the CNTL DD is:
+*  -Copy member
+*  -Desc (description of member)
+*  -Hist (history for this update)
+*
+*  The -Copy card MUST precede the -Desc and -Hist cards for each
+*  member to be copied.  The Description and History data MUST be
+*  enclosed in parentheses ().
+*  You can supply up to 6 -Desc cards to provide a description for the
+*  member.  The description will be copied from the source archive if
+*  it exists and you don't supply one.
+*  You can supply up to 6 -Hist cards to provide history for the
+*  copied version of the member.  The history will be copied from the
+*  source archive if it exists and you don't supply it.
+*.
+*. 2009/04/08 Created by bsquare
+*/
+ZISPFRC = 0
+address ISPExec "CONTROL ERRORS RETURN"
+address TSO
+/* Read the archive update statements */
+"ExecIO * DiskR CNTL (STEM Cntl. FINIS"
+if RC <> 0 then call Issue 16,'Unable to read CNTL DD'
+parse VALUE '' WITH MemList,Name
+Desc. = 0
+Hist. = 0
+do i=1 to Cntl.0
+   parse UPPER VAR Cntl.i Cmd cName .
+   if Left(Cmd,1) <> '-' then iterate
+   Select
+   When Cmd = '-COPY' then do
+      if Name <> '' then parse VALUE d h WITH Desc.Name.0 Hist.Name.0
+      parse VALUE 0 0 WITH d h
+      Name = cName
+      if WordPos(Name,MemList) = 0 then MemList = MemList||Name||' '
+      else call Issue 16,'Duplicate member name' Name 'on line' i'.'
+      call Issue 'Request to copy member' Name
+      end
+   When Name = '' then
+      call Issue 16,'No -Copy statement before' Cmd 'on line' i'.'
+   When Cmd = '-DESC' then parse VALUE d+1 Cntl.i WITH d Desc.Name.d
+   When Cmd = '-HIST' then parse VALUE h+1 Cntl.i WITH h Hist.Name.h
+   Otherwise call Issue 4,'Unrecognized command' Cmd 'on line' i'.'
+   End
+end
+if Name <> '' then parse VALUE d h WITH Desc.Name.0 Hist.Name.0
+
+if MemList = '' then do
+   call Issue 4,'No members were selected to copy'
+   exit ZISPFRC
+end
+
+address ISPExec
+"LMInit DATAID(InID) DDNAME(OLDDD)"
+if RC > 0 then call Issue 16,'Unable to init ID for DD OLDDD'
+"LMInit DATAID(OutID) DDNAME(NEWDD) ENQ(SHRW)"
+if RC > 0 then call Issue 16,'Unable to init ID for DD NEWDD'
+ArcID = ''
+
+TargetInfo = ArcInfo(OutID)
+parse VAR TargetInfo TargetDS ',' TargetArc ',' TargetVol
+SourceInfo = ArcInfo(InID)
+parse VAR SourceInfo SourceDS ',' SourceArc ',' SourceVol
+
+if TargetInfo = '' then
+   call Issue 'NEWDD is not an archive.  Processing as a PDS.'
+else do
+   /* Do a SuperC compare of the selected members */
+   address TSO
+   "Alloc f(OUTDD) DUMMY REUSE"
+   "Alloc f(SYSIN) NEW DELETE UNIT(SYSDA) SPACE(1,1) TRACKS",
+      "DSORG(PS) RECFM(F B) LRECL(80) REUSE"
+   do i=1 to Words(MemList)
+      queue 'SELECT' Word(MemList,i)
+   end
+   "ExecIO" Words(MemList) "DiskW SYSIN (FINIS"
+   "Alloc f(DELDD) NEW RECFM(F,B) LRECL(80) REUSE",
+       "SPACE(1,1) CYL BLKSIZE(0) DSORG(PS)"
+   if RC > 0 then call Issue 16,'Unable to open temporary DS for SuperC'
+
+   address ISPExec "Select Pgm(ISRSUPC) Parm(NOLISTL,CMP,UPDCNTL)"
+   if RC > 4 then call Issue 16,'Failure calling SuperC'
+
+   "ExecIO * DiskR DELDD (STEM Compare. FINIS"
+   if RC > 4 then call Issue 16,'Returned data failure from SuperC'
+   "Free f(OUTDD SYSIN DELDD)"
+   Name = ''
+   Diff. = 0
+   do i=1 to Compare.0
+      Select
+      When Left(Compare.i,1) = '*' then do
+         parse UPPER VAR Compare.i . Stmt Info .
+         if Stmt = 'NEW:' then parse VAR Info '(' Name ')'
+         if Stmt = 'END' then Name = ''
+         Ln = 0
+         end
+      When Name = '' then call Issue 4,'???? from SuperC:' Compare.i
+      Otherwise
+         Ln = Ln+1
+         Diff.Name.Ln = Compare.i
+         Diff.Name.0 = Ln
+      End
+   end
+end
+
+do while MemList <> ''
+   parse VAR MemList Name MemList
+   call Issue 'Processing member' Name '...'
+   if TargetInfo = '' then do
+      /* Not an archive.  Just copy the member */
+      "LMCopy FromID(&InID) FromMem(&Name) ToDataID(&OutID) REPLACE"
+      if RC = 0 then call Issue '   'Name 'copied.'
+      else do
+         call Issue 8,'   Failed to copy' Name
+         call Issue '   'ZErrLM
+      end
+      iterate
+   end
+
+   /* The rest of this is only for Archived targets. */
+   /* Get Stats of source member */
+   address ISPExec
+   NewStats = ''
+   "LMOpen DataID(&InID)"
+   "LMMFind DataID(&InID) Member(&Name) Stats(YES)"
+   fRC = RC
+   "LMClose DataID(&InID)"
+   if fRC > 0 then do
+      call Issue 8,'   Failed to locate OLDDD' Name
+      iterate
+   end
+   parse VALUE '' WITH Vers User Mod
+   if ZLVers <> '' then
+      Vers = 'Version('Right(ZLVers,2,0)'.'Right(ZLMod,2,0)')'
+   if ZLUser <> '' then User = 'User('Strip(ZLUser)')'
+   if ZLM4Date <> '' then
+      Mod = 'Modified('ZLM4Date ZLMTime':'ZLMSec')'
+   NewStats = Vers User Mod
+
+   address TSO
+   CntlDesc = (Desc.Name.0 > 0)
+   CntlHist = (Hist.Name.0 > 0)
+   if TargetVol = '' then ArcKey = TargetDS'('Name')'
+   else ArcKey = TargetVol':'TargetDS'('Name')'
+   parse VALUE a#Open('IN',ArcKey) WITH Archive VolInfo
+   HasArc = (Archive <> '')
+   TgtDesc. = 0
+   parse VALUE '' WITH OldStats,Opts
+   if Archive = '' then call Issue '   'Name 'not previously archived'
+   else do
+      "ExecIO * DiskR IN (STEM In. FINIS"
+      "Free f(IN)"
+      if In.0 < 1 then do
+         call Issue 8,'   Malformed archive' Archive VolInfo
+         iterate
+      end
+      parse UPPER VAR In.1 2 Type Info
+      if Type <> 'CURRENT' then do
+         call Issue 8,'   Unsupported archive' Archive VolInfo
+         iterate
+      end
+      parse VAR Info,
+         'HEADER('hLines')' 1 'DATA('dLines')' 1 'MEMBER('ArcMem')'
+      if ArcMem <> Name then do
+         call Issue 8,'   Archive member' ArcMem 'should be' Name
+         iterate
+      end
+      if hLines = '' then hLines = 0
+      if dLines = '' then dLines = 0
+      do i=2 for hLines
+         Type = Translate(Word(In.i,1))
+         Select
+         When Type = '-STATS' then OldStats = In.i
+         When Type = '-OPTS'  then Opts = In.i
+         When Type = '-DESC'  then do
+            TgtDesc.Name.0 = TgtDesc.Name.0+1
+            parse VALUE TgtDesc.Name.0 In.i WITH td TgtDesc.Name.td
+            end
+         When Type = '-HIST'  then nop  /* ignore old history */
+         Otherwise
+            call Issue 4,'   Ignored unrecognized archive instruction-'
+            call Issue 4,'   'In.i
+         End
+      end
+   end
+
+   if \(CntlDesc & CntlHist) then do 1
+      /* Get the Description and/or History from the source archive */
+      if SourceDS = '' then leave /* temp ds?  not an archive, anyway */
+      if SourceVol = '' then SrcKey = SourceDS'('Name')'
+      else SrcKey = SourceVol':'SourceDS'('Name')'
+      parse VALUE a#Open('IN',SrcKey) WITH SrcArc svInfo
+      if SrcArc = '' then leave
+      "ExecIO * DiskR IN (STEM Src. FINIS"
+      "Free f(IN)"
+      /* Get the Description from the )Current section */
+      if Src.0 < 1 then leave
+      parse UPPER VAR Src.1 2 Type Info
+      if Type <> 'CURRENT' then leave
+      parse VAR Info 'HEADER('hl')' 1 'DATA('dl')' 1 'MEMBER('am')'
+      if am <> Name then leave
+      parse VALUE 0||hl 0||dl WITH hl dl
+      do i=2 for hl
+         Type = Translate(Word(Src.i,1))
+         if Type = '-DESC' then do
+            if CntlDesc then iterate   /* Desc overridden in CNTL */
+            Desc.Name.0 = Desc.Name.0+1
+            parse VALUE Desc.Name.0 Src.i WITH d Desc.Name.d
+         end
+         /* It is possible to have History in the )Current section */
+         if Type = '-HIST' then do
+            if CntlHist then iterate   /* Hist overridden in CNTL */
+            Hist.Name.0 = Hist.Name.0+1
+            parse VALUE Hist.Name.0 Src.i WITH h Hist.Name.h
+         end
+      end
+      /* Get the History from the 1st )Archive section */
+      al = 2+hl+dl
+      if al > Src.0 then leave
+      parse UPPER VAR Src.al 2 Type Info
+      if Type <> 'ARCHIVE' then leave
+      parse VAR Info 'HEADER('hl')' 1 'DATA('dl')'
+      do i=al+1 for hl
+         Type = Translate(Word(Src.i,1))
+         if Type = '-HIST' then do
+            if CntlHist then iterate   /* Hist overridden in CNTL */
+            Hist.Name.0 = Hist.Name.0+1
+            parse VALUE Hist.Name.0 Src.i WITH h Hist.Name.h
+         end
+      end
+   end
+   if Desc.Name.0 = TgtDesc.Name.0 then do alone=1 for 1
+      do i=1 to Desc.Name.0
+         if Desc.Name.i <> TgtDesc.Name.i then leave alone
+      end
+      Desc.Name.0 = 0
+   end
+
+   /* Determine whether the target member exists or not */
+   address ISPExec
+   "LMOpen DataID(&OutID)"
+   "LMMFind DataID(&OutID) Member(&Name)"
+   isNew = (RC <> 0)
+   "LMClose DataID(&OutID)"
+
+   address TSO
+   Stmt. = 0
+   if isNew then call Issue '   adding new'
+   else do 1
+      "Alloc f(InDD) dsn('"TargetDS"("Name")') SHR REUSE"
+      if RC <> 0 then leave
+      s = 0
+      /* Generate the archive update statements */
+      do i=1 to Diff.Name.0
+         /* Match, Insert, Delete, Alter */
+         parse VAR Diff.Name.i NewLine OldLine,
+            22 mLen . 31 iLen . 40 dlen . 49 aLen .
+         parse VALUE NewLine+0 OldLine+0 WITH NewLine OldLine
+         if aLen <> '' then do; iLen = aLen; dLen = aLen; end
+         if iLen <> '' then do
+            Len = iLen+0
+            s = s+1; Stmt.s = '-Ins Lines('Len') Start('NewLine')'
+            "ExecIO" Len "DiskR InDD" NewLine "(STEM Temp."
+            do t=1 to Len
+               s = s+1; Stmt.s = Strip(Temp.t,'T')
+            end
+         end
+         if dLen <> '' then do
+            Len = dLen+0
+            s = s+1; Stmt.s = '-Del Count('Len') Start('OldLine')'
+         end
+      end
+      "ExecIO 0 DiskR InDD (FINIS"
+      "Free f(InDD)"
+      Stmt.0 = s
+   end
+
+   /* Copy the member */
+   address ISPExec,
+      "LMCopy FromID(&InID) FromMem(&Name) ToDataID(&OutID) REPLACE"
+   if RC = 0 then call Issue '   'Name 'copied.'
+   else do
+      call Issue 8,'   Failed to copy' Name 'to' TargetDS
+      call Issue '   'ZErrLM
+      iterate
+   end
+
+   parse VALUE Desc.Name.0 Hist.Name.0 WITH d h
+   /* if we are not changing the archive, don't write it */
+   if isNew+d+Stmt.0 = 0 then do
+      call Issue 4,'   'Name 'no changes to archive'
+      iterate
+   end
+
+   /* Use the target description if no other is available */
+   if d = 0 then do
+      d = TgtDesc.Name.0
+      do i=1 to d
+         Desc.Name.i = TgtDesc.Name.i
+      end
+   end
+
+   /* Attempt to open the Archive for output */
+   parse VALUE a#Open('OUT',ArcKey,'WRITE') WITH Archive VolInfo
+   if Archive = '' then
+      call Issue 16,'   Unable to open archive for writing:' ArcKey
+
+   /* If the source didn't change, ignore change history */
+   if isNew+Stmt.0 = 0 then parse VALUE 0 WITH h,OldStats
+   if isNew & \HasArc then parse VALUE 0 h WITH h nh
+   else nh = 0
+   nLines = (NewStats <> '') + (Opts <> '') + d + nh
+   oLines = (OldStats <> '') + h
+   queue ')Current Header('nLines') Member('Name')'
+   if NewStats <> '' then queue '-Stats' NewStats
+   if Opts <> '' then queue Opts
+   do i=1 to d
+      queue Desc.Name.i
+   end
+   do i=1 to nh
+      queue Hist.Name.i
+   end
+   if oLines+Stmt.0 > 0 then do
+      queue ')Archive Header('oLines') Data('Stmt.0')'
+      if OldStats <> '' then queue OldStats
+      do i=1 to h
+         queue Hist.Name.i
+      end
+      do i=1 to Stmt.0
+         queue Stmt.i
+      end
+   end
+   if HasArc then do i=2+hLines+dLines to In.0; queue In.i; end
+   "ExecIO" Queued() "DiskW OUT (FINIS"
+   eRC = RC
+   "Free f(OUT)"
+   if RC > 0 then
+      call Issue 16,'   Failure writing archive for' ArcKey
+   call Issue '   'Name 'archive updated.'
+   if TargetArc <> TargetDS then do
+      address ISPExec
+      Copy = "'"TargetArc"'"
+      if ArcID = '' then "LMInit DATAID(ArcID) DataSet(&Copy)" VolInfo
+      "LMCopy FromID(&InID) FromMem(&Name) ToDataID(&ArcID) REPLACE"
+      if RC > 0 then
+         call Issue 12,'   Failed to back up' Name 'to' TargetArc
+      else call Issue '   'Name 'archival copy made.'
+   end
+end
+address ISPExec
+"LMFree DATAID(INID)"
+"LMFree DATAID(OUTID)"
+if ArcID <> '' then "LMFree DATAID(ARCID)"
+exit ZISPFRC
+
+/* Issue a (possibly error) message */
+Issue: procedure EXPOSE ZISPFRC
+   parse arg Code,Message
+   if Code = '' then Code = 0
+   if Message = '' & DataType(Code,'W') = 0 then
+      parse VALUE 0 Code WITH Code Message
+   RCMsg = 'RC='Right(Code,2,0)' '
+   if Code = 0 then RCMsg = '      '
+   say RCMsg||Message
+   if Code > ZISPFRC then ZISPFRC = Code
+   address ISPExec "VPut ZISPFRC"
+   if ZISPFRC > 12 then exit ZISPFRC
+   return
+
+/* Return DSN,ArcDSN,VolSer for an archived dataset or '' otherwise. */
+ArcInfo: procedure
+   arg DID
+   address ISPExec
+   "LMOpen DataID(&DID)"
+   if RC > 0 then return ''
+   "LMQuery DataID(&DID) DDName(DD)",
+      "LRecL(LRecL) RecFm(RecFm) DSOrg(DSOrg) oVolume(VolSer)"
+   SysDSName = ''      /* if DID refers to VIO, this will not change */
+   IsCat = ListDSI(DD 'FILE') < 8
+   if IsCat then IsCat = ListDSI("'"SysDSName"'") <= 4
+   if IsCat then IsCat = (SysVolume = VolSer)
+   if IsCat then VolSer = ''
+
+   if DSOrg <> 'PO' then call Issue 16,'DD is not a PDS:' DD
+   DSN = SysDSName
+   if Right(DSN,4) = '.ARC' then do
+      "LMClose DataID(&DID)"
+      return ''
+   end
+
+   /* Check for an externally archived dataset. */
+   IsArc = 0
+   if DSN <> '' then do
+      ArcDSN = DSN'.ARC'
+      if VolSer <> '' then VolInfo = ' VOLUME('VolSer')'
+      else VolInfo = ''
+      if Length(ArcDSN) <= 44 then do 1
+         RC = ListDSI("'"ArcDSN"'"||VolInfo)
+         if RC > 4 then leave
+         if Left(SysDSOrg,2) <> 'PO' then leave
+         if Left(SysRecFm,1) = 'V' then SysLRecL = SysLRecL-4
+         if SysLRecL < LRecL then leave
+         IsArc = 1
+      end
+   end
+
+   /* Could this be a self-archived PDS? */
+   if IsArc = 0 then do
+      ArcDSN = DSN
+      "VGet (ZTERM)"
+      SetTerm = (WordPos(ZTerm,'3278 3278A') = 0)
+      if SetTerm then "Select Pgm(ISPTTDef) Parm(3278)"
+      "LMMFind DataID(&DID) Member(Z{PARMS{)"
+      IsArc = (RC = 0)
+      if SetTerm then "Select Pgm(ISPTTDef) Parm("ZTerm")"
+   end
+   "LMClose DataID(&DID)"
+   if IsArc then return DSN','ArcDSN','VolSer
+   return ''

@@ -1,0 +1,215 @@
+Reducing journalling/monitoring I/O and CPU
+
+This article is relevant to users of CICS 2.1.2 or previous
+versions of CICS, who are doing any of the following:
+
+1      Writing many records asynchronously to user journals, ie
+      CICS journals with JCT jfileid=2 to 99.
+
+2      Writing many blocks of monitoring data to a journal or SMF.
+
+3      Having disk contention problems on volumes with user journals.
+
+4      Being CPU constrained and hence need to extend the life
+      of CICS 2.1.2 or their current mainframe.
+
+Since IBM has rewritten the Journal Control Program, this
+article is probably not germane to CICS Version 3 users. This
+article's suggestions can cause a high reduction in I/O and
+related CPU for shops that do heavy user or MCT journalling.
+It could potentially allow a CPU's life to be extended
+considerably.
+
+Two years ago, our installation had occasional problems with
+slow response to the disk volumes that contained CICS journal
+datasets. It was noticed that the block sizes of blocks written
+asynchronously to various user journals were much smaller
+than the Buffer Shift-Up Value (BUFSUV) coded in the JCT.
+This can be observed by examining the block lengths on the
+file, or the CICS shut-down journal control statistics. The
+column containing the average output block size showed a
+value much smaller than BUFSUV, although only asyn-
+chronous journalling was being performed. (However, this
+column does not give a meaningful value for blocks written to
+a JCT entry with JTYPE=SMF for monitoring information.)
+The blocks being so small made the blocking factor much
+smaller, so many more I/Os were being performed, causing
+disk contention. Some of our user journals had only one user
+record per block! The extra I/O also used more CPU.
+
+IBM's CICS Resource Definition (Macro) manual mentions
+that the actual value used to determine when a block is to be
+written (to satisfy asynchronous requests) is dynamically re-
+adjusted to try to obtain one physical I/O every half a second.
+For details on this dynamic process, the source code for
+DFHJCP was read.
+
+Three fields exist in each JCT entry to deal with the buffer
+shift-up process:
+
+1      JCTBBA - buffer begin address (stays the same).
+
+2      JCTBSUA - buffer shift-up address equals JCTBBA plus
+      BUFSUV (stays the same).
+
+3      JCTSBSUA - sliding buffer shift-up address (dynamically
+      changed by DFHJCP within the range of JCTBBA and
+      JCTBSUA),  relevant in determining when a block I/O is done.
+
+During CICS initialization, the address of storage acquired for
+the buffer is placed in JCTBBA. The BUFSUV value chosen
+by the CICS system programmer is added to JCTBBA giving
+fields JCTBSUA and JCTSBSUA. DFHJCP will increment or
+(as is more often the case) decrement the sliding buffer shift-up
+address JCTSBSUA, based on whether the last block was
+written less than or more than 0.5 seconds before the current
+block being written.
+
+But JCTSBSUA is never incremented to a value higher than
+JCTBSUA. If the address of the last byte of a record placed in
+the buffer is greater than the sliding buffer shift-up address
+JCTSBSUA, an I/O is done. This change in 'sliding buffer
+shift-up' is the only thing that DFHJCP's 0.5 second logic
+does. Note that DFHJCP does not do anything to force a block
+to be physically written simply because a record has been in the
+buffer for more than 0.5 seconds. No interval posting is done
+to redispatch DFHJCP every 0.5 seconds to see if a record has
+existed in a buffer for more 0.5 seconds. A record could be in
+the buffer for hours, but it would not be written until DFHJCP
+is executed to place another record in the buffer.
+
+The above logic explains why your CICS shut-down statistics
+may show an average output block size significantly smaller
+than your selected BUFSUV. At Firstar, most BUFSUV values
+were set to 3285, but the average journal block sizes were only
+1300. When all logical record lengths are small (less than 300
+bytes), the difference between BUFSUV and actual block size
+is largest.
+
+Current DFHJCP logic causes more (and too small) blocks to
+be written to user journals than desired. The 0.5 second logic
+defeats the purpose and effect of the BUFSUV JCT parameter.
+During peak volume processing, user journal I/O becomes a
+bottleneck as too many (and too small) blocks cause contention
+to disk units. This is a problem today as IBM double and triple
+density 3380/3390 disk devices make it more difficult to spread
+out the journals over different units. Smaller block sizes get
+less data on a disk track, increasing hardware costs, and
+slowing later jobs that must read the journal. What is sacred
+about doing journal I/O at approximately 0.5 second intervals?
+
+JCT and MCT tuning suggestions in IBM manuals and
+INFO/ACCESS ignore the consequences of the sliding buffer
+shift-up value being dynamically changed to do I/O on 0.5
+second intervals. Attempts to implement those suggestions will
+usually be fruitless on a production CICS region having even a
+moderate task volume.
+
+Our installation wrote a Guide requirement proposing three
+possible solutions. The first was to add a changeable time
+parameter in the JCT and change DFHJCP to reference it rather
+than the hard-coded 0.5 second value in the DFHJCP field
+JCRESPND when determining the sliding buffer shift-up value.
+Since DFHJCP already has addressability to the JCT entry
+when determining the sliding buffer shift-up value, the coding
+change necessary in DFHJCP seems quite easy. The other two
+suggestions were to either eliminate the 0.5 second logic or
+change it to a longer time (probably at least 4 seconds).
+
+IBM accepted the requirement, but only for the CICS/ESA
+platform. JCP was rewritten for CICS Version 3 and addressed
+the problem. However, CICS 2.1.2 users will not be getting
+this solution from IBM. Therefore, it is appropriate for CICS
+2.1.2 (or earlier version) users to make a simple ZAP to the
+four-byte packed field JCRESPND in DFHJCP. The sample
+JCL to do this would look like this:
+
+//ZAPIT EXEC PGM=IMASPZAP
+//SYSLIB DD DISP=SHR,DSN=CICS.LOADLIB
+//SYSPRINT DD SYSOUT=*
+//SYSIN DD *
+ NAME DFHJCP    DFHJCP
+ VER 0276 0000,005C
+ REP 0276 9999,999C
+or
+ REP 0270 0000,040C
+/*
+
+The above displacement in DFHJCP is for CICS 2.1.2. If an
+unsupported CICS level is being run, the displacement may be
++26C or +270. By zapping JCRESPND to 4.0 seconds most of
+Firstar's CICS user journals doing asynchronous writes
+obtained actual block sizes close to the BUFSUV value coded
+in the JCT. If complete defeat of IBM's 0.5 second logic is
+desired to ensure that all user journals obtain block sizes close
+to the BUFSUV value coded in the JCT, the field can be
+zapped to X'9999999C'. Alternatively, an SMP USERMOD
+could also be created to make this a source code change of field
+JCRESPND.
+
+Implementation of the above ZAP can eliminate 60 to 70% of
+asynchronous physical I/Os to user journals. After
+implementation of this ZAP, performance results will be
+obtained as discussed in IBM's tuning suggestions in manuals
+or INFO/ACCESS.
+
+Shops that use write cache devices to speed up CICS journal
+writes will still benefit from zapping the 0.5 second value to a
+larger number. Since that decreases the physical I/O requested,
+the corresponding CPU associated with the physical I/O would
+still be saved.
+
+This modification can be especially helpful to reduce I/O
+and/or CPU cycles for monitoring. The number of blocks
+written for monitoring at our installation was very large. This
+was because DFHJCP had, within only an hour of CICS start-
+up, decremented the sliding buffer shift-up address JCTSBSUA
+to the same value as JCTBBA. Hence, each MCT block moved
+to the monitoring user journal triggered DFHJCP to write the
+MCT buffer out immediately, without any effective journal
+blocking factor. If a shop specifies JTYPE=SMF for the
+monitoring user journal, a typical BSAM I/O is not being done,
+but DFHJCP still has to execute an SVC to get the data to
+SMF. Therefore, CPU can still be saved by reducing the
+number of blocks written to SMF.
+
+If a shop refuses to permit a modification to CICS, some of
+DFHJCP's 0.5 second logic can be defeated by changing MCT
+MAXBUF parameters to big numbers. Increasing the MCT
+CLASS= PERFORM's MAXBUF parameter to 17850 or larger
+works well to minimize the number of blocks written for
+monitoring (assuming you cannot zap JCRESPND). Increasing
+the MAXBUF parameters for CLASS=ACCOUNT or
+EXCEPTION MCT entries will probably not be as effective in
+reducing the number of journal blocks written for monitoring.
+
+By changing our MCT CLASS=PERFORM MAXBUF
+parameter from 2048 to 17850, the count in the 'Number of
+blocks written' column in the journal statistics was reduced by
+92%. This was done before implementing the above ZAP.
+Such a large MAXBUF value should not be necessary to
+reduce the number of blocks written if the above ZAP is
+applied - making the receiving journal buffer several times
+larger than the MAXBUF size should be sufficient.
+
+The above ZAP shouldn't affect the frequency of synchronous
+writes, as is typically done to the CICS system log, unless the
+JCT parameter SYSWAIT=ASIS is coded. The CICS 2.1.2
+Performance Guide discussion of the SYSWAIT=ASIS option
+implies that IBM may have originally intended  the 0.5 second
+value used to determine the sliding buffer shift-up value to be
+effective only for journals with SYSWAIT=ASIS, and that, at
+some time, IBM decided to also make the 0.5 second value
+effective for all asynchronous puts to any journal.
+
+Regardless of the history behind it, it is important for the CICS
+systems programmer who is attempting to tune CICS JCT
+values to be aware of the 0.5 second value. If this value in JCP
+is not zapped to a larger value, the  programmer should ignore
+much of IBM's documentation on selecting a JCT buffer shift-
+up value. Otherwise, frustration will occur when block sizes
+mysteriously occur that are significantly smaller than the buffer
+shift-up value coded in the JCT.
+
+                                                      c Reserved 1993
+

@@ -1,0 +1,13 @@
+
+## $$DOC.txt
+```
+Global Resource Serialization (GRS) ISPF Interface
+    - Current Version is 1.4.2
+
+Provides an interactive view of the GRS queue. A high
+level resource list is displayed based on user
+specified selection criteria.  From the high level
+resource list, individual resource details can be
+accessed.
+```
+

@@ -1,0 +1,180 @@
+/*                                                                          REXX
+
+ ISPCMDE  - ISF Command Table Update (ISPCMDU) edit data
+
+ Syntax: ISPCMDE USER | SYS | datasetÝ(member)¨ | null
+
+ History
+ 2016-10-31 Initial
+ 2016-12-28 Add primary commands Insert and Find.
+            Change parm to USER | SYS | dataset
+            Dataset must be fully qualified, quotes will be ignored.
+            Some restructure.
+ 2018-09-26 Major rewrite, use XISPTBL for table display and update.
+*/
+
+ Address TSO
+ Address Ispexec "control errors return"
+ parse source sys type whoami ddn whereami .
+ parse value 0 with $changed $table cmddsn ispcmdue enve lastfind
+ parse value '' with $ddlist cmdmname
+ numeric digits 12
+ $table='A'left(d2x(space(translate(time('l'),' ','.:'),0)),7)
+
+ parse value space(translate(translate(arg(1)," ","'()"))) with cmddsn cmdmbr
+ cmdmbr=word(cmdmbr 'ISPCOMND',1)
+ cmdmname=cmdmbr
+
+ Select
+   when pos('.',cmddsn)>0 then nop
+   when cmddsn='SYS' then do
+     cmddsn=PrmLbLoc(cmdmbr)
+     if cmddsn='' then call close 8 'Could not find' cmdmbr 'in parmlib'
+   end
+   when cmddsn='USER' | cmddsn='' then do
+     zz=Listdsi('ispprof file')
+     cmddsn=sysdsname
+   end
+   otherwise call close 8 'Invalid parm:' p
+ End
+ fullds="'"cmddsn"("cmdmbr")'"
+
+ /* setup enviroment       */
+ Address ispexec
+ "control errors return"
+ if MakeTbl()<>0 then call close
+ if EditTbl()=1 | $changed then call SaveTbl
+ Call close
+
+ /*--------------------------------------------------------------------
+                               Return
+ --------------------------------------------------------------------*/
+Close:
+ parse arg clsrc clsmsg
+ if clsmsg<>'' then say clsmsg
+ Address TSO "delstack"
+ if $table<>'' then Address ispexec "tbend" $table
+ if $ddlist<>'' then call silent "free dd("$ddlist")"
+ Exit word(clsrc 0,1)
+
+ /*--------------------------------------------------------------------
+                      This is where it happens
+ --------------------------------------------------------------------*/
+MakeTbl:
+ /* load data or make initial list */
+ address tso
+ if Sysdsn(fullds)='OK' then do
+   cc=bpxwdyn('alloc da('fullds') shr rtddn(xdd)')
+   if cc<>0 then return xmsg("Alloc ds" fullds "failed" cc,8)
+   "execio * diskr" xdd "(stem cmds. finis)"
+   if rc<>0 then return xmsg('Read ds failed rc' rc,8)
+   cc=bpxwdyn('free dd('xdd')')
+ end
+ else do
+   parse value '1 \MYCMDS\0\select cmd(%ispcmde)\my commands',
+         with cmds.0 cmds.1
+   $changed=1
+ end
+
+ /* create work table        */
+ Address ispexec
+ "tbcreate" $table "names(verb abrv cmd desc dlm zsel grp)"
+ if rc<>0 then return xmsg('Tbcreate failed rc' rc zerrlm,8)
+ rec=''
+ zsel=''
+ do i=1 to cmds.0
+   if cmds.i='' | word(cmds.i,1) = '/*' | left(cmds.i,1)='*' then iterate
+   rec=rec''strip(cmds.i)
+   if right(rec,1)='-' then rec=left(rec,length(rec)-1)
+   else do
+     if pos('\',rec)=0 then rec=translate(rec,'\',left(rec,1)) /* new dlm */
+     parse var rec dlm +1 verb . (dlm) abrv . (dlm) cmd (dlm) desc (dlm) .
+     desc=strip(desc)
+     upper verb
+     rec=''
+     grp=3
+     if translate(cmd)='ALIAS' then grp=1
+     if translate(cmd)='PASSTHRU' then grp=2
+     "tbadd"   $table  /* rc 8 => duplicate */
+     if rc<>0 & rc<>8 then return xmsg('Tbadd failed rc' rc zerrlm)
+   end
+ end
+ Return 0
+
+ /*--------------------------------------------------------------------
+                         Edit table dialog
+ --------------------------------------------------------------------*/
+EditTbl:
+ cc=XIspTbl('table('$table') panel(ispcmdel) dpanel(ispcmded)',
+            'crc(1) isel(all) sort(=) icmd(sort)',
+            'hdr(Edit ISPF Command Table additions in' cmddsn')')
+ if cc>8 then return xmsg('error',8)
+ if cc=8 then return xmsg('cancelled',4)
+ if cc=1 then return xmsg('List has been changed',1)
+ return 0
+
+ /*--------------------------------------------------------------------
+                       (re)write table
+ Commands with 'ALIAS' at top, followed by lines with 'PASSTHRU',
+ followed by the rest.
+ --------------------------------------------------------------------*/
+SaveTbl:
+ say 'Saving table' fullds
+
+ /* reorder table */
+ "TBSORT" $table "FIELDS(grp,N,A,verb,C,A)"
+
+ /* pull table rows */
+ address tso "delstack"
+ queue  '*saved' date('s') time()
+ "tbtop" $table
+ "tbquery" $table "rownum(rows)"
+ do n=1 to rows
+   "tbskip" $table
+   line=dlm''verb''dlm''abrv''dlm''cmd''dlm''desc
+   do while length(line)>68
+     parse var line l =68 line
+     queue l'-'
+   end
+   queue line
+ end
+
+ /* write external data */
+ cc=bpxwdyn('alloc da('fullds') shr rtddn(xdd)')
+ if cc<>0 then return xmsg("Alloc ds" fullds "failed" cc)
+ address tso "execio" queued() "diskw" xdd "(finis)"
+ if rc<>0 then return xmsg('Write ds failed rc' rc)
+ cc=bpxwdyn('free dd('xdd')')
+ address tso "delstack"
+ return 0
+
+ /*--------------------------------------------------------------------
+                            Subroutines
+ --------------------------------------------------------------------*/
+PrmLbLoc: Procedure /* locate member in parmlib concatenation */
+ arg mbr
+ trace off
+ /* go through list of parmlibs*/
+ cvt      = Storage(10,4)                    /* get the CVT address   */
+ cvtecvt  = Storage(D2x(C2d(cvt)+140),4)     /* get the ECVT address  */
+ ecvtipa  = Storage(D2x(C2d(cvtecvt)+392),4) /* get the ihaipa Address*/
+ Do loop = 0 to 10                           /* loop for parmlibs    */
+  ipaplib = Storage(D2x(c2d(ecvtipa)+416+(loop*64)),64) /*           */
+  ipapldsn = Substr(ipaplib,1,44)            /* parmlib dsname       */
+  ipaplvol = Substr(ipaplib,46,6)            /* parmlib volume       */
+  ipaplflg = X2b(C2x(Substr(ipaplib,64,1)))  /* parmlib flags        */
+  if Strip(ipapldsn) = '' then iterate       /*                      */
+  if sysdsn("'"strip(ipapldsn)"("mbr")'")='OK' then return strip(ipapldsn)
+ End
+ return ''
+
+Requote: if arg(1)='' then return '';else return "'"Unquote(arg(1))"'"
+Unquote: return space(translate(arg(1)," ","'"),0)
+Silent:$=outtrap('$.');Address TSO arg(1);$=outtrap('off');return 0
+
+XMsg:
+ parse arg zedlmsg
+ if zedlmsg='' then return word(arg(2) 0,1)
+ address ispexec "vput zedlmsg"
+ address ispexec "setmsg msg(isrz000)"
+ return  word(arg(2) 0,1)

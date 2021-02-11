@@ -1,0 +1,721 @@
+  /* REXX ************************************************************/
+  /*                                                                 */
+  /* EXEC        : XNUDSRN1                                          */
+  /*                                                                 */
+  /* AUTHOR      : RNH                                               */
+  /*                                                                 */
+  /* LAST UPDATE : 23/08/92                                          */
+  /*                                                                 */
+  /* PURPOSE     : Rename all <oldproj>.<olduser>.* datasets to      */
+  /*               <newproj>.<newuser>.* where possible              */
+  /*                                                                 */
+  /*               Program DBARACHK is used to check the user has    */
+  /*               ALTER authority to both oldname and newname for   */
+  /*               every object they propose to rename               */
+  /*                                                                 */
+  /*               LISTC is used to check that the prospective NEW   */
+  /*               name of each dataset does not already exist       */
+  /*                                                                 */
+  /*               If a rename attempt does fail (most likely if the */
+  /*               dataset is in use elsewhere) then the failure is  */
+  /*               reported                                          */
+  /*                                                                 */
+  /*               Migrated datasets are not renamed or recalled.    */
+  /*               They are reported on, and it is up to the user to */
+  /*               either HDELETE or HRECALL each one.               */
+  /*                                                                 */
+  /*               ISPF profiles are not renamed. There is another   */
+  /*               utility to convert them 'intelligently'           */
+  /*                                                                 */
+  /*               GDG bases are reported on but not changed. GDG    */
+  /*               members are ignored (GnnnnVnn in last 8 chars)    */
+  /*                                                                 */
+  /*               CLUSTER entries are LISTCed to find all their     */
+  /*               associations. If their AIXs, the AIXs are also    */
+  /*               LISTCed to find their associations. IDCAMS ALTER  */
+  /*               is used to change the names of all associated     */
+  /*               entries.                                          */
+  /*                                                                 */
+  /*               2 run modes are possible:                         */
+  /*               CHECK  - find all datasets and say which can and  */
+  /*                        which cannot be renamed, and why.        */
+  /*                                                                 */
+  /*               RENAME - rename where possible. Produce a report  */
+  /*                        to say what was done with each dataset.  */
+  /*                                                                 */
+  /* COMMENTS    : Written to help with migration to personal TSO    */
+  /*               userids                                           */
+  /*                                                                 */
+  /* REXX ************************************************************/
+
+  arg old_quals new_quals mode .
+
+  max_rc            = 0
+  line_count        = 50
+
+  tot_found         = 0
+  tot_gdg           = 0
+  tot_migrat        = 0
+  tot_cart          = 0
+  tot_nonvsam_good  = 0
+  tot_nonvsam_bad   = 0
+  tot_cluster_good  = 0
+  tot_cluster_bad   = 0
+
+  delstack
+
+  trapvar  = outtrap("lvl.",'*',"noconcat")
+  "listc lvl('" || old_quals || "')"
+  trapvar  = outtrap('off')
+
+  do i = 1 to lvl.0
+
+    testword = substr(lvl.i,1,8)
+    if testword = "CLUSTER " | testword = "NONVSAM " | ,
+       testword = "GDG BASE" then
+      do
+        dsn = word(substr(lvl.i,17,44),1)
+        start_pos = length(dsn) - 7         /* test for GDG member   */
+        suffix    = substr(dsn,start_pos,8)
+        if substr(suffix,1,1)           = "G"   & ,
+           datatype(substr(suffix,2,4)) = "NUM" & ,
+           substr(suffix,6,1)           = "V"   & ,
+           datatype(substr(suffix,7,2)) = "NUM" then
+          do
+              say "Dataset" dsn "is part of a GDG"
+              iterate
+          end
+
+      end
+
+    select
+      when testword = "CLUSTER " then
+        do
+          tot_found    = tot_found + 1
+          cluster_rc   = process_cluster(dsn)
+          if cluster_rc = 0
+            then
+              tot_cluster_good = tot_cluster_good + 1
+            else
+              tot_cluster_bad  = tot_cluster_bad  + 1
+          if cluster_rc > max_rc then max_rc = cluster_rc
+          queue " "
+          line_count = line_count + 1
+        end
+
+      when testword = "GDG BASE" then
+        do
+          tot_found  = tot_found + 1
+          tot_gdg    = tot_gdg  + 1
+          comments   = "Not renamed. GDGs cannot be renamed"
+          write_rc   = write_line(dsn "GDG" "NO")
+          queue " "
+          line_count = line_count + 1
+        end
+
+      when testword = "NONVSAM " then
+        do
+          tot_found    = tot_found + 1
+          if substr(suffix,2,7) = "ISPPROF" then
+            do
+              comments = "Not renamed. There is a special utility to",
+                         "convert ISPF profiles"
+              write_rc   = write_line(dsn "ISPPROF" "NO")
+              queue " "
+              line_count = line_count + 1
+              tot_nonvsam_bad = tot_nonvsam_bad + 1
+              iterate
+            end
+
+          nonvsam_rc   = process_nonvsam(dsn)
+          select
+            when nonvsam_rc = 0 then        /* Processed OK          */
+              do
+                tot_nonvsam_good = tot_nonvsam_good + 1
+                write_rc = write_line(dsn "NONVSAM" "Yes")
+              end
+
+            when nonvsam_rc = 4 then        /* HSM migrated          */
+              do
+                tot_migrat       = tot_migrat       + 1
+                write_rc = write_line(dsn "MIGRATED" "NO")
+              end
+
+            when nonvsam_rc = 8 then        /* Tape/cartridge        */
+              do
+                tot_cart         = tot_cart         + 1
+                write_rc = write_line(dsn "CART" "NO")
+              end
+
+            otherwise                       /* Some error            */
+              do
+                tot_nonvsam_bad  = tot_nonvsam_bad  + 1
+                write_rc = write_line(dsn "NONVSAM" "NO")
+              end
+          end
+
+          queue " "
+          line_count = line_count + 1
+          if nonvsam_rc > max_rc then max_rc = nonvsam_rc
+        end
+
+      when testword = "     IN-" | ,
+           testword = "AIX ----" | ,
+           testword = "DATA ---" | ,
+           testword = "INDEX --" | ,
+           testword = "PATH ---" then nop
+
+      otherwise say "Unknown entry -" word(substr(lvl.i,17,44),1)
+
+    end                                     /* of select             */
+
+  end                                       /* of do i = 1...        */
+
+  call terminal_report
+
+  if SYSDSN(PURENAME) = "OK" then
+      "alloc f(REPORT) da(PURENAME) OLD reuse"
+    ELSE
+      "alloc f(REPORT) da(PURENAME) new",
+      "      lrecl(133) recfm(f b a) blksize(13300) reuse"
+
+  queue ""
+  "execio * diskw REPORT (finis"            /* write out the report  */
+
+  exit max_rc
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   process_cluster                                      */
+  /*                                                                 */
+  /* CALLED BY: main loop                                            */
+  /*                                                                 */
+  /* PURPOSE:   rename a VSAM cluster                                */
+  /*                                                                 */
+  /*            If MIGRAT, issue HRECALL and leave                   */
+  /*                                                                 */
+  /*            If not, find all the associated bits and use IDCAMS  */
+  /*            ALTER to rename them                                 */
+  /*                                                                 */
+  /*******************************************************************/
+
+process_cluster:
+  arg oldname
+
+  trapvar  = outtrap("ent.",'*',"noconcat")
+  "listc ent('" || oldname || "') ALL"
+  trapvar  = outtrap('off')
+
+  assoc.0    = 0                            /* Init associations     */
+  vtype.0    = 0
+  assoc_flag = "N"
+
+  do e = 1 to ent.0
+    if substr(ent.e,6,12) = "ASSOCIATIONS" then
+      do
+        say "Checking associations for cluster" oldname
+        assoc_flag = "Y"
+        iterate
+      end
+
+    if assoc_flag = "N" then iterate
+
+    if substr(ent.e,4,1) ¬= " " then leave  /* All associations found*/
+
+    select
+      when substr(ent.e,8,3) = "AIX"      then
+        do
+          assoc.0     = assoc.0 + 1
+          vtype.0     = assoc.0
+          count       = assoc.0
+          assoc.count = word(substr(ent.e,17,44),1)
+          vtype.count = "AIX"
+          say "Found AIX      component" assoc.count
+          aix_rc = process_aix(assoc.count)
+          if aix_rc ¬= 0 then
+            do
+              comments = "AIX checking error for cluster" oldname
+              write_rc = write_line(oldname "CLUSTER" "NO")
+              return 8
+            end
+        end
+
+      when substr(ent.e,8,4) = "DATA"     then
+        do
+          assoc.0     = assoc.0 + 1
+          vtype.0     = assoc.0
+          count       = assoc.0
+          assoc.count = word(substr(ent.e,17,44),1)
+          vtype.count = "DATA"
+          say "Found DATA     component" assoc.count
+        end
+
+      when substr(ent.e,8,5) = "INDEX"    then
+        do
+          assoc.0     = assoc.0 + 1
+          vtype.0     = assoc.0
+          count       = assoc.0
+          assoc.count = word(substr(ent.e,17,44),1)
+          vtype.count = "INDEX"
+          say "Found INDEX    component" assoc.count
+        end
+
+      when substr(ent.e,8,4) = "PATH"     then
+        do
+          assoc.0     = assoc.0 + 1
+          vtype.0     = assoc.0
+          count       = assoc.0
+          assoc.count = word(substr(ent.e,17,44),1)
+          vtype.count = "PATH"
+          say "Found PATH     component" assoc.count
+        end
+
+      otherwise
+        do
+          unknown = word(substr(ent.e,17,44),1)
+          say "Found UNKNOWN  component" unknown
+          return 8
+        end
+
+    end                                     /* of select             */
+
+  end                                       /* of do e = 1...        */
+
+  /*******************************************************************/
+  /*                                                                 */
+  /*      Find newname for base cluster and check it out             */
+  /*                                                                 */
+  /*******************************************************************/
+
+  suffix  = delstr(oldname,1,length(old_quals))
+  newname = new_quals || suffix
+
+  trapvar  = outtrap("temp.",'*',"noconcat")
+  "listc ent('" || newname || "')"
+  trapvar  = outtrap('off')
+
+  if rc = 0 then                            /* New name already there*/
+    do
+      comments = "New name already exists. Cannot rename to",
+                 newname
+      write_rc = write_line(oldname "CLUSTER" "NO")
+      return 8
+    end
+
+  "CALL 'SYS3.LINKLIB(DBARACHK)' '"oldname",ALTER'"
+  old_rc = rc
+  "CALL 'SYS3.LINKLIB(DBARACHK)' '"newname",ALTER'"
+  new_rc = rc
+  if old_rc = 0 & new_rc = 0
+    then
+      nop
+    else
+      do
+        comments = "Not enough authority to rename dataset"
+        write_rc = write_line(oldname "CLUSTER" "NO")
+        return 8
+      end
+
+  /*******************************************************************/
+  /*                                                                 */
+  /*      Find newnames for associations and check them out          */
+  /*                                                                 */
+  /*******************************************************************/
+
+  newass.0 = assoc.0
+
+  do e = 1 to assoc.0
+
+    suffix   = delstr(assoc.e,1,length(old_quals))
+    newass.e = new_quals || suffix
+
+    trapvar  = outtrap("temp.",'*',"noconcat")
+    "listc ent('" || newass.e || "')"
+    trapvar  = outtrap('off')
+
+    if rc = 0 then                          /* New name already there*/
+      do
+        comments = "New name already exists. Cannot rename to",
+                   newass.e
+        write_rc = write_line(oldname "CLUSTER" "NO")
+        return 8
+      end
+
+    "CALL 'SYS3.LINKLIB(DBARACHK)' '"assoc.e",ALTER'"
+    old_rc = rc
+    "CALL 'SYS3.LINKLIB(DBARACHK)' '"newass.e",ALTER'"
+    new_rc = rc
+    if old_rc = 0 & new_rc = 0
+      then
+        nop
+      else
+        do
+          comments = "Not enough authority to rename dataset"
+          write_rc = write_line(oldname "CLUSTER" "NO")
+          return 8
+        end
+
+  end                                       /* of do e = 1 to assoc.0*/
+
+  /*******************************************************************/
+  /*                                                                 */
+  /*      Start renaming cluster and all its associations if mode    */
+  /*      is RENAME                                                  */
+  /*                                                                 */
+  /*******************************************************************/
+
+  if mode = "CHECK" then                    /* report and return     */
+    do
+      comments = "All checks were OK - check mode only"
+      write_rc = write_line(oldname "CLUSTER" "Yes")
+      do j = 1 to assoc.0
+        write_rc = write_line(assoc.j vtype.j "Yes")
+      end
+      return 0
+    end                                     /* of mode CHECK         */
+
+  say "Renaming" oldname "to" newname
+  "ALTER '" || oldname || "' NEWNAME('" || newname || "')"
+
+  if rc = 0 then
+    do
+      comments = "Rename of dataset worked OK"
+      write_rc = write_line(oldname "CLUSTER" "Yes")
+    end
+  else
+    do
+      comments = "Rename of dataset failed RC" rc
+      write_rc = write_line(oldname "CLUSTER" "NO")
+      return 12
+    end
+
+  do e = 1 to assoc.0
+    say "Renaming" assoc.e "to" newass.e
+    "ALTER '" || assoc.e || "' NEWNAME('" || newass.e || "')"
+
+    if rc = 0 then
+      do
+        comments = "Rename of dataset worked OK"
+        write_rc = write_line(assoc.e vtype.e "Yes")
+      end
+    else
+      do
+        comments = "Rename of dataset failed RC" rc
+        write_rc = write_line(assoc.e vtype.e "NO")
+        return 12
+      end
+
+  end                                       /* of do e = 1 to assoc.0*/
+
+return 0
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   process_aix                                          */
+  /*                                                                 */
+  /* CALLED BY: process_cluster                                      */
+  /*                                                                 */
+  /* PURPOSE:   Pick up associations of an alternate index (AIX)     */
+  /*            and add them to the list of associations of the      */
+  /*            original cluster being checked                       */
+  /*                                                                 */
+  /*******************************************************************/
+
+process_aix:
+  arg aixname
+
+  trapvar  = outtrap("aix.",'*',"noconcat")
+  "listc ent('" || aixname || "') ALL"
+  trapvar  = outtrap('off')
+
+  aix_assoc_flag = "N"
+
+  do a = 1 to aix.0
+    if substr(aix.a,6,12) = "ASSOCIATIONS" then
+      do
+        say "Checking associations for AIX" aixname
+        aix_assoc_flag = "Y"
+        iterate
+      end
+
+    if aix_assoc_flag = "N" then iterate
+
+    if substr(aix.a,6,1) ¬= " " then leave  /* All associations found*/
+
+    select
+      when substr(aix.a,8,7) = "CLUSTER"  then nop
+
+      when substr(aix.a,8,4) = "DATA"     then
+        do
+          assoc.0 = assoc.0 + 1
+          count   = assoc.0
+          assoc.count = word(substr(aix.a,17,44),1)
+          vtype.count = "AIXDATA"
+          say "Found DATA     component" assoc.count
+        end
+
+      when substr(aix.a,8,5) = "INDEX"    then
+        do
+          assoc.0 = assoc.0 + 1
+          count   = assoc.0
+          assoc.count = word(substr(aix.a,17,44),1)
+          vtype.count = "AIXINDEX"
+          say "Found INDEX    component" assoc.count
+        end
+
+      when substr(aix.a,8,4) = "PATH"     then
+        do
+          assoc.0 = assoc.0 + 1
+          count   = assoc.0
+          assoc.count = word(substr(aix.a,17,44),1)
+          vtype.count = "PATH"
+          say "Found PATH     component" assoc.count
+        end
+
+      otherwise
+        do
+          unknown = word(substr(aix.a,17,44),1)
+          say "Found UNKNOWN  component" unknown
+          return 8
+        end
+
+    end                                     /* of select             */
+
+  end                                       /* of do a = 1...        */
+
+return 0
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   process_nonvsam                                      */
+  /*                                                                 */
+  /* CALLED BY: main loop                                            */
+  /*                                                                 */
+  /* PURPOSE:   rename a NONVSAM dataset                             */
+  /*                                                                 */
+  /*            If part of a GDG, return (need to process whole GDG) */
+  /*                                                                 */
+  /*            If MIGRAT, issue HRECALL and return                  */
+  /*                                                                 */
+  /*            If on tape or cartridge, return (done manually)      */
+  /*                                                                 */
+  /*            If proposed new name exists, return with a message   */
+  /*                                                                 */
+  /*            If user does not have ALTER access to profiles       */
+  /*            protecting oldname & newname, return with a message  */
+  /*                                                                 */
+  /*            Rename to change old_quals to new_quals otherwise    */
+  /*                                                                 */
+  /*******************************************************************/
+
+process_nonvsam:
+  arg oldname
+
+  trapvar  = outtrap("ent.",'*',"noconcat")
+  "listc ent('" || oldname || "') VOL"
+  trapvar  = outtrap('off')
+
+  do e = 1 to ent.0
+    if substr(ent.e,8,6) ¬= "VOLSER"
+      then
+        iterate
+      else
+        leave
+  end
+
+  volser    = substr(ent.e,26,6)
+
+  if volser = "MIGRAT" then                 /* See if migrated       */
+    do
+      comments = "Must be HRECALLed or HDELETEd"
+      return 4
+    end
+
+  if substr(ent.e,37,7) ¬= "DEVTYPE" then
+    do
+      comments = "Error processing LISTC output for dataset"
+      return 12
+    end
+
+  devtype   = substr(ent.e,52,8)            /* see if on cartridge   */
+
+  if devtype = "78008080" | devtype = "78048080" | ,
+     devtype = "32008003" then
+    do
+      comments = "Cartridge/tape dataset. It will not be",
+                 "renamed"
+      return 8
+    end
+
+  suffix  = delstr(oldname,1,length(old_quals))
+  newname = new_quals || suffix
+
+  trapvar  = outtrap("temp.",'*',"noconcat")
+  "listc ent('" || newname || "')"
+  trapvar  = outtrap('off')
+
+  if rc = 0 then                            /* New name already there*/
+    do
+      comments = "New name already exists. Cannot rename to",
+                 newname
+      return 12
+    end
+
+  "CALL 'SYS3.LINKLIB(DBARACHK)' '"oldname",ALTER'"
+  old_rc = rc
+  "CALL 'SYS3.LINKLIB(DBARACHK)' '"newname",ALTER'"
+  new_rc = rc
+  if old_rc = 0 & new_rc = 0
+    then
+      nop
+    else
+      do
+        comments = "Not enough authority to rename dataset"
+        return 12
+      end
+
+  if mode = "CHECK" then
+    do
+      comments = "All checks were OK - check mode only"
+      return 0
+    end
+
+  "RENAME '" || oldname || "' '" || newname || "'"
+
+  if rc ¬= 0 then
+    do
+      comments = "Rename of dataset failed RC" rc
+      return 12
+    end
+
+  comments = "Rename of dataset worked OK"
+
+return 0
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   write_line                                           */
+  /*                                                                 */
+  /* CALLED BY: process_cluster                                      */
+  /*            process_nonvsam                                      */
+  /*                                                                 */
+  /* PURPOSE:   write a line to report on one dataset                */
+  /*                                                                 */
+  /*******************************************************************/
+
+write_line:
+  arg dsn type status
+
+  if line_count > 40 then call page_heading
+
+  select
+    when type = "AIX"     | type = "DATA"     | type = "INDEX"
+      then
+        dsn = "  "   || dsn
+
+    when type = "AIXDATA" | type = "AIXINDEX" | type = "PATH"
+      then
+        dsn = "    " || dsn
+
+    otherwise nop
+  end
+
+  dsn    = left(dsn,49)
+  type   = left(type,9)
+  status = left(status,4)
+  queue " " || dsn || type || status || comments
+  line_count = line_count + 1
+
+return 0
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   page_heading                                         */
+  /*                                                                 */
+  /* CALLED BY: write_line                                           */
+  /*                                                                 */
+  /* PURPOSE:   write a page heading for the detail report           */
+  /*                                                                 */
+  /*******************************************************************/
+
+page_heading:
+  queue "1        PURENAME - renaming of datasets from prefix " ,
+     || old_quals "to prefix" new_quals
+  underline = "+        ____________________________________________",
+           || "___________"
+  extra     = ""
+  extra     = left(extra,(length(old_quals) + length(new_quals)),"_")
+  underline = underline || extra
+  queue underline
+  queue "0"
+
+  queue " Dataset Name                                    ",
+        "Type     OK? Comments"
+  queue "+________________________________________________",
+        "________ ___ _____________________________________________",
+     || "______________"
+  Queue " "
+
+  line_count = 0
+
+return 0
+
+  /*******************************************************************/
+  /*                                                                 */
+  /* ROUTINE:   terminal_report                                      */
+  /*                                                                 */
+  /* CALLED BY: main loop                                            */
+  /*                                                                 */
+  /* PURPOSE:   produce final page of dataset renaming report        */
+  /*                                                                 */
+  /*******************************************************************/
+
+terminal_report:
+
+  queue "1        Terminal report for rename of" old_quals "datasets",
+        "to a prefix of" new_quals
+  underline = "+        ____________________________________________",
+           || "___________"
+  extra     = ""
+  extra     = left(extra,(length(old_quals) + length(new_quals)),"_")
+  underline = underline || extra
+  queue underline
+
+  if mode = "CHECK" then
+    do
+      queue "-        Option selected was CHECK. No datasets have " ,
+         || "been renamed but all other checks have been made"
+      queue "+        ____________________________________________" ,
+         || "________________________________________________"
+    end
+  else
+    do
+      queue "-        Option selected was RENAME. See detailed re" ,
+         || "port for explanations if datasets were not renamed"
+      queue "+        ___________________________________________" ,
+         || "__________________________________________________"
+    end
+
+  queue "0"
+  queue "0"
+  margin = "0                           "
+
+  queue margin "Number of migrated datasets               ",
+        right(tot_migrat,4)
+  queue margin "Number of datasets on cartridge or tape   ",
+        right(tot_cart,4)
+  queue margin "Number of non-VSAM datasets: processed OK ",
+        right(tot_nonvsam_good,4)
+  queue margin "                           : not processed",
+        right(tot_nonvsam_bad,4)
+  queue margin "Number of VSAM clusters    : processed OK ",
+        right(tot_cluster_good,4)
+  queue margin "                           : not processed",
+        right(tot_cluster_bad,4)
+  queue margin "Number of GDGs found (not processed)      ",
+        right(tot_gdg,4)
+  queue margin "Total                                     ",
+        right(tot_found,4)
+
+return 0
+

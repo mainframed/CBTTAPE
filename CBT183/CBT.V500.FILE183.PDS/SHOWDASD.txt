@@ -1,0 +1,400 @@
+/*************************************************************** REXX *\
+|*                                                                    *|
+|* MODULE NAME = SHOWDASD                                             *|
+|*                                                                    *|
+|* DESCRIPTIVE NAME = Display on-line DASD devices                    *|
+|*                                                                    *|
+|* STATUS = R105                                                      *|
+|*                                                                    *|
+|* FUNCTION = This REXX exec allows an ISPF user to display a list    *|
+|*            of on-line DASD devices.                                *|
+|*                                                                    *|
+|* AUTHOR   =  Gilbert Saint-Flour <carlos@gsf-soft.com>              *|
+|*             http://gsf-soft.com/Freeware/SHOWDASD.shtml            *|
+|*                                                                    *|
+|* DEPENDENCIES = TSO/E V2                                            *|
+|*                ISPF V4 or V5                                       *|
+|*                RXSMS module                                        *|
+|*                SHOWDPNL and SHOWVTOC Panels                        *|
+|*                                                                    *|
+|* SYNTAX = See below                                                 *|
+|*                                                                    *|
+|*     SHOWDASD                                                       *|
+|*              <volume filter>                                       *|
+|*              <SG=storgrp>                                          *|
+|*                                                                    *|
+|*101 Check for invalid commands                                 2004 *|
+|*102 z/OS 1.7 HBB7720 ULUT V2                                   2007 *|
+|*103 LIBDEF ISPPLIB LIBRARY ID(SYSEXEC) STACK                   2009 *|
+|*    Activate REFRESH command                                        *|
+|*104 VTOC info now displayed with V or I                        2010 *|
+|*105 z/OS 2.2 HBB77A0 ULUT V3 (or Z/OS 2.1 / 1.13 w/PTFs)       2015 *|
+|*    ULUT is now in 64 bit storage                                   *|
+|*                                                                    *|
+\**********************************************************************/
+ADDRESS ISPEXEC
+"CONTROL ERRORS RETURN"
+"ISREDIT MACRO (filter)"
+IF rc>0 THEN ARG filter
+UPPER filter
+IF filter='' THEN filter='*'
+filter2=filter
+
+vars='ucb volser devn devc device sg cyls totspc fspc fpct maxfree'
+DO i=1 BY 1
+  tbname='VOLS' || RIGHT(i,4,'0')
+  "TBCREATE &tbname NOWRITE KEYS(&vars) NAMES(lcmd)"
+  IF rc=0 THEN LEAVE
+END
+lcmd=''; n=0
+CALL Build_table                                /* Build the table */
+IF n=0 THEN DO
+   ZMSG000S='No on-line volume'
+   ZMSG000L='No on-line volumes were found ' ||,
+                                     'that match specified vol/sg names'
+  "SETMSG MSG(ISPZ000)"                      /* initial Message       */
+  EXIT 8
+  END
+MSG000S=n || 'volumes displayed'
+MSG000L=n || 'DASD volumes are displayed'
+"SETMSG MSG(ISPZ000)"                      /* initial Message       */
+  /*---------------------------------------------------------------*\
+  |*                  Display the table                            *|
+  \*---------------------------------------------------------------*/
+"TBTOP &tbname"
+
+DO FOREVER
+  n=0; zerrmsg=''
+  "TBDISPL &tbname PANEL(SHOWDPNL) AUTOSEL(YES) ROWID(rowid)"
+  IF rc=8 THEN LEAVE                       /* END/RETURN */
+  tbrc=rc                                  /* save rc=4 */
+  IF rc=12 THEN DO
+    "LIBDEF ISPPLIB LIBRARY ID(SYSEXEC) STACK"
+    IF rc=0 THEN sysexec='OK'
+    "TBDISPL &tbname PANEL(SHOWDPNL) AUTOSEL(YES) ROWID(rowid)"
+    IF rc=8 THEN LEAVE                     /* END/RETURN */
+    tbrc=rc                                /* save rc=4 */
+    END
+  IF rc>8 THEN DO
+    IF zerrmsg\='' THEN
+      'SETMSG MSG(&zerrmsg)'              /* TBDISPL error message */
+    EXIT tbrc
+    END
+  IF zcmd\='' THEN DO
+    SELECT
+      WHEN WORD(zcmd,1) = 'SORT' THEN DO
+        fields=DELWORD(zcmd,1,1)
+        IF fields='' THEN fields='VOLSER'
+        "TBSORT &tbname FIELDS(&fields)"
+        IF rc>0 THEN DO
+          IF zerrmsg\='' THEN
+            'SETMSG MSG(&zerrmsg)'           /* TBSORT error message */
+          END
+        "TBTOP &tbname"
+        ITERATE                              /* ignore selections */
+        END
+      WHEN ABBREV('REFRESH',WORD(zcmd,1),3) THEN DO
+  n=0
+        CALL Refresh                         /* refresh SMS info */
+        END
+      OTHERWISE
+        'SETMSG MSG(ISPZ001)'                /* Invalid Command */
+      END
+    END
+  IF tbrc=4 THEN DO UNTIL rc=0
+    CALL Selected_Row                      /* show current volume */
+    "TBDISPL &tbname"
+    END
+
+  CALL Selected_Row                        /* show last volume */
+  "TBSKIP &tbname NUMBER(&n)"              /* undo scrolling         */
+END
+
+"TBCLOSE &tbname"
+IF sysexec='OK' THEN
+  "LIBDEF ISPPLIB"       /* say sysexec rc */
+EXIT 1
+
+  /*---------------------------------------------------------------*\
+  |*       Sub-routine: Refresh SMS information                    *|
+  \*---------------------------------------------------------------*/
+
+Refresh:
+  "TBCLOSE &tbname"
+  "TBCREATE &tbname NOWRITE KEYS(&vars) NAMES(lcmd)"
+    IF zerrmsg\='' THEN
+      'SETMSG MSG(&zerrmsg)'              /* TBDISPL error message */
+  filter=filter2
+  CALL Build_table                         /* Rebuild the table */
+  "TBTOP &tbname"
+  RETURN
+
+    /*------------------------------------------------------*\
+    |*   Scan UCB table and load data into table entries    *|
+    \*------------------------------------------------------*/
+
+Build_table :
+  TotTracks=0;TotFree=0
+
+    /*     Retrieve volumes from SMS if filter="SG=xxxx"    */
+
+IF LEFT(filter,3)='SG=' THEN DO
+  filter=SUBSTR(filter,4)                /* name of storage group  */
+  IF INDEX(filter,'*')=0 & INDEX(filter,'%')=0 THEN DO
+    IF RXSMS('SGV','vol.',filter) = 0 THEN DO v=1 TO vol.0
+      ucb=X2D(WORD(vol.v,7))
+      IF ucb>0 THEN                        /* on-line device?        */
+        CALL Process_UCB ucb v
+      END
+    END
+  ELSE DO                                  /* generic filter         */
+    IF RXSMS('AVL','vol.',filter) = 0 THEN DO v=1 TO vol.0
+      IF WILDCARD(WORD(vol.v,2),filter) THEN DO
+        ucb=X2D(WORD(vol.v,7))
+        IF ucb>0 THEN                        /* on-line device?      */
+          CALL Process_UCB ucb v
+        END
+      END
+    END
+  END
+
+    /*     Loop through ULUT entries if filter=''       */
+
+ELSE DO
+  cvt = C2D(STORAGE(10,4))                 /* CVTPTR               */
+  iocom = C2D(STORAGE(D2X(cvt+124),4))     /* CVTIXAVL             */
+  iovt = C2D(STORAGE(D2X(iocom+208),4))    /* IOCIOVTP             */
+  NUMERIC DIGITS 20                        /* ULUT > 3B9AC9FF      */
+  ulut = C2D(STORAGE(D2X(iovt+8),4))       /* IOVTULUT             */
+  if ulut = 0 then                           /* IF 31 bit addr = 0 */
+    ulut = C2D(STORAGE(D2X(iovt+440),8))     /* THEN ULUT in 64 bit*/
+  uluentry = C2D(STORAGE(D2X(ulut+12),4))  /* ULUT1ST              */
+  count = C2D(STORAGE(D2X(ulut+16),4))     /* ULUTUCBC             */
+  IF STORAGE(D2X(ulut+4),1)='02'X THEN DO       /* ULUT V2 HBB7720 */
+    uluentry = C2D(STORAGE(D2X(ulut+12+8),4))   /* ULUT V2 HBB7720 */
+    count = C2D(STORAGE(D2X(ulut+16+8),4))      /* ULUT V2 HBB7720 */
+    END                                         /* ULUT V2 HBB7720 */
+  IF STORAGE(D2X(ulut+4),1)='03'X THEN DO       /* ULUT V3         */
+    uluentry = C2D(STORAGE(D2X(ulut+12+4),8))   /* ULUT V3 64 bits */
+    count = C2D(STORAGE(D2X(ulut+24+4),4))      /* ULUT V3 HBB7780 */
+    END                                         /* ULUT V3 HBB7780 */
+  DO i=1 TO count
+    ucb = C2D(STORAGE(D2X(uluentry+8),4))  /* ULUEUCBP             */
+    stat = STORAGE(D2X(ucb+3),1)           /* UCBSTAT              */
+    IF BITAND(stat,'80'x)='80'x THEN DO    /* on-line device?      */
+      byt3 = STORAGE(D2X(ucb+18),1)        /* UCBTBYT3             */
+      IF byt3='20'x THEN DO                /* class=DASD           */
+        volser=STORAGE(D2X(ucb+28),6)      /* UCBVOLI              */
+        IF WILDCARD(volser,filter) THEN DO
+          fl5 = STORAGE(D2X(ucb+1),1)      /* UCBFL5               */
+          IF BITAND(fl5,'20'x)='20'x THEN DO /* UCBSMS             */
+            rc=RXSMS('VOL','vol.',STORAGE(D2X(ucb+28),6))
+            CALL Process_UCB ucb 1
+            END
+          ELSE                             /* non-SMS              */
+            CALL Process_UCB ucb 0
+          END
+        END                                /* Wildcard             */
+      END                                  /* DASD                 */
+    uluentry=uluentry+12                   /* next UCB look-up entry */
+    END                                    /* on-line              */
+  END                                      /* ULUT scan            */
+
+  /*                  Display the message                          */
+
+IF TotTracks>0 THEN DO
+  pct=TRUNC((TotFree*100)/TotTracks,1) || '%'
+  IF TotTracks<10000 THEN
+   TotTracks=TotTracks || 'MB'
+  ELSE
+   TotTracks=TRUNC(TotTracks/1000,1) || 'GB'
+  IF TotFree<10000 THEN
+   TotFree=TotFree || 'MB'
+  ELSE
+   TotFree=TRUNC(TotFree/1000,1) || 'GB'
+   ZMSG000S= TotTracks TotFree pct
+   ZMSG000L= 'Total Space:' TotTracks,
+            ' Total Free Space:' TotFree,
+            '(' || pct || ')'
+  "SETMSG MSG(ISPZ000)"                      /* initial Message       */
+  END
+RETURN
+
+  /*---------------------------------------------------------------*\
+  |*                 Process a selected volume                     *|
+  \*---------------------------------------------------------------*/
+
+Selected_Row:
+  tbvol=volser
+  IF tbrc=0 & zcurinx>0 & rowid=0 THEN
+    "TBSKIP &tbname NUMBER(&zcurinx)"
+  IF zcurinx>0 THEN
+    n=ztdtop-zcurinx
+
+ /*
+ SAY 'rc='tbrc 'zsel='zsel 'ztdtop='ztdtop+0 'zcurinx='zcurinx+0,
+     'rowid='rowid+0 'volser='volser 'tbvol='tbvol 'n='n
+ */
+
+  "CONTROL DISPLAY SAVE"
+  SELECT
+    WHEN zcurinx+rowid=0 THEN DO            /* ENTER, no selection */
+      "TBSKIP &tbname NUMBER(&ztdtop)"
+      zsel=''
+      END
+    WHEN zsel='S' THEN DO                   /* List VTOC */
+      'LMDINIT LISTID(LID) VOLUME(&volser)'
+      IF RC>0 THEN SAY 'LMDINIT RC='RC
+      'LMDDISP LISTID(&LID)'
+      IF RC>0 THEN SAY 'LMDDISP RC='RC
+      'LMDFREE LISTID(&LID)'
+      IF RC>0 THEN SAY 'LMDFREE RC='RC
+      END
+    WHEN zsel='U' THEN DO                   /* Show UCB */
+      say 'UCB='D2X(ucb) 'VOL='volser
+      END
+    WHEN (zsel='I' | zsel='V') THEN DO      /* VTOC stats */
+      ZDDNVOL=volser
+      'VPUT ZDDNVOL SHARED'
+      ZDDNSKP='0'
+      'SELECT PGM(ISRUDL) PARM(SHOWVTOC)'
+      END
+    OTHERWISE DO
+      SAY 'invalid selection'
+      zsel=''
+      END
+    END
+  "CONTROL DISPLAY RESTORE"
+  IF zsel\='' THEN DO
+    lcmd=zsel
+    'TBPUT &tbname'
+ /* say 'lcmd='lcmd 'tbput='rc 'volser='volser */
+    END
+RETURN
+
+  /*---------------------------------------------------------------*\
+  |*  Sub-routine: Process a DASD volume and create a table entry  *|
+  \*---------------------------------------------------------------*/
+
+Process_UCB: PROCEDURE EXPOSE tbname vol. TotTracks TotFree n
+  ARG ucb v
+  volser=STORAGE(D2X(ucb+28),6)           /* UCBVOLI                */
+  devc = C2X(STORAGE(D2X(ucb+4),2))       /* UCBCHAN                */
+  devn = STORAGE(D2X(ucb+4),2)            /* UCBCHAN                */
+  devt = STORAGE(D2X(ucb+16),4)           /* UCBTYP                 */
+  cmext = C2D(STORAGE(D2X(ucb+21),3))     /* UCBEXTP                */
+  IF cmext//2 = 1 THEN                    /* UCB above the 16MB line */
+    cmext=TRUNC(ucb/16777216)*16777216+cmext-1
+  dce = C2D(STORAGE(D2X(cmext+24),4))     /* UCBCLEXT               */
+  obr = STORAGE(D2X(dce+23),1)            /* DCEOBRDT               */
+  SELECT
+    WHEN obr='1E'x THEN unit=STRIP(unitname(devt)) || 'D '
+    WHEN obr='21'x THEN unit=STRIP(unitname(devt)) || 'J '
+    WHEN obr='23'x THEN unit=STRIP(unitname(devt)) || 'K '
+    WHEN obr='2E'x THEN unit=STRIP(unitname(devt)) || 'E '
+    WHEN obr='26'x THEN unit=STRIP(unitname(devt)) || '-1'
+    WHEN obr='27'x THEN unit=STRIP(unitname(devt)) || '-2'
+    WHEN obr='24'x THEN unit=STRIP(unitname(devt)) || '-3'
+    WHEN obr='32'x THEN unit=STRIP(unitname(devt)) || '-9'
+    OTHERWISE unit=STRIP(unitname(devt))
+    END
+  device=LEFT(unit,6)                     /* pad                    */
+  hicyl = C2D(STORAGE(D2X(dce+20),2))     /* DCEHICYL               */
+  cyls = RIGHT(hicyl+1,5)                 /* pad                    */
+  IF v>0 THEN DO                          /* SMS info available     */
+    sg=WORD(vol.v,2)                      /* Storage Group          */
+    TotSpc=WORD(vol.v,8)                  /* Total Space            */
+    fspc=WORD(vol.v,9)                    /* Free Space             */
+    TotFree=TotFree+fspc                  /* Tally Free Space       */
+    MaxFree=WORD(vol.v,10)                /* Largest Extent         */
+    fpct=''
+    IF TotSpc>0 THEN DO
+      TotTracks=TotTracks+TotSpc          /* Tally Tracks           */
+      fpct=TRUNC((fspc*100)/TotSpc)
+      fpct=RIGHT(fpct,2) || '%'
+      END
+    fspc=RIGHT(fspc,5) || 'MB'
+    TotSpc=RIGHT(TotSpc,5) || 'MB'
+    MaxFree=RIGHT(MaxFree,5) || 'MB'
+    END
+  ELSE DO
+    stab = STORAGE(D2X(ucb+34),1)          /* UCBSTAB              */
+    SELECT
+      WHEN BITAND(stab,'10'x)='10'x THEN sg='Private'
+      WHEN BITAND(stab,'08'x)='08'x THEN sg='Public'
+      OTHERWISE sg='Storage'
+      END
+    END
+  "TBADD &tbname"
+  n=n+1
+  IF rc>0 THEN SAY 'TBADD rc='rc 'vol='volser
+  RETURN
+
+  /*---------------------------------------------------------------*\
+  |*       Sub-routine: Match name against specified pattern       *|
+  \*---------------------------------------------------------------*/
+
+WILDCARD: PROCEDURE
+  ARG name,pattern                   /* parse arguments */
+/*SAY name pattern*/
+  IF pattern='*' THEN RETURN 1       /* we have a match */
+  n=1
+  DO p=1 TO LENGTH(pattern)
+    p1=SUBSTR(pattern,p,1)
+    SELECT
+      WHEN p1=SUBSTR(name,n,1) THEN n=n+1
+      WHEN p1='%' THEN n=n+1
+      WHEN p1='*' THEN DO
+        IF p=LENGTH(pattern) THEN RETURN 1
+        n=INDEX(name,SUBSTR(pattern,p+1,1),n+1)
+        IF n=0 THEN RETURN 0        /* mismatch, exit */
+        END
+      OTHERWISE RETURN 0            /* mismatch, exit */
+      END
+  END
+  RETURN n=LENGTH(name)+1
+
+  /*----------------------------------------------------------------*\
+  |*                                                                *|
+  |*         Convert a device type (UCBTYP) to a unit name          *|
+  |*                                                                *|
+  |* This routine converts a 4-byte device type such as '3030200F'x *|
+  |* to an 8-character unit name such as '3390    ' using the       *|
+  |* IEFEB4UV service, as described in the IBM docs.                *|
+  |* To speed things up, this routine maintains a look-aside table  *|
+  |* of already converted devtype/unitname pairs.                   *|
+  |*                                                                *|
+  \*----------------------------------------------------------------*/
+
+unitname: PROCEDURE EXPOSE devtunit.
+  ARG devt                                   /* e.g. '3030200F'x */
+  IF devtunit.0 = 'DEVTUNIT.0' THEN          /* first time */
+    i=1
+  ELSE                                       /* not first time */
+    DO i=1 to devtunit.0                  /* scan look-aside table */
+      IF LEFT(devtunit.i,4) = devt THEN
+        RETURN RIGHT(devtunit.i,8)                /* e.g. '3390' */
+    END
+    /*                                                      */
+    /* devt not found in table, invoke IEFEB4UV to perform  */
+    /*       conversion and add new entry to table          */
+    /*                                                      */
+  devtunit.0 = i
+  unitname = '12345678' || devt || '00000000'x
+  flags='0100'x
+  ADDRESS LINKPGM 'IEFEB4UV unitname flags'
+  IF rc=0 THEN DO                            /* unknown devt */
+    flags='2000'x
+    ADDRESS LINKPGM 'IEFEB4UV unitname flags'
+    IF rc=0 THEN DO
+      devtunit.i = devt || LEFT(unitname,8)
+      RETURN RIGHT(devtunit.i,8)                  /* e.g. '3390' */
+      END
+    END
+    /*                                                        */
+    /* If IEFEB4UV failed to convert the devt to a unit name, */
+    /* convert the devt to EBCDIC and return it to the caller */
+    /*                                                        */
+  SAY 'IEFEB4UV RC='rc 'FLAGS='C2X(flags) 'DEVT='C2X(devt)
+  devtunit.i = devt || C2X(devt)
+  RETURN RIGHT(devtunit.i,8)                     /* '3030200F' */

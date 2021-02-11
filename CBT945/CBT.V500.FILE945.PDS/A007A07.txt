@@ -1,0 +1,881 @@
+Load a KSDS or ESDS
+
+This is an Assembler program that may be used to load a
+KSDS or ESDS. The program is written to use the VSAM load
+option of RECOVERY. As a result, the load may be restarted
+should there be a failure. The program will also report
+secondary allocation, key compression, and other problems.
+
+The program will operate either in initial load or resume load
+mode. Initial load mode occurs when the high-used RBA of the
+VSAM object is zero, resume load when the high-used RBA is
+non-zero.
+
+When in initial load mode, the program will determine the
+following:
+
+o      Load option - speed or recovery
+
+o      Number of records per CA.
+
+When in resume load mode, the program will determine the
+last key (KSDS) or record (ESDS) that was loaded in the
+VSAM object. This is determined by positioning on the high-
+used-RBA and reading forwards. The input QSAM file is then
+positioned on a key that is not less than the VSAM high-key,
+or on an identical record for an ESDS. The load will resume
+from that point.
+
+The program should use the temporary close option (TYPE=T)
+of the close macro when operating in initial load mode with
+RECOVERY enabled. SVC 23 is not very reliable, and is not
+used. Instead, after the first CA has been loaded, the VSAM
+object is closed and re-opened. Should the load operation fail at
+this point, VERIFY will correctly reset the high-used-RBA.
+
+The current initial load with RECOVERY is not very
+satisfactory because the VERIFY must perform a great deal of
+processing. As a result, the re-institution of the temporary close
+following the loading of every data CA should be performed as
+soon as the reliability of SVC 23 improves.
+
+VSAMLOAD TITLE 'SEMI-INTELLIGENT LOAD'
+         PRINT NOGEN
+*        PROGRAM ATTRIBUTES:
+*              REENTRANT
+*        SAMPLE JCL
+*              //LOAD   EXEC PGM=VSAMLOAD
+*              //QSAM     DD DSN=INPUT.QSAM,DISP=SHR,DCB=BUFNO=30
+*              //STEPLIB  DD DSN=MY.LOAD,DISP=SHR
+*              //SYSPRINT DD SYSOUT=*
+*              //VSAM     DD DSN=OUTPUT.VSAM,DISP=OLD,AMP='BUFND=43'
+         TITLE 'MACROS AND CONTROL BLOCKS USED'
+*        THE FOLLOWING MACROS ARE USED WITHIN THIS PROGRAM
+*
+*        ABEND                          TERMINATE TASK
+*        CLOSE                          TERMINATE FILE PROCESSING
+*        FREEMAIN                       RELEASE STORAGE
+*        FREEPOOL                       RELEASE BUFFER POOL
+*        GENCB                          GENERATE A CONTROL BLOCK
+*        GET                            RETRIEVE RECORD
+*        GETMAIN                        ACQUIRE STORAGE
+*        MODCB                          MODIFY A CONTROL BLOCK
+*        OPEN                           PREPARE FILE FOR PROCESSING
+*        POINT                          POSITION WITHIN FILE
+*        PUT                            OUTPUT RECORD
+*        SHOWCB                         SHOW CONTENT OF CONTROL BLOCK
+*        TESTCB                         TEST CONTENT OF CONTROL BLOCK
+*        WTO                            OUTPUT MESSAGE
+*
+*        THE FOLLOWING CONTROL BLOCKS ARE USED WITHIN THIS PROGRAM
+*        DCBD                           DCB MAPPING
+*        IDAAMB                         AMB MAPPING
+*        IDAAMBL                        AMBL MAPPING
+*        IDAAMDSB                       AMDSB MAPPING
+*        IFGACB                         ACB MAPPING
+*
+*        REGISTER USAGE - GENERAL
+*        0                              . MACROS
+*        1                              . MACROS
+*        2                              . WORK
+*        3                              . WORK
+*                                       . -> CONTROL BLOCK
+*        4                              . -> CONTROL BLOCK
+*        5                              . -> CONTROL BLOCK
+*        6                              . WORK
+*        7                              . -> MESSAGE DETAIL
+*        8                              . -> INPUT RECORD
+*        9                              . -> PARAMETER WORK AREA
+*        10                             . -> BRANCH AND SAVE RETURN
+*        11                             . -> CSECT BASE
+*        12                             . -> CSECT BASE +4096
+*        13                             . -> SAVE AREA
+*        14                             . -> RETURN
+*        15                             . -> ENTRY POINT
+*                                       . RETURN CODE
+         TITLE 'CONTROL CODE'
+*        1.    PROGRAM PROLOG
+*        2.    PERFORM INITIALIZATION
+*        3.    PERFORM MAIN PROCESSING (IF NOT EOF ON QSAM)
+*        4.    PERFORM TERMINATION
+*        5.    PROGRAM EPILOG
+         SPACE 1
+VSAMLOAD CSECT
+         STM   R14,R12,12(R13)          . SAVE CALLER'S REGISTERS
+         LR    R11,R15                  . 11 -> EPA
+         LA    R12,4095(,R11)           . 12 -> EPA +4095
+         LA    R12,1(,R12)              . 12 -> EPA +4096
+         USING VSAMLOAD,R11,R12         . CSECT ADDRESSABILITY
+         LA    R2,DYNLEN                . 2 - LENGTH OF DYNAMIC AREA
+         GETMAIN RU,                    . ACQUIRE DYNAMIC AREA         C
+               LOC=BELOW,                                              C
+               LV=(R2)
+         ST    R1,8(,R13)               . SAVE LSA ->
+         ST    R13,4(,R1)               . SAVE HSA ->
+         LR    R13,R1                   . 13 -> DYNAMIC / SAVE AREA
+         USING DYNAREA,R13              . DSECT ADDRESSABILITY
+         BAS   R10,INITIAL              . PERFORM INITIALIZATION
+         CLI   EOF,ON                   . Q. EOF ON QSAM INPUT?
+         BE    A0001                    . A. YES
+         BAS   R10,PROCESS              . PERFORM MAIN PROCESS
+A0001    EQU   *
+         BAS   R10,TERMIN               . PERFORM TERMINATION
+         LR    R2,R13                   . 2 -> DYNAMIC AREA
+         L     R13,4(,R13)              . 13 -> CALLER'S SAVE AREA
+         LA    R3,DYNLEN                . 3 - LENGTH OF DYNAMIC AREA
+         FREEMAIN RU,                   . RELEASE STORAGE              C
+               A=(R2),                                                 C
+               LV=(R3)
+         LM    R14,R12,12(R13)          . RESTORE CALLER'S REGISTERS
+         SLR   R15,R15                  . 15 - ZERO
+         BR    R14                      . RETURN
+         TITLE 'PROGRAM INITIALIZATION'
+*        1.    GENERATE ACB, EXIT LIST AND RPL
+*        2.    OPEN VSAM, OBTAIN DATA FROM CONTROL BLOCKS
+*              AND THROUGH SHOWCB AND TESTCB REQUESTS
+*        3.    CLOSE VSAM OBJECT
+*        4.    IF RECOVERY ENABLED, PERFORM LOCATE HIGH VSAM RECORD
+*        5.    MODIFY ACB AND RPL FOR KSDS OR ESDS
+*        6.    INITIALIZE DATA AREAS, OPEN ALL FILES AND CHECK OPEN
+*        7.    IF RECOVERY AND HIGH-USED RBA NON-ZERO, RE-POSITION QSAM
+*        8.    CHANGE QSAM EOD ADDRESS
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        2                              WORK
+*        3                              -> ACB
+*        4                              -> EXIT LIST
+*                                       -> RPL
+*                                       -> QSAM DCB
+*        5                              -> SYSPRINT DCB
+*        9                              -> PARAMETER WORK AREA
+*        10                             RETURN ADDRESS
+         SPACE 1
+INITIAL  EQU   *
+         ST    R10,BSAVE                . SAVE RETURN REGISTER
+         LA    R2,RPLLEN                . 2 - LENGTH OF LONGEST
+*                                       .   PARAMETER AREA
+         GETMAIN RU,                    . ACQUIRE PARAMETER STORAGE    C
+               LV=(R2)
+         LR    R9,R1                    . 9 -> ACQUIRED STORAGE
+         GENCB BLK=ACB,                 . GENERATE ACB                 C
+               AM=VSAM,                                                C
+               DDNAME=VSAM,                                            C
+               MACRF=(SEQ,OUT),                                        C
+               MF=(G,(R9))
+         ST    R1,@ACB                  . SAVE ACB ->
+         LR    R3,R1                    . 3 -> ACB
+         GENCB BLK=EXLST,               . GENERATE EXIT LIST           C
+               EODAD=E0005,                                            C
+               MF=(G,(R9))
+         ST    R1,@EXLST                . SAVE EXIT LIST ->
+         LR    R4,R1                    . 4 -> EXIT LIST
+         MODCB ACB=(R3),                . MODIFY ACB FOR EXIT LIST     C
+               EXLST=(R4),                                             C
+               MF=(G,(R9))
+         GENCB BLK=RPL,                 . GENERATE RPL                 C
+               ACB=(R3),                                               C
+               AM=VSAM,                                                C
+               OPTCD=(ADR,SEQ,MVE),                                    C
+               MF=(G,(R9),RPLLEN)
+         ST    R1,@RPL                  . SAVE RPL ->
+         MVC   DMAL(LOPEN1L),OPEN1L     . MOVE DMA LIST TO DYNAMIC
+         OPEN  ((R3),OUTPUT),           . OPEN VSAM ACB                C
+               MF=(E,DMAL)
+         B     *+4(R15)                 . BRANCH ON RETURN CODE
+         B     B0002                    . 0 - OPEN OKAY
+         B     B0001                    . 4 - OPEN WITH WARNINGS
+         B     B0010                    . 8 - OPEN FAILED
+B0001    EQU   *
+         LA    R2,ERRFLD                . 2 -> ACB ERROR AREA
+         SHOWCB ACB=(R3),               . DETERMINE ACB ERROR          C
+               AREA=(R2),                                              C
+               FIELDS=ERROR,                                           C
+               LENGTH=4,                                               C
+               MF=(G,(R9))
+         CLC   ERRFLD,=F'+118'          . Q. VERIFY OKAY?
+         BNE   B0010                    . A. NO - ABEND
+B0002    EQU   *
+         USING IFGACB,R3                . ACB DSECT ADDRESSABILITY
+         L     R2,ACBAMBL               . 2 -> AMB LIST
+         DROP  R3
+         USING IDAAMBL,R2               . AMB LIST DSECT ADDRESSABILITY
+         L     R2,AMBLDTA               . 2 -> AMB FOR DATA
+         DROP  R2
+         USING IDAAMB,R2                . AMB DSECT ADDRESSABILITY
+         MVC   DAMBFLG1,AMBFLG1         . SAVE FLAG
+         TM    DAMBFLG1,AMBSPEED        . Q. SPEED OPTION ENABLED?
+         BO    B0003                    . A. YES
+         L     R2,AMBDSB                . 2 -> AMDSB
+         DROP  R2
+         USING IDAAMDSB,R2              . AMDSB DSECT ADDRESSABILITY
+         MVC   DAMDCICA,AMDCIPCA        . SAVE CIS PER CA
+         MVC   DAMDFSCA,AMDFSCA         . SAVE CA FREE SPACE BYTES
+         MVC   DAMDFSCI,AMDFSCI         . SAVE CI FREE SPACE BYTES
+         DROP  R2
+         LA    R2,SHOWAREA              . 2 -> SHOWCB AREA
+         SHOWCB ACB=(R3),               . DETERMINE ACB DATA           C
+               AREA=(R2),                                              C
+               FIELDS=(CINV,ENDRBA,KEYLEN,LRECL,RKP),                  C
+               LENGTH=20,                                              C
+               MF=(G,(R9))
+B0003    EQU   *
+         MVI   OBJ,ESDS                 . DEFAULT TO ESDS
+         TESTCB ACB=(R3),               . Q. OBJECT AN ESDS?           C
+               ATRB=ESDS,                                              C
+               MF=(G,(R9))
+         BE    B0004                    . A. YES
+         MVI   OBJ,KSDS                 . FLAG AS KSDS
+         TESTCB ACB=(R3),               . Q. OBJECT A KSDS?            C
+               ATRB=KSDS,                                              C
+               MF=(G,(R9))
+         BNE   B0013                    . A. NO - ERROR
+B0004    EQU   *
+         CLOSE ((R3)),                  . CLOSE VSAM ACB               C
+               MF=(E,DMAL)
+         TM    DAMBFLG1,AMBSPEED        . Q. SPEED ENABLED?
+         BO    B0005                    . A. YES
+         BAS   R10,LASTVSAM             . LOCATE HIGH-RECORD ON VSAM
+B0005    EQU   *
+         L     R4,@RPL                  . 4 -> RPL
+         CLI   OBJ,ESDS                 . Q. ESDS OBJECT?
+         BE    B0006                    . A. YES
+         MODCB RPL=(R4),                . MODIFY RPL FOR KSDS          C
+               OPTCD=(KEY,SEQ),                                        C
+               MF=(G,(R9))
+         L     R3,@ACB                  . 3 -> ACB
+         MODCB ACB=(R3),                . MODIFY ACB FOR KSDS          C
+               MACRF=(KEY,SEQ,OUT),                                    C
+               MF=(G,(R9))
+         B     B0007                    . CONTINUE
+B0006    EQU   *
+         MODCB RPL=(R4),                . MODIFY RPL FOR ESDS          C
+               OPTCD=(ADR,SEQ),                                        C
+               MF=(G,(R9))
+         L     R3,@ACB                  . 3 -> ACB
+         MODCB ACB=(R3),                . MODIFY ACB FOR ESDS          C
+               MACRF=(ADR,SEQ,OUT),                                    C
+               MF=(G,(R9))
+B0007    EQU   *
+         ZAP   #RECREAD,=P'+0'          . INITIALIZE COUNTS
+         ZAP   #RECWRIT,=P'+0'
+         ZAP   #PAGE,=P'+0'
+         ZAP   #LINE,=P'+60'            . INITIALIZE LINE COUNTER
+         MVI   EOF,OFF                  . SET NOT-EOF ON QSAM
+         MVI   OUTLINE,C' '             . INITIALIZE REPORT LINE
+         MVC   OUTLINE+1(L'OUTLINE-1),OUTLINE
+         MVC   DCB1(LQSAMDCB),QSAMDCB   . MOVE QSAM DCB TO DYNAMIC
+         MVC   DCB2(LSYSDCB),SYSDCB     . MOVE SYSPRINT DCB TO DYNAMIC
+         L     R3,@ACB                  . 3 -> VSAM ACB
+         LA    R4,DCB1                  . 4 -> QSAM DCB
+         USING IHADCB,R4                . DCB DSECT ADDRESSABILITY
+         MVC   DCBEXIT+1(3),=AL3(OPENEXIT) . OPEN EXIT ADDRESS
+         MVI   DCBEXIT,X'85'            . OPEN EXIT AND END
+         LA    R2,DCBEXIT               . 2 -> DCB EXIT
+         ST    R2,DCBEXLST              . SAVE IN QSAM DCB
+         MVC   DMAL(LOPEN3L),OPEN3L     . DMA LIST TO DYNAMIC
+         LA    R5,DCB2                  . 5 -> SYSPRINT DCB
+         OPEN  ((R3),OUTPUT,(R4),,(R5),OUTPUT), . OPEN FILES           C
+               MF=(E,DMAL)
+         LTR   R15,R15                  . Q. OPEN OKAY?
+         BZ    B0008                    . A. YES
+         USING IFGACB,R3                . ACB DSECT ADDRESSABILITY
+         TM    ACBOFLGS,ACBOPEN         . Q. VSAM ACB OPEN?
+         BNO   B0010                    . A. NO
+         TM    DCBOFLGS,DCBOFOPN        . Q. QSAM DCB OPEN?
+         BNO   B0011                    . A. NO
+         DROP  R4
+         USING IHADCB,R5                . MAP SYSPRINT DCB
+         TM    DCBOFLGS,DCBOFOPN        . Q. SYSPRINT DCB OPEN?
+         BNO   B0012                    . A. NO
+         DROP  R5
+B0008    EQU   *
+         TM    DAMBFLG1,AMBSPEED        . Q. SPEED ENABLED?
+         BO    B0009                    . A. YES
+         OC    ENDRBA,ENDRBA            . Q. HI-USED RBA ZERO?
+         BZ    B0009                    . A. YES
+         BAS   R10,SKIPQSAM             . REPOSITION QSAM
+B0009    EQU   *
+         LA    R4,DCB1                  . 4 -> QSAM DCB
+         USING IHADCB,R4                . MAP QSAM DCB
+         MVC   DCBEODAD,=AL4(C0009)     . CHANGE QSAM EODAD ADDRESS
+         DROP  R4
+         L     R10,BSAVE                . RESTORE RETURN ADDRESS
+         BR    R10                      . RETURN
+B0010    EQU   *                        . VSAM OPEN FAIL
+         ST    R15,ERR15                . SAVE 15
+         WTO   MF=(E,WTO1L)             . OUTPUT MESSAGE
+         LA    R2,ERRFLD                . 2 -> ACB ERROR AREA
+         SHOWCB ACB=(R3),               . DETERMINE ACB ERROR          C
+               AREA=(R2),                                              C
+               FIELDS=ERROR,                                           C
+               LENGTH=4,                                               C
+               MF=(G,(R9))
+         LM    R2,R3,ERR15              . LOAD DATA INTO REGS
+         B     B0014                    . BRANCH TO ABEND
+B0011    EQU   *                        . QSAM OPEN FAIL
+         WTO   MF=(E,WTO2L)             . OUTPUT MESSAGE
+         B     B0014                    . BRANCH TO ABEND
+B0012    EQU   *                        . SYSPRINT OPEN FAIL
+         WTO   MF=(E,WTO3L)             . OUTPUT MESSAGE
+         B     B0014                    . BRANCH TO ABEND
+B0013    EQU   *                        . NOT KSDS OR ESDS
+         WTO   MF=(E,WTO4L)             . OUTPUT MESSAGE
+B0014    EQU   *                        . ABEND POINT
+         ABEND 400,                     . TERMINATE TASK               C
+               DUMP
+         TITLE 'MAIN PROGRAM PROCESSING'
+*        1.    READ QSAM RECORD, INCREMENT RECORDS READ
+*        2.    IF RECORD FORMAT VARIABLE, CHANGE RECORD LENGTH AND ->
+*        3.    MODIFY RPL DATA, AND PUT VSAM RECORD
+*        4.    CHECK RESULT OF PUT
+*        5.    IF INITIAL LOAD AND RECOVERY ENABLED, CHECK IF FIRST CA
+*              HAS BEEN LOADED.  ISSUE CLOSE AND OPEN OF VSAM AFTER
+*              FIRST CA LOADED.
+*        6.    CONTINUE UNTIL EOF ON QSAM
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        2                              WORK
+*        3                              -> RPL
+*        4                              -> QSAM DCB
+*        6                              PUT ACCUMULATOR
+*        7                              -> MESSAGE DETAIL
+*        8                              -> QSAM RECORD
+*        9                              -> PARAMETER WORK AREA
+*        10                             RETURN ADDRESS
+         SPACE 1
+PROCESS  EQU   *
+         ST    R10,CSAVE                . SAVE RETURN ADDRESS
+         USING IHADCB,R4                . MAP QSAM DCB
+         L     R3,@RPL                  . 3 -> RPL
+         SLR   R6,R6                    . 6 - ZERO
+         MVI   MSGSW,C'0'               . INITIALIZE MESSAGE FLAG
+C0001    EQU   *
+         GET   (R4)                     . GET A QSAM RECORD
+         AP    #RECREAD,=P'+1'          . INCREMENT RECORDS READ
+         LR    R8,R1                    . 8 -> INPUT RECORD
+         LH    R2,DCBLRECL              . 2 - LOGICAL RECORD LENGTH
+         TM    DCBRECFM,DCBRECV         . Q. VARIABLE FORMAT?
+         BNO   C0002                    . A. NO
+         SH    R2,=H'+4'                . DECREMENT LENGTH BY FOUR
+         LA    R8,4(,R8)                . 8 -> AFTER RDW
+C0002    EQU   *
+         MODCB RPL=(R3),                . MODIFY RPL                   C
+               AREA=(R8),               .   -> RECORD                  C
+               RECLEN=(R2),             .   - LENGTH OF RECORD         C
+               MF=(G,(R9))
+         PUT   RPL=(R3)                 . PUT TO VSAM
+         AP    #RECWRIT,=P'+1'          . INCREMENT RECORDS WRITTEN
+         ST    R15,ERR15                . SAVE 15
+         B     *+4(R15)                 . BRANCH ON RETURN CODE
+         B     C0003                    . 0 - CHECK RPL FEED BACK
+         B     C0006                    . 4 - STRING ERROR
+         B     C0007                    . 8 - LOGIC ERROR
+         B     C0008                    . 12 - PHYSICAL ERROR
+C0003    EQU   *
+         LA    R2,ERRFLD                . 2 -> RPL FEED BACK AREA
+         SHOWCB RPL=(R3),               . DETERMINE RPL FEED BACK      C
+               AREA=(R2),                                              C
+               FIELDS=FDBK,                                            C
+               LENGTH=4,                                               C
+               MF=(G,(R9))
+         L     R15,ERRFLD               . 15 - RPL FEED BACK
+         B     *+4(,R15)                . BRANCH ON FEED BACK
+         B     C0005                    . 0 - PUT SUCCESSFUL
+         B     C0004                    . 4 - SECONDARY ALLOCATION
+         B     C0004                    . 8 - DUPLICATE ALTERNATE INDEX
+         B     C0004                    . 12 - WRITE BUFFER
+         B     C0004                    . 16 - SEQUENCE SET CAPACITY
+         B     C0005                    . 20 - RESERVED
+         B     C0004                    . 24 - NO BUFFER WRITES
+         B     C0005                    . 28 - CI SPLIT INDICATOR
+         B     C0005                    . 32 - MARK BUFFER INVALID
+         B     C0005                    . RESERVED
+         B     C0005                    . RESERVED
+C0004    EQU   *
+         SRA   R15,2                    . DIVIDE 15 BY FOUR
+         BCTR  R15,R0                   . DECREMENT BY ONE
+         MH    R15,=H'+60'              . MULTIPLY BY SIXTY
+         LA    R7,RC0MSG                . 7 -> MESSAGE ARRAY
+         AR    R7,R15                   . 7 -> SPECIFIC MESSAGE
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+C0005    EQU   *
+         OC    ENDRBA,ENDRBA            . Q. HI-USED RBA ZERO?
+         BNZ   C0001                    . A. NO
+         TM    DAMBFLG1,AMBSPEED        . Q. SPEED ENABLED?
+         BO    C0001                    . A. YES
+         LA    R6,1(,R6)                . INCREMENT 6 BY ONE
+         C     R6,RECPERCA              . Q. FIRST CA LOADED?
+         BNH   C0001                    . A. NO
+         L     R2,@ACB                  . 2 -> ACB
+         MVC   DMAL(LOPEN1L),OPEN1L     . MOVE DMA LIST TO DYNAMIC
+*              THE NEXT THREE STATEMENTS - CLOSE, OPEN, AND MVI
+*              ARE CODED DUE TO THE INCORRECT OPERATION OF SVC 23
+*              THESE SHOULD BE REPLACED BY
+*        CLOSE ((R2)),                  . TEMPORARILY CLOSE ACB        C
+               TYPE=T,                                                 C
+               MF=(E,DMAL)
+         CLOSE ((R2)),                  . CLOSE VSAM ACB               C
+               MF=(E,DMAL)
+         OPEN  ((R2),OUTPUT),           . OPEN VSAM ACB                C
+               MF=(E,DMAL)
+         MVI   DAMBFLG1,AMBSPEED        . FLAG SPEED ENABLED
+         LA    R6,1                     . 6 - ONE
+         LA    R7,TCMSG                 . 7 -> CLOSE MESSAGE
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         B     C0001                    . PROCESS NEXT QSAM RECORD
+C0006    EQU   *
+         LA    R7,RC4MSG                . 7 -> OUTPUT MESSAGE
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         B     C0010                    . TERMINATE
+C0007    EQU   *
+         LA    R7,RC8MSG                . 7 -> OUTPUT MESSAGE
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         B     C0010                    . TERMINATE
+C0008    EQU   *
+         LA    R7,RC12MSG               . 7 -> OUTPUT MESSAGE
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         B     C0010                    . TERMINATE
+C0009    EQU   *
+         DROP  R4
+         L     R10,CSAVE                . RESTORE RETURN ADDRESS
+         BR    R10                      . RETURN
+C0010    EQU   *
+         WTO   MF=(E,WTO7L)             . OUTPUT MESSAGE
+         LM    R2,R3,ERR15              . LOAD REGISTERS
+         ABEND 402,                     . TERMINATE PROGRAM            C
+               DUMP
+         TITLE 'PROGRAM TERMINATION'
+*        1.    RELEASE PARAMETER WORK STORAGE
+*        2.    OUTPUT END OF RUN MESSAGE
+*        3.    CLOSE FILES
+*        4.    FREE QSAM AND SYSPRINT BUFFER POOLS
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        3                              -> ACB
+*                                       WORK
+*        4                              -> QSAM DCB
+*        5                              -> SYSPRINT DCB
+*        9                              -> PARAMETER WORK AREA
+*        10                             RETURN ADDRESS
+         SPACE 1
+TERMIN   EQU   *
+         ST    R10,DSAVE                . SAVE RETURN ADDRESS
+         LA    R3,RPLLEN                . 3 - LENGTH OF LARGEST PARAM
+         FREEMAIN RU,                   . RELEASE STORAGE              C
+               A=(R9),                                                 C
+               LV=(R3)
+         LA    R7,LOADMSG               . 7 -> OUTPUT MESSAGE
+         MVI   MSGSW,C'E'               . SET MESSAGE FLAG
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         MVC   DMAL(LOPEN3L),OPEN3L     . MOVE DMA LIST TO DYNAMIC
+         L     R3,@ACB                  . 3 -> VSAM ACB
+         LA    R4,DCB1                  . 4 -> QSAM DCB
+         LA    R5,DCB2                  . 5 -> SYSPRINT DCB
+         CLOSE ((R3),,(R4),,(R5)),      . CLOSE FILES                  C
+               MF=(E,DMAL)
+         FREEPOOL (R4)                  . FREE QSAM BUFFER POOL
+         FREEPOOL (R5)                  . FREE SYSPRINT BUFFER POOL
+         L     R10,DSAVE                . RESTORE RETURN ADDRESS
+         BR    R10                      . EXIT
+         TITLE 'DETERMINE LAST RECORD OUTPUT TO VSAM'
+*        1.    EXIT IF HIGH-USED RBA ZERO
+*        2.    CALCULATE RECORDS PER CA
+*        3.    ACQUIRE STORAGE FOR VSAM RECORD
+*        4.    MODIFY ACB AND RPL FOR RBA ACCESS
+*        5.    OPEN ACB
+*        6.    POSITION ON CALCULATED RBA
+*        7.    READ FORWARDS UNTIL SEOF FOUND
+*        8.    CLOSE ACB
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        2                              WORK
+*        3                              WORK
+*                                       -> ACB
+*        4                              WORK
+*                                       -> RPL
+*        6                              -> RBA AREA
+*        8                              -> RECORD AREA
+*        9                              -> PARAMETER WORK AREA
+*        10                             RETURN ADDRESS
+         SPACE 1
+LASTVSAM EQU   *
+         OC    ENDRBA,ENDRBA            . Q. HI-USED RBA ZERO?
+         BNZ   E0002                    . A. NO
+         OC    DAMDFSCI,DAMDFSCI        . Q. CI FREE SPACE BYTES ZERO?
+         BNZ   E0001                    . A. NO
+         MVC   DAMDFSCI,=F'10'          . TEN UNUSABLE PER CI
+E0001    EQU   *
+         L     R2,CINV                  . 2 - CI SIZE
+         S     R2,DAMDFSCI              . DECREMENT BY CI FREE SPACE
+*                                       .   BYTES
+         SRDA  R2,32                    . SHIFT INTO 3
+         L     R4,LRECL                 . 4 - LOGICAL RECORD LENGTH
+         DR    R2,R4                    . DIVIDE USABLE CI BY RECORD
+*                                       .   LENGTH
+         LH    R4,DAMDCICA              . 4 - CIS PER CA
+         SH    R4,DAMDFSCA              . DECREMENT BY FREE CIS PER CA
+         MR    R2,R4                    . MULTIPLY BY RECORDS PER CI
+         ST    R3,RECPERCA              . SAVE RECORDS PER CA
+E0002    EQU   *
+         L     R2,LRECL                 . 2 - RECORD LENGTH
+         GETMAIN RU,                    . ACQUIRE STORAGE FOR RECORD   C
+               LOC=BELOW,                                              C
+               LV=(R2)
+         ST    R1,@REC                  . SAVE RECORD AREA ADDRESS
+         OC    ENDRBA,ENDRBA            . Q. HI-USED RBA ZERO?
+         BZ    E0006                    . A. YES
+         LH    R3,DAMDCICA              . 3 - CIS PER CA
+         M     R2,CINV                  . MULTIPLY BY CI SIZE
+         ST    R3,CASZ                  . SAVE BYTES PER CA
+         L     R3,@ACB                  . 3 -> VSAM ACB
+         MODCB ACB=(R3),                . MODIFY ACB FOR RBA ACCESS    C
+               MACRF=(IN,ADR,SEQ),                                     C
+               MF=(G,(R9))
+         L     R2,LRECL                 . 2 - LOGICAL RECORD LENGTH
+         L     R4,@RPL                  . 4 -> RPL
+         LA    R6,RBA                   . 6 -> RBA AREA
+         L     R8,@REC                  . 8 -> RECORD WORK AREA
+         MODCB RPL=(R4),                . MODIFY RPL                   C
+               AREA=(R8),                                              C
+               AREALEN=(R2),                                           C
+               ARG=(R6),                                               C
+               MF=(G,(R9))
+         OPEN  ((R3)),                  . OPEN VSAM ACB                C
+               MF=(E,DMAL)
+         LTR   R15,R15                  . Q. OPEN SUCCESSFUL?
+         BNZ   E0007                    . A. NO
+         L     R2,ENDRBA                . 2 - HI-USED RBA
+         S     R2,CASZ                  . DECREMENT BY BYTES PER CA
+         LTR   R2,R2                    . Q. RESULT POSITIVE?
+         BP    E0003                    . A. YES
+         SLR   R2,R2                    . 2 - ZERO
+E0003    EQU   *
+         ST    R2,RBA                   . SAVE IN RBA AREA
+         POINT RPL=(R4)                 . POSITION ON RBA
+         LTR   R15,R15                  . Q. POINT SUCCESSFUL?
+         BNZ   E0008                    . A. NO
+E0004    EQU   *
+         GET   RPL=(R4)                 . GET PHYSICAL RECORD
+         LTR   R15,R15                  . Q. GET SUCCESSFUL?
+         BNZ   E0009                    . A. NO
+         B     E0004                    . A. YES - GET NEXT
+E0005    EQU   *
+         CLOSE ((R3)),                  . CLOSE VSAM ACB               C
+               MF=(E,DMAL)
+E0006    EQU   *
+         BR    R10                      . RETURN
+E0007    EQU   *                        . VSAM OPEN FAILURE
+         ST    R15,ERR15                . SAVE RETURN CODE
+         WTO   MF=(E,WTO1L)             . OUTPUT MESSAGE
+         LA    R2,ERRFLD                . 2 -> ACB ERROR FIELD
+         SHOWCB ACB=(R3),               . DETERMINE ACB ERROR CODE     C
+               AREA=(R2),                                              C
+               FIELDS=ERROR,                                           C
+               LENGTH=4,                                               C
+               MF=(G,(R9))
+         B     E0011                    . BRANCH TO ABEND
+E0008    EQU   *                        . VSAM POINT FAILURE
+         ST    R15,ERR15                . SAVE RETURN CODE
+         WTO   MF=(E,WTO5L)             . OUTPUT MESSAGE
+         B     E0010                    . BRANCH TO RPL PROCESS
+E0009    EQU   *                        . VSAM GET FAILURE
+         ST    R15,ERR15                . SAVE RETURN CODE
+         WTO   MF=(E,WTO6L)             . OUTPUT MESSAGE
+E0010    EQU   *
+         LA    R2,ERRFLD                . 2 -> RPL FEED BACK AREA
+         SHOWCB RPL=(R4),               . DETERMINE RPL FEED BACK      C
+               AREA=(R2),                                              C
+               FIELDS=FDBK,                                            C
+               LENGTH=4,                                               C
+               MF=(G,(R9))
+E0011    EQU   *
+         LM    R2,R3,ERR15              . LOAD REGISTERS
+         ABEND 401,                     . TERMINATE TASK               C
+               DUMP
+         TITLE 'CODE REPOSITIONING INPUT QSAM FILE'
+*        1.    IF KSDS BEING PROCESSED, DETERMINE KEY LENGTH AND
+*              DISPLACEMENT IN LAST VSAM RECORD READ
+*        2.    READ QSAM RECORD AND INCREMENT RECORDS READ
+*        3.    IF KSDS BEING PROCESSED, COMPARE QSAM KEY AGAINST
+*              KEY IN LAST VSAM RECORD READ.  IF NOT LESS THAN, EXIT
+*        4.    IF ESDS BEING PROCESSED, COMPARE QSAM RECORD READ
+*              AGAINST LAST VSAM RECORD READ.  IF EQUAL, EXIT
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        2                              -> QSAM RECORD
+*        3                              RECORD LENGTH
+*        4                              -> QSAM DCB
+*        6                              -> VSAM KEY AREA (KSDS)
+*                                       -> VSAM RECORD AREA (ESDS)
+*        7                              KEY LENGTH (KSDS)
+*                                       RECORD LENGTH (ESDS)
+*                                       -> MESSAGE DETAIL
+*        10                             RETURN ADDRESS
+         SPACE 1
+SKIPQSAM EQU   *
+         ST    R10,GSAVE                . SAVE RETURN ADDRESS
+         CLI   OBJ,KSDS                 . Q. KSDS BEING PROCESSED?
+         BNE   F0001                    . A. NO
+         L     R6,@REC                  . 5 -> LAST VSAM RECORD
+         L     R7,KEYLEN                . 7 - KEY LENGTH
+         BCTR  R7,R0                    . DECREMENT FOR EXECUTE
+         L     R2,RKP                   . 2 - RELATIVE KEY POSITION
+         LA    R6,0(R2,R6)              . 6 -> KEY IN LAST VSAM RECORD
+F0001    EQU   *
+         GET   (4)                      . GET NEXT QSAM RECORD
+         AP    #RECREAD,=P'+1'          . INCREMENT RECORDS READ
+         CLI   OBJ,KSDS                 . Q. KSDS BEING PROCESSED?
+         BNE   F0002                    . A. NO
+         LA    R1,0(R2,R1)              . 1 -> KEY IN QSAM RECORD
+         EX    R7,CLC                   . Q. QSAM KEY >= VSAM KEY
+         BNL   F0004                    . A. YES
+         B     F0001                    . TRY NEXT QSAM
+F0002    EQU   *                        . ESDS COMPARISON
+         L     R6,@REC                  . 6 -> LAST VSAM RECORD
+         L     R7,LRECL                 . 7 - LOGICAL RECORD LENGTH
+         LR    R2,R1                    . 2 -> QSAM RECORD
+         LR    R3,R7                    . 3 - LOGICAL RECORD LENGTH
+         CLCL  R2,R6                    . Q. QSAM RECORD = VSAM RECORD?
+         BNE   F0001                    . A. NO - PROCESS NEXT QSAM
+         B     F0004                    . A. YES - EXIT
+F0003    EQU   *                        . QSAM EODAD
+         MVI   EOF,ON                   . FLAG END OF FILE
+F0004    EQU   *
+         LA    R7,SKIPMSG               . 7 -> OUTPUT MESSAGE
+         MVI   MSGSW,C'S'               . INITIALIZE MESSAGE FLAG
+         BAS   R10,PUTSYS               . OUTPUT MESSAGE
+         L     R10,GSAVE                . RESTORE RETURN ADDRESS
+         BR    R10                      . EXIT
+CLC      CLC   0(0,R1),0(R6)            . EXECUTED KEY COMPARE
+         TITLE 'REPORT OUTPUT ROUTINE'
+*        1.    IF HEADING LINE REQUIRED, OUTPUT HEADING
+*        2.    FORMAT AND OUTPUT MESSAGE DATA
+         SPACE 1
+*        REGISTERS USED
+*        0                              MACROS
+*        1                              MACROS
+*        2                              -> OUTPUT LINE
+*        8                              -> SYSPRINT DCB
+*        10                             RETURN ADDRESS
+         SPACE 1
+PUTSYS   EQU   *
+         LA    R2,OUTLINE               . 2 -> OUTPUT LINE
+         LA    R8,DCB2                  . 5 -> SYSPRINT DCB
+         CP    #LINE,=P'+58'            . Q. HEADINGS REQUIRED?
+         BL    G0001                    . A. NO
+         MVC   OUTLINE,HEAD1            . FORMAT HEADINGS
+         MVC   OUTLINE+PAGEOUT+4(L'MASK5),MASK5
+         AP    #PAGE,=P'+1'             . INCREMENT PAGE NUMBER
+         ED    OUTLINE+PAGEOUT+4(L'MASK5),#PAGE
+         PUT   (R8),                    . OUTPUT HEADING               C
+               (R2)
+         ZAP   #LINE,=P'+1'             . ZAP LINE COUNT
+         MVI   OUTLINE,C'0'             . CHANGE ASA CONTROL CHARACTER
+         MVI   OUTLINE+1,C' '           . SPACE FILL OUTPUT LINE
+         MVC   OUTLINE+2(L'OUTLINE-2),OUTLINE+1
+G0001    EQU   *
+         MVC   OUTMSG,0(R7)             . OUTPUT MESSAGE DETAIL
+         MVC   RECOUT,MASK9             . MOVE MASK
+         CLI   MSGSW,C'0'               . Q. MESSAGE FLAG ZERO?
+         BNE   G0002                    . A. NO
+         MVC   OUTLRR,=C'LAST RECORD READ:' . OUTPUT LITERAL
+         ED    RECOUT,#RECREAD          . OUTPUT RECORDS READ
+         B     G0004                    . CONTINUE
+G0002    EQU   *
+         MVI   OUTLRR,C' '              . SPACE-FILL LITERAL AREA
+         MVC   OUTLRR+1(L'OUTLRR-1),OUTLRR
+         CLI   MSGSW,C'S'               . Q. MESSAGE FLAG 'S'?
+         BNE   G0003                    . A. NO
+         ED    RECOUT,#RECREAD          . OUTPUT RECORDS READ
+         B     G0004                    . CONTINUE
+G0003    EQU   *
+         ED    RECOUT,#RECWRIT          . OUTPUT RECORDS WRITTEN
+G0004    EQU   *
+         PUT   (R5),                    . OUTPUT REPORT DETAIL         C
+               (R2)
+         AP    #LINE,=P'+1'             . INCREMENT LINES PRINTED
+         MVI   OUTLINE,C' '             . RESET ASA CONTROL CHARACTER
+         BR    R10                      . RETURN
+         TITLE 'QSAM DCB OPEN EXIT'
+*        1.    IF NOT VARIABLE SPANNED, EXIT
+*        2.    IF LRI ENABLED, EXIT
+*        3.    ENABLE LRI
+         SPACE 1
+*        REGISTERS USED
+*        4                              -> QSAM DCB
+*        14                             -> RETURN
+         SPACE 1
+OPENEXIT EQU   *
+         USING IHADCB,R4                . MAP QSAM DCB
+         TM    DCBRECFM,DCBRECV+DCBRECSB . Q. RECFM=SV?
+         BNOR  R14                      . A. NO - EXIT
+         TM    DCBBFTEK,DCBBFTA         . Q. BFTEK=A SPECIFIED?
+         BOR   R14                      . A. YES
+         OI    DCBBFTEK,DCBBFTA         . ENABLE BFTEK=A
+         DROP  R4
+         BR    R14                      . EXIT
+         TITLE 'DYNAMIC AREA DSECT'
+DYNAREA  DSECT
+         DS    18F                      . STANDARD OS SAVE AREA
+@ACB     DS    F                        . -> ACB
+@EXLST   DS    F                        . -> EXIT LIST
+@REC     DS    F                        . -> RECORD AREA
+@RPL     DS    F                        . -> RPL
+BSAVE    DS    F                        . REGISTER SAVE
+CASZ     DS    F                        . BYTES PER CA
+CSAVE    DS    F                        . REGISTER SAVE
+DAMDFSCI DS    F                        . FREE SPACE BYTES PER CI
+DAMDCICA DS    H                        . CIS PER CA
+DAMDFSCA DS    H                        . FREE SPACE CIS PER CA
+DCBEXIT  DS    F                        . DCB EXIT ->
+DCB1     DS    XL(LQSAMDCB)             . DYNAMIC DCB FOR QSAM
+DCB2     DS    XL(LSYSDCB)              . DYNAMIC DCB FOR SYSPRINT
+         DS    0F
+DMAL     DS    XL(LOPEN3L)              . DATA MANAGEMENT ADDRESS LIST
+DSAVE    DS    F                        . REGISTER SAVE
+GSAVE    DS    F                        . REGISTER SAVE
+RBA      DS    F                        . RBA WORK AREA
+RECPERCA DS    F                        . RECORDS PER CA
+ERR15    DS    F                        . R15 SAVE AREA
+ERRFLD   DS    F                        . ACB ERROR / RPL FEED BACK
+SHOWAREA DS    0F                       . SHOWCB AREA
+CINV     DS    F                        . CI SIZE
+ENDRBA   DS    F                        . HI-USED RBA
+KEYLEN   DS    F                        . KEY LENGTH
+LRECL    DS    F                        . MAXIMUM RECORD LENGTH
+RKP      DS    F                        . RELATIVE KEY POSITION
+DAMBFLG1 DS    CL1                      . AMB FLAG 1 SAVE
+EOF      DS    CL1                      . QSAM EOF FLAG
+MSGSW    DS    CL1                      . MESSAGE FLAG
+OBJ      DS    CL1                      . OBJECT TYPE FLAG
+OUTLINE  DS    0CL121                   . OUTPUT REPORT LINE
+         DS    CL14
+OUTMSG   DS    CL60                     . MESSAGE AREA
+         DS    CL3
+OUTLRR   DS    CL17                     . LITERAL AREA
+RECOUT   DS    CL10                     . RECORD COUNT
+         DS    CL17
+#RECREAD DS    PL5                      . # RECORDS READ
+#RECWRIT DS    PL5                      . # RECORDS WRITTEN
+#LINE    DS    PL2                      . # LINES ON PAGE
+#PAGE    DS    PL3                      . # PAGES
+DYNLEN   EQU   *-DYNAREA                . LENGTH OF DYNAMIC AREA
+         TITLE 'IBM SUPPLIED DSECTS'
+         DCBD  DEVD=DA,                 . DCB MAPPING                  C
+               DSORG=PS
+         IFGACB                         . ACB MAPPING
+IDAAMB   DSECT                          . AMB MAPPING
+         DS    XL20
+AMBDSB   DS    F
+         DS    XL1
+AMBFLG1  DS    XL1
+AMBSPEED EQU   X'08'
+IDAAMBL  DSECT                          . AMBL MAPPING
+         DS    XL52
+AMBLDTA  DS    F
+IDAAMDSB DSECT                          . AMDSB MAPPING
+         DS    XL12
+AMDCIPCA DS    H
+AMDFSCA  DS    H
+AMDFSCI  DS    F
+         TITLE 'LIST FORM MACROS AND FORM CODE'
+VSAMLOAD CSECT
+OPEN1L   OPEN  (,),                     . OPEN ONE FILE                C
+               MF=L
+LOPEN1L  EQU   *-OPEN1L                 . LENGTH OF DMA LIST
+OPEN3L   OPEN  (,,,,,),                 . OPEN THREE FILES             C
+               MF=L
+LOPEN3L  EQU   *-OPEN3L                 . LENGTH OF DMA LIST
+WTO1L    WTO   'OPEN FAILED FOR VSAM',                                 C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO2L    WTO   'OPEN FAILED FOR QSAM',                                 C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO3L    WTO   'OPEN FAILED FOR SYSPRINT',                             C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO4L    WTO   'RRDS NOT PROCESSED',                                   C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO5L    WTO   'POINT FAILED FOR VSAM',                                C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO6L    WTO   'GET FAILED FOR VSAM',                                  C
+               ROUTCDE=11,                                             C
+               MF=L
+WTO7L    WTO   'PUT FAILED FOR VSAM',                                  C
+               ROUTCDE=11,                                             C
+               MF=L
+QSAMDCB  DCB   DDNAME=QSAM,             . QSAM FORM DCB                C
+               DSORG=PS,                                               C
+               EODAD=F0003,                                            C
+               MACRF=GL
+LQSAMDCB EQU   *-QSAMDCB                . LENGTH OF DCB
+SYSDCB   DCB   BLKSIZE=11374,           . SYSPRINT FORM DCB            C
+               DDNAME=SYSPRINT,                                        C
+               DSORG=PS,                                               C
+               LRECL=121,                                              C
+               MACRF=PM,                                               C
+               RECFM=ABF
+LSYSDCB  EQU   *-SYSDCB
+         TITLE 'EQUATES, CONSTANTS AND LITERAL POOL'
+ESDS     EQU   C'E'
+KSDS     EQU   C'K'
+ON       EQU   X'01'
+OFF      EQU   X'00'
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+MASK5    DC    XL6'402020202120'
+MASK9    DC    XL10'40202020202020202120'
+HEAD1    DC    CL105'1                                          VSAM LOC
+               AD                                                 PAGE'
+PAGEOUT  EQU   *-HEAD1
+         DC    CL16' '
+LOADMSG  DC    CL60'LOAD OPERATION COMPLETED - NUMBER OF RECORDS LOADEDC
+               :'
+RC0MSG   DC    CL60'SECONDARY ALLOCATION OR NEW VOLUME REQUIRED'
+         DC    CL60'DUPLICATE KEY CREATED IN ALTERNATE INDEX'
+         DC    CL60'WRITE BUFFER SUGGESTED'
+         DC    CL60'SEQUENCE SET RECORD CAPACITY PROBLEM - KEYS NOT COMC
+               PRESSING'
+         DC    CL60'RESERVED'
+         DC    CL60'NO BUFFER WRITES PERFORMED'
+         DC    CL60'CONTROL INTERVAL SPLIT INDICATOR DETECTED'
+         DC    CL60'MARK BUFFER INVALID'
+RC4MSG   DC    CL60'RPL ACTIVE FOR ANOTHER REQUEST'
+RC8MSG   DC    CL60'LOGIC ERROR OCCURRED DURING THE PUT OPERATION'
+RC12MSG  DC    CL60'PHYSICAL ERROR OCCURRED DURING THE PUT OPERATION'
+SKIPMSG  DC    CL60'LOAD OPERATION WAS RESTARTED - NUMBER OF RECORDS SKC
+               IPPED:'
+TCMSG    DC    CL60'TEMPORARY CLOSE ISSUED'
+         LTORG
+         END
+
+Dave Loveluck
+Instructor/Consultant (USA)                        c Dave Loveluck 1992
+

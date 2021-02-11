@@ -1,0 +1,702 @@
+*
+*  Copyright 2001-2008 James M. Morrison
+*
+*----------------------------------------------------------------------
+*
+*  Things to do:
+*
+*  2) research INMFFM vs. INMFM (CMS?)
+*  5) PAIRCHAR - verify target field length before copy
+*
+*----------------------------------------------------------------------
+*
+*  XMIT control segment key table definition macro
+*
+         MACRO
+&LABEL   KEY   &KEY,&TYPE,&TEXT,&SAVE=SAV,&FLAG=0,&IL=0
+         LCLA  &L
+         LCLC  &FIELD,&NDX,&SAV
+&NDX     SETC  '&SYSNDX'
+&L       SETA  K'&TEXT-1
+&L       SETA  (&L/2)*2
+&FIELD   SETC  '0'
+&SAV     SETC  '0'
+         AIF   ('&SAVE' EQ '').GEN
+&FIELD   SETC  '&SAVE.&KEY'
+&SAV     SETC  'L''&FIELD-1'
+.GEN     ANOP
+&LABEL   IM#SECT LABEL
+TE&NDX   DC    AL2(INM&KEY)            XMIT control segment key
+         DC    AL1(TAB$&TYPE)          key flag/count-length-value type
+         DC    AL1(TL&NDX)             length of this TAB entry
+         DC    S(&FIELD)               zero or save field Bddd
+         DC    AL2(&IL)                intrinsic field length
+         DC    AL1(&FLAG)              special processing flag
+         DC    AL1(&SAV)               SAVxxxxx field length minus one
+         DC    CL&L.&TEXT
+TL&NDX   EQU   *-TE&NDX
+         MEND
+         EJECT ,
+*----------------------------------------------------------------------
+*  XMIT control segment key attributes table
+*----------------------------------------------------------------------
+TAB      DSECT ,
+TABKEY   DS    XL2      INMRxxxx key
+*
+TABTYPE  DS    X        key type:
+TAB$CLVH EQU   1             key, count, (length,value) pairs - hex
+TAB$CLVE EQU   2             key, count, (length,value) pairs - EBCDIC
+TAB$FLAG EQU   3             flag only (no count, length, value)
+*
+TABELEN  DS    X        length of complete TAB entry (including text)
+*
+TABSCON  DS    XL2      zero (don't save) or S-con for save field
+*                       valid base regs: R13 (SAVEAREA), R15 (CS2)
+*
+TABILEN  DS    XL2      intrinsic field length
+*
+TABFLG1  DS    X        flags for PAIR code
+TAB1DSN  EQU   128           special DSN handling
+*
+TABSAVL  DS    X        length of save field minus one
+*
+TABTEXT  DS    0C       description of related key
+*
+L$TABOVH EQU   *-TAB    TAB entry overhead length
+*
+*
+RECVCTL  TITLE 'Handle XMIT Control segments'
+*----------------------------------------------------------------------
+         U#SET FUNC=RECV
+*----------------------------------------------------------------------
+* Function: Read the XMIT control segments, decide which to call:
+*
+*           a) RECVSEQ to handle sequential input datasets
+*
+*           b) RECVPDS to handle partitioned input datasets
+*
+*           If neither of the above, complain & abandon execution.
+*           Depending on debug level, this code may also display
+*           information about the XMIT control segments, such as
+*           key, count, and length/value pairs.
+*
+* Entry:  AMODE=24, ASC=PRIMARY, KEY=*, STATE=*
+*
+*         R0  =
+*         R1  =
+*
+* Exit:   R15 = return code
+*         R15 = 00 success
+*               04 warning issued
+*               08 error(s) encountered
+*
+* Abends: yes
+*
+* Notes:
+*
+* Diagnostics:
+*         2 - show status
+*         3 - show control segment
+*         4 - show control segment details
+*         5 - show CS2
+*         6 - show savearea at exit
+*         7 - show sasavptr
+*             show TAB entry
+*         8 - show saved-hex value
+*----------------------------------------------------------------------
+* R2     scratch
+* R3     current key
+* R4     ptr to current key/count/length/value
+* R5     scratch, BXLE index
+* R6     scratch, BXLE entry length
+* R7     scratch, BXLE limit
+* R8     segment length
+* R9     segment ptr
+* R10    scratch
+* R11    XMTWA
+* R12    base reg
+* R13    savearea
+*----------------------------------------------------------------------
+ERR#1    EQU   1        RECVGSEG returned data segment
+ERR#2    EQU   2        too many INMR02s
+ERR#8    EQU   8        INMR03, but no INMR02s in XMIT
+ERR#9    EQU   9        utility error return code
+ERR#10   EQU   10       queued control segment SEGL=0
+ERR#11   EQU   11       returned segment's seg length = 0
+         TITLE ' '
+*----------------------------------------------------------------------
+RECVCTL  UPROC L=L$SA,ID=RCTL,WA=SAVEAREA,INIT=MVCL
+*----------------------------------------------------------------------
+*  Initialize
+*----------------------------------------------------------------------
+*
+*  Activate the dummy CS2, for saved fields in TAB which can occur
+*  before we've seen an INMR02 (but are based in the CS2s).
+*  For instance, INMLRECL typically appears in INMR01s as well as
+*  INMR02s.
+*
+         UDIAG 1,'CTL enter'
+         LA     R0,SACS2X                   dummy CS2
+         ST     R0,SA@CS2
+*----------------------------------------------------------------------
+*  Read control record
+*----------------------------------------------------------------------
+GETSEG   DS    0H
+         TM    SAFLG1,SA1MR6                trailer seen?
+         BO    CLOSE                        br, done
+         TM    SAFLG1,SA1QCS                queued control seg?
+         BNO   CALLGC
+         MVI   SAREASON,ERR#10              queued segment SEGL=0
+         L     R9,SA@QCS                    dequeue ctl seg
+         USING XMITSEG,R9
+         SLR   R14,R14
+         ICM   R14,1,SEGL
+         BZ    DIE
+         UDIAG 2,'CTL dequeue cseg',(R9),(R14)
+         NI    SAFLG1,255-SA1QCS            segment dequeued
+         LR    R1,R9                        give q'd seg to GCTL
+         B     *+6
+*
+CALLGC   DS    0H
+         SLR   R1,R1                        no queued ctl seg
+         UCALL RECVGCTL                     retrieve XMIT ctl rec
+         LR    R8,R0                        save ctl rec length
+         LTR   R9,R1                        @ returned segment or zero
+         BZ    EOF
+         C     R15,=F'8'                    error?
+         BL    HAVESEG                      no, br
+         MVI   SAREASON,ERR#1               RECVGCTL error
+         B     DIE
+         EJECT ,
+*----------------------------------------------------------------------
+*  We have an XMIT control segment
+*----------------------------------------------------------------------
+HAVESEG  DS    0H
+         UDIAG 3,'CTL control record',(R9),(R8)
+         USING SEGBUF,R9
+         CLC   SEGCTLNM,=C'INMR02'
+         BNE   DISPLAY
+*
+*  XMIT files are built by TRANSMIT (or XMIT370), and the order
+*  of the INMR02s reflects the sequence of operations that TRANSMIT
+*  performed.  For an IEBCOPY unloaded PDS, the IEBCOPY INMR02 is
+*  first, then the INMCOPY INMR02.
+*
+         OI    SAFLG1,SA1CS2           INMR02 seen
+         L     R15,SA@CS2              current CS2 (might be dummy)
+         LA    R15,L$CS2(,R15)         @ next CS2
+         LA    R0,SACS2BAD             limit
+         CR    R15,R0                  too many INMR02s?
+         BL    NEWCS2
+         UDIAG 0,'CTL too many INMR02s'
+         MVI   SAREASON,ERR#2          too many INMR02s
+         B     DIE
+*
+NEWCS2   DS    0H
+         ST    R15,SA@CS2
+         USING CS2,R15
+         MVC   CS2ID,=C'CS2 '          set CS2 id
+         SLR   R0,R0
+         ICM   R0,15,SEGC2NUM          retain file #
+         ST    R0,CS2#FILE
+         DROP  R15
+         UPSR  2,'CTL INMR02 applies to file',(R0)
+         EJECT ,
+*----------------------------------------------------------------------
+*  Print the details header line
+*----------------------------------------------------------------------
+DISPLAY  DS    0H
+         UDIAG 4,'CTL control segment details'
+         MVI   SAMSG,C' '
+         MVC   SAMSG+1(L$SAMSG-1),SAMSG     clear message area
+         MVC   SAMSG(3),=C'<4>'
+         MVC   SATYPE,=C'TYPE'
+         MVC   SAKEY,=C'KEY '
+         MVC   SACOUNT-1(5),=C'COUNT'
+         MVC   SALEN,=C'LEN '
+         MVC   SAILEN,=C'ILEN '             intrinsic field length
+         MVC   SAVALUE(5),=C'VALUE'
+         MVC   SATEXT(11),=C'DESCRIPTION'
+         BAL   R14,MSGOUT                   label output to follow
+         EJECT ,
+*----------------------------------------------------------------------
+*  Examine each key in the control segment
+*----------------------------------------------------------------------
+DETAILS  DS    0H
+         LA    R4,SEGCKEYS                  standard 1st key offset
+         CLC   SEGCTLNM,=C'INMR02'          non-standard?
+         BNE   *+8
+         LA    R4,SEGC2KEY                  INMR02 1st key offset
+*
+NEXTKEY  DS    0H                           R4 @ key, R8 = seg length
+         LA    R0,SEGBUF(R8)                @ end of segment
+         CR    R4,R0
+         BNL   FINSEG                       exhausted keys, finish seg
+         SLR   R3,R3
+         ICM   R3,3,0(R4)                   grab key
+         LM    R5,R7,=A(TABLE,0,TABEND-1)   set TAB scan regs
+         USING TAB,R5
+*
+SCAN     DS    0H                           scan TAB for matching key
+         IC    R6,TABELEN                   get TAB entry length
+         CLM   R3,3,TABKEY                  found key?
+         BE    FOUND
+         BXLE  R5,R6,SCAN
+*
+         UPSR  0,'CTL unrecognized key',(R3)
+         MVI   SAREASON,3
+SNAPDIE  UDIAG 0,'CTL control seg',(R9),(R8)
+         B     DIE
+         EJECT ,
+*----------------------------------------------------------------------
+*  Found key, issue descriptive message(s) based on key type
+*----------------------------------------------------------------------
+COPYTEXT MVC   SATEXT(*-*),TABTEXT          copy text to display line
+*
+FOUND    DS    0H
+         MVI   SAMSG,C' '
+         MVC   SAMSG+1(L$SAMSG-1),SAMSG     clear message area
+         MVC   SAMSG(3),=C'<4>'
+         UDIAG 7,'CTL TAB entry',(R5),(R6)
+         ST    R5,SATABENT                  save @ entry for PAIR code
+         LA    R0,L$TABOVH                  TAB entry overhead
+         SR    R6,R0                        R6 = text length
+         LR    R0,R3
+         SLR   R1,R1
+         UCALL U370HEX                      convert key to EBCDIC
+         STCM  R1,15,SAKEY
+         BCTR  R6,0
+         EX    R6,COPYTEXT
+         LA    R4,L$CKEY(,R4)               bump to count
+*
+*  Set up pointer to save field for ease of handling in the PAIRS code
+*
+*  We build a LA instruction in SAINSTR (X'4110ssss') from the
+*  S-con in the current TAB entry, then execute it to point R1
+*  at the field which will be used to save the current value.
+*  We use an S-con, since we only really care about the INMR02 values;
+*  other values are either ignored or saved somewhere in SAVEAREA.
+*
+*  Avoid wiping out CS2s with INMR03 data by always pointing INMR03
+*  save field at SABOGUS
+*
+         LA    R1,SABOGUS                   field for unsaved fields
+         CLC   TABSCON,=AL2(0)              is this field to be saved?
+         BE    NULLSAVE
+         CLC   SEGCTLNM,=C'INMR03'
+         BE    NULLSAVE
+         MVC   SAINSTR(2),=X'4110'          first half of LA R1, instr
+         MVC   SAINSTR+2(2),TABSCON         add S-con (base=R15)
+         MVI   SAREASON,4
+         ICM   R15,15,SA@CS2                select current CS2
+         BZ    DIE
+         EX    R0,SAINSTR                   R1 @ save field
+*
+NULLSAVE DS    0H
+         ST    R1,SASAVPTR
+         UPSR  7,'CTL sasavptr',(R1)
+         EJECT ,
+*----------------------------------------------------------------------
+*  Examine key type
+*----------------------------------------------------------------------
+         CLI   TABTYPE,TAB$FLAG             flag only?
+         BNE   CKCLV
+*
+SETFLAG  DS    0H                           flag: count=0, no value(s)
+         L     R1,SASAVPTR                  @ save field
+         MVI   0(R1),C'Y'                   flag set
+         MVC   SATYPE,=C'FLAG'
+         SLR   R0,R0
+         ICM   R0,3,0(R4)                   document zero count
+         SLR   R1,R1
+         UCALL U370HEX
+         STCM  R1,15,SACOUNT
+         BAL   R14,MSGOUT                   display message
+         LA    R4,L$CCOUNT(,R4)             skip past zero count
+         B     NEXTKEY                      finished with flag
+*
+*  Common setup for either CLVE or CLVH
+*
+CKCLV    DS    0H
+         SLR   R0,R0
+         ICM   R0,3,0(R4)
+         ST    R0,SAXCOUNT                  save count for PAIR code
+         SLR   R1,R1
+         UCALL U370HEX
+         STCM  R1,15,SACOUNT
+         LA    R4,L$CCOUNT(,R4)             bump to length/value pairs
+         CLI   TABTYPE,TAB$CLVE             EBCDIC?
+         BNE   CKCLVH
+*
+CLVE     DS    0H
+         MVC   SATYPE,=C'CLVE'              EBCDIC
+         B     PAIRS
+*
+CKCLVH   DS    0H
+         MVI   SAREASON,5
+         CLI   TABTYPE,TAB$CLVH             HEX?
+         BNE   DIE
+         MVC   SATYPE,=C'CLVH'              HEX
+         EJECT ,
+*----------------------------------------------------------------------
+*  Handle length/value pairs (R4 @ first length, SAXCOUNT = # pairs)
+*----------------------------------------------------------------------
+PAIRS    DS    0H
+         BAL   R14,MSGOUT
+         ICM   R2,15,SAXCOUNT               # pairs
+         BNZ   PAIRLOOP
+         UDIAG 0,'CTL count 0'              should only happen for flag
+         MVI   SAREASON,6
+         B     SNAPDIE
+*
+PAIRLOOP DS    0H
+         SLR   R0,R0
+         ICM   R0,3,0(R4)                   grab length
+         LR    R10,R0                       save length in safe reg
+         SLR   R1,R1
+         UCALL U370HEX
+         STCM  R1,15,SALEN
+         ICM   R0,3,TABILEN                 intrinsic length
+         BZ    PAIRVAL
+         SLR   R1,R1
+         UCALL U370HEX
+         STCM  R1,15,SAILEN
+PAIRVAL  LA    R4,L$CLEN(,R4)               point at value
+*
+         CLI   TABTYPE,TAB$CLVE             EBCDIC value?
+         BNE   PAIRHEX
+         EJECT ,
+*----------------------------------------------------------------------
+*  EBCDIC value - R4 @ value, R10 = value length
+*----------------------------------------------------------------------
+*
+*  set up initial blanks in char fields, so that short values
+*  (like CL7 ddname) are right blank padded after save
+*
+PAIRCHAR DS    0H
+         L     R15,SASAVPTR                 @ save field
+         MVI   0(R15),C' '                  blank 1st save char
+         SLR   R14,R14
+         ICM   R14,1,TABSAVL                L' save field minus one
+         BZ    PCBLNKD                      only one char, already done
+         BCTR  R14,0
+         EX    R14,BLNKSAVE                 propagate blank
+PCBLNKD  DS    0H
+         BCTR  R10,0
+         EX    R10,COPYVALU                 copy value to display line
+         EX    R10,COPYSAVE                 copy value to save field
+         BAL   R14,MSGOUT                   display message
+         LA    R4,1(R10,R4)                 at next key
+         BCT   R2,PAIRLOOP
+         B     NEXTKEY
+*
+COPYVALU MVC   SAVALUE(*-*),0(R4)
+COPYSAVE MVC   0(*-*,R15),0(R4)
+BLNKSAVE MVC   1(*-*,R15),0(R15)
+         EJECT ,
+*----------------------------------------------------------------------
+*  HEX value - R4 @ value, R10 = value length
+*----------------------------------------------------------------------
+PAIRHEX  DS    0H
+         MVI   SAREASON,7
+         C     R10,=F'4'                    max supported HEX length
+         BH    DIE
+*
+*  Copy hex value to save field
+*
+         SLL   R10,2                        index RETRIEVE list
+         L     R1,SASAVPTR
+         SLR   R0,R0
+         EX    R0,RETRIEVE-4(R10)           grab 1 to 4 bytes -> R0
+         ST    R0,0(R1)                     store saved field
+         SRL   R10,2
+         UPSR  8,'CTL saved-hex',(R0)
+*
+*  display hex value, two EBCDIC chars at a time
+*
+         LA    R5,SAVALUE                   @ output field
+         LA    R7,0(R10,R4)                 @ next key
+         ICM   R0,15,0(R4)                  grab max hex value
+         LA    R1,SAWORK
+         UCALL U370HEX
+         LA    R14,2                        increment
+         LA    R15,SAWORK
+*
+PHLOOP   DS    0H
+         MVC   0(2,R5),0(R15)               copy 2 EBCDIC chars
+         AR    R15,R14
+         AR    R5,R14
+         BCT   R10,PHLOOP
+         BAL   R14,MSGOUT
+         LR    R4,R7                        @ next key
+         BCT   R2,PAIRLOOP                  process remaining values
+         B     NEXTKEY
+*
+RETRIEVE ICM   R0,1,0(R4)
+         ICM   R0,3,0(R4)
+         ICM   R0,7,0(R4)
+         ICM   R0,15,0(R4)
+*
+DIE      UABEND SAREASON                    internal error
+*----------------------------------------------------------------------
+*  MSGOUT subroutine, returns via R14
+*----------------------------------------------------------------------
+*
+*  This code should only be called to display debug level 4 messages
+*
+MSGOUT   DS    0H
+         ST    R14,SASUB14                  save return reg
+         UDIAG 4,SKIP=MSGCLEAR
+         ULOG  SAMSG,L$SAMSG                display message
+MSGCLEAR DS    0H
+         MVI   SAMSG,C' '
+         MVC   SAMSG+1(L$SAMSG-1),SAMSG     clear message area
+         MVC   SAMSG(3),=C'<4>'
+         L     R14,SASUB14                  restore return ret
+         BR    R14                          return
+         EJECT ,
+*----------------------------------------------------------------------
+*  Control segment parse complete
+*----------------------------------------------------------------------
+*
+*  The INMR02 control segment describes the invocation of a utility
+*  such as INMCOPY, IEBCOPY, IDCAMS, etc.
+*
+FINSEG   DS    0H
+         CLC   SEGCTLNM,=C'INMR02'
+         BNE   FSCK06
+         L     R1,SA@CS2                    current CS2
+         UDIAG 5,'CTL CS2 built',(R1),L$CS2
+         B     GETSEG
+*
+*  The INMR06 control segment is always the last segment of a
+*  properly constructed XMIT file.
+*
+FSCK06   CLC   SEGCTLNM,=C'INMR06'
+         BNE   FSCK03
+         OI    SAFLG1,SA1MR6                INMR06 (trailer) seen
+         B     GETSEG                       read rest of input anyway
+*
+*  The INMR03 control segment indicates data segments follow
+*  immediately after the INMR03
+*  If an embedded message is present, it appears as file number one
+*
+FSCK03   DS    0H
+         CLC   SEGCTLNM,=C'INMR03'
+         BNE   GETSEG
+         L     R14,SAFILE#
+         LA    R14,1(,R14)                  increment file #
+         ST    R14,SAFILE#
+         TM    SAFLG1,SA1CS2                built CS2(s)?
+         BO    FSCS2
+         ULOG  'CTL ERROR: invalid XMIT'
+         ULOG  'CTL ERROR: INMR03, but no INMR02(s)'
+         MVI   SAREASON,ERR#8
+         B     DIE
+*
+*  Scan the CS2 list to find a utility to call
+*
+FSCS2    DS    0H
+         UDIAG 5,'CTL saved CS2s',SACS2,SACS2BAD
+         LA    R5,SACS2A                    BXLE: index
+         LA    R6,L$CS2                     BXLE: increment
+         LA    R7,SACS2BAD-1                BXLE: limit
+         USING CS2,R5
+FSSCAN   DS    0H
+         CLI   CS2DONE,CS2$DONE             CS2 not yet handled?
+         BNE   FSSELECT                     yes, find last related CS2
+         BXLE  R5,R6,FSSCAN                 keep looking
+*
+         UDIAG 2,'CTL exhausted CS2s'
+         NI    SAFLG1,255-SA1CS2            no pending CS2s
+         B     GETSEG                       finish reading input
+*
+*  Find the last CS2 which is related to the current file number
+*  This CS2 will be passed to RECVUTIL, who will handle it then
+*  look backwards in the CS2 list for additional utilities which
+*  address the same file number.  If RECVUTIL finds more such
+*  utilities, it will call them, too.
+*
+FSSELECT DS    0H
+         L     R0,CS2#FILE                  associated file number
+FSSCAN2  DS    0H
+         C     R0,CS2#FILE                  same file #?
+         BNE   FSUTIL                       no, back up to last good
+         LR    R1,R5                        @ acceptable CS2
+         BXLE  R5,R6,FSSCAN2                keep looking
+*
+FSUTIL   DS    0H
+         UCALL RECVUTIL                     handle associated utilities
+         MVI   SAREASON,ERR#9               utility error
+         C     R15,=F'4'                    returned ctl seg?
+         BH    DIE                          no, bad rc; br
+         BNE   GETSEG                       no ctl seg emitted, br
+         MVI   SAREASON,ERR#11              error if emitted seg SEGL=0
+         ST    R1,SA@QCS                    queue control seg
+         SLR   R14,R14
+         ICM   R14,1,SEGL-SEG(R1)
+         BZ    DIE                          null ctl seg returned
+         OI    SAFLG1,SA1QCS
+         UDIAG 2,'CTL RECVUTIL emit ctl seg',(R1),(R14)
+         B     GETSEG                       finish reading input
+         DROP  R5
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+*
+*  We've seen the INMR06, and since some XMIT files have garbage
+*  at the end, we don't read the rest of the XMIT once we've seen
+*  the INMR06
+*
+CLOSE    DS    0H
+         UDIAG 2,'CTL closing XMIT; INMR06 seen'
+         SLR   R0,R0
+         ICM   R0,8,=AL1(RGET$CLO)          option: close XMIT
+         UCALL RECVGSEG                     close XMITIN
+EOF      DS    0H
+         UDIAG 2,'CTL EOF'
+         TM    SAFLG1,SA1MR6                saw trailer?
+         BO    EXIT
+*
+         ULOG  'CTL Warning: INMR06 (trailer) missing'
+         ULOG  'CTL Warning: XMIT file may be damaged'
+         CLI   SARC+3,4                     more severe error?
+         BH    EXIT                         yes, leave it; br
+         MVI   SARC+3,4                     warning: XMIT damaged
+*
+EXIT     DS    0H
+         UDIAG 6,'CTL savearea at exit',(R13),L$SA
+         UDIAG 1,'CTL exit rc',*SARC
+         UPEND RC=*SARC
+         EJECT ,
+*----------------------------------------------------------------------
+*  XMIT control segment key attributes (see TAB DSECT)
+*----------------------------------------------------------------------
+         PUSH  USING
+         USING CS2,R15                      generate S-con w/ R15
+TABLE    DS    0D
+         KEY   DDNAM,CLVE,'DDNAME'
+         KEY   DSNAM,CLVE,'DSN',FLAG=TAB1DSN
+         KEY   ERRCD,CLVH,'receive error code'
+         KEY   FACK,FLAG,'acknowledgement request'
+         KEY   FNODE,CLVE,'origin node name'
+         KEY   FTIME,CLVE,'origin time stamp'
+         KEY   FUID,CLVE,'origin userid'
+         KEY   FVERS,CLVE,'origin version number'
+         KEY   NUMF,CLVH,'number of files'
+         KEY   RECCT,CLVH,'transmitted record count'
+         KEY   SECND,CLVH,'secondary space qty'
+         KEY   TNODE,CLVE,'target node name'
+         KEY   TTIME,CLVE,'destination time stamp'
+         KEY   TUID,CLVE,'target userid'
+         KEY   TYPE,CLVH,'data set type'
+*
+         KEY   USERP,CLVE,'user parm string',SAVE=
+*
+         KEY   BLKSZ,CLVH,'BLKSIZE',SAVE=CS2,IL=2
+         KEY   DIR,CLVH,'directory blocks',SAVE=CS2
+         KEY   CREAT,CLVH,'creation date',SAVE=CS2
+         KEY   DSORG,CLVH,'DSORG',SAVE=CS2,IL=2
+         KEY   EXPDT,CLVH,'expiration date',SAVE=CS2
+         KEY   LCHG,CLVH,'last changed date',SAVE=CS2
+         KEY   LRECL,CLVH,'LRECL',SAVE=CS2,IL=2
+         KEY   LREF,CLVH,'last referenced date',SAVE=CS2
+         KEY   MEMBR,CLVE,'member',SAVE=CS2
+         KEY   RECFM,CLVH,'RECFM',SAVE=CS2,IL=1
+         KEY   SIZE,CLVH,'approx file size (bytes)',SAVE=CS2
+         KEY   TERM,FLAG,'terminal alloc (msg)',SAVE=CS2
+         KEY   UTILN,CLVE,'utility name',SAVE=CS2
+*
+*  I've not seen an example of the next key, so the following is
+*  a great big guess.
+*
+         KEY   FFM,CLVE,'filemode number (CMS)',SAVE=
+TABEND   DS    0X
+         POP   USING
+*
+         LTORG ,
+         EJECT ,
+         DRCS2 ,
+         EJECT ,
+*----------------------------------------------------------------------
+*  Savearea/workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SA       DS    18F
+SARC     DS    F
+*
+SAFLG1   DS    X             status flag
+SA1MR6   EQU   128                INMR06 seen (trailer)
+SA1CS2   EQU   64                 INMR02 seen
+SA1QCS   EQU   32                 control seg queued
+*
+SAREASON DS    X             UABEND reason code
+*
+SAWORK   DS    D             hex conversion return
+SAXCOUNT DS    F             hex count
+SASAVPTR DS    A             zero or ptr to key value save field
+SATABENT DS    A             ptr to TAB entry associated with key
+SAINSTR  DS    F             LA R1,xxx(R15) instruction
+SA@CS2   DS    A             pointer to current INMR02 save (CS2)
+SASUB14  DS    A             low-level subroutine return reg
+SA@QCS   DS    A             addr of queued control seg
+SAFILE#  DS    F             current file #
+*
+*  message giving segment details
+*
+SAMSG    DS    0C
+         DS    CL4
+SATYPE   DS    CL4
+         DS    CL4
+SAKEY    DS    CL4
+         DS    CL2
+SACOUNT  DS    CL4
+         DS    CL2
+SALEN    DS    CL4
+         DS    CL2
+SAILEN   DS    CL4                     intrinsic field length
+         DS    CL2
+SAVALUE  DS    CL20
+         DS    CL2
+SATEXT   DS    CL30
+SALIMIT  DS    0C                      last valid message char
+L$SAMSG  EQU   *-SAMSG
+         DS    0D
+SABOGUS  DS    CL256                   protection from runaway SAVALUEs
+*                                      and slot for unsaved fields
+*
+*  Save fields
+*
+         DS    0D
+SAVDSNAM DS    CL44
+SAVTNODE DS    CL8
+SAVTUID  DS    CL8
+SAVFNODE DS    CL8
+SAVFUID  DS    CL8
+SAVFVERS DS    CL8
+SAVFTIME DS    CL16
+SAVTTIME DS    CL16
+SAVNUMF  DS    F
+SAVFACK  DS    F
+SAVERRCD DS    F
+SAVRECCT DS    F
+SAVDDNAM DS    CL8
+SAVSECND DS    F
+SAVTYPE  DS    F
+*
+*  CS2 list (saved INMR02 info)
+*
+SACS2    DS    0D
+SACS2X   DS    CL(L$CS2)     CS2 - dummy
+SACS2A   DS    CL(L$CS2)     CS2 for 1st INMR02 (usually IEBCOPY)
+SACS2B   DS    CL(L$CS2)     CS2 for 2nd INMR02 (usually INMCOPY)
+SACS2C   DS    CL(L$CS2)     CS2 for 3rd INMR02 (INMCOPY when MSG)
+SACS2BAD EQU   *             too many CS2s if past here
+*
+         DS    0D
+L$SA     EQU   *-SAVEAREA
+         PRINT NOGEN
+         WARECV ,
+         DXSEG ,
+RECVCTL  UFINI DXDRCTL,L$SA
+         END   ,

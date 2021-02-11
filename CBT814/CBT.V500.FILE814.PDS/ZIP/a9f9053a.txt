@@ -1,0 +1,359 @@
+Automated operations with REXX
+
+
+JCL for Started Task
+
+//SHUTDOWN PROC
+//SHUTDOWN EXEC PGM=IKJEFT01,PARM='%SHUTDOWN',TIME=NOLIMIT
+//SYSEXEC  DD DSN=your-exec-library,DISP=SHR
+//SYSTSPRT DD DUMMY
+//SYSTSIN  DD DUMMY
+
+
+REXX EXEC
+
+/* Rexx */
+if userid() ^= 'your-userid' then
+   return
+sysid = strip(storage(d2x(c2d(storage(10,4))+c2d('154'x)),8))
+tables = 'ignore_table. special_table. message_table. db2_table.'
+tcb_ptr = c2d(storage(21c,4))
+tiot_ptr = c2d(storage(d2x(tcb_ptr+12),4))
+our_name =  storage(d2x(tiot_ptr),8)
+address TSO
+"consprof soldisp(no) unsoldisp(no)"
+"console activate"
+jscb_ptr = c2d(storage(d2x(tcb_ptr+180),4))
+ssib_ptr = c2d(storage(d2x(jscb_ptr+316),4))
+if storage(d2x(ssib_ptr+8),4) ^= 'MSTR' then
+   do
+      address CONSOLE "START "strip(our_name)",SUB=MSTR"
+      return
+   end
+if ^shutdown_confirmed() then
+do
+   "SE 'SHUTDOWN cancelled - invalid or no reply ' OPERATOR(2)"
+   return
+end
+call build_tables
+address CONSOLE
+"F TSO,USERMAX=0"
+/* stop JES initiators and lines etc */
+"$P"
+call wait 1
+"$PI"
+call wait 1
+"$PLINE1-15"
+call wait 1
+"$PLOGON1"
+/* warn any logged on TSO users */
+"CART TSO"
+"D TS"
+getcode = getmsg('response.','SOL','TSO',,5)
+parse var response.3 . . tso_users .
+if tso_users > 0 then
+   "SE 'please LOGOFF, system "sysid" is being shut down'"
+call shutdown_cics_systems 'CICS*'
+call shutdown_db2
+if tso_users > 0 then
+   call wait 60                /* give TSO users some time .... */
+call shutdown_stcs
+call reply_to_wtors
+if dpvsam = 'yes' then         /* DataPacker VSAM shut-down */
+do
+   "BCSS CAS STOP ALL"
+   call wait 2
+   "BCSS SHUTDOWN"
+   call wait 2
+   "BMCP SHUTDOWN"
+end
+call complete_db2_shutdown     /* stop any IRLMs */
+"Z NET,QUICK"
+ok_to_stop_jes = 0             /* false */
+do 6 until ok_to_stop_jes
+   call wait 20
+   call whats_active
+end
+if ok_to_stop_jes then
+   do
+      "$PJES2"
+      call wait 5
+      "P ACF2"
+      call wait 5
+      "Z EOD"
+   end
+else
+   address TSO "SE 'SHUTDOWN - unable to continue' OPERATOR(2)"
+address TSO "console deactivate"
+address TSO "consprof soldisp(yes) unsoldisp(yes)"
+return
+shutdown_cics_systems : PROCEDURE expose (tables)
+   parse arg cics_prefix
+   "CART CICS"
+   "D A,"cics_prefix
+   getcode = getmsg('response.','SOL','CICS',,5)
+   not_found = cics_prefix' NOT FOUND'
+   if pos(not_found,response.4) ^= 0 then
+      return
+   cics_count = 0
+   do i = 4 to response.0
+      first_part = substr(response.i,1,35)
+      parse var first_part name .
+      if name = ' ' then iterate
+      "F "name",CEMT PER SHUT"
+      call wait 1
+      call add_to 'ignore_table',name
+      cics_count = cics_count + 1
+   end
+   call wait cics_count*5  /* wait 5 seconds per CICS system */
+return
+shutdown_db2 : PROCEDURE expose (tables) sysid
+   "CART DB2"
+   "D O"
+   getcode = getmsg('response.','SOL','DB2',,5)
+   db2_count = 0
+   do i = 3 to response.0
+      parse var response.i prefix owner system .
+      if system = sysid & pos('MSTR',owner) ^= 0 then
+         do
+            prefix"STOP DB2"
+            call wait 1
+            db2_count = db2_count + 1
+            db2_system_name = substr(owner,1,3)
+            call add_to 'db2_table',db2_system_name
+            call add_to 'ignore_table',db2_system_name'IRLM'
+            call add_to 'ignore_table',db2_system_name'MSTR'
+            call add_to 'ignore_table',db2_system_name'DBM1'
+            call add_to 'ignore_table',db2_system_name'DIST'
+         end
+   end
+   call wait db2_count*5     /* wait 5 seconds per DB2 system */
+return
+complete_db2_shutdown : PROCEDURE expose (tables)
+   if db2_table.0 = 0 then
+      return
+   do i = 1 to db2_table.0
+      db2_prefix = db2_table.i
+      "CART "db2_prefix
+      "D A,"db2_prefix"*"
+      getcode = getmsg('response.','SOL',db2_prefix,,5)
+      not_found = db2_prefix'* NOT FOUND'
+      if pos(not_found,response.4) ^= 0 then
+        iterate
+      db2_stc.0 = 0
+      do j = 4 to response.0
+         first_part = substr(response.j,1,35)
+         parse var first_part name .
+         if name ^= ' ' then
+            do
+               count = db2_stc.0 + 1
+               db2_stc.count = name
+               db2_stc.0 = count
+            end
+      end
+      irlm_name = db2_prefix'IRLM'
+      if db2_stc.0 = 1 & db2_stc.1 =  irlm_name then
+         "P "irlm_name
+      else
+         address TSO "SE 'DB-2 system "db2_prefix" still active' OPERATOR(2)"
+   end
+return
+shutdown_stcs : PROCEDURE expose (tables) dpvsam
+   "CART STCS"
+   "D J,ALL"
+   getcode = getmsg('response.','SOL','STCS',,5)
+   stc_count = 0
+   do i = 5 to response.0
+      first_35 = substr(response.i,1,35)
+      type_indicator = substr(response.i,35,1)
+      parse var first_35 jname stepname .
+      if jname = ' ' then
+         iterate
+      if type_indicator = '*' | ,         /* ignore system stc */
+         type_indicator = 'I' | ,         /* ignore initiator  */
+         type_indicator = 'A' | ,         /* ignore APPC job   */
+         type_indicator = 'J' then        /* ignore batch job  */
+         iterate
+      if stepname = 'STARTING' then
+         iterate
+      if jname = 'BMCP' then              /* set flag if active */
+         dpvsam = 'yes'
+      call search_table 'ignore_table',jname
+      if result ^= 0 then                 /* found - ignore */
+         iterate
+      stc_count = stc_count + 1
+      call search_table 'special_table',jname
+      if result = 0 then
+         "P "stepname
+      else
+         do
+            parse var result . type command
+            if type = 'MODIFY' then
+               "F "jname","command
+            else
+               type jname
+         end
+       call wait 1
+   end
+   call wait stc_count*5   /* wait 5 seconds per stc */
+return
+reply_to_wtors : PROCEDURE expose (tables) sysid
+   "CART WTOR"
+   "D R,R,SYS="sysid",CN=(ALL)"
+   getcode = getmsg('response.','SOL','WTOR',,5)
+   if pos('NO MESSAGES OUTSTANDING',response.3) ^= 0 then
+      return
+   do i = 4 to response.0
+      parse var response.i id . . message .
+      if datatype(id) ^= 'NUM' then iterate
+      call search_table 'message_table',message
+      if result = 0 then
+         address TSO "SE 'unable to process "message"' OPERATOR(2)"
+      else
+         do
+            parse var result . reply .
+            call mvs_command  'R 'id','reply
+            call wait 1
+         end
+   end
+return
+wait : PROCEDURE
+   arg interval
+   if interval > 0 then
+      getcode = getmsg('not_interested.','SOL','NONE',,interval)
+return
+mvs_command : PROCEDURE
+   arg command
+   address TSO "call 'your-library(svc34-program)' '"command"'"
+return
+build_tables : PROCEDURE expose (tables) our_name
+   special_table.0 = 0
+   ignore_table.0 = 0
+   message_table.0 = 0
+   db2_table.0 = 0
+   /* list here tasks that require a command other than P to stop */
+   call add_to 'special_table','MIM MODIFY SHUTDOWN FREE'
+   call add_to 'special_table','TMSINIT CANCEL'
+   call add_to 'special_table','NETM* MODIFY FSTOP'
+   call add_to 'special_table','APPC CANCEL'
+   call add_to 'special_table','ASCH CANCEL'
+   /* list here tasks to ignore */
+   call add_to 'ignore_table','JES2'
+   call add_to 'ignore_table','ACF2'
+   call add_to 'ignore_table','NET'
+   call add_to 'ignore_table','INIT'
+   call add_to 'ignore_table','CTDP*'
+   call add_to 'ignore_table','CONTROL2'
+   call add_to 'ignore_table','BMC*'
+   call add_to 'ignore_table','PSFPROC'
+   call add_to 'ignore_table',our_name
+   /* list here messages that need to be replied to */
+   call add_to 'message_table','CAS9227A Y'
+   call add_to 'message_table','IKT010D FSTOP'
+return
+add_to : PROCEDURE expose (tables)
+   parse arg table_name,entry
+   interpret 'i = 'table_name'.0 + 1'
+   interpret table_name'.0 = i'
+   interpret table_name'.i = entry'
+return
+whats_active : PROCEDURE expose ok_to_stop_jes
+   ok_to_stop_jes = 1  /* true */
+   init_count  = 0
+   asch_count  = 0
+   tso_count   = 0
+   other_count = 0
+   "CART DISPLAY"
+   "$DA,XEQ,ALL"
+   getcode = getmsg('response.','sol','DISPLAY',,5)
+   do until (getcode ^= 0)
+      parse var response.1 . jname . class .
+      select
+         when (jname = 'INIT') then
+            init_count = init_count + 1
+         when (jname = 'ASCHINT') then
+            asch_count = asch_count + 1
+         when (class = '@') then
+            tso_count = tso_count + 1
+         when (jname ^= 'SYSLOG') then
+            do
+               other_count = other_count + 1
+               name.other_count = jname
+            end
+         otherwise
+      end
+      getcode = getmsg('response.','sol','DISPLAY',,5)
+   end
+   address TSO
+   if init_count > 0 then
+      do
+         "SE '"init_count" initiators still active ' OPERATOR(2)"
+         ok_to_stop_jes = 0
+      end
+   if asch_count > 0 then
+      do
+         "SE '"asch_count" ASCH initiators still active ' OPERATOR(2)"
+         ok_to_stop_jes = 0
+      end
+   if tso_count > 0 then
+      do
+         "SE '"tso_count" active TSO users ' OPERATOR(2)"
+         ok_to_stop_jes = 0
+      end
+   if other_count > 0 then
+      do
+         "SE 'waiting on "other_count" task(s) ' OPERATOR(2)"
+         ok_to_stop_jes = 0
+         do i = 1 to other_count
+            "SE ' ---- "name.i" ' OPERATOR(2)"
+         end
+      end
+   address CONSOLE
+return
+search_table : PROCEDURE expose (tables)
+   parse arg table_name,value
+   interpret 'max = 'table_name'.0'
+   do i = 1 to max
+      interpret 'table_item = 'table_name'.i'
+      parse var table_item key .
+      if value = key then
+         return (table_item)
+      if substr(key,compare(value,key)) = '*' then
+         return (table_item)
+   end
+return 0  /* if not found */
+shutdown_confirmed : PROCEDURE expose sysid
+   confirmed = 0   /* false */
+   valid_response = 'SYSNAME='sysid
+   "SE 'confirm SHUTDOWN request                 ' OPERATOR(2)"
+   "SE '                                         ' OPERATOR(2)"
+   "SE '    reply SYSNAME=name                   ' OPERATOR(2)"
+   "SE '                                         ' OPERATOR(2)"
+   "SE '    use SE ''SYSNAME=name'',CN="userid()"        ' OPERATOR(2)"
+   "SE '                                         ' OPERATOR(2)"
+   "SE 'you have 2 minutes to respond ......     ' OPERATOR(2)"
+   a = time(r)
+   wait_time = 120
+   do until (wait_time = 0)
+      getcode = getmsg('response.',,,,wait_time)
+      upper response.1
+      if getcode = 0 then
+         if pos(valid_response,response.1) > 0 then
+            do
+               confirmed = 1  /* true */
+               leave
+            end
+         else
+            do
+               wait_time = format(120 - time(e),,0)
+               if wait_time < 0 then wait_time = 0
+               "SE '"response.1" is not valid ' OPERATOR(2)"
+            end
+      else
+         wait_time = 0
+   end
+return (confirmed)  /* returns TRUE or FALSE */
+
+
+David Welch (New Zealand)                   c Xephon 1996
+

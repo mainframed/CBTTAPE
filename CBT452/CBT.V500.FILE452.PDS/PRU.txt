@@ -1,0 +1,589 @@
+PRU      TITLE 'PDS RESCUE UTILITY'
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Support Email Address: zOS.JES2@Gmail.com                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+*=====================================================================*
+*                                                                     *
+*PURPOSE:IF YOU HAVE EVER ACCIDENTLY DONE A SAVE AT THE WRONG TIME    *
+*        UNDER SPF, PROBABLY LIKE MOST PEOPLE -- YOU REALIZE          *
+*        10 MILLISECS AFTER HITTING THE ENTER KEY.                    *
+*                                                                     *
+*        THIS PROGRAM SHOULD HELP YOU RECOVER THE ORIGINAL MEMBER     *
+*        PROVIDING THAT YOU RUN THIS PROGRAM BEFORE DOING ANY         *
+*        COMPRESSES. IT LOCATES ALL DEAD MEMBERS IN THE PDS AND       *
+*        COPIES THEM TO AN OUTPUT PDS GIVING THEM MEMBER NAMES OF     *
+*        MEM001 TO MEMNNN WHERE MEMNNN WILL BE THE MOST RECENTLY      *
+*        SAVED MEMBER. (DELETED MEMBERS ARE ALSO COPIED BUT THEIR     *
+*        MEM NUMBER IS NOT PREDICATABLE).                             *
+*                                                                     *
+*        SPF BROWSE, EDIT OR ANY EQUIVALENT MEANS MAY THEN BE USED TO *
+*        LOCATE THE DESIRED ONE. IF THIS IS DONE IMMEDIATLY AFTER THE *
+*        10 MILLISECS MENTIONED ABOVE IT SHOULD BE MEMNNN.            *
+*                                                                     *
+*                                                                     *
+*METHOD: (1) READS PDS DIRECTORY AND STORES ALL ACTIVE MEMBER TTRS.   *
+*                                                                     *
+*        (2) READS ENTIRE INPUT PDS DATA. IF A BLOCK BEGINS AFTER     *
+*            AN END-OF-FILE IT IS DEEMED TO BE THE BEGINNING OF THE   *
+*            MEMBER.  IF NOT A TTR FOUND ABOVE THEN THIS IS A DEAD    *
+*            MEMBER AND WRITTEN TO THE OUTPUT PDS. A SUMMARY OF EACH  *
+*            MEMBER THUS WRITTEN IS LOGGED ON  THE PRT FILE.          *
+*                                                                     *
+*        (3) AT THE END OF PDS (HIGHEST TTR ON FILE IS REACHED) THE   *
+*            OUTPUT PDS IS FIXED TO GIVE PROPER DCB ATTRUIBUTES.      *
+*                                                                     *
+*---------------------------------------------------------------------*
+*                                                                     *
+*        SAMPLE JCL:                                                  *
+*        //PRU      EXEC  PGM=PRU,REGION=4M,                          *
+*        //*        PARM=ALL   <--- COPY "LIVE" MEMBERS AS WELL       *
+*        //STEPLIB  DD    DSN=PRU.LOADLIB,DISP=SHR                    *
+*        //SYSPRINT DD    SYSOUT=*                                    *
+*        //SYSUDUMP DD    SYSOUT=*                                    *
+*        //INPUT    DD    DISP=SHR,DSN=UNCOMPRESSED.PDS               *
+*        //OUTPUT   DD    DSN=PRU.OUTPUT.FILE,DISP=(,CATLG),          *
+*        //         UNIT=SYSDA,SPACE=(CYL,(1,1,90))                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+*                                                                     *
+*        #DD99253 - ADD RETURN CODE 4 FOR "NO OUTPUT MEMBERS"         *
+*        #DD04223 - READ TILL END OF "USED" PORTION OF DATASET.       *
+*                 - RECOGNIZE PDS/E INPUT DATASET.                    *
+*        #DD06229 - CORRECT DCB PROCESSING ERROR.                     *
+*        #DD12062 - ADD EAV SUPPORT.                                  *
+*                                                                     *
+*=====================================================================*
+
+         ACONTROL OPTABLE(ZS3)     Assembly OPTCDE Table
+         SPLEVEL  SET=6            Specify OS/390 R2 macro format
+         SYSSTATE ARCHLVL=2        Assembly requires z/Architecture
+         SYSSTATE OSREL=ZOSV1R13   Assembly requires z/OS 1.13 & higher
+
+PRU      #START BASE=(R12),WKCSECT=WRKCSECT,                           *
+               APARS=,COPY=YES,                                        *
+               LEVEL=V001R04                                   #DD06229
+         USING PSA,0
+
+*-------
+*
+*        VALIDATE PARAMETER LIST
+*
+*-------
+
+         L     R1,0(R1)            >>---> PARAMETER LIST
+         LH    R2,0(R1)            LOAD PARAMETER LENGTH
+         LA    R1,2(,R1)           >>---> PARAMETER DATA
+         CH    R2,=AL2(3)          CHECK FOR VALID LENGTH
+         BNE   PRU00100
+         CLC   0(3,R1),=C'ALL'     CHECK FOR PARM='ALL'
+         BNE   PRU00100
+         OI    FLAGBYTE,FLAGALL    REMEMBER TO COPY ALL MEMBERS
+
+*-------
+*
+*        OPEN OUTPUT MESSAGE FILE
+*
+*-------
+
+PRU00100 DS    0H
+         LA    R2,DCBDDNAM-IHADCB+SYSPRINT
+         MVC   ERROR1+17(8),0(R2)
+         TIOTSCAN DDN=(R2),NOK=ERROR1
+         OPEN  (SYSPRINT,OUTPUT)   OPEN THE MESSAGE FILE
+         TM    DCBOFLGS-IHADCB+SYSPRINT,DCBOFOPN
+         BNO   ERROR1
+
+*-------
+*
+*        BUILD A MEMBER NAME/TTR TABLE
+*
+*-------
+
+         LA    R2,DCBDDNAM-IHADCB+DIRDCB
+         MVC   ERROR1+17(8),0(R2)
+         TIOTSCAN DDN=(R2),NOK=ERROR1
+
+         RDJFCB BSAMDCB            GET INPUT JFCB              #DD04223
+
+         LA    R14,INJFCB                                      #DD06229
+         USING INFMJFCB,R14                                    #DD06229
+         MVC   DSNAME,JFCBDSNM     DSN=                        #DD06229
+         MVC   LRECL,JFCLRECL      LRECL=                      #DD06229
+         MVC   VOLSER,JFCBVOLS     VOL=                        #DD06229
+         DROP  R14                                             #DD06229
+
+         OBTAIN SEARCHPL,EADSCB=OK GET FORMAT1 DSCB            #DD12062
+         TM    DS1SMSFG,DS1PDSE    CHECK FOR PDS/E             #DD04223
+         BO    ERROR4                                          #DD04223
+         MVC   MAXTTR,DS1LSTAR     SAVE LAST TTR ADDRESS       #DD04223
+
+         OPEN  (DIRDCB,INPUT)      OPEN THE DIRECTORY
+         TM    DIRDCB+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR1
+         LA    R3,MEMTAB@          >>---> 1ST ENTRY POINTER
+
+         B     PRU00300            READ THE FIRST DIRECTORY BLOCK
+PRU00200 DS    0H
+         IC    R1,11(0,R2)         LOAD LENGTH OF NEXT ENTRY
+         SLL   R1,27
+         SRL   R1,26
+         LA    R2,12(R1,R2)        >>---> NEXT DIRECTORY ENTRY
+         CLR   R2,R4               CHECK FOR END OF DIRECTORY BLOCK
+         BL    PRU00400
+PRU00300 DS    0H
+         GET   DIRDCB              READ IN A DIRECTORY BLOCK
+         LH    R4,0(0,R1)          LOAD LENGTH OF CURRENT BLOCK
+         LA    R4,0(R1,R4)         >>---> LAST USED BYTE IN DIRECTORY
+         LA    R2,2(0,R1)          >>---> FIRST ENTRY IN DIRECTORY
+PRU00400 DS    0H
+         CLI   0(R2),255           CHECK FOR END OF DIRECTORY
+         BE    PRU00500
+
+         GETMAIN RU,LV=MEMTABLN    GET STORAGE FOR NEW ENTRY
+         ST    R1,0(R3)            CHAIN TO PREVIOUS ENTRY
+         LR    R3,R1               >>---> NEW MEMBER ENTRY
+         USING MEMTABD,R3
+         XC    0(MEMTABLN,R3),0(R3)
+         MVC   MEMNAME,0(R2)       INSERT MEMBER NAME
+         MVC   MEMTTR,8(R2)        INSERT RELATIVE TTR OF DATA
+         DROP  R3
+         B     PRU00200            LOOP TILL END OF DIRECTORY
+
+PRU00500 DS    0H
+         CLOSE DIRDCB              CLOSE THE DIRECTORY
+
+*-------
+*
+*        COPY ALL MEMBERS TO OUTPUT DATASET
+*
+*-------
+
+         LA    R2,DCBDDNAM-IHADCB+BSAMDCB
+         MVC   ERROR1+17(8),0(R2)
+         TIOTSCAN DDN=(R2),NOK=ERROR1
+         OPEN  (BSAMDCB,INPUT)
+         TM    BSAMDCB+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR1
+
+         LA    R2,DCBDDNAM-IHADCB+BPAMDCB
+         MVC   ERROR1+17(8),0(R2)
+         TIOTSCAN DDN=(R2),NOK=ERROR1
+         OPEN  (BPAMDCB,OUTPUT)
+         TM    BPAMDCB+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR1
+
+         ESTAE TRAPABND,PARAM=(R12) SET ESTAE EXIT
+
+*-------
+*
+*        READ EACH MEMBER WHETHER IT IS IN THE DIRECTORY OR NOT
+*
+*-------
+
+PRU00600 DS    0H
+         MVI   CURRTTR+3,1         SETUP TO READ NEXT BLOCK
+         POINT BSAMDCB,CURRTTR     POINT TO NEXT TTR
+         READ  RDECB,SF,BSAMDCB,BUFF,'S'
+         CHECK RDECB               WAIT FOR COMPLETION OF READ
+
+         TM    FLAGBYTE,FLAGSYNA   CHECK FOR SYNAD ERROR
+         BO    ERROR2M             ISSUE ERROR MESSAGE
+
+         NOTE  BSAMDCB             GET CURRENT TTR
+         ST    R1,CURRTTR          SAVE CURRENT TTR
+         MVI   CURRTTR+3,0
+
+         TM    FLAGBYTE,FLAGDIR    CHECK IF DIRECTORY HAS BEEN READ
+         BNO   PRU00600            IF NOT READ TILL END OF DIRECTORY
+
+*-------
+*
+*        CHECK IF THE CURRENT MEMBER IS IN THE DIRECTORY
+*
+*-------
+
+         L     R1,BLKCNT           LOAD EXISTING BLOCK COUNT
+         LA    R1,1(,R1)           ADD 1 TO BLOCK COUNT
+         ST    R1,BLKCNT           SAVE NEW BLOCK COUNT
+         C     R1,=F'1'            CHECK FOR FIRST BLOCK
+         BNE   PRU01000
+
+         NOTE  BSAMDCB             GET CURRENT TTR
+         ST    R1,STARTTTR         SAVE STARTING TTR ADDRESS
+
+         L     R14,=A(BUFF)                                    #DD12062
+         MVC   PR1STLNE,0(R14)     COPY FIRST LINE             #DD12062
+         NI    FLAGBYTE,255-FLAGDEAD
+         LA    R3,MEMTAB@          >>---> START OF MEMBER TABLE
+PRU00800 DS    0H
+         USING MEMTABD,R3
+         CLC   MEMTTR,CURRTTR      CHECK FOR MATCHING TTR
+         BE    PRU00900            IF SO DO REMEMBER MEMBER NAME
+         ICM   R3,B'1111',MEMNEXT@ >>---> NEXT MEMBER IN DIRECTORY
+         BNZ   PRU00800
+         OI    FLAGBYTE,FLAGDEAD   COPY THIS MEMBER
+         B     PRU01000
+
+PRU00900 DS    0H
+         MVC   STOWNAME(8),MEMNAME
+         DROP  R3
+
+PRU01000 DS    0H
+         TM    FLAGBYTE,FLAGDEAD   CHECK IF THIS IS A DEAD MEMBER
+         BO    PRU01100            IF SO ALWAYS COPY IT
+         TM    FLAGBYTE,FLAGALL    CHECK IF COPYING ALL MEMBERS
+         BNO   PRU00600            IF NOT READ NEXT THROUGH THIS MEMBER
+
+PRU01100 DS    0H
+         LH    R1,DCBBLKSI-IHADCB+BSAMDCB
+         L     R14,RDECB+16        >>---> IOB
+         SH    R1,14(R14)          SUBTRACT RESIDUAL
+         STH   R1,DCBBLKSI-IHADCB+BPAMDCB
+         A     R1,BLKBYTES
+         ST    R1,BLKBYTES         ACCUMULATE TOTAL BYTES WRITTEN
+         WRITE WDECB,SF,BPAMDCB,BUFF,'S'
+         CHECK WDECB
+         B     PRU00600            LOOP TILL END OF CURRENT MEMBER
+
+*-------
+*
+*        PROCESS AFTER END OF MEMBER
+*
+*-------
+
+PRU01200 DS    0H
+         NOTE  BSAMDCB             GET CURRENT TTR
+         ST    R1,CURRTTR          SAVE CURRENT TTR
+         ST    R1,ENDTTR           SAVE LAST TTR
+
+         MVI   CURRTTR+3,0
+         TM    FLAGBYTE,FLAGDIR    CHECK IF DIRECTORY WAS READ
+         BO    PRU01300
+         OI    FLAGBYTE,FLAGDIR    REMEMBER THE DIRECTORY WAS PROCESSED
+         B     PRU01900            PROCEED WITH NEXT ENTRY
+PRU01300 DS    0H
+         TM    FLAGBYTE,FLAGDEAD   WAS THIS MEMBER IN THE DIRECTORY
+         BNO   PRU01500            IF NOT PROCEED WITH NEXT ENTRY
+         MVC   STOWNAME(3),=C'MEM' INSERT MEMBER NAME PREFIX
+         ICM   R1,15,BLKCNT        CHECK IF ANY BLOCKS WRITTEN #DD04223
+         BZ    PRU01900            B. IF NOT                   #DD04223
+PRU01400 DS    0H
+         AP    MEMNUM,=PL3'1'      ADD 1 TO MEMBER NUMBER
+         UNPK  STOWNAME+3(5),MEMNUM
+         OI    STOWNAME+7,X'F0'
+
+PRU01500 DS    0H
+         TM    FLAGBYTE,FLAGALL    CHECK IF COPYING ALL MEMBERS
+         BO    PRU01600            IF SO PROCEED AS NORMAL
+         TM    FLAGBYTE,FLAGDEAD   WAS THIS A DEAD MEMBER
+         BNO   PRU01900            IF NOT DO NOT UPDATE DIRECTORY
+PRU01600 DS    0H
+         STOW  BPAMDCB,STOWNAME    STORE MEMBER NAME IN THE DIRECTORY
+         LTR   R15,R15             CHECK FOR STOW ERROR
+         BZ    PRU01700            IF NOT PROCEED
+         TM    FLAGBYTE,FLAGDEAD   WAS THIS MEMBER IN THE DIRECTORY
+         BNO   ERROR3              ERROR3 IF SO PROCESS ERROR
+         CH    R15,=H'04'          CHECK FOR DUPLICATE MEMBER NAME
+         BE    PRU01400            IF SO TRY A NEW MEMBER NAME
+         B     ERROR3
+PRU01700 DS    0H
+         L     R1,STOW#                                        #DD99253
+         LA    R1,1(,R1)           INCREMENT NUMBER OF MEMBERS #DD99253
+         ST    R1,STOW#                                        #DD99253
+         MVI   PRDEADFL,C' '
+         TM    FLAGBYTE,FLAGDEAD   WAS THIS MEMBER IN THE DIRECTORY
+         BNO   PRU01800
+         MVI   PRDEADFL,C'*'
+PRU01800 DS    0H
+         MVC   PRMEMBER,STOWNAME   COPY MEMBER NAME TO OUTPUT
+
+         SLR   R0,R0
+         ICM   R0,B'1110',STARTTTR GET STARTING TTR
+         L     R1,DCBDEBAD-IHADCB+BPAMDCB
+         LA    R2,DBLWORD          >>---> OUTPUT AREA
+         L     R14,FLCCVT          >>---> CVT
+         L     R15,CVTPCNVT-CVTMAP(R14)
+         STM   R3,R13,SAVEREGS     SAVE DESTROYED REGISTERS
+         LA    R3,SAVEREGS         SAVE SAVE AREA ADDRESS
+         BALR  R14,R15             LINK TO RESIDENT CONVERT RTN
+         LM    R3,R13,0(R3)        RESTORE DESTROYED REGISTERS
+         UNPK  PRTTRSTA(11),DBLWORD+3(6) UNPACK CCHHR
+         TR    PRTTRSTA(11),TRTBL  XLATE TO EBCDIC
+
+         ICM   R0,B'1110',ENDTTR   GET ENDING TTR
+         L     R1,DCBDEBAD-IHADCB+BPAMDCB
+         LA    R2,DBLWORD          >>---> OUTPUT AREA
+         L     R14,FLCCVT          >>---> CVT
+         L     R15,CVTPCNVT-CVTMAP(R14)
+         STM   R3,R13,SAVEREGS     SAVE DESTROYED REGISTERS
+         LA    R3,SAVEREGS         SAVE SAVE AREA ADDRESS
+         BALR  R14,R15             LINK TO RESIDENT CONVERT RTN
+         LM    R3,R13,0(R3)        RESTORE DESTROYED REGISTERS
+         UNPK  PRTTREND(11),DBLWORD+3(6) UNPACK CCHHR
+         TR    PRTTREND(11),TRTBL  XLATE TO EBCDIC
+
+         L     R1,BLKCNT           LOAD BLOCK COUNT
+         CVD   R1,DBLWORD
+         MVC   PRBLKCNT,=X'402020202021'
+         ED    PRBLKCNT,DBLWORD+5
+         LA    R1,PRINTLNE         >>---> LINE TO BE PRINTED
+         BAL   R14,PRINTRTN        PRINT THE LINE
+
+PRU01900 DS    0H
+         XC    BLKCNT,BLKCNT
+         CLC   MAXTTR,ENDTTR       CHECK IF DONE READING       #DD04223
+         BH    PRU00600            B. IF MORE TO READ          #DD04223
+
+*-------
+*
+*        RE-CONSTRUCT THE DCB'S TO SIMULATE THE INPUT DATASET
+*
+*-------
+
+PRU02000 DS    0H
+         CLOSE (BSAMDCB,,BPAMDCB,,SYSPRINT)
+         MVC   EXITLST2+1(3),=AL3(SETDCBO2) CHANGE EXIT
+         OPEN  (BPAMDCB,OUTPUT)    OPEN FOR OUTPUT TO COPY INPUT DCB'S
+         CLOSE (BPAMDCB)
+
+         ICM   R0,15,STOW#         CHECK FOR OUTPUT MEMBERS    #DD99253
+         BNZ   PRUEXIT             B. IF SOME WRITTEN          #DD99253
+         #SETRC 4                  SET RETURN CODE             #DD99253
+
+*-------
+*
+*        RETURN TO CALLER WITH APPROPRIATE RETURN CODE
+*
+*-------
+
+PRUEXIT  #STOP ,                   RETURN TO CALLER
+
+ERROR1   WTO   'PRU0001I XXXXXXXX DD STATEMENT MISSING',ROUTCDE=11
+         #SETRC 8                  SET RETURN CODE
+         B     PRUEXIT
+
+ERROR2   DS    0H
+         SYNADAF ACSMETH=BSAM
+         MVC   ERROR2M+17(78),50(R1)
+         OI    FLAGBYTE,FLAGSYNA
+         SYNADRLS
+         BR    R14
+
+ERROR2M  WTO   'PRU0002I XXXXXXXXX+XXXXXXXXX+XXXXXXXXX+XXXXXXXXX+XXXXXX*
+               XXX+XXXXXXXXX+XXXXXXXXX+XXXXXXXX',ROUTCDE=11
+         #SETRC 12                 SET RETURN CODE
+         B     PRU02000
+
+ERROR3   DS    0H
+         MVC   ERROR3M+40(8),STOWNAME INSERT MEMBER NAME
+         CVD   R15,DBLWORD
+         OI    DBLWORD+7,X'0F'
+         UNPK  ERROR3M+53(4),DBLWORD
+ERROR3M  WTO   'PRU0003I STOW FAILED FOR MEMBER XXXXXXXX R15=XXXX ',   *
+               ROUTCDE=11
+         #SETRC 16                 SET RETURN CODE
+         B     PRU01900
+
+ERROR4   DS    0H                                              #DD04223
+         WTO   'PRU0004I INPUT DD IS A PDS/E',                 #DD04223*
+               ROUTCDE=11                                      #DD04223
+         #SETRC 20                 SET RETURN CODE             #DD04223
+         B     PRUEXIT                                         #DD04223
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        ESTAE EXIT                                                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+
+TRAPABND DS    0H
+         USING *,R15
+         CH    R0,=F'12'           CHECK IF RTM PROVIDED AN SDWA
+         BNE   TRAP0010
+         SLR   R15,R15             IF NOT: PERCOLATE
+         BR    R14                 RETURN TO CALLER
+
+         DROP  R15
+
+TRAP0010 DS    0H
+         STM   R14,R12,12(R13)     SAVE CALLER'S REGISTERS
+         LR    R4,R1               >>---> SDWA
+         USING SDWA,R4
+         L     R12,SDWAPARM        RE-LOAD BASE REGISTER
+
+         LR    R5,R13              >>---> CALLERS SAVE AREA
+         LA    R13,TRAPSAVE        >>---> ESTAE SAVE AREA
+         ST    R5,TRAPSAVE+4       SAVE CALLERS SAVE AREA ADDRESS
+         ST    R13,8(0,R5)         SAVE OUR SAVE AREA ADDRESS
+
+         CLOSE (BPAMDCB)
+         MVC   EXITLST2+1(3),=AL3(SETDCBO2) CHANGE EXIT
+         OPEN  (BPAMDCB,OUTPUT)    OPEN FOR OUTPUT TO COPY INPUT DCB'S
+         CLOSE (BPAMDCB)
+
+         L     R13,4(,R13)         RESTORE CALLERS SAVE AREA ADDRESS
+         SETRP RC=0,                                                   *
+               WKAREA=(4),                                             *
+               REGS=(14,12),                                           *
+               DUMP=YES
+
+         POP   USING
+
+STOWNAME DS    0H
+         DC    CL8'MEM-----',XL4'0'
+MEMNUM   DC    PL3'0'
+SYSPRINT DCB   DDNAME=SYSPRINT,MACRF=PM,RECFM=FBA,                     *
+               DSORG=PS,EXLST=EXITLST3,                                *
+               DCBE=DCBE1                                      #DD12062
+DCBE1    DCBE  EADSCB=OK                                       #DD12062
+DIRDCB   DCB   DDNAME=INPUT,MACRF=GL,                                  *
+               DSORG=PS,RECFM=F,LRECL=256,BLKSIZE=256,                 *
+               DCBE=DCBE2                                      #DD12062
+DCBE2    DCBE  EADSCB=OK                                       #DD12062
+BSAMDCB  DCB   DDNAME=INPUT,MACRF=RP,                                  *
+               EODAD=PRU01200,SYNAD=ERROR2,                            *
+               DSORG=PS,EXLST=EXITLIST,                                *
+               DCBE=DCBE3                                      #DD12062
+DCBE3    DCBE  EADSCB=OK                                       #DD12062
+BPAMDCB  DCB   DDNAME=OUTPUT,MACRF=W,                                  *
+               DSORG=PO,EXLST=EXITLST2,                                *
+               DCBE=DCBE4                                      #DD12062
+DCBE4    DCBE  EADSCB=OK                                       #DD12062
+EXITLIST DC    0F'0',AL1(000+5),AL3(SAVEDCBI)                  #DD04223
+         DC    0F'0',AL1(128+7),AL3(INJFCB)                    #DD04223
+EXITLST2 DC    0F'0',AL1(128+5),AL3(SETDCBO)
+EXITLST3 DC    0F'0',AL1(128+5),AL3(DCBEXIT)
+INJFCB   DC    0F'0',XL176'00'     INPUT FILE'S JFCB           #DD04223
+SEARCHPL CAMLST SEARCH,DSNAME,VOLSER,WORKAREA,EADSCB=OK        #DD12062
+*=================================================================*
+* SAVE ORIGINAL DCB FORMAT AND MAKE RECFM UNDEFINED.              *
+*=================================================================*
+SAVEDCBI DC    0H'0'
+         USING IHADCB,R1                                       #DD06229
+         USING SAVEDCBI,R15                                    #DD06229
+         MVC   RECFM,DCBRECFM                                  #DD06229
+         MVI   DCBRECFM-IHADCB+BSAMDCB,DCBRECU                 #DD06229
+         MVC   LRECL,DCBLRECL                                  #DD06229
+         MVC   BLKSIZE,DCBBLKSI                                #DD06229
+         BR    R14
+         DROP  R15                                             #DD06229
+*=================================================================*
+* MAKE OUTPUT DCB LIKE INPUT                                      *
+*=================================================================*
+SETDCBO  DC    0H'0'
+         MVC   DCBRECFM-IHADCB+BPAMDCB,DCBRECFM-IHADCB+BSAMDCB
+         MVC   DCBLRECL-IHADCB+BPAMDCB,=H'00'
+         MVC   DCBBLKSI-IHADCB+BPAMDCB,DCBBLKSI-IHADCB+BSAMDCB
+         BR    R14
+SETDCBO2 DC    0H'0'
+         MVC   DCBBLKSI-IHADCB+BPAMDCB,BLKSIZE
+         MVC   DCBLRECL-IHADCB+BPAMDCB,LRECL
+         MVC   DCBRECFM-IHADCB+BPAMDCB,RECFM
+         BR    R14
+DCBEXIT  DS    0H
+         #DCBEXIT LRECL=133
+PRINTRTN DS    0H
+         STM   R0,R15,SAVEREGS     SAVE ALL REGISTERS
+         LR    R10,R1              >>>---> RECORD TO BE PRINTED
+         AP    LINE#,=PL3'1'       ADD 1 TO LINE NUMBER
+         CP    LINE#,=PL3'60'      CHECK IF TITLES ARE REQUIRED
+         BNE   PRINT010
+         L     R1,PAGE#            LOAD OLD PAGE NUMBER
+         LA    R1,1(,R1)           ADD 1 TO PAGE NUMBER
+         ST    R1,PAGE#            SAVE CURRENT PAGE NUMBER
+         CVD   R1,DBLWORD
+         MVC   PRTPAGE#,=X'402020202021'
+         ED    PRTPAGE#,DBLWORD+5
+         PUT   SYSPRINT,TITLE1
+         PUT   SYSPRINT,TITLE2
+         PUT   SYSPRINT,TITLE3
+         PUT   SYSPRINT,TITLE4
+         PUT   SYSPRINT,TITLE5
+         MVC   LINE#,=PL3'6'
+PRINT010 DS    0H
+         PUT   SYSPRINT,0(R10)     PRINT RECORD
+         LM    R0,R15,SAVEREGS     RESTORE ALL REGISTERS
+         BR    R14
+
+         LTORG ,
+LINE#    DC    PL3'+59'            LINE NUMBER
+PAGE#    DC    F'0'                PAGE NUMBER
+TITLE1   DC    CL133'1 '
+         ORG   TITLE1+57
+         DC    C'PDS Rescue Utility'
+         ORG   TITLE1+123
+         DC    C'Page'
+PRTPAGE# DS    CL6
+         ORG   ,
+TITLE2   DC    CL133'0 '
+         ORG   TITLE2+2
+         DC    C' Member   Input Dataset CCHHR    Block'
+         ORG   ,
+TITLE3   DC    CL133'  '
+         ORG   TITLE3+2
+         DC    C'  Name   Starting       Ending   Count First Record'
+         ORG   ,
+TITLE4   DC    CL133'+ '
+         ORG   TITLE4+2
+         DC    C'  ____   _____________________   _____ ____________'
+         ORG   ,
+TITLE5   DC    CL133'  '
+ABENDCDE DC    XL3'00'
+PRINTLNE DC    CL133' '
+         ORG   PRINTLNE+1
+PRDEADFL DC    CL1' '
+PRMEMBER DC    CL8' '
+         DC    CL1' '
+PRTTRSTA DC    CL11' '
+PRTTREND DC    CL11' '
+         DC    CL1' '
+PRBLKCNT DC    CL6' '
+         DC    CL1' '
+PR1STLNE DC    CL80' '
+         ORG   ,
+TRAPSAVE DS    18F                 ESTAE SAVE AREA
+BLKSIZE  DS    H                   INPUT BLOCKSIZE
+LRECL    DS    H                     "   LRECL
+RECFM    DS    X                     "   RECFM
+TRTBL    DS    0CL256
+         DC    CL240' '
+         DC    C'0123456789ABCDEF'
+
+BUFF     DS    0D,CL(32*1024)      READ/WRITE BUFFER
+
+         #STARTWA ,
+BLKBYTES DS    F
+BLKCNT   DS    F
+CURRTTR  DS    F
+DBLWORD  DS    D
+ENDTTR   DS    F
+FLAGBYTE DS    X
+FLAGDEAD EQU   X'80'               CURRENT MEMBER IS NOT IN DIRECTORY
+FLAGDIR  EQU   X'40'               DIRECTORY HAS BEEN READ
+FLAGSYNA EQU   X'10'               BSAM SYNAD ERROR OCCURRED
+FLAGALL  EQU   X'08'               ALL MEMBERS ARE TO BE COPIED
+MAXTTR   DS    XL3
+MEMTAB@  DS    F                   >>---> MEMBER NAME TABLE
+SAVEREGS DS    16F
+STARTTTR DS    F
+STOW#    DS    F                   NUMBER OF OUTPUT MEMBERS    #DD99253
+DSNAME   DC    CL44' '             DATASET NAME                #DD04223
+VOLSER   DC    CL6' '              VOLUME SERIAL               #DD04223
+WORKAREA DC    0F'0',265X'00'      OBTAIN WORK AREA            #DD04223
+         ORG   WORKAREA-L'DS1DSNAM                             #DD04223
+         IECSDSL1 1                FORMAT 1 DSCB               #DD04223
+         ORG   ,                                               #DD04223
+         #STOPWA ,
+
+MEMTABD  DSECT ,
+MEMNEXT@ DS    F                   >>---> NEXT ENTRY IN TABLE
+MEMNAME  DS    CL8                 MEMBER NAME
+MEMTTR   DS    CL3                 TTR
+MEMTABLN EQU   *-MEMTABD
+         #DSECTS CVT,DCB,JFCB,SDWA,PSA                         #DD04223
+         END   ,

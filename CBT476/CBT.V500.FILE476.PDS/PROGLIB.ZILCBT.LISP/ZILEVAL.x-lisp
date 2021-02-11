@@ -1,0 +1,738 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; The guts of the EVALUATOR.
+;
+;         Implementation notes:
+;
+;         See ZILAPPLY for discussion of the "environment" arg and
+;         how it affects FEXPR's and the "alist" arg to functions.
+;
+;         See MKNEWENV for discussion of the "environment" arg and
+;         what to do if the format needs to be changed.
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 06/01/88 - Changes to support multiple values, BLOCK and TAGBODY    *
+;*            even before they're implemented.  ZEVMACS changed.       *
+;*                                                                     *
+;* 06/13/88 - Support for THROW as a special form, required in order   *
+;*            to support multiple values.                              *
+;*                                                                     *
+;* 06/27/88 - Support for PROG and RETURN removed.                     *
+;*                                                                     *
+;* 12/14/88 - Fixed BLOCK processing by adding unwind-protection.      *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;
+;;; The current deep binding scheme implements fake value cells
+;;; (actually binding cells) for global variables.  This consists of a
+;;; binding pair stored in the "PBIND" cell of the symbol.
+;;;
+;;; When shallow binding is implemented for specials, some changes
+;;; will take place to both ZILAPPLY and ZILEVAL, not to mention
+;;; many others.  In any case, support needs to be added to ZILAPPLY
+;;; for inline declarations.
+;;;
+
+   ;;
+   ;; Steps in adding a new special form:
+   ;;
+   ;; (1) Add it to the list in ZEVINIT.
+   ;; (2) Add it to ZILEVAL.
+   ;; (3) Add it to FEXPAND.
+   ;; (3) Add it to ZILCOTRN.
+   ;; (4) Add it to ZILCOINT.
+   ;; (5) Figure out how to compile it.
+   ;;
+
+(defload car zcar)
+
+;
+; Macro definitions
+;
+
+(include #.(zil-source-member zevmacs)) ; Include evaluator macros.
+
+(defun zileval (x a toplevelp)
+ (let (q r s)
+  (cond
+    ( (null x)                nil                                    )
+    ( (symbolp x)
+                              (if (eq (pbind x) x) ; Self-evaluating?
+                                  x
+                                  (evsymbol x a))                    )
+
+;;; All other kinds of atoms (numbers, etc.) are self-defining.
+
+    ( (atom x)                x                                      )
+
+;;; If this is a dotted pair (CDR is a non-NIL atom), reject.
+
+    ( (progn
+       (desetq (q . r) x)
+       (and r (atom r)))
+                              (zerror  "Invalid S-expression" x)     )
+
+;;; The following two hacks are in case of evaluating (#.#'foo bar baz)
+;;; or (#.(subr foo) bar baz) hacks.  These are sort of irregular,
+;;; but placed up front in case of efficiency hacks in the interpreter
+;;; which replace symbols with their compiled functions or something.
+
+;;; If CAR of the form is subr or closure, process like a subr call.
+
+    ( (codep q)               (zilxsub q (zevlist r a))              )
+
+;;; If CAR of the form is an interpreted lexical closure, apply it.
+
+    ( (funargp q)             (zilapply (funfun q)
+                                        (zevlist r a)
+                                        (funenv q)
+                                        q)                           )
+
+;-----------------------------------------------------------------------
+;
+;
+;;; Add tests for FSUBRP, etc. here if they should ever exist.
+;
+;   ( (??????p q)             (zilxsub q r)                          )
+;
+;-----------------------------------------------------------------------
+
+;;; If CAR of the form is a list, pass it directly to APPLY, which
+;;; will signal an error unless the form is a LAMBDA or LABEL or such.
+;;; Pass the same environment through.
+
+    ( (consp q)               (zilapply q (zevlist r a) a q)         )
+
+;;; If CAR of the form is an atom, but not a compiled code object,
+;;; then it has to be a symbol, else no good (e.g. numbers are bad).
+
+    ( (not (symbolp q))
+      (zerror "Invalid form in functional position" q)               )
+
+;;; If CAR of the form is a symbol, it's some kind of function name.
+
+    ( (progn
+       (setq s (or (getl q '(macro |SPECIAL FORM| expr fexpr subr))
+                   '(nil)))
+
+       ;;; Macros override everything else.
+
+       (eq (car s) 'macro))
+                              (zileval (macroexpand x) a toplevelp)  )
+
+;;; Check all special forms.
+
+    ( (eq (car s) '|SPECIAL FORM|)
+      (case q
+             (quote               (car (or r
+                                           (zerror "Missing argument"
+                                                   'quote)))          )
+             (cond                (evcon r a)                         )
+             (setq                (evsetq r a)                        )
+             (and                 (evand r a)                         )
+             (or                  (evor r a)                          )
+             (progn               (evprogn r a toplevelp)             )
+             (block               (evblock r a)                       )
+             (return-from         (evretfrom r a)                     )
+             (tagbody             (evtagbody r a)                     )
+             (go                  (evgo r a)                          )
+             (function            (mkfunarg (car (or r
+                                                     (zerror
+                                                     "Missing argument"
+                                                     'function)))
+                                                  a)                  )
+
+             (defun               (zevdefun r toplevelp)              )
+             (defvar              (zevdvar r toplevelp)               )
+             (defload             (zevdefld r toplevelp)              )
+             (catch               (evcatch r a)                       )
+             (throw               (evthrow r a)                       )
+             (unwind-protect      (evuwp r a)                         )
+             (arg                 (evarg r a)                         )
+             (setarg              (evsetarg r a)                      )
+             (listify             (evlistify r a)                     )
+             (eval-when           (evevwhen r a toplevelp)            )
+             (subr                (car (or r
+                                           (zerror "Missing argument"
+                                                   'subr)))           )
+             (declare             (evdcl r a toplevelp)               )
+
+             (multiple-value-list (evmvlist r a)                      )
+             (multiple-value-bind (evmvbind r a)                      )
+
+             (t (zerror "Special form unknown to EVAL" q)))           )
+
+;;; Not a special form - look for functional property.
+;;;
+;;; Note: If dynamic scoping, pass "a" instead of "nil" to ZILAPPLY in
+;;;       the calls for EXPR and FEXPR below.
+;;;
+
+    ( (eq (car s) 'subr)      (zilxsub (cadr s) (zevlist r a))       )
+
+    ( (eq (car s) 'expr)      (zilapply (cadr s) (zevlist r a) nil q) )
+
+    ( (eq (car s) 'fexpr)     (zilapply (cadr s)
+                                        (list r (bindenv a)) nil q)   )
+
+;-----------------------------------------------------------------------
+;
+;   ( (eq (car s) 'fsubr)     (zilxsub (cadr s) (list r (bindenv a))))
+;
+;-----------------------------------------------------------------------
+
+;
+; Otherwise, resolve using AUTOLOAD property if any.
+;
+    ( t                       (zevauto q t)
+                              (zileval x a toplevelp)                )
+  )
+ )
+)
+
+;
+; EVSYMBOL - evaluate symbol.
+;
+; Note - the hacks for the symbols OBLIST and ALIST have been deleted.
+;
+
+(defun evsymbol (x a)
+ (let (v)
+  (cond
+
+;;;;;; Maybe "self-evaluating" or "constant" - no support for those yet.
+;;;
+;;; Self-evaluating symbols (those whose PBIND cells point to
+;;; themselves, like T or keywords) were handled in ZILEVAL and
+;;; not passed to this routine.
+;;;
+;;; ((self-evaluating-p x) x)
+;;; ((constant-symbol-p x) x)
+;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+   ;; First, search local bindings in environment.
+
+   ;; Note that the CDR of this binding pair cannot be the "unbound"
+   ;; object, because that should be placed there only by MAKUNBOUND
+   ;; (which is defined to work on special bindings only).
+
+   ((setq v (assq x (bindenv a)))
+    (cdr v))
+
+   ;; If not locally bound, see if it is special.
+
+   ((or (memq x (specenv a))   ;  If it is in pervasive SPECIAL decls,
+        (specialp x))          ;  or globally proclaimed SPECIAL,
+    (cdr (or (zevsym x)                  ; find the SPECIAL binding.
+             (zerror "Unbound SPECIAL variable" x))))
+
+   ;; If not found there, search for a special binding.
+   ;; After all, this code might have been invoked by a compiled
+   ;; routine that declared the variable SPECIAL, either implicitly
+   ;; (e.g. a DEFMETHOD) or explicitly (e.g. the * ** *** - + ++ +++
+   ;; variables of READ-EVAL-PRINT).
+
+   ((consp (setq v (zevsym x)))
+    (cdr v))
+
+   ;; If not found there either, give up.
+
+   (t
+    (zerror "Unbound variable" X)))))
+
+
+
+;
+; EVCON - evaluate special form COND
+;
+(defun evcon (x a)
+ (prog (v)
+   loop
+       (or x (return nil))
+       (and (atom (car x))
+            (zerror "Invalid COND syntax" (car x)))
+       (and (setq v (zileval (caar x) a nil))
+            (return (if (null (cdar x)) ; (COND ((FORM)) ...) ?
+                        v
+                        (evprogn (cdar x) a nil))))
+       (setq x (cdr x))
+       (go loop)))
+
+;
+; EVGO - evaluate special form GO
+;
+(defun evgo (l a &aux tag)
+ (cond
+  ( (null l)                 (zerror  "Missing argument" 'go)          )
+  ( (cdr l)                  (zerror  "Too many arguments" 'go)        )
+  ( (not (or (symbolp (setq tag (car l)))
+             (integerp tag)))
+                             (zerror  "Invalid GO tag" tag)            )
+  ( (null (progenv a))       (zerror  "GO outside of PROG" l)          )
+  ( t
+    (let (prog-body-from-tag-onward)
+         (loop for env in (progenv a)
+               when    (setq prog-body-from-tag-onward
+                             (member tag (progbody env)))
+               do      (unless (cdr (tagbodytag env))
+                               (zerror "GO to inactive PROG" tag))
+                       (throw (tagbodytag env)
+                              (setf (progrest env)
+                                    (cdr prog-body-from-tag-onward)))
+               finally (zerror "GO tag undefined" tag))))))
+
+;
+; EVPROGN - evaluate special form PROGN
+;
+(defun evprogn (r a toplevelp)
+ (cond
+  ((null r) nil)
+  (t
+   (prog ()
+    loop (cond
+          ((null (cdr r))
+           (return (zileval (car r) a toplevelp))) ; possible M.V.'s
+          (t
+           (zileval (car r) a toplevelp)           ; effect only
+           (setq r (cdr r))
+           (go loop)))))))
+
+;
+; EVSETQ - evaluate special form SETQ
+;
+(defun evsetq (r a)
+ (prog (var val z)
+  loop (or r (return z))
+       (setq var (car r))
+       (or (cdr r) (zerror "Odd number of arguments" 'setq))
+       (setq val (cadr r))
+       (setq z (evsetq1 var val a))
+       (setq r (cddr r))
+       (go loop)))
+
+(defun evsetq1 (var val a &aux v)
+ (unless (and var (symbolp var) (neq (pbind var) var))
+         (zerror "Invalid SETQ variable" var))
+
+ (cond
+
+;;;;;; Maybe "self-evaluating" or "constant" - no support for those yet.
+;;;
+;;; The "self-evaluating" case was handled by the PBIND check above.
+;;;
+;;; ((self-evaluating-p x) (zerror "Cannot assign to this variable" x))
+;;; ((constant-symbol-p x) (zerror "Cannot assign to this variable" x))
+;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+ ;; First, search for a current interpretive/lexical binding.
+ ;; If one is found, RPLACD it.
+
+  ((setq v (assq var (bindenv a)))
+   (setf (cdr v) (zileval val a nil)))
+
+ ;; If not locally bound, see if it is special.
+
+   ((or (memq var (specenv a)) ;  If it is in pervasive SPECIAL decls,
+        (specialp var))        ;  or globally proclaimed SPECIAL,
+                               ;  then call special-binding-modifier.
+         ;; ZEVSET will always return a binding, never NIL.
+    (cdr (zevset var (zileval val a nil))))
+
+ ;; If not there, then assume a new SPECIAL variable.
+ ;; ZEVSET will always return a binding, never NIL.
+
+  (t
+
+ ;; If the variable is unknown, then assume it is a special variable,
+ ;; and mark it special, like NIL does.  Note that this is not done
+ ;; for SETQ's originating from compiled code.
+ ;;
+ ;; Do not force the variable to be SPECIAL if it is already
+ ;; on the special-alist, as it may be put there by FLAVORS.
+ ;;
+ ;; Globally bound variables may be forced SPECIAL, since
+ ;; they should have been to begin with.
+
+   (unless (or
+               (specialp var)            ; No warn if declared special
+               (assq var (special-alist)); No warn if dynamically bound
+           )                             ; (even if it has no value)
+    (warn "SETQ assigning to assumed SPECIAL variable" var)
+    (setf (specialp var) t)
+   )
+   (cdr (zevset var (zileval val a nil))))))
+
+;
+; EVAND - evaluate special form AND
+;
+(defun evand (r a)
+ (if (null r)
+     t
+     (prog ()
+      loop (when (null (cdr r))
+                 (return (zileval (car r) a nil))) ; possible M.V.'s
+           (when (null (zileval (car r) a nil))    ; test only
+                 (return nil))
+           (setq r (cdr r))
+           (go loop))))
+
+;
+; EVOR - evaluate special form OR
+;
+(defun evor (r a)
+ (if (null r)
+     nil
+     (prog ()
+      loop (when (null (cdr r))
+                 (return (zileval (car r) a nil))) ; possible M.V.'s
+           (return
+            (cond
+             ((zileval (car r) a nil))              ; test only
+             (t
+              (setq r (cdr r))
+              (go loop)))))))
+
+;
+; EVCATCH - evaluate special form CATCH
+;
+(defun evcatch (r a)
+ (cond
+  ( (not (and r (cdr r)))  (zerror  "Too few arguments" 'catch)        )
+  ( t                      (let (((tag . form) r))
+                                (catch (zileval tag a nil)
+                                       (evprogn form a nil)))          )
+ )
+)
+;
+; EVTHROW - evaluate special form THROW
+;
+(defun evthrow (r a)
+ (cond
+  ( (not (and r (cdr r)))  (zerror  "Too few arguments" 'throw)        )
+  ( (not (null (cddr r)))  (zerror "Too many arguments" 'throw)        )
+  ( t                      (let (((tag form) r))
+                                (throw (zileval tag a nil)
+                                       (zileval form a nil)))          )
+ )
+)
+;
+; EVUWP - evaluate special form UNWIND-PROTECT
+;
+(defun evuwp (r a)
+ (cond
+  ( (not (and r (cdr r)))  (zerror  "Too few arguments" 'unwind-protect))
+  ( t                      (let (((pf . cf) r))
+                                (unwind-protect (zileval pf a nil)
+                                                (evprogn cf a nil))))))
+;
+; EVARG - evaluate special form ARG
+;
+; Note: only for ZIL, (ARG T) gives the list of args lexpr-bound.
+;       This allows, for example, Maclisp LISTIFY to be implemented
+;       using (ARG T).
+;
+(defun evarg (r a)
+ (let* ((arg (argenv a))
+        (env (if (null arg) (zerror "ARG outside of LEXPR" r) (car arg)))
+       )
+  (if (null r)
+   then
+    (length env)
+   else
+   if (cdr r)
+   then
+    (zerror "Too many arguments" 'arg)
+   else
+    (let
+     ((n (zileval (car r) a nil)))
+     (cond
+      ((null n)    (length env))
+      ((eq n t)    env)
+      ((fixnump n) (evarg-nth (1- n) env n))
+      (t (zerror "Argument to ARG not NIL, T, or fixnum" n)))))))
+
+(defun evarg-nth (n arglist original-n)
+ (prog ()
+  loop
+       (and (or (null arglist)
+                (minusp n))
+            (zerror "ARG value does not exist" original-n))
+       (and (zerop n)
+            (return (car arglist)))
+       (setq n (1- n))
+       (setq arglist (cdr arglist))
+       (go loop)))
+
+;
+; EVSETARG - evaluate special form SETARG
+;
+(defun evsetarg (r a)
+ (or r         (zerror "Too few arguments" 'setarg))
+ (or (cdr r)   (zerror "Too few arguments" 'setarg))
+ (and (cddr r) (zerror "Too many arguments" 'setarg))
+ (prog (n v arg env)
+  (setq arg (argenv a))
+  (setq env (if (null arg)
+                (zerror "SETARG outside of LEXPR" r)
+                (car arg)))
+  (setq n (zileval (car r) a nil))
+  (setq v (zileval (cadr r) a nil))
+  (cond
+   ((fixnump n) (evsetarg-rplacnth (1- n) env v n))
+   (t           (zerror "Argument 1 to SETARG not a fixnum" n))
+  )
+  (return v)))
+
+(defun evsetarg-rplacnth (n arglist v original-n)
+ (prog ()
+  loop
+       (and (or (null arglist)
+                (minusp n))
+            (zerror "SETARG value does not exist" original-n))
+       (and (zerop n)
+            (return (rplaca arglist v)))
+       (setq n (1- n))
+       (setq arglist (cdr arglist))
+       (go loop)))
+
+;
+; EVLISTIFY - evaluate special form LISTIFY
+;
+
+(defun evlistify (r a)
+ (and r (cdr r) (zerror "Too many arguments" 'listify))
+ (let* (
+        (arg (argenv a))
+        (env (if (null arg)
+                 (zerror "LISTIFY outside of LEXPR" r)
+                 (car arg)))
+        (n   (if r (zileval (car r) a nil)))
+        (argn (length env)))
+  (cond ((null n)       env)
+        ((not (fixp n)) (zerror "Arg to LISTIFY not a fixnum or NIL" n))
+        ((minusp n)     (let ((l (+ argn n)))
+                             (if (plusp l)
+                                 (nthcdr l env)
+                                 env)))
+        ((zerop n)      nil)
+        ((lessp n argn) (do ((i 1 (1+ i))
+                             (a env (cdr a))
+                             (z nil))
+                            ((or (null a) (> i n)) z)
+                            (setq z (nconc z (list (car a))))))
+        (t              env))))
+
+
+;
+; EVEVWHEN - evaluate special form EVAL-WHEN
+;
+; (eval-when (compile) ignored.
+; (eval-when (load)    ignored.
+; (eval-when (eval)    evaluated.
+;
+
+(defun evevwhen (r a toplevelp)
+ (unless toplevelp
+         (zerror "Misplaced EVAL-WHEN"))
+ (or r (zerror "Too few arguments" 'eval-when))
+ (when (memq 'eval (car r))
+       (evprogn (cdr r) a toplevelp)))
+
+;
+; EVDCL - evaluate special form DECLARE
+;
+
+(defun evdcl (r a toplevelp)
+ (unless toplevelp
+         (zerror "Misplaced DECLARE" r))
+ (dolist (declaration r)
+  (if (atom declaration)
+      (warn "Invalid declaration" declaration)
+      (case (car declaration)
+            ((special) (dolist (dclarg (cdr declaration))
+                               (evdcl-special dclarg)))
+            ; otherwise ignore declaration...
+      ))))
+
+(defun evdcl-special (var)
+ (if (or (null var)
+         (not (symbolp var))
+         (eq var t))
+     (warn "Invalid DECLARE SPECIAL variable" var)
+     ;;; (proclaim `(special ,var))
+     (setf (specialp var) t)))
+
+;
+; EVBLOCK - evaluate special form BLOCK
+;
+
+(defun evblock (x a)
+ (prog (blockname p penv)
+  (unless x
+          (zerror "Missing block name and forms" x))
+  (setq blockname (car x))
+  (unless (symbolp blockname)
+          (zerror "Invalid BLOCK block name" blockname))
+
+  (setq p (make-progenv))          ; Fresh PROG environment component.
+
+  (setf (blocktag p) (cons blockname t)) ; Create a unique BLOCK tag.
+
+  (setq penv (copyenv a))          ; Create a new environment.
+  (push p (progenv penv))          ; Add new PROG environment component.
+
+  (unwind-protect
+   (catch (blocktag p)
+          (setf (progvalue p)
+                (multiple-value-list
+                 (evprogn (cdr x) penv nil))))
+
+  ;;; If RETURN-FROM is executed, a THROW will occur that sets
+  ;;; (progvalue p) to the value(s) being returned.
+
+   (setf (cdr (blocktag p)) nil)   ; Invalidate RETURN from this BLOCK.
+  )
+
+  (return (values-list (progvalue p)))
+))
+
+;
+; EVRETFROM - evaluate special form RETURN-FROM
+;
+
+(defun evretfrom (l a &aux bname)
+ (cond
+  ( (null l)            (zerror "Missing block name" 'return-from))
+  ( (cddr l)            (zerror "Too many arguments" 'return-from))
+  ( (not (symbolp (setq bname (car l))))
+                        (zerror  "Invalid RETURN-FROM block name" bname))
+  ( t
+    (loop for env in (progenv a)
+          with btag
+          do   (setq btag (blocktag env))
+          when (and btag (eq bname (car btag)))
+          do   (unless (cdr btag)
+                       (zerror "RETURN-FROM block inactive" bname))
+               (throw (blocktag env)
+                      (setf (progvalue env)
+                            (multiple-value-list
+                             (zileval (if (cdr l) (cadr l) nil) a nil)
+                            )
+                      ))
+          finally (zerror "RETURN-FROM block does not exist" bname)))))
+
+;
+; EVTAGBODY - evaluate special form TAGBODY
+;
+
+(defun evtagbody (x a &aux stmt p penv)
+ (when x                             ; Return NIL if no forms.
+  (setq p (make-progenv))            ; Fresh PROG environment component.
+  (setf (tagbodytag p) (cons nil t)) ; Create a unique TAGBODY tag.
+  (setf (progbody p) x)              ; Executable body including tags.
+  (setf (progrest p) x)            ; Initialize executable body to body.
+  (setq penv (copyenv a))          ; Create a new environment.
+  (push p (progenv penv))          ; Add new PROG environment component.
+
+  (unwind-protect
+   (loop do
+         (setq stmt (car (progrest p)))
+         (setf (progrest p) (cdr (progrest p)))
+         (unless (atom stmt)
+                 (catch (tagbodytag p)
+                        (zileval stmt penv nil)))
+
+                 ; If (GO xxx), will change PROGREST.
+
+         while (progrest p)
+   )
+   (setf (cdr (tagbodytag p)) nil) ; Invalidate GO to this TAGBODY.
+  ))
+ nil) ; Always return NIL.
+
+;
+; EVMVLIST - evaluate special form MULTIPLE-VALUE-LIST
+;
+
+(defun evmvlist (r a)
+ (cond
+  ((null r)
+   (zerror "Too few arguments" 'multiple-value-list))
+  ((not (null (cdr r)))
+   (zerror "Too many arguments" 'multiple-value-list))
+  (t
+   (multiple-value-list (zileval (car r) a nil)))))
+
+;
+; EVMVBIND - evaluate special form MULTIPLE-VALUE-BIND
+;
+
+(defun evmvbind (r a)
+ (cond
+  ((or (null r) (null (cdr r)))
+   (zerror "Too few arguments" 'multiple-value-bind))
+  (t
+   (let (((vars form . body) r))
+        (do ((v vars (cdr v)))
+            ((null v))
+            (cond
+             ((atom v)
+              (zerror "MULTIPLE-VALUE-BIND arglist not a proper list"
+                      vars))
+             ((llkeywdp (car v))
+              (zerror
+    "MULTIPLE-VALUE-BIND arglist cannot contain lambda list keywords"
+                     vars))))
+        ;;;
+        ;;; To avoid a lot of duplication of code, and to let the
+        ;;; code in ZILAPPLY handle the binding, we process a form
+        ;;;  (MULTIPLE-VALUE-BIND (A B C) (VALUE-FORM) . BODY)
+        ;;; as if it were
+        ;;;  ((LAMBDA (&OPTIONAL (A NIL) (B NIL) (C NIL) &REST (NIL))
+        ;;;           . BODY)
+        ;;;   (MULTIPLE-VALUE-LIST (VALUE-FORM)))
+        ;;; The explicit NILs are there in case the variable names
+        ;;; are destructuring templates, which is accepted in ZIL.
+        ;;; The body may, of course, contain declarations.
+        ;;; This works out as equivalent, if you think about it -
+        ;;; the variables are set to NIL if not found in the
+        ;;; resulting list, and any extras are swallowed up by the
+        ;;; dummy &REST argument.  (This would work as a macro for
+        ;;; compilation as well, except that we don't want to CONS
+        ;;; in compiled code - the whole point of multiple values
+        ;;; is to avoid consing!)
+        ;;;
+        ;;; (NIL) works as the dummy &REST argument because:
+        ;;;  * we don't want to use GENSYM in the interpreter so that
+        ;;;    user calls to GENSYM come out in "normal" sequence
+        ;;;  * &REST NIL is equivalent to no &REST arg, the way the
+        ;;;    interpreter works now
+        ;;;  * &REST (NIL) is a destructuring request that throws away
+        ;;;    the CAR of the &REST list and ignores the rest (n.p.i.)
+        ;;;
+        (zilapply
+         (mkfunarg
+          `(lambda (&optional ,.(mapcar #'(lambda (x) `(,x nil))
+                                        vars)
+                              &rest (nil))
+                   . ,(or body '(nil)))
+           a)
+         (multiple-value-list (zileval form a nil))
+         a
+         'multiple-value-bind)))))
+

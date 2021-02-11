@@ -1,0 +1,712 @@
+//jobname JOB (account),userid,CLASS=S,MSGCLASS=Y,REGION=4M
+//*
+//* First modify JOB card and data set names to your environment
+//* Assemble and Link program/module
+//*
+//ASMH EXEC PGM=ASMA90,REGION=4M,
+// PARM='TEST,OBJECT,NODECK,NOXREF,BATCH,RENT'
+//SYSLIB   DD DISP=SHR,DSN=SYS1.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MODGEN
+//         DD DISP=SHR,DSN=SYS3.UTILITY.MACLIB.TEST      <== hlq.MACLIB
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//SYSIN    DD *
+*-------------------------------------------------------------------
+     TITLE 'SVM0037  REXX function L_PGM'
+*-------------------------------------------------------------------
+* History of Changes (last comes first):
+* 07-10-2003 SVM Added WTP if IRXSAY not available (in OPS)
+* 04/02/03 SVM Created
+*.....................................................................
+*   Runs in both TSO (IKJEFT1B) and non-TSO environment (IRXJCS)
+*
+* FUNCTION:     Open Load library member and read ESD,RLD,SYM data
+*               (if any) to the arrays that will be returned to
+*               the caller.
+*               Creates (if not already exist) a hidden variable
+*               value(dsname) that contains library data used for
+*               faster re-open. This variable will exist until
+*               the exec ends and is re-usable.
+*               See $PARM map for $OPEN for field description.
+* Sample use:
+*               If L_PGM(dsn,program,volume) Then Do
+*               /* ... process variables  */
+*               See also MAPPGM exec in hlq.EXEC libarary
+*               for a sample variables processing and print data
+*
+* PARAMETERS:   dsn,program,volume
+*               dsn     - required, must be a load library name
+*               program - required, member name
+*               volume  - optional, can be omitted, blanks or null
+*
+* OUTPUT:       Result ='1' - normal, '0' - abnormal
+*               R15 = 0
+*               If abnormal call to routine:
+*               Say message:
+*               - no dsname specified
+*               - no program specified
+*               - $OPEN program cannot be LOADed
+*               - no dataset or open error
+*               - no member in library
+*               - not a PDS
+*               - RAM shortage
+*               - Overlay and SCTR programs not supported.
+*               If Normal, creates REXX variables:
+*               PTAB - string mapped by the following structure:
+*               - p#name   CL8 main program name
+*               - p#entry  F   entry point offset
+*               - p#size   F   program size, bytes
+*               -          X   reserved
+*               - p#ssi    XL3 ssi (date of linkage)
+*               - p#ac     BL1 program authorization code
+*               - p#at1    BL1 copy of PDS2ATR1 (ref IHAPDS)
+*               - p#at2    BL1 copy of PDS2ATR2 (ref IHAPDS)
+*               - p#ft2    BL1 copy of PDS2FTB2 (ref IHAPDS),
+*                              but bit0 = PDS2ALIS (alias flag)
+*               - p#aname  CL8 alias name (if member is an alias)
+*               - p#aentry F   alias entry point offset
+*               CTAB.i (i=1,2,...) - section data
+*               - c#name   CL8 CSECT name
+*               - c#addr   F   section offset in the program
+*               - c#size   F   section size, bytes
+*               - c#type   X   type 00-SD,03-LR,04-PC,05-Common
+*               - c#ssi    XL3 section compilation date
+*               DTAB.i (j=1,2,...) - DSECT data
+*               - d#name   CL8 section name
+*               - d#addr   F   zeroes
+*               - d#size   F   section size, bytes
+*               - d#type   X   type
+*               - d#num    AL3 number of parent CTAB (i)
+*               CTAB.i.n (i=1,2,..., n=1,2,...) - csect field data
+*               - n#name   CL8 field name
+*               - n#addr   F   field offset in section
+*               - n#size   F   field length, bytes
+*               - n#type   X   field type
+*               - n#mult   AL3 filed multiplier (20CL8 20=mult,8=size)
+*               DTAB.j.n (j=1,2,..., n=1,2,...) - dsect field data
+*               - n#name   CL8 field name
+*               - n#addr   F   field offset in section
+*               - n#size   F   field length, bytes
+*               - n#type   X   field type
+*               - n#mult   AL3 filed multiplier (20CL8 20=mult,8=size)
+*
+* Attributes:
+*               reentrant, AMODE=31,RMODE=ANY
+* Externals:
+*               $OPEN - dynalloc/read interface module (A=24)
+*                            LOADed and CALLed
+*--------------------------------------------------------------------
+.* Macro to handle variable: &N is a name of var name, constant
+         MACRO
+         STORE &N,&L,&C=SHVSTORE
+         AIF   ('&N' EQ '').NON
+&VAL     SETC  'L''&N'
+         AIF   ('&L' EQ '').C
+         AIF   ('&L'(1,1) NE '(').NREG
+.* -- Len is a (R):
+&VAL     SETC  '0&L'
+         AGO   .C
+.* -- Len is abs value:
+.NREG    ANOP
+&VAL     SETC  '&N'
+.C       LA    R1,&VAL
+         ST    R1,SHVNAML               --> Store name length
+         LA    R1,&N
+         ST    R1,SHVNAMA               --> store name addr
+         MVI   SHVCODE,&C               --> Set "store" code
+         BAL   R14,CALLXCOM             - process variable
+.NON     ANOP
+         MEND
+*--------------------------------------------------------------------
+IRXF@PGM BEGIN A=31
+WRK      WORK  LV=WRKL,LOC=BELOW
+         B     START
+*--------------------------------------------------------------------
+*  Exit the program - clean up first:
+EXIT     DS    0H
+         L     R3,DATADDR
+         LTR   R3,R3
+         BZ    FIN
+         L     R2,DATALEN
+         FREEMAIN RU,A=(R3),LV=(R2)
+FIN      SR    R15,R15
+         FIN
+*---------------------------------------------------------------------
+* REGISTER EQUATES:
+* R8  -> SHVBLOCK  variable access block
+* R9  -> EVALBLOCK result block
+* R10 -> IRXEFPL   parm block
+* R11 -> ENVBLOCK  environment block
+*---------------------------------------------------------------------
+*- Set REXX environment:
+START    LR    R10,R1                  IRXEFPL
+         USING EFPL,R10                - parm list
+         LR    R11,R0                  ENVBLOCK
+         USING ENVBLOCK,R11            - externals
+         L     R9,EFPLEVAL
+         L     R9,0(R9)                EVALBLOCK
+         USING EVALBLOCK,R9            - result
+         LA    R8,SHVBLK
+         USING SHVBLOCK,R8             - to set variables
+         BAL   R14,SETSHV
+*  set default return:
+         SR    R2,R2                   By default:
+         ST    R2,RETC                 return rc = 0
+         ST    R2,DATADDR              indicate RAM not allocated
+         LA    R2,1
+         ST    R2,EVALBLOCK_EVLEN      return result
+         MVI   EVALBLOCK_EVDATA,C'1'   '1'
+*---------------------------------------------------------------------
+*  get parm #1 (DSNAME)
+         LA    R2,1
+         BAL   R14,GETPARM             R3=addr,R4=length (0=not found)
+         LTR   R4,R4
+         LA    R15,#NODSN
+         BZ    ERROR                   no parm
+         ST    R4,DSNLEN               store length
+         BCTR  R4,0                    length - 1
+         MVC   DSNAME(44),#BLANKS
+         EX    R4,MVCDSN               copy parm to DSNAME
+*---------------------------------------------------------------------
+*  Check if variable (dsname) exists, if not - create
+         LA    R1,DSNAME               where to store value
+         ST    R1,SHVVALA              store data addr
+         LA    R1,$PARMLEN             data length
+         ST    R1,SHVBUFL              store data length
+         L     R1,DSNLEN               real name length
+         STORE DSNAME,(R1),C=SHVFETCH  fetch variable
+* get parm #2 (MEMBER)
+         LA    R2,2
+         BAL   R14,GETPARM             R3=addr,R4=length (0=not found)
+         LTR   R4,R4
+         LA    R15,#NOMEM
+         BZ    ERROR                   no parm
+         BCTR  R4,0                    length - 1
+         MVC   MEMBER(8),#BLANKS
+         EX    R4,MVCMEM               copy parm to DSNAME
+* get parm #3 (VOLUME)
+         MVC   VOLUME(6),#BLANKS
+         LA    R2,3
+         BAL   R14,GETPARM             R3=addr,R4=length (0=not found)
+         LTR   R4,R4
+         BZ    NOVOL                   blank
+         BCTR  R4,0                    length - 1
+         EX    R4,MVCVOL               copy parm to VOLUME
+NOVOL    DS    0H
+*---------------------------------------------------------------------
+*  Check if variable (dsname) exists, if not - create
+         CLI   SHVRET,SHVNEWV          did not exist?
+         BE    CREATE
+*        WTO   'Using existing $PARM:',ROUTCDE=11
+*      SAY   ,DSNAME,80
+         B     ALLOC
+*- create variable (dsname):
+CREATE   DS    0H
+*        WTO   'Creating $PARM...',ROUTCDE=11
+         XC    RECLEN(NUMLEN),RECLEN   Nullify other fields in $PARM
+         XC    RC(4),RC
+         XC    SHVNEXT(SHVBLEN),SHVNEXT clear it all
+         LA    R1,DSNAME
+         ST    R1,SHVVALA              store data addr
+         LA    R1,$PARMLEN
+         ST    R1,SHVVALL              store data length
+         L     R1,DSNLEN               real dsn length
+         STORE DSNAME,(R1)             store variable
+*---------------------------------------------------------------------
+*  Get data area for program data (PTAB, CTABs, NTABS, and DTABs)
+ALLOC    DS    0H
+         USING PTAB,R2                 for P#DLEN  & P#LENGTH only
+         L     R2,=A(P#DLEN)           P#DATA length
+         LA    R2,P#LENGTH(R2)         add P#LENGTH for total
+         ST    R2,DATALEN              store data length (bytes)
+         GETMAIN RU,LV=(R2),LOC=RES
+         ST    R1,DATADDR              store data addr
+         LR    R2,R1
+*  Clear PTAB in Data:
+         MVI   0(R2),X'00'             set to clear
+         LR    R14,R2                  from
+         LA    R0,1(R2)                to
+         L     R1,DATALEN
+         BCTR  R1,0                    length
+         LR    R15,R1                  length
+         MVCL  R0,R14                  clear total PTAB
+*  Set required fields:
+         L     R1,=A(P#DLEN)           P#DATA size in bytes
+         SRL   R1,2                    /4 = size in words
+         ST    R1,P#ASIZE              ===> store P#ASIZE
+         LA    R1,P#DATA
+         ST    R1,P#AFREE              ===> store P#AFREE
+         L     R1,DATADDR
+         A     R1,DATALEN
+         ST    R1,P#AEND               ===> store P#AEND
+*  Call A31ESD:
+         ST    R2,A$PTAB
+         LA    R1,$PARM
+         ST    R1,A$PARM
+         LA    R1,A$PARM
+         CALL  A31ESD
+         CH    R15,H12
+         BNH   CONTINUE
+         LR    R1,R15
+         LA    R15,#NOOPN
+         CH    R1,=H'16'
+         BE    ERROR
+         LA    R15,#NORAM
+         CH    R1,=H'20'
+         BE    ERROR
+         LA    R15,#NOLOD
+         B     ERROR
+*---------------------------------------------------------------------
+*  R2->PTAB, R3->CTAB, R4->DTAB, R5->NTAB
+*  Create variable for PTAB:
+CONTINUE LA    R1,VVALUE
+         MVC   0(8,R1),P#NAME          store P#NAME
+         MVC   8(4,R1),P#ENTRY         store P#ENTRY
+         MVC   12(4,R1),P#SIZE         store P#SIZE
+         SR    R0,R0
+         ICM   R0,B'0111',P#SSI
+         ST    R0,16(R1)               store P#SSI
+         MVC   20(12,R1),P#ACODE       store flags & alias name
+         MVC   32(4,R1),P#AENTRY       store P#AENTRY
+         ST    R1,SHVVALA              set var addr
+         LA    R1,L'VVALUE             set var length
+         ST    R1,SHVVALL
+         LA    R1,L'#PTAB              var name length
+         STORE #PTAB,(R1)              store variable
+*        WTO   'PTAB created',ROUTCDE=11
+*        B     CDONE
+*-------------------------------------------------------------
+*  Create array variables for each CSECT and DSECT:
+         LA    R1,VVLEN                change length for others
+         ST    R1,SHVVALL              and store
+         XC    C#(2),C#                clear
+         USING CTAB,R3
+         USING DTAB,R4
+         L     R3,P#CTAB               1st CTAB
+         DROP  R2
+CLOOP    LTR   R3,R3
+         BZ    CDONE
+         XC    N#(2),N#
+         LA    R1,VVALUE               FILL CTAB:
+         MVC   0(8,R1),C#NAME          --
+         MVC   8(4,R1),C#ADDR          --
+         MVC   12(4,R1),C#SIZE         --
+         MVC   16(1,R1),C#TYPE         -- 0=SD, 3=LR, 4=PC, 5=CM
+         MVC   17(3,R1),C#SSI          --
+*    SHVVALA and SHVVALL remain the same (VVALUE and 20)
+*    update name and store REXX variable:
+         LH    R1,C#                   CTAB array counter
+         LA    R1,1(R1)                advance counter
+         STH   R1,C#                   update counter
+         LR    R0,R1                   counter value for SETNAME
+         MVC   VNAME(L'VNAME),#BLANKS
+         MVC   VNAME(L'#CTAB),#CTAB    set name
+         LA    R1,VNAME+L'#CTAB        set index position
+         BAL   R14,SETNAME             set index, R1=len(ndx)-1
+         LA    R1,L'#CTAB+1(,R1)       set name length
+         STORE VNAME,(R1)              create variable
+*      SAY   'SHVBLOCK=',SHVBLOCK,32
+*      SAY   'NAME=',VNAME,12
+*      SAY   'C#=',C#,2
+*
+*  process NTAB for CTAB:
+         L     R1,SHVNAML              ctab name length
+         LA    R5,VNAME
+         AR    R5,R1                   end of ctab name
+         MVI   0(R5),C'.'
+         MVC   CNAME(L'VNAME),VNAME    store name prefix 'CTAB.n.'
+         LA    R1,1(R1)                length + 1 for '.'
+         ST    R1,CNLEN                store length of 'CTAB.x'
+*      SAY   'CTAB=',(R3),40
+         L     R5,C#NTAB
+         USING NTAB,R5
+NLOOP    LTR   R5,R5
+         BZ    NDONE
+         LA    R1,VVALUE
+         MVC   0(8,R1),N#NAME          set fields
+         MVC   8(4,R1),N#ADDR
+         MVC   12(4,R1),N#SIZE
+         MVC   16(1,R1),N#TYPE
+         MVC   17(3,R1),N#DIM+1
+*        SHVVALA and SHVVALL remain the same (VVALUE and 20)
+         LH    R1,N#
+         LA    R1,1(R1)                get array index
+         STH   R1,N#                   update array index
+         LR    R0,R1                   index for SETNAME
+         MVC   VNAME(L'VNAME),CNAME    clear name
+         LA    R1,VNAME                set
+         A     R1,CNLEN                    index position
+         BAL   R14,SETNAME             set index, R1=len(ndx)-1
+         A     R1,CNLEN
+         LA    R1,1(R1)                name length = cnlen + R1 + 1
+         STORE VNAME,(R1)              create variable
+*      SAY   'SHVBLOCK=',SHVBLOCK,32
+*      SAY   'NAME=',VNAME,12
+*      SAY   'VAL =',VVALUE,20
+         L     R5,N#NEXT               next NTAB
+         B     NLOOP
+*
+*  process DTAB
+NDONE    L     R4,C#DTAB
+DLOOP    LTR   R4,R4
+         BZ    DDONE                   no more DTAB
+         XC    N#(2),N#
+         LA    R1,VVALUE               FILL CTAB:
+         MVC   0(8,R1),D#NAME          --
+         XC    8(4,R1),8(R1)           -- D#addr
+         MVC   12(4,R1),D#SIZE         --
+         XC    16(2,R1),16(R1)         -- reserv
+         MVC   18(2,R1),C#             -- parent CTAB number
+*    SHVVALA and SHVVALL remain the same (VVALUE and 20)
+*    update name and store REXX variable:
+         LH    R1,D#                   CTAB array counter
+         LA    R1,1(R1)                advance counter
+         STH   R1,D#                   update counter
+         LR    R0,R1                   counter value for SETNAME
+         MVC   VNAME(L'VNAME),#BLANKS
+         MVC   VNAME(L'#DTAB),#DTAB    set name
+         LA    R1,VNAME+L'#DTAB        set index position
+         BAL   R14,SETNAME             set index, R1=len(ndx)-1
+         LA    R1,L'#DTAB+1(,R1)       set name length
+         STORE VNAME,(R1)              create variable
+*  process NTAB for DTAB:
+         L     R1,SHVNAML              ctab name length
+         LA    R5,VNAME
+         AR    R5,R1                   end of ctab name
+         MVI   0(R5),C'.'
+         MVC   DNAME(L'VNAME),VNAME    store name prefix 'DTAB.n.'
+         LA    R1,1(R1)                length + 1 for '.'
+         ST    R1,DNLEN                store length of 'DTAB.x'
+*      SAY   'DTAB=',(R4),32
+         L     R5,D#NTAB
+         USING NTAB,R5
+NLOOP2   LTR   R5,R5
+         BZ    NDONE2
+         LA    R1,VVALUE
+         MVC   0(8,R1),N#NAME          set fields
+         MVC   8(4,R1),N#ADDR
+         MVC   12(4,R1),N#SIZE
+         MVC   16(1,R1),N#TYPE
+         MVC   17(3,R1),N#DIM+1
+*        SHVVALA and SHVVALL remain the same (VVALUE and 20)
+         LH    R1,N#
+         LA    R1,1(R1)                get array index
+         STH   R1,N#                   update array index
+         LR    R0,R1                   index for SETNAME
+         MVC   VNAME(L'VNAME),DNAME    clear name
+         LA    R1,VNAME                set
+         A     R1,DNLEN                    index position
+         BAL   R14,SETNAME             set index, R1=len(ndx)-1
+         A     R1,DNLEN
+         LA    R1,1(R1)                name length = cnlen + R1 + 1
+         STORE VNAME,(R1)              create variable
+*      SAY   'SHVBLOCK=',SHVBLOCK,32
+*      SAY   'NTAB=',(R5),32
+*      SAY   'NAME=',VNAME,12
+*      SAY   'VAL =',VVALUE,20
+         L     R5,N#NEXT               next NTAB
+         B     NLOOP2
+*
+NDONE2   L     R4,D#NEXT
+         B     DLOOP
+*
+DDONE    L     R3,C#NEXT               next CTAB
+         B     CLOOP
+*
+CDONE    DS    0H
+*---------------------------------------------------------------------
+*  Update value(dsname)
+*        WTO   'Updating $PARM...',ROUTCDE=11
+         XC    SHVNEXT(SHVBLEN),SHVNEXT clear it all
+         LA    R1,DSNAME
+         ST    R1,SHVVALA              store data addr
+         LA    R1,$PARMLEN
+         ST    R1,SHVVALL              store data length
+         L     R1,DSNLEN               real dsn length
+         STORE DSNAME,(R1)             store variable
+         B     EXIT
+*--------------------------------------------------------------------
+ERROR    EQU   *
+         USING ERRBLK,R15
+         MVC   RETC(4),ERRCODE
+         MVC   MESSAGE(ERRMSGL),ERRMSG store for WTP
+* make parm for IRXSAY:
+         MVC   P1(8),=CL8'WRITE'       function request
+         LA    R1,ERRMSG
+         ST    R1,P2                   string addr
+         LA    R1,ERRMSGL
+         ST    R1,P3                   string length
+         ST    R11,P4                  ENVBLOCK
+         XC    P5(4),P5                clear RC
+* make addr list:
+         LA    R1,P1
+         ST    R1,A1
+         LA    R1,P2
+         ST    R1,A2
+         LA    R1,P3
+         ST    R1,A3
+         LA    R1,P4
+         ST    R1,A4
+         LA    R1,P5
+         ST    R1,A5
+         OI    A5,X'80'                set VL bit
+* call program:
+         LA    R1,A1                   parm list addr
+         L     R15,ENVBLOCK_IRXEXTE    addr IRXEXTE
+         USING IRXEXTE,R15
+         L     R15,IRXSAY              addr IRXSAY
+         DROP  R15
+         LTR   R15,R15
+         BZ    NOSAY
+         BALR  R14,R15                 Call IRXSAY
+         MVI   EVALBLOCK_EVDATA,C'0'   Return '0'
+         B     EXIT
+* WTP message instead of Saying:
+NOSAY    LA    R1,MSGLEN
+         ST    R1,A1
+         OI    A1,X'80'
+         LA    R1,ERRMSGL
+         STH   R1,MSGLEN
+         LA    R1,A1
+         CALL  WTP
+         MVI   EVALBLOCK_EVDATA,C'0'   Return '0'
+         B     EXIT
+*
+*=====================================================================*
+*        S U B R O U T I N E S                                        *
+*---------------------------------------------------------------------*
+* SETNAME - set array variable name.
+*    entry :  R0 = array index requested, R1=index position
+*    use   :  C#, N#, D# = array counters, R0, R15 - work
+*    return:  R1=name length, VNAME has correct array name
+*---------------------------------------------------------------------*
+SETNAME  STM   R2,R0,S2
+         LR    R2,R1                   save
+* R0=array index, R2=index position in VNAME
+         CVD   R0,VAL                  convert
+         UNPK  D(5),VAL(8)             to
+         OI    D+4,C'0'                decimal
+         LA    R1,5                    set index length
+         BAL   R14,STRIPL              R1 = index length - 1
+         EX    R1,MVCNDX1              copy index to name
+SETRET   LM    R2,R0,S2                return R1
+         BR    R14
+MVCNDX1  MVC   0(0,R2),D
+*---------------------------------------------------------------
+* Strip number left: value: D, index length: R1.
+*    Set R1 to new length of index
+*---------------------------------------------------------------
+STRIPL   STM   R2,R5,WRKSAVE2
+         LA    R2,D                     start with 1st char
+         LA    R5,1                     Min result length
+         LNR   R4,R5                    Increment = -1
+LOOPN    CLI   0(R2),C'0'
+         BNE   CUTN
+         LA    R2,1(R2)                 advance position
+         BXH   R1,R4,LOOPN              cut length by 1
+*  R2-> leftmost non-zero, R1 = new length
+CUTN     BCTR  R1,0
+         EX    R1,MVCNDX                shift index left
+         LM    R2,R5,WRKSAVE2
+         BR    R14
+MVCNDX   MVC   D(0),0(R2)
+*---------------------------------------------------------------------*
+* GET input parameter (addr,length) by number:                        *
+*    entry :  R2=parm # (not changed)                                 *
+*    use   :  R15 (return 0, when parm is found)                      *
+*    return:  to R14, R3=parm addr, R4=parm length (0, if not found)  *
+*---------------------------------------------------------------------*
+GETPARM  DS    0H
+         LR    R15,R2
+         SR    R4,R4                   make length zero
+         L     R3,EFPLARG              A(1st parm)
+         B     GETPL1                  go into loop
+GETPL    LA    R3,8(R3)                next parm
+GETPL1   CLC   0(8,R3),PARMEND
+         BER   R14                     not found
+         BCT   R15,GETPL
+* parm found:
+         L     R4,4(R3)                parm length
+         L     R3,0(R3)                parm addr
+         BR    R14
+*---------------------------------------------------------------------*
+* Set IRXEXCOM parameters:
+*---------------------------------------------------------------------*
+SETSHV   DS    0H
+* (re)make addr list:
+         LA    R1,#EXCOM
+         ST    R1,A1                   A1 = Addr of module name
+         XC    A2(8),A2                clear A2 and A3
+         LA    R1,SHVBLK
+         ST    R1,A4                   A4 -> SHVBLOCK
+         OI    A4,X'80'                set VL bit
+* (re)fill SHVBLOCK:
+         XC    SHVNEXT(SHVBLEN),SHVNEXT clear it all
+         BR    R14
+*--------------------------------------------------------------------*
+* Call IRXEXCOM:
+*--------------------------------------------------------------------*
+CALLXCOM ST    R14,SAVER14
+*     STM   R0,R7,S2
+*     LM    R0,R7,SHVBLK
+*     CALL  WTOREGS
+*     LM    R0,R7,S2
+         L     R15,ENVBLOCK_IRXEXTE    addr IRXEXTE
+         USING IRXEXTE,R15
+         L     R15,IRXEXCOM            addr IRXEXCOM
+         DROP  R15
+         LA    R1,A1                   parm list addr
+         LR    R0,R11                  point to ENVBLOCK
+         BALR  R14,R15                 Call IRXEXCOM
+         ST    R15,SAVERC              save return code
+         L     R14,SAVER14             restore return address
+         BR    R14
+*=====================================================================
+*  Constants:
+*---------------------------------------------------------------------
+PARMEND  DC    8X'FF'
+#EXCOM   DC    C'IRXEXCOM'             REXX module name
+#EVDFLT  DC    F'250'                  Standard EVDATA max len
+#BLANKS  DC    CL44' '
+#GETBLK  DC    C'GETBLOCK'                  func for IRXRLT
+MVCDSN   MVC   DSNAME(0),0(R3)              move parm to DSNAME
+MVCMEM   MVC   MEMBER(0),0(R3)              move parm to MEMBER
+MVCVOL   MVC   VOLUME(0),0(R3)              move parm to VOLUME
+H12      DC    H'12'
+#PTAB    DC    C'PTAB'                 var   name
+#CTAB    DC    C'CTAB.'                array name
+#DTAB    DC    C'DTAB.'                array name
+#NTAB    DC    C'NTAB.'                array name
+VVLEN    EQU   20                      CTAB/NTAB/DTAB length
+* Error blocks:
+#NOMEM   DC    F'16'
+         DC    CL40'L_PGM: Error - no MEMBER passed        '
+#NODSN   DC    F'16'
+         DC    CL40'L_PGM: Error - no DSNAME passed        '
+#NOOPN   DC    F'16'
+         DC    CL40'L_PGM: Error - Cannot open data set    '
+#NORAM   DC    F'16'
+         DC    CL40'L_PGM: Error - REGION too small        '
+#NOLOD   DC    F'16'
+         DC    CL40'L_PGM: Error - $OPEN cannot be LOADed  '
+         LTORG
+*=====================================================================
+*  Mapping:
+*---------------------------------------------------------------------
+WRK      DSECT
+S        DS    18F
+S2       DS    18F
+WRKSAVE2 DS    4F
+VAL      DS    D
+D        DS    2D
+SAVERC   DS    F                       RC from IRXEXCOM
+SAVER14  DS    F
+RCESD    DS    F
+SHVBLK   DS    8F'0'                   IRXSHVB area
+RETC     DS    F
+DSNLEN   DS    F
+*- $PARM map for $OPEN:
+$PARM    DS    0F
+RC       DC    F'0'                    <Return Code
+DSNAME   DC    44C' '                  >Dataset Name
+MEMBER   DC    8C' '                   >PDS Member Name/blanks
+VOLUME   DC    6C' '                   >Volume Name/blanks
+RECLEN   DC    H'0'                    <Current Record Length
+TYPE     EQU   RECLEN
+DCBAD    DC    F'0'                   ><DCB Address
+BUFADDR  DC    F'0'                   ><Buffer Address
+LENGTH   DC    F'0'                    <Data Length in Buffer (bytes)
+RECADDR  DC    F'0'                    <Current Record Addr
+NUMLEN   EQU   *-RECLEN
+$PARMLEN EQU   *-DSNAME
+*- end of $PARM map
+*- Parm for IRXRLT:
+PA#1     DS    A                     > Addr of function
+PA#2     DS    A                      <Addr of A(new EVALBLOCK)
+PA#3     DS    A                     > Requested length of EVDATA,VL
+FUNC     DS    CL8                     =C'GETBLOCK'
+EVBADDR  DS    A
+EVDTLEN  DS    F
+*- end of parm for IRXRLT
+*- Parmlist for A31ESD:
+A$PARM   DS    A
+A$PTAB   DS    A
+*- Data area variables:
+DATALEN  DS    F                       length of data allocated
+DATADDR  DS    A                       addr of data allocated
+*- Rexx Function call parameter:
+*- R0 -> env block IRXENVB
+*- R1 -> following parameter list:
+A1       DS    A
+A2       DS    A
+A3       DS    A
+A4       DS    A
+A5       DS    A
+A6       DS    A
+* parameter values:
+P1       DS    CL8                     function requested
+P2       DS    A                       addr os data
+P3       DS    F                       length of data
+P4       DS    A                   IRXENVB optional, R0 is alternative
+P5       DS    A                       RC and VL bit
+* to create variables:
+VNAME    DS    CL12                    variable name
+CNAME    DS    CL12                    variable name
+DNAME    DS    CL12                    variable name
+C#       DS    H                       current CTAB #
+D#       DS    H                       current DTAB #
+N#       DS    H                       current NTAB #
+CNLEN    DS    F                       current name length
+DNLEN    DS    F                       current name length
+         DS    0F
+VVALUE   DS    CL36                    variable value
+CTABADDR DS    A
+MSGLEN   DS    H                       For WTP
+MESSAGE  DS    CL40                    For WTP
+WRKL     EQU   (*-WRK+7)/8*8           WORK AREA LENGTH
+*
+*---------------------------------------------------------------------*
+*        DSECTS                                                       *
+*---------------------------------------------------------------------*
+PTAB     DSECT
+         COPY  $PTAB
+CTAB     DSECT
+         COPY  $CTAB
+DTAB     DSECT
+         COPY  $DTAB
+NTAB     DSECT
+         COPY  $NTAB
+ERRBLK   DSECT
+ERRCODE  DS    F
+ERRMSG   DS    CL40
+ERRMSGL  EQU   *-ERRMSG
+*        PRINT NOGEN
+         YREGS
+* REXX specific DSECTs:
+         IRXEFPL DSECT=YES             REXX parameter list
+         IRXEVALB                      REXX evaluation block EVALBLOCK
+         IRXEXTE                       REXX vector of external ep
+         IRXENVB                       REXX environment block ENVBLOCK
+         IRXSHVB                       REXX shared variables block
+         END
+//*
+//LKED    EXEC PGM=HEWLKED,COND=(8,LE),
+//        PARM='TEST,RENT,REUS,CAL,MAP,AC=1,RMOD=ANY,AMOD=31'
+//SYSLIB   DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST       <== hlq.LOAD
+//SYSLMOD  DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST(IRXF@PGM) <=*.LOAD
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//*
+//* test changes, if any:
+//GO      EXEC PGM=IRXJCL,COND=(8,LE),
+//        PARM='MAPPGM SYS3.UTILITY.LOADLIB.TEST,IRXF@PGM,N'
+//* To get program data put library and program name to parm above
+//* Append option ,N to include details
+//SYSEXEC  DD DISP=SHR,DSN=SYS3.UTILITY.EXEC.SHARE         <== hlq.EXEC
+//STEPLIB  DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST       <== hlq.LOAD
+//SYSTSPRT DD  SYSOUT=*
+//SYSTSIN  DD  DUMMY
+//SYSUDUMP DD SYSOUT=*
+//ABNLIGNR DD DUMMY
+//

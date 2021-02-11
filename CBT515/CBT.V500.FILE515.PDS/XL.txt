@@ -1,0 +1,875 @@
+         MACRO
+&NAME    ISPLINK &OPRNDS,&RC=,&ERROR=
+         GBLB  &IHBSWA
+&IHBSWA  SETB  1                       VL=1
+&NAME    LA    R1,ISPLINK_PLIST        ; ISPLINK parm list
+         IHBOPLST ,&OPRNDS,MF=(E,(1))
+         L     R15,ISPLINK@            ; Address from load
+         BALR  R14,R15                 ; Invoke ISPLINK
+         AIF   (T'&RC EQ 'O').ERR
+         ST    R15,&RC                 ; Save retcode
+.ERR     ANOP
+         AIF   (T'&ERROR EQ 'O').MEND
+         LTR   R15,R15                 ; Set condition code
+         BNZ   &ERROR
+.MEND    MEND
+*
+XL          TITLE 'Produce a 3.4 list of datasets using LM* services'
+XL          AMODE 31
+XL          RMODE ANY
+*----------------------------------------------------------------------
+* Produce a 3.4 list of datasets using LM* services
+*
+* If there is an error from ISPF service, ISPF message will be
+* displayed.
+*
+*  This example does not use IKJ* parsing macros, just to show how
+*   to code without it. Also, since this program can be called as
+*   SELECT(PGM), there will not be a CPPL available. The same is
+*   true, I think, for the edit macro call.
+*
+*
+* Call format:
+*
+*              XL DSN(dataset_name_mask) VOL(xxxxxx)
+*     or
+*              XL dataset_name_mask
+*
+*  If arguments are not present, ISPF prefix is used as a dsn mask
+*  (only for TSO XL format).
+*  Order of arguments is not important.
+*  Unidentified data is ignored, if after the last argument.
+*===================================================================
+* This program can be called as follows:
+*
+*1). TSO CMD call.
+*
+*   TSO XL dataset_name
+*   TSO XL DSN(dataset_name)
+*   TSO XL DSN(dataset_name) VOL(volser)
+*   TSO XL VOL(volser)
+*
+*2). ISPF PGM call.
+*
+*   Set in the command table (ISR) -
+*     XL   0  SELECT SUSPEND PGM(XL) MODE(FSCR) PARM(&ZPARM)
+*   Call from the command line
+*   with parameters the same as in CMD call.
+*
+*3) ISPF and SDSF point and shoot.
+*
+*    Define the command table entry (ISR, ISF) as in 2).
+*    Set PFkey to XL.
+*    Position the cursor under dataset name and press PFkey
+*
+*4). ISPF edit macro.
+*
+*    Set pfkey to !XL, and:
+*    a) type args on the command line and press pfkey
+*          or
+*    b) position cursor under the dataset name and press pfkey.
+*
+*  This program attempts to resolve GDG relative generation number,
+*  like xxx.xxxxx(0) or (-1), etc. using LOCATE/CAMLST. if
+*  it is positive or otherwise considered incorrect, it is
+*  ignored, for example, for  XXXX.XXXXX(MMMM) - (MMMM) will be
+*  ignored and XXXX.XXXXX will be DSLIST'ed.
+*
+* 12/98 axb
+*----------------------------------------------------------------------
+XL       CSECT
+         USING XL,R15                ; Address program.
+         SAVE  (14,12),,XL.SSE.ALEX.BRODSKY.&SYSDATE.&SYSTIME
+         LR    R12,R15            ; Set program base.
+         DROP  R15
+         USING XL,R12,R11         ; Address program.
+         LA    R11,2048(R12)
+         LA    R11,2048(R11)
+         LA    R0,WORKLEN         ; Set length and
+         GETMAIN R,LV=(0)         ; ... get dynamic save area.
+         LA    R6,0(R1)
+         LA    R7,WORKLEN         ; Clear save area.
+         SR    R8,R8
+         SR    R9,R9
+         MVCL  R6,R8              ; Clear GETMAIN area.
+         ST    R1,8(R13)          ; Chain saveareas.
+         ST    R13,4(R1)          ; ...
+         LR    R13,R1             ; ...
+         USING WORKAREA,R13
+****     XC    RETCODE(4),RETCODE ; Set normal return code - 0
+         L     R1,4(,R13)         ; Get to the prev savearea
+         LM    R0,R1,20(R1)       ; Restore parm pointers
+         SPACE 3
+*
+* End of housekeeping statements.
+*
+START    DS    0H
+         USING @CSRPL,@CSRP   ; Dependent using
+         MVC   @CSREYE(4),=CL4'@CSR'
+         LR    R10,R1
+*----------------------------------------------------------------
+*  See if ISPF is active, get the prefix, if needed.
+*----------------------------------------------------------------
+*
+* Load the ISPLINK interface module address and save it.
+*
+         LOAD  EPLOC=@ISPLINK
+         ST    R0,ISPLINK@             ; Save ISPLINK address
+*
+         ISPLINK (@CONTROL,@ERRORS,@RETURN),RC=RETCODE,ERROR=EXIT
+*
+* Init misc areas.
+*
+         MVC   DSN(L'DSN),BLANKS       ; Prepare
+         MVC   VOL(L'VOL),BLANKS       ; ...
+         MVC   TSTGDG(8),=8C'0'        ; Init for GDG testing
+         MVC   TMPCOLSZ(4),=F'5'       ; Variable size
+         MVC   TMPLINESZ(4),=F'6'      ; Variable size
+         MVC   RELGDG(L'RELGDG),BLANKS ; Prepare
+*
+* determine if we are called as SELECT(PGM) or SELECT(CMD).
+*  - if SELECT(PGM), then R1 points to a buffer, 1st halfword
+*    is a size, the rest - parm. High order bit is set.
+*  - if SELECT(CMD), then R1 points to CPPL. High order bit not set.
+*
+*
+         ICM   R15,B'1111',0(R10) ; see if called as PGM
+         BNM   TSOCMD             ; No
+         LH    R4,0(,R15)         ; Parm size
+         LTR   R4,R4              ; Anything there?
+         BNZ   PGM                ; Yes, definitely PGM
+* Could be edit macro. Issue first macro cmd - ISREDIT MACRO (INARG)
+* if error try to get the data from the screen.
+*
+    ISPLINK (@ISREDIT,@ISREM1SZ,@ISREM1),ERROR=ATCURSORP
+*
+* Yes, it is an edit macro. See if there is an argument, and if
+*   so interpret just like PGM or CMD argument(s).
+*   if error, use default parm.
+*
+         OI    EDITMAC,L'EDITMAC        ; Set a flag
+         MVC   TMPWORD(4),=AL4(L'INARG) ; Target size
+*
+* Copy the variable from the pool to our work area
+    ISPLINK (@VCOPY,=C'(INARG)',TMPWORD,INARG,@MOVE),ERROR=DEFPARM
+         ICM   R4,B'1111',TMPWORD   ; Parm size?
+         BNP   ATCURSOR             ; Nothing there, see if at cursor
+         LA    R3,INARG             ; Parm address
+         B     JOIN_CMD_PGM         ; Join common processing
+*
+* We are not an edit macro. Let's try to get the data from the
+* ISPF (internally) maintained Logical Display Table.
+*
+ATCURSORP DS   0H
+         ICM   R15,B'1111',@CSRADDR ; Is routine available?
+         BZ    DEFPARM              ; No, did not LKED
+         LA    R1,@CSRP             ; Get the plist
+         BALR  R14,R15              ; will do
+         LTR   R15,R15              ; Any luck there?
+         BNZ   DEFPARM              ; Forget it.
+         B     JOIN_FROM_ATCURSORP  ; Try to get DSN this way.
+*
+* We were called as Edit macro, without arguments.
+*  See if we can get DSN from the cursor position.
+*
+ATCURSOR DS    0H
+*
+* Get the cursor position - line number and column number.
+*  ISREDIT (LINE,COL) = CURSOR
+*
+    ISPLINK (@ISREDIT,@ISRLCCSZ,@ISRLCC),ERROR=DEFPARM
+*
+* Get the LINE and COL. See if cursor was on command line.
+*   Will use it later to restore cursor position.
+*   Be carefull not to change the variables order.
+*
+    ISPLINK (@VCOPY,=C'(COL,LINE)',TMPCOLSZ,TMPCOL,@MOVE),ERROR=DEFPARM
+*   ISPLINK (@VCOPY,=C'(COL)',TMPCOLSZ,TMPCOL,@MOVE),ERROR=DEFPARM
+*   ISPLINK (@VCOPY,=C'(LINE)',TMPLINESZ,TMPLINE,@MOVE),ERROR=DEFPARM
+         PACK  DWORD,TMPCOL+2(3)    : convert from printable
+         CVB   R4,DWORD             ; Cursor position - column
+         ST    R4,CURPOSC           ; Save cursor position (col).
+         LTR   R4,R4                ; Cursor on command line?
+         BNZ   EDMAC01              ; No. continue.
+*
+* Set error message - Place cursor on DSN - and exit.
+*
+    ISPLINK (@VREPLACE,@ZEDSMSG,@ZEDSMSG1SZ,ZEDSMSG1),RC=RETCODE,ERROR=*
+               EXIT
+    ISPLINK (@VREPLACE,@ZEDLMSG,@ZEDLMSG1SZ,ZEDLMSG1),RC=RETCODE,ERROR=*
+               EXIT
+         MVC   ZERMSG(8),@ISRZ000 ; Set error message number
+         B     EXIT
+*
+* Cursor on the data line.
+*
+EDMAC01  DS    0H
+*
+* Get the data line under the cursor (only 255 bytes).
+*  ISREDIT (DATALINE) = LINE .ZCSR
+*
+    ISPLINK (@ISREDIT,@ISRDLCSZ,@ISRDLC),ERROR=DEFPARM
+*
+* Copy this variable into a buffer. Note that the size will be
+*   returned in DTLSZ variable.
+*
+         MVC   DTLSZ(4),=AL4(L'DATALINE) ; Work buffer size (256)
+  ISPLINK (@VCOPY,=C'(DATALINE)',DTLSZ,DATALINE,@MOVE),ERROR=DEFPARM
+JOIN_FROM_ATCURSORP DS 0H
+         BAL   R14,GETDSN      ; Attempt to find DSN on the data line
+         BZ    DEFPARM         ; ... and then use it.
+*
+* Set error message - Could not find DSN - and exit.
+*
+    ISPLINK (@VREPLACE,@ZEDSMSG,@ZEDSMSG2SZ,ZEDSMSG2),RC=RETCODE,ERROR=*
+               EXIT
+    ISPLINK (@VREPLACE,@ZEDLMSG,@ZEDLMSG2SZ,ZEDLMSG2),RC=RETCODE,ERROR=*
+               EXIT
+         MVC   ZERMSG(8),@ISRZ000 ; Set error message number
+         B     MACEXIT            ; Restore cursor position end exit
+*
+* We were called as SELECT(PGM)
+*
+PGM      DS    0H
+         LA    R3,2(,R15)         ; Parm address
+         B     JOIN_CMD_PGM       ; Join common processing
+*
+* We were called as SELECT(CMD) or TSO CMD
+*
+TSOCMD   DS    0H
+*
+* Get the parm from CPPL.
+*  if the parm is bad, DSN will be left blank.
+*
+*
+         USING CPPL,R10           ; Establish CPPL mapping
+         L     R2,CPPLCBUF        ; Command buffer
+*
+         LH    R4,0(R2)           ; Command buffer size
+         LH    R3,2(R2)           ; Offset to parms start
+         SH    R4,=H'4'           ; Subtract 2 halfwords size
+         SR    R4,R3              ; See what's left
+         BNP   DEFPARM            ; Not much...
+         LA    R3,4(R2,R3)        ; Position at parm start
+*
+* SELECT(PGM)
+* SELECT(CMD)
+* Edit macro
+*    all come here eventually
+*
+JOIN_CMD_PGM   DS 0H
+* Now the parm size is in R4.
+         CH    R4,=H'80'
+         BH    DEFPARM            ; Too much...
+         BAL   R14,PARSEPARM      ; Get the data supplied
+         DROP  R10
+DEFPARM  DS    0H
+*----------------------------------------------------------------
+*  Continue. Call VDEFINE service.
+*----------------------------------------------------------------
+VDEFINE  ISPLINK (@VDEFINE,@LISTIDV,LISTIDV,@CHAR,L8),RC=RETCODE
+         ISPLINK (@VDEFINE,@DSN,DSN,@CHAR,L44)
+         ISPLINK (@VDEFINE,@VOL,VOL,@CHAR,L6)
+         ISPLINK (@VDEFINE,@ZERRMSG,ZERMSG,@CHAR,L8)
+         ISPLINK (@VDEFINE,@ZPREFIX,ZPREFIX,@CHAR,L8)
+* If dsn not supplied, use prefix
+         CLI     DSN,C' '
+         BNE     LMDINIT
+* If volume is supplied and dsn is not, dont use prefix
+         CLI     VOL,C' '
+         BNE     LMDINIT
+         ISPLINK (@VGET,@ZPREFIX,@SHARED)
+         MVC     DSN(8),ZPREFIX
+*
+* In case of an error, error message will be set by the ISPF service
+*  and we will keep RC=0 to have the cursor restore process work.
+*  (I think it is back on the command line if rc<> 0).
+*
+LMDINIT  ISPLINK (@LMDINIT,@LISTIDV,DSN,VOL),ERROR=MACEXIT
+LMDDISP  ISPLINK (@LMDDISP,LISTIDV,@VOLUME,@YES)
+LMDFREE  ISPLINK (@LMDFREE,LISTIDV)
+*        B     EXIT0
+*
+*--------------------------------------------------------------------*
+*                    Exits
+*--------------------------------------------------------------------*
+MACEXIT  DS    0H                 ; Exit after edit macro.
+         TM    EDITMAC,L'EDITMAC  ; Were we called as a macro?
+         BNO   EXIT               ; No
+*
+* Restore cursor position before the call.
+*  We could've issued a more direct command CURSOR= linenum colnum
+*   but this looks neat.
+*
+    ISPLINK (@VREPLACE,=C'(COL,LINE)',TMPCOLSZ,TMPCOL)
+    ISPLINK (@ISREDIT,@ISRCRCSZ,@ISRCRC)   ; CURSOR=(LINE,COL)
+EXIT     DS    0H
+         CLI   ZERMSG,C' '        ; ??
+         BE    EXIT0
+         CLI   ZERMSG,X'00'       ; ??
+         BE    EXIT0
+         ISPLINK (@SETMSG,ZERMSG) ; Error message set by ISPF function
+EXIT0    DS    0H
+         ISPLINK (@VRESET)        ; Undo VDEFINE's
+         L     R15,RETCODE        ; Get return code.
+         LR    R1,R13             ; Address save area.
+         L     R13,4(,R13)        ; Address prev save area.
+         ST    R15,16(R13)        ; Set return code.
+         LA    R0,WORKLEN         ; Set length and
+         FREEMAIN R,A=(1),LV=(0)  ; ... free workarea.
+EXITX    DS    0H
+         RETURN (14,12)           ; Retcode already set
+         EJECT
+*--------------------------------------------------------------------*
+* Parse the parm supplied.
+*--------------------------------------------------------------------*
+PARSEPARM DS 0H
+         MVI   PARMFLAG,0         ; Prepare the flag
+***      LA    R3,4(R2,R3)        ; Position at parm start
+*----------------------------------------------------------------+
+         BCT   R4,*+10            ; Around instr                 ³
+         MVC   PARM(0),0(R3)      ; *** executed ***             ³
+         EX    R4,*-6             ; Copy the parm                ³
+*----------------------------------------------------------------+
+         TR    PARM(L'PARM),UPCASE ; xlate all to uppercase
+         LA    R3,PARM            ; Use uppercased parm from now...
+         LA    R5,0(R3,R4)        ; Last byte of parm
+*
+* See if dataset name only, no prefix
+*
+         CLC   0(L'PFXDSN,R3),PFXDSN    ; Correct DSN prefix?
+         BE    PARSEPARM_001      ; Yes
+         CLC   0(L'PFXVOL,R3),PFXVOL    ; Correct VOL prefix?
+         BE    PARSEPARM_001      ; Yes
+* Interpret this data as dataset name.
+*----------------------------------------------------------------+
+         B     *+10               ; Around instr                 ³
+         MVC   DSN(0),0(R3)       ; *** executed ***             ³
+         EX    R4,*-6             ; Copy the parm as dsn         ³
+*----------------------------------------------------------------+
+         B     PARSEPARM_OUT      ; ... and let ISPF figure it out
+PARSEPARM_001  DS  0H
+         BAL   R7,GETKWRD         ; Extract the keyword
+         BNZ   PARSEPARM_OUT
+         BAL   R7,GETNB           ; Next keyword parm
+         BNZ   PARSEPARM_OUT
+         BAL   R7,GETKWRD         ; Extract the keyword
+* The rest of command line is ignored
+PARSEPARM_OUT DS 0H
+          BR   R14
+****
+* Get the keyword from the keyword parm
+*   R3 - parm address
+*   R4 - parm size - 1
+****
+GETKWRD  DS    0H
+* first determine what is it that is being extracted and set
+* some related values
+         CLC   0(L'PFXDSN,R3),PFXDSN    ; Extracting DSN parm?
+         BE    GETKWRD_DSN      ; Yes
+         CLC   0(L'PFXVOL,R3),PFXVOL    ; Correct VOL prefix?
+         BE    GETKWRD_VOL        ; Yes
+GETKWRD_NOK DS 0H
+         CLI   *,X'93'            ; Set cc<>0
+         BR    R7                 ; out
+GETKWRD_OK DS 0H
+         CLI   *,X'95'            ; Set cc=0
+         BR    R7                 ; out
+* DSN(xxxx.xxx.xxx)
+GETKWRD_DSN   DS 0H
+         TM    PARMDSN,L'PARMDSN  ; Already extracted?
+         BO    GETKWRD_NOK        ; Yes
+         LA    R8,DSN             ; Point to DSN
+         L     R9,L44             ; ... and max size
+         L     R6,PFXDSNSZ        ; ... and prefix size
+         OI    PARMDSN,L'PARMDSN  ; Mark as already extracted
+         B     GETKWRD_001
+* VOL(xxxxxx)
+GETKWRD_VOL   DS 0H
+         TM    PARMVOL,L'PARMVOL  ; Already extracted?
+         BO    GETKWRD_NOK        ; Yes
+         LA    R8,VOL             ; Point to VOL
+         L     R9,L6              ; ... and max size
+         L     R6,PFXVOLSZ        ; ... and prefix size
+         OI    PARMVOL,L'PARMVOL  ; Mark as already extracted
+         B     GETKWRD_001
+** all values are set for kwrd extraction
+GETKWRD_001 DS 0H
+         AR    R3,R6              ; at the keyword value
+         SR    R4,R6              ; adjust size
+         BNP   GETKWRD_NOK        ; Not much there
+* Look for closing paren
+*---------------------------------------------------------------+
+         B     *+10               ; Around the instruction      ³
+         TRT   0(0,R3),CLBANANA   ; *** executed ***            ³
+         EX    R4,*-6             ; ...                         ³
+*---------------------------------------------------------------+
+         BZ    GETKWRD_NOK        ; Not there
+         LR    R2,R1              ; ")" address
+         SR    R2,R3              ; Keyword value size
+         BNP   GETKWRD_NOK        ; Not much there
+         CR    R2,R9              ; Too long for the approp value?
+         BH    GETKWRD_NOK        ; Yes
+*---------------------------------------------------------------+
+         BCT   R2,*+10                                          ³
+         MVC   0(0,R8),0(R3)      ; *** executed ***            ³
+         EX    R2,*-6             ; Copy approp value           ³
+*---------------------------------------------------------------+
+         CR    R1,R5              ; Anything else there?
+         BE    GETKWRD_NOK        ; No, we are done
+         LR    R4,R5              ; Compute new
+         SR    R4,R1              ; ... size
+         LTR   R4,R4              ; ???
+         BNP   GETKWRD_NOK        ; Ignore the rest, we are done
+         BCTR  R4,0               ; Size - 1
+         LA    R3,1(,R1)          ; Next byte after ")"
+         B     GETKWRD_OK         ; ... and leave s/routine
+GETNB    DS 0H
+* Look for first non-blank
+*---------------------------------------------------------------+
+         B     *+10               ; Around the instruction      ³
+         TRT   0(0,R3),NONBLANK   ; *** executed ***            ³
+         EX    R4,*-6             ; First non-blank             ³
+*---------------------------------------------------------------+
+         BZ    GETNB_NOK          ; Not there, ignore the rest
+         LR    R4,R5              ; Compute new
+         SR    R4,R1              ; ... size -1;
+         LTR   R4,R4              ; ???
+         BNP   GETNB_NOK          ; Ignore the rest, we are done
+         LR    R3,R1              ; reload new address
+         B     GETKWRD_OK         ; ... and leave s/routine
+GETNB_NOK DS 0H
+         CLI   *,X'93'            ; Set cc<>0
+         BR    R7                 ; out
+GETNB_OK DS 0H
+         CLI   *,X'95'            ; Set cc=0
+         BR    R7                 ; out
+         EJECT ,
+*--------------------------------------------------------------------*
+* GETDSN  - attempt to extract dsn from the file line under the
+*           cursor.
+*   CURPOSC  - cursor position.
+*   DATALINE - data line from the file (under the cursor)
+*   DTLSZ    - dataline size
+*
+*   Cursor must be under the dataset.
+*   This is how dataset name is isolated.
+*
+* 1. scan back from the cursor position for the first blank,
+*    open paren or start of the line; position on valid start char.
+*
+* 2. starting at (1), locate the first blank or end-of-line
+*
+* 3. Starting at (1), locate "(" - open paren
+*
+* 3.1.   "(" found.
+*
+*           Starting at (3.1), locate ")" - close paren
+*
+* 3.1.1.       ")" found
+*                  isolate word in parens. if numeric, process as GDG
+*                  if not - goto 4.
+*
+* 3.1.2        ")" not found.  goto 4.
+*
+* 3.2    "(" not found.  goto 4.
+*
+* 4.  Word starts at (1), ends at (3.1) - 1. Process as a dataset.
+*
+*
+*--------------------------------------------------------------------*
+GETDSN   DS   0H
+         STM  R14,R12,SAVE_GETDSN   ; Save registers
+*
+* Set up translation tables. Good chars first.
+*
+         MVI  GOODCHAR,C' '
+         MVC  GOODCHAR+1(255),GOODCHAR    ; Bad chars to blanks
+*033099  MVI  GOODCHAR+C'''',C''''        ; This is ok
+         MVI  GOODCHAR+C'.',C'.'          ; and this...
+         MVI  GOODCHAR+C'-',C'-'          ; and this...
+         MVI  GOODCHAR+C'(',C'('          ; and this...
+         MVI  GOODCHAR+C')',C')'          ; and this...
+         MVI  GOODCHAR+C'$',C'$'          ; and this...
+         MVC  GOODCHAR+C'#'(2),=C'#@'     ; This is ok too
+         MVC  GOODCHAR+C'a'(9),=C'ABCDEFGHI' ; Uppercase this guys
+         MVC  GOODCHAR+C'j'(9),=C'JKLMNOPQR' ; these too
+         MVC  GOODCHAR+C's'(8),=C'STUVWXYZ'  ; ...
+         MVC  GOODCHAR+C'A'(9),=C'ABCDEFGHI' ; Alpha
+         MVC  GOODCHAR+C'J'(9),=C'JKLMNOPQR' ; ...
+         MVC  GOODCHAR+C'S'(8),=C'STUVWXYZ'  ; ...
+         MVC  GOODCHAR+C'0'(10),=C'0123456789' ; Num
+*
+* Now translate all bad chars to blanks
+*
+         L    R3,DTLSZ         ; Line size
+         LA   R4,DATALINE      ; File line address
+         L    R5,CURPOSC       ; Cursor column
+         BCTR R5,0               ; Make it zero-based
+*----------------------------------------------------------------+
+         BCT  R3,*+10            ; Around executed instruction   ³
+         TR   0(0,R4),GOODCHAR   ; *** executed ***              ³
+         EX   R3,*-6             ; Get rid of undesirable chars  ³
+*----------------------------------------------------------------+
+         LA   R6,0(R4,R5)        ; Byte over the cursor position
+         CLI  0(R6),C' '         ; Any good stuff there?
+         BE   GETDSN_NOK         ; No, should be on valid char
+*
+* Scan back for the first blank or the line start, or open paren.
+*
+XLL001   DS   0H
+         CLI  0(R6),C' '         ; Are we there yet?
+         BE   XLL002             ; Yes
+         CLI  0(R6),C'('         ; Are we there yet?
+         BE   XLL002             ; Yes
+         BCTR R6,0               ; back off 1 byte
+         CR   R6,R4              ; At the beginning if the line?
+         BNL  XLL001             ; No
+XLL002   LA   R6,1(,R6)          ; Now under the 1st nonblank
+*
+* R6 is now the address of first non-blank char of (maybe) dsn.
+*  Let's try to locate the first blank.
+*
+         LA   R7,0(R4,R3)        ; Last byte of the line
+         SR   R7,R6              ; Size - 1 from non-blank up
+         LTR  R7,R7
+         BNP  GETDSN_NOK
+*----------------------------------------------------------------+
+         B    *+10               ; Around executed instruction   ³
+         TRT  0(0,R6),YESBLANK   ; *** executed ***              ³
+         EX   R7,*-6             ; Go look for the blank         ³
+*----------------------------------------------------------------+
+         BZ   XLL003             ; CC=0 blank not found
+         LR   R7,R1              ; Blank address
+         SR   R7,R6              ; String size - 1.
+         BCTR R7,0               ; ...
+*
+* R6 - start of (maybe) dsn
+* R7 - size - 1
+*
+XLL003   DS   0H
+         LA   R4,0(R6,R7)        ; Last byte address
+* Look for opening paren
+XLL105   DS   0H
+*---------------------------------------------------------------+
+         B     *+10               ; Around the instruction      ³
+         TRT   0(0,R6),OPBANANA   ; *** executed ***            ³
+         EX    R7,*-6             ; ... See if there            ³
+*---------------------------------------------------------------+
+         BZ    GETDSN_MOVE        ; No.  LMM* will decide.
+*
+*-- "(" located.
+*        isolate word in parens. if too big or null, ignore it
+*        and move stuff before the "(" as dsn.
+*
+         LR    R2,R1              ; Save R1 for the future
+         LR    R5,R7              ; save the size
+         LA    R3,1(,R2)          ; Byte after (
+         CLI   0(R3),C'('         ; This is not good
+         BE    GETDSN_MOVE_1      ; Unbalanced parens
+         CLI   0(R3),C')'         ; Anything inside parens?
+         BE    GETDSN_MOVE_1      ; No, reject this stuff
+* R4 is still last byte address - )
+         SR    R4,R3              ; Size of member or GDG
+         LTR   R4,R4              ; One more time, just in case...
+         BNP   GETDSN_MOVE_1      ; ...
+         C     R4,=F'8'           ; Cannot be more than 8 bytes long
+         BH    GETDSN_MOVE_1      ; Too big.
+* See if we've got the relative generation number. "+" is possible,
+* but is kind of useless since it is not created yet...
+* therefore, it is translated to blanks in the beginning of GETDSN
+         CLC   0(3,R2),=C'(0)'    ; Current generation?
+         BE    GDG002             ; Yes, call LOCATE.
+         CLI   0(R3),C'-'         ; Possibly GDG?
+         BNE   MEMBER_NAME        ; No, could be a member name
+         BCTR  R4,0               ; Size - 1;
+*
+* R4 - size -1; r3 - first byte address of GDG/member name.
+*  but we know that the first byte of it is "-"
+GDG001   DS    0H
+*---------------------------------------------------------------+
+         BCT   R4,*+10            ; Around executed instruction ³
+         MVZ   TSTGDG(0),1(R3)    ; *** executed ***            ³
+         EX    R4,*-6             ; See if numeric              ³
+*---------------------------------------------------------------+
+* TSTGDG must be 8C'0' for the thing inside parens to be numeric.
+GDG002   DS    0H
+         CLC   TSTGDG(8),=8C'0'   ; All digits were numeric?
+         BNE   GETDSN_NOK         ; No, fail this
+*
+* We are reasonably certain that we've got a GDG specification
+* Let's try to get the real dataset name out of a catalog.
+* Again, R6 - first byte address, R7 - size-1.
+* I think that GDG name cannot be more that 44 bytes.
+*
+         C     R7,=F'43'           ; Too big?
+         BH    GETDSN_NOK          ; Yes, fail this
+*
+* Prepare for LOCATE macro
+*  Init the CAMLST in work area
+*  fill up the DSN, that will be expanded
+*  Fill up CAMLST in work area.
+*
+*---------------------------------------------------------------+
+         B     *+10               ; Around executed instruction ³
+         MVC   RELGDG(0),0(R6)    ; *** executed ***            ³
+         EX    R7,*-6             ; Copy to work area           ³
+*---------------------------------------------------------------+
+         MVC   EXPAND_GDG(LMODEL_GDG),MODEL_GDG ; CAMLST
+         MVI   LOCAREA,0           ; dont care about this
+         LA    R0,RELGDG           ; Input/output dsn
+         ST    R0,EXPAND_GDG+4     ; Save in plist
+         LA    R0,LOCAREA          ; Work area address
+         ST    R0,EXPAND_GDG+12    ; Save in plist
+         LOCATE EXPAND_GDG         ; see if we can do it.
+         LTR   R15,R15            ; Success?
+         BNZ   GETDSN_NOK         ; Forget it
+         MVC   DSN(L'RELGDG),RELGDG  ; Copy full gdg name
+         B     GETDSN_OK          ; Leave with full dsn name
+*
+GETDSN_MOVE_1 EQU  MEMBER_NAME
+*+* for now we can assume that this is a member name.
+*+* We will ignore it, move what we think is a dataset name to
+*+* DSN and get out.
+*+* R2 is a ( address, R6 - start of dsn address
+MEMBER_NAME DS 0H
+         SR    R2,R6              ; Size of data in question
+*---------------------------------------------------------------+
+         BCT   R2,*+10            ; Around executed instruction ³
+         MVC   DSN(0),0(R6)       ; *** executed ***            ³
+         EX    R2,*-6             ; Copy the dataset name       ³
+*---------------------------------------------------------------+
+         B     GETDSN_OK          ; ...and leave
+*
+* When we decided that DSN is close to be correct, move it to the
+*  DSN buffer and leave
+*
+GETDSN_MOVE DS 0H
+*------------------------------------------------------------------+
+         B    *+10                  ; Around executed instruction  ³
+         MVC  DSN(0),0(R6)          ; *** executed ***             ³
+         EX   R7,*-6                ; Copy the DSN                 ³
+*------------------------------------------------------------------+
+         B    GETDSN_OK             ; And leave this code
+*
+* Exit from GETDSN s/routine.
+*
+GETDSN_NOK CLI   *,X'93'            ; Set cc<>0
+         B     GETDSN_OUT           ; out
+GETDSN_OK  DS   0H
+* delete possible trailing ")"
+         MVI  GOODCHAR+C'(',C' '    ; blank both out
+         MVI  GOODCHAR+C')',C' '    ; ...
+         TR   DSN(L'DSN),GOODCHAR   ; and get rid of them
+         CLI   *,X'95'              ; Set cc=0
+GETDSN_OUT LM   R14,R12,SAVE_GETDSN   ; Restore registers
+         BR    R14                  ; out
+*--------------------------------------------------------------------*
+*     Constants and work areas
+*--------------------------------------------------------------------*
+*
+         WXTRN @CSR
+@CSRADDR DC    V(@CSR)
+*
+L6       DC    F'6'               ; VOL variable size
+L8       DC    F'8'               ; LISTIDV size
+L44      DC    F'44'              ; DSN variable size
+*
+* ISPLINK stuff.
+*
+@ADDPOP  DC    CL8'ADDPOP'
+@CHAR    DC    CL8'CHAR'
+@CONTROL DC    CL8'CONTROL'
+@DSN     DC    CL8'DSN'             ; DSN variable name
+@ERRORS  DC    CL8'ERRORS'
+@ISPLINK DC    CL8'ISPLINK'
+*                        line   col
+@ISRCRC  DC    C'CURSOR=(LINE,COL)'   ; Restore cursor position
+@ISRDLC  DC    C'(DATALINE) = LINE .ZCSR' ; Get data line
+@ISREDIT DC    CL8'ISREDIT'         ; Service name
+@ISREM1  DC    C'MACRO (INARG)'  ; first macro command
+@ISRLCC  DC    C'(LINE,COL) = CURSOR' ; Get cursor position
+@ISRZ000 DC    CL8'ISRZ000'         ; Message id
+@LISTIDV DC    CL8'LISTIDV'
+@LMDDISP DC    CL8'LMDDISP'
+@LMDFREE DC    CL8'LMDFREE'
+@LMDINIT DC    CL8'LMDINIT'
+@MOVE    DC    CL8'MOVE'             ; for VCOPY
+@REMPOP  DC    CL8'REMPOP'
+@RETURN  DC    CL8'RETURN'
+@SETMSG  DC    CL8'SETMSG'
+@SHARED  DC    CL8'SHARED'
+@VCOPY   DC    CL8'VCOPY'
+@VDEFINE DC    CL8'VDEFINE'
+@VGET    DC    CL8'VGET'
+@VOL     DC    CL8'VOL'               ; VOL variable name
+@VOLUME  DC    CL8'VOLUME'
+@VREPLACE DC   CL8'VREPLACE'
+@VRESET  DC    CL8'VRESET'
+@YES     DC    CL8'YES'               ; confirm delete
+@ZEDSMSG  DC   CL8'ZEDSMSG'
+@ZEDLMSG  DC   CL8'ZEDLMSG'
+@ZERRMSG DC    CL8'ZERRMSG'
+@ZPREFIX DC    CL8'ZPREFIX'
+*
+* Model for the CAMLST. Copied to working storage.
+*
+MODEL_GDG CAMLST NAME,(8),,(9)
+LMODEL_GDG EQU *-MODEL_GDG
+         DS    0D
+UPCASE   DC    X'000102030440060708090A0B0C0D0E0F'  ; Translate table
+         DC    X'101112131415161718191A1B1C1D1E1F'  ; .for input parm
+         DC    X'202122232425262728292A2B2C2D2E2F'
+         DC    X'303132333435363738393A3B3C3D3E3F'
+         DC    X'404142434445464748494A4B4C4D4E4F'
+         DC    X'505152535455565758595A5B5C5D5E5F'
+         DC    X'606162636465666768696A6B6C6D6E6F'
+         DC    X'707172737475767778797A7B7C7D7E7F'
+         DC    X'80C1C2C3C4C5C6C7C8C98A8B8C8D8E8F'
+         DC    X'90D1D2D3D4D5D6D7D8D99A9B9C9D9E9F'
+         DC    X'A0A1E2E3E4E5E6E7E8E9AAABACADAEAF'
+         DC    X'B0B1B2B3B4B5B6B7B8B9BABBBCBDBEBF'
+         DC    X'C0C1C2C3C4C5C6C7C8C9CACBCCCDCECF'
+         DC    X'D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDF'
+         DC    X'E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF'
+         DC    X'F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF'
+*
+* Look for opening/closing paren TRT tables
+*
+OPBANANA DC    256X'00'
+         ORG   OPBANANA+C'('
+         DC    C'('
+         ORG   ,
+CLBANANA DC    256X'00'
+         ORG   CLBANANA+C')'
+         DC    C')'
+         ORG   ,
+*
+* Look for first blank   TRT table
+*
+YESBLANK DC    256X'00'
+         ORG   YESBLANK+C' '
+         DC    C' '
+         ORG   ,
+*
+* Look for the first non-blank TRT table
+*
+NONBLANK DC    256AL1(*-NONBLANK)    ; Fill it up
+         ORG   NONBLANK+C' '
+         DC    X'00'
+         ORG   ,
+*
+         DS    0F
+PFXDSNSZ DC    AL4(L'PFXDSN)       ; Size of PARM DSN pfx
+PFXVOLSZ DC    AL4(L'PFXVOL)       ; Size of PARM VOL pfx
+@ISRCRCSZ DC   AL4(L'@ISRCRC)  ; Size of restore cursor  command
+@ISRDLCSZ DC   AL4(L'@ISRDLC)  ; Size of get dataline    command
+@ISREM1SZ DC   AL4(L'@ISREM1)  ; Size of 1st command
+@ISRLCCSZ DC   AL4(L'@ISRLCC)  ; Size of cursor position command
+@ZEDSMSG1SZ DC AL4(L'ZEDSMSG1) ; Size of 1st short message
+@ZEDLMSG1SZ DC AL4(L'ZEDLMSG1) ; Size of 1st long  message
+@ZEDSMSG2SZ DC AL4(L'ZEDSMSG2) ; Size of 2nd short message
+@ZEDLMSG2SZ DC AL4(L'ZEDLMSG2) ; Size of 2nd long  message
+*
+PFXDSN   DC    CL4'DSN('           ; dsn(xxx.xxx.xxxxx)
+PFXVOL   DC    CL4'VOL('           ; vol(xxxxxx)
+BLANKS   DC    CL80' '             ; Handy
+ZEDSMSG1 DC    C'Place cursor on DSN'
+ZEDLMSG1 DC    C'Place cursor on DSN and rerun this command'
+ZEDSMSG2 DC    C'Could not locate DSN'
+ZEDLMSG2 DC    C'Could not find DSN on the file line under the cursor'
+*
+         DS    0D
+         LTORG
+*--------------------------------------------------------------------*
+*                    DSECTS
+*--------------------------------------------------------------------*
+*
+* Workarea dsect. R13 points to it.
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                ; Registers save area
+RETCODE  DS    F                  ; Return code
+SAVE_GETDSN DS 16F                ; Save area for GETDSN s/routine
+*
+* Data for LOCATE macro - expand GDG
+*
+*  EXPAND_GDG CAMLST NAME,RELGDG,,LOCAREA
+EXPAND_GDG CAMLST NAME,(8),,(9)
+RELGDG   DS    CL44' '            ; e.g. JUNK.JUNK(-3)
+LOCAREA  DS    0D
+         DS    265X'00'           ; Results
+*
+*
+ISPLINK_PLIST DS 10F              ; plist to call ISPLINK
+RC       DS    F                  ; Retcode after ISPLINK
+ISPLINK@ DS    F                  ; Address from load
+TMPWORD  DS    F                  ; Just a temp fullword
+DWORD    DS    D                  ; Dword for misc work
+@CSRP    DS    XL(L@CSRPL)'00'    ; Plist to call @CSR
+* DTLSZ    DS    F                  ; Dataline size for MACRO
+* CURPOSC  DS    F                  ; Cursor column
+* DATALINE DS    CL256' '           ; File data line for Edit macro.
+         SPACE 2
+INARG    DS    CL80' '            ; Input arg from edit macro
+         ORG   ,
+* Keep next 2 together, do not change order.
+TMPCOL   DS    XL5                ; Cursor position before the MACRO
+TMPLINE  DS    XL6                ; Line   position before the MACRO
+* Keep next 2 together, do not change order.
+TMPCOLSZ DS    F
+TMPLINESZ DS   F
+*
+TSTGDG   DS    CL8' '             ; For GDG testing
+*
+DSN      DS    CL56' '            ; Dataset name from parm
+VOL      DS    CL6' '             ; Volser from parm
+PARM     DS    CL80' '            ; Parm supplied by a caller
+LISTIDV  DS    CL8' '             ; Output from LMDINIT
+ZERMSG   DS    CL8' '             ; Error message ID variable
+ZPREFIX  DS    CL8' '             ; Another ISPF variable
+*
+PARMFLAG DS    XL1'00'            ; Parm parsing flag
+PARMDSN  EQU   PARMFLAG,X'80'     ; DSN extracted
+PARMVOL  EQU   PARMFLAG,X'40'     ; Vol extracted
+DSNQ     EQU   PARMFLAG,X'20'     ; DSN in the file, in quotes
+EDITMAC  EQU   PARMFLAG,X'10'     ; Edit macro
+*
+* Translate tables for the dataset name isolation
+*
+GOODCHAR DS    XL256'00'
+         DS    0D
+WORKLEN  EQU   *-WORKAREA
+*--------------------------------------------------------------------*
+         PRINT ON
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12   BASE
+R13      EQU   13   WORKAREA BASE
+R14      EQU   14
+R15      EQU   15
+*
+* Map the call to @CSR
+*
+@CSRPL   DSECT
+@CSREYE  DS    CL4'@CSR'
+DTLSZ    DS    F                  ; Dataline size for MACRO
+CURPOSC  DS    F                  ; Cursor column
+DATALINE DS    CL256' '           ; File data line for Edit macro.
+L@CSRPL  EQU   *-@CSRPL           ; Plist size
+*--------------------------------------------------------------------*
+* MACROS.
+*--------------------------------------------------------------------*
+         IKJCPPL                              COMMAND PROCESSOR LIST
+*
+         END

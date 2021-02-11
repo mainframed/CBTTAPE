@@ -1,0 +1,280 @@
+RECVRCPY TITLE 'RECEIVE INMCOPY'
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do:
+*----------------------------------------------------------------------
+         U#SET FUNC=RECV
+*----------------------------------------------------------------------
+* Function: Internal implementation of INMCOPY utility
+*
+*           Copy XMIT data blocks to the specified DDNAME
+*
+*           If the TERM flag is set, the data following the
+*           INMR03 represents a message file, in which case
+*           the message file will be echoed to the LOG
+*           rather than being written to DDNAME.
+*
+* Entry:  S/370 ECMODE KEY=8, STATE=PROB, AUTHORIZED
+*
+*         R0  = CL8'ddname' (output file)
+*         R1  = address of CS2 representing INMCOPY
+*
+* Exit:   R15 = return code
+*
+*         00   success
+*              R1 = 0
+*
+*         04   control segment returned (everything else OK)
+*              R1  = address of control segment
+*
+* Abends: yes
+*
+* Diagnostics:
+*         1  -  entry/exit; show exit rc
+*         2  -  CS2 at entry, DCB (open/close), RECVBLK nonzero rc
+*         3  -  show returned data block
+*
+* Notes:  A few words about INMR02s, from which our CS2 was built:
+*         IBM doc, at least at the OS/390 2.8 level I checked, states:
+*
+*             The text units that are in the INMR02 record describe
+*             the output of the utility operation.
+*
+*         This is slightly misleading, at least from what I've
+*         seen in XMIT files.  The INMR02 represents the INPUT
+*         to a utility at TRANSMIT time; at RECEIVE time, it
+*         represents the OUTPUT of a utility.
+*
+*         In addition, the RECFM field (which has an intrinsic DCB
+*         length of one byte) is represented in the INMR02
+*         as two bytes, with the actual RECFM value at the
+*         beginning of the value string.  Everywhere else (that
+*         I've noticed), values which are represented in the INMR02s
+*         with lengths larger than their intrinsic lengths are
+*         right justified; RECFM is the exception.
+*         I've no idea what the 2nd RECFM byte represents.
+*----------------------------------------------------------------------
+* R2
+* R3     DCB
+* R4
+* R5
+* R6
+* R7     scratch
+* R8     buffer addr
+* R9     buffer length
+* R10    CS2
+*----------------------------------------------------------------------
+ERR#1    EQU   1        R0 = 0 at entry
+ERR#2    EQU   2        R1 = 0 at entry
+ERR#3    EQU   3        BLKSIZE not specified in CS2
+ERR#4    EQU   4        LRECL   not specified in CS2
+ERR#5    EQU   5        DCB failed to OPEN
+ERR#6    EQU   6        read error
+         TITLE ' '
+*----------------------------------------------------------------------
+RECVRCPY UPROC L=L$SA,ID=RCPY,WA=SAVEAREA
+*----------------------------------------------------------------------
+*  Initialize
+*----------------------------------------------------------------------
+INIT     DS    0H
+         MVI   SAREASON,ERR#1               DDname parm = 0
+         LTR   R15,R0
+         BZ    DIE
+         MVI   SAREASON,ERR#2               CS2 parm = 0
+         LTR   R10,R1                       save CS2
+         BZ    DIE
+         MVC   SADDNAME,0(R15)              save DDNAME
+*
+         USING CS2,R10
+         UDIAG 1,'RCPY enter'
+         UDIAG 2,'RCPY INMCOPY CS2 at entry',(R10),L$CS2
+         LA    R14,L$CS2
+         SR    R10,R14
+         UDIAG 2,'RCPY IEBCOPY CS2 at entry',(R10),L$CS2
+         LA    R14,L$CS2
+         AR    R10,R14
+         EJECT ,
+*----------------------------------------------------------------------
+*  Open output DDNAME
+*----------------------------------------------------------------------
+CKDCB    DS    0H
+         LA    R3,SADCB
+         USING IHADCB,R3
+         MVC   SADCB(L$DCB),MODLDCB         copy model DCB macro
+         MVC   SAOPN(L$OPN),MODLOPN         copy model OPEN macro
+         MVC   DCBDDNAM,SADDNAME            overlay DDNAME
+*
+         MVC   DCBDSORG,CS2DSORG+2          overlay DSORG
+         MVC   DCBRECFM,CS2RECFM+2          overlay RECFM
+         MVI   SAREASON,ERR#3               BLKSIZE not specified
+         ICM   R0,15,CS2BLKSZ               have BLKSIZE spec'd?
+         BZ    DIE
+         STCM  R0,3,DCBBLKSI                overlay BLKSIZE
+         MVI   SAREASON,ERR#4               LRECL not specified
+         ICM   R0,15,CS2LRECL               have LRECL spec'd?
+         BZ    DIE
+         STCM  R0,3,DCBLRECL                overlay BLKSIZE
+*
+         UDIAG 2,'RCPY pre open DCB',(R3),L$DCB
+         OPEN  ((R3),OUTPUT),MF=(E,SAOPN)
+         TM    DCBOFLG1,DCBOFOPN            opened?
+         BO    DCBOPEN
+*
+         UDIAG 0,'RECVRCPY DCB open error',(R3),L$DCB
+         MVI   SAREASON,ERR#5               DCB didn't open
+UABEND   UABEND SAREASON                    ABEND w/ diagnostic msgs
+*
+DIE      STM   R0,R15,RCVREGS
+         UDIAG 0,'RECVRCPY pre-ABEND regs',RCVREGS,16*4
+         B     UABEND
+*
+DCBOPEN  DS    0H
+*----------------------------------------------------------------------
+*  Allocate buffer
+*----------------------------------------------------------------------
+BUFALLOC DS    0H
+         L     R0,=A(32*1024)          max QSAM blocksize
+         ST    R0,SALBUF
+         GETMAIN R,LV=(0)              allocate buffer
+         ST    R1,SA@BUF
+         EJECT ,
+*----------------------------------------------------------------------
+*  Retrieve data block
+*----------------------------------------------------------------------
+GETBLOCK DS    0H
+         LA    R14,4                   L'RDW
+         LM    R0,R1,SAXBUF            R0=BUFL, R1@BUF
+         LA    R1,0(R14,R1)            reserve RDW space
+         SR    R0,R14
+         UCALL RECVBLK,ERR=READCTL     retrieve data block
+         LTR   R8,R1                   @ buffer
+         BZ    READERR
+         LTR   R9,R0                   length of block or 0 (no data)
+         BNZ   WRITE
+*
+READCTL  DS    0H
+         ST    R1,SACTL                save ctl seg addr
+         ST    R15,SARC                save RECVBLK rc
+         UPSR  2,'RCPY RECVBLK rc',(R15)
+         OI    SAFLG1,SA1CTL           control segment returned
+         B     CLOSE
+*
+READERR  DS    0H
+         UDIAG 0,'RECVRCPY XMIT read error',RCVREGS,16*4,REGS=YES
+         UDIAG 0,'RECVRCPY DCB',(R3),L$DCB
+         MVI   SAREASON,ERR#6               read error
+         B     UABEND
+         EJECT ,
+*----------------------------------------------------------------------
+*  Write data block
+*----------------------------------------------------------------------
+WRITE    DS    0H
+         TM    DCBRECFM,DCBRECU        RECFM=U?
+         BO    WRITEU
+         LH    R7,DCBLRECL             LRECL
+         TM    DCBRECFM,DCBRECF        RECFM=F?
+         BO    WRITEF
+WRITEV   L     R8,SA@BUF               RECFM=V; @ RDW space
+         LA    R9,4(,R9)               add RDW overhead
+         STH   R9,0(,R8)               create RDW
+         UPSR  3,'RCPY PUT-V data block RDW length',(R9)
+WRITEU   DS    0H
+         UDIAG 3,'RCPY PUT data block',(R8),(R9)
+         PUT   (R3),(R8)               write IEBCOPY unload rec
+         B     GETBLOCK
+*
+WRITEF   DS    0H
+         UDIAG 3,'RCPY PUT-F data block',(R8),(R9)
+         PUT   (R3),(R8)               write IEBCOPY unload rec
+         AR    R8,R7                   @ next fixed length record
+         SR    R9,R7                   remaining size of buffer
+         BP    WRITEF                  write rest of recs in block
+         B     GETBLOCK
+         EJECT ,
+*----------------------------------------------------------------------
+*  Close output
+*----------------------------------------------------------------------
+CLOSE    DS    0H
+         UDIAG 2,'RCPY closing DCB',(R3),L$DCB
+         MVC   SACLOS(L$CLOS),MODLCLOS      copy model CLOSE macro
+         CLOSE ((R3),),MF=(E,SACLOS)
+*----------------------------------------------------------------------
+*  Free buffer
+*----------------------------------------------------------------------
+FREEBUF  DS    0H
+         LM    R0,R1,SAXBUF
+         LTR   R0,R0
+         BZ    NOFREE
+         FREEMAIN R,LV=(0),A=(1)            free output buffer
+NOFREE   DS    0H
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+EXIT     DS    0H
+         L     R2,SARC
+         UPSR  1,'RCPY exit rc',(R2)
+         L     R1,SACTL
+         UPEND RC=(R2),R1=PASS              return R1, R15
+         EJECT ,
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+MODLOPN  OPEN  (,),MF=L                model OPEN
+L$OPN    EQU   *-MODLOPN               l' model open
+*
+MODLCLOS CLOSE (,),MF=L                model CLOSE
+L$CLOS   EQU   *-MODLCLOS              l' model close
+*
+MODLDCB  DCB   DDNAME=IEBUT1,                                          +
+               MACRF=PM,                                               +
+               DSORG=PS,                                               +
+               LRECL=0
+L$DCB    EQU   *-MODLDCB
+         LTORG ,
+*        EJECT ,
+*----------------------------------------------------------------------
+*  Savearea/workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F                     savearea for anyone we call
+*
+SAFLG1   DS    X
+SA1CTL   EQU   128                     have control segment
+*
+SAREASON DS    X                       UABEND reason code
+*
+SARC     DS    F                       our return code
+SADDNAME DS    CL8                     output DDNAME
+*
+SACTL    DS    F                       @ control segment
+*
+SAXBUF   DS    0F
+SALBUF   DS    F                       output buffer length
+SA@BUF   DS    A                       output buffer address
+*
+SAOPN    OPEN  (,),MF=L
+SACLOS   OPEN  (,),MF=L
+SADCB    DCB   DDNAME=IEBUT1,                                          +
+               MACRF=PM,                                               +
+               DSORG=PS
+*
+         DS    0D
+L$SA     EQU   *-SAVEAREA
+*
+         EJECT ,
+         DRCS2 ,
+*
+         PUSH  PRINT
+         PRINT NOGEN
+*
+         WARECV ,
+*
+         DCBD  DSORG=PS,DEVD=DA
+*
+         POP   PRINT
+*
+         PRINT GEN
+RECVRCPY UFINI DXDRCPY,L$SA            pseudo-register
+         END   ,

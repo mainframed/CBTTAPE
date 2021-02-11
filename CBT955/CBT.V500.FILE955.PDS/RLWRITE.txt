@@ -1,0 +1,413 @@
+*---------------------------------------------------------------------*
+* RMTLOG  - MVS Remote Syslog Facility.                               *
+*---------------------------------------------------------------------*
+* This version does synchronous socket operations.                    *
+*---------------------------------------------------------------------*
+* RLWRITE - Write a record to a remote syslog server.                 *
+*---------------------------------------------------------------------*
+* Entry:                                                              *
+*   R11 - Points to common area.                                      *
+*   R1  - Points to parameter list.                                   *
+*   +0  - Pointer to data to write.                                   *
+*   +4  - Pointer to length of data.                                  *
+*  F+4  - Pointer to length of data.                                  *
+*---------------------------------------------------------------------*
+* Record format - Time option 1 (Use system time)                     *
+* <039>May 25 22:12:12 Hostname :Hi there world...                    *
+*---------------------------------------------------------------------*
+* 01/28/2011 - John Miller - Changed code so that 2 character PRI     *
+* values will not cause a space in the PRI field.  e.g. if  "PRI 35": *
+* Old code: <35 >May 25 22:12:12 Hostname :Hi there world...          *
+* New code: <35>May 25 22:12:12 Hostname :Hi there world...           *
+* This was done to accomodate syslog servers that don't like leading  *
+* zeros in the PRI value, and to remove embedded spaces from the PRI  *
+* value which does not technically conform to RFC5424.                *
+* Changed code is tagged with: @JCM1                                  *
+*---------------------------------------------------------------------*
+* 06/10/2010 John C. Miller                                           *
+*---------------------------------------------------------------------*
+*
+*=====================================================================*
+* RMTLOG Remote logging program copyright 2010-2017 John C. Miller.   *
+*---------------------------------------------------------------------*
+* This program is free software: you can redistribute it and/or       *
+* modify it under the terms of the GNU General Public License as      *
+* published by the Free Software Foundation, either version 3 of      *
+* the License, or (at your option) any later version.                 *
+*                                                                     *
+* This program is distributed in the hope that it will be useful,     *
+* but WITHOUT ANY WARRANTY; without even the implied warranty of      *
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the       *
+* GNU General Public License in member $GPL for more details.         *
+*---------------------------------------------------------------------*
+         GBLB  &NODEBUG
+&NODEBUG SETB  0
+*
+RLWRITE  CSECT
+RLWRITE  AMODE ANY
+RLWRITE  RMODE ANY
+         PRINT GEN,DATA
+         YREGS                     Do register equates.
+*---------------------------------------------------------------------*
+* Prolog - Get private and common storage areas and set up.
+*---------------------------------------------------------------------*
+         BAKR  R14,0                Save caller env.
+         LAE   R12,0(R15)           Load base reg.
+         USING RLWRITE,R12          Addressability.
+         LR    R2,R1                Save R1 contents.
+         STORAGE OBTAIN,LENGTH=DYNL Obtain private work area.
+         LR    R13,R1               Get workarea addr in reg.
+         USING DATD,R13             DSECT addressability.
+         MVC   4(4,R13),=C'F1SA'    Indicate Fmt1 save area.
+         USING RLCOMM,R11           Common area addressability.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* R1SAVE contains the contents of R1 when the parent program got cntl.*
+* We need this R1 because it points to the CPPL if one exists (i.e.   *
+* we are running under TSO.).  This allows us to use PUTLINEs.        *
+* We use R2 to save R1 as passed to this program, which points        *
+* to our parameter list as per standard call linkage.                 *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         L     R1,R1SAVE            Get saved R1 contents for CPPL.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Check the FLAG for partial write needed.  If so then do it.         *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         TM    FLAG,FPARTWRT       Get third passed parm.
+         BO    REWRITE             Yes, go do it.
+*---------------------------------------------------------------------*
+* @WRITE - Set up syslogd buffer and write it.                        *
+*---------------------------------------------------------------------*
+* TIME - Get local system time, and plug it into the SYSLOG message.  *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* 0        4        8 9 A B  12                                       *
+* 08040498 12260000 05062010 00000000                                 *
+*---------------------------------------------------------------------*
+@WRITE   DS    0H
+*
+* Use MVCL to set buffer to blanks.
+*
+         LA    R6,@@HEADER         Target of move.
+         LA    R7,@LENALL          Length of move.
+         SR    R4,R4               Dummy source for MVCL.
+         SR    R5,R5               Clear reg.
+         ICM   R5,B'1000',=X'40'   Pad character.
+         MVCL  R6,R4               Clear entire msg buffer.
+         LA    R4,@MESSAGE         -> message buffer.
+*
+* Copy HOSTNAME to data buffer if it was hardcoded.  If not hardcoded,
+* then copy the hostname that was retrieved by gethostname.
+* HOSTNM & HOSTNML are the hard coded hostname/length.
+* HOSTNAM & HOSTNAML are the looked up hostname/length.
+* R9 contains the running length of the message to be sent.
+*
+         ICM   R9,B'1111',HOSTNML  Get len of hardcoded host name.
+         BZ    HOSTNM2             Zero len, so check next hostname.
+*        TPUT  =CL50'HOSTNM:',50
+         MVC   0(8,R4),HOSTNM      Move hard coded host name.
+         B     HOSTNMMV            Go move it.
+HOSTNM2  DS    0H
+         ICM   R9,B'1111',HOSTNAML Get lenght of looked up hostname.
+         BZ    NOHSTNAM            Zero means no host name to use.
+         MVC   0(8,R4),HOSTNAM     Move looked up host name.
+HOSTNMMV DS    0H
+         ICM   R3,B'0011',=C' :'   Get delimiter chars in register.
+         STH   R3,0(R4,R9)         Store delimiters past host name.
+         LA    R9,2(R9)            Point past delimiters, and
+         AR    R4,R9               ... point past hostname.
+NOHSTNAM DS    0H
+*
+* Copy caller's data to our header and msg buffer.
+*
+         L     R6,0(R2)            -> caller's data.
+         L     R5,4(R2)            Load -> length.
+         L     R5,0(R5)            Load length.
+         LR    R7,R5               Load length.
+         MVCL  R4,R6               Move message to our buffer.
+*
+* Update R4 to point to end of the data.
+*
+         L     R5,4(R2)            Load -> length.
+         L     R5,0(R5)            Load length.
+         AR    R9,R5               Length to end of data.
+*
+* For TCP connections only, add a CR/LF to the end of the data.
+* UDP connections don't need it.  Insert CR/LF characters x'0D25'
+* into our buffer after msg text.
+*
+         CLC   =C'UDP',PROTO       UDP?
+         BE    UDPNOCR             Yes, branch around crlf code.
+         LH    R3,=X'0D25'         Get CR/LF in EBCDIC.
+         STH   R3,@MESSAGE(R9)     Put CR/LF at end of message.
+         LA    R9,2(R9)            Point past delimiters.
+UDPNOCR  DS    0H
+         LA    R9,@HEADRLN(R9)     Add length of header.
+         ST    R9,BUFFERL          Store len of hrd+msg.
+*
+* @@@ copy PRI value from PARMS.
+*
+         MVC   @PRI,PRI            Copy PRI from PARMS.
+
+*
+* Populate time and date.  Use TIMESRC parm to decide whether to use:
+* MESSAGE - Time embedded in the MVS MDB;
+* SYSTEM  - Use system time.
+*
+*---------------------------------------------------------------------*
+* TIME - Get local system time, and plug it into the SYSLOG message.  *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* 0        4        8 9 A B  12                                       *
+* 08040498 12260000 05062010 00000000                                 *
+* hhmmsshh          mmddyyyy 00000000                                 *
+* 00.43.24 TIMEMDB                                                    *
+* 01234567 TIMEMDB                                                    *
+* 2010155  DATEMDB                                                    *
+*---------------------------------------------------------------------*
+         CLC   TIMESRC,=CL8'SYSTEM' Use time stamp from system clock?
+         BE    SYSTIME             Yes, go use it.
+         CLC   TIMEMDB,=CL8' '     Bad MDB time?
+         BE    SYSTIME             Yes, use system time.
+         MVC   @TIME(8),TIMEMDB    Move time.
+         MVI   @TIME+2,C':'        Move :
+         MVI   @TIME+5,C':'        Move :
+         MVI   @TIME+8,C' '        Move blank.
+         CALL  JULIAN,(DATEMDB,=X'50',JANDATE),MF=(E,PARMLIST)
+         MVC   @MON,JANDATE        Move text month.
+         MVC   @DAY,JANDATE+4      Move 2 digit day.
+         CLI   @DAY,C'0'           Leading '0'?
+         BNE   NOLDZER             No, leave it.
+         MVI   @DAY,C' '           Make it a space per RFC 3164.
+NOLDZER  DS    0H
+         B     TIMECONT            Continue formatting time and date.
+SYSTIME  DS    0H
+         TIME  DEC,TIMEDATE,ZONE=LT,LINKAGE=SYSTEM,DATETYPE=MMDDYYYY
+         SR    R6,R6               Clear reg.
+         LH    R6,TIMEDATE+10      Load halfword containing year.
+         SLL   R6,4                Shift left to make room for sign.
+         O     R6,=X'0000000C'     Make positive sign.
+         ST    R6,DWORK+4          Store packed decimal in work area.
+         UNPK  WRK,DWORK+4(4)      Unpack it.
+         OI    WRK+7,X'F0'         Fix the sign.
+         MVI   @YEAR,C'-'          Add a dash.
+         MVC   @YEAR+1(4),WRK+4    Put year in message header.
+         MVI   @YEAR+5,C'-'        Add a dash.
+* Set text version of month.
+         SR    R6,R6               Clear reg.
+         IC    R6,TIMEDATE+8       Get month byte.
+         S     R6,=F'1'            Back up one.
+         CH    R6,=H'0'            Too low for a month?
+         BL    @MONBAD             Check for month too high.
+         CH    R6,=H'11'           Month too high?
+         BNH   @MONOK              No, continue on.
+@MONBAD  DS    0H
+         LA    R6,0                Bad month, so hard code Jan.
+@MONOK   DS    0H
+         SLL   R6,2                Mult. by 4 by shifting lft 2 bits.
+         LA    R5,@MONS            -> months table.
+         L     R4,0(R6,R5)         Get appropriate month.
+         STCM  R4,B'1111',@MON     Save month.
+* Set text version of day.
+         SR    R6,R6               Clear reg.
+         IC    R6,TIMEDATE+9       Get day byte in reg.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@DAY+1           Store right hand digit of day.
+         IC    R6,TIMEDATE+9       Get day byte in reg.
+         SRL   R6,4                Get left digit in lo order position.
+         LTR   R6,R6               Leading zero?
+         BZ    LEADZERO            Yes, don't store '0', leave blank.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@DAY             Store left hand digit of day.
+LEADZERO DS    0H
+*
+* Convert to zoned decimal: Hour
+         IC    R6,TIMEDATE         Get first byte.
+         SRL   R6,4                Get first nibble.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME            Store byte of time.
+         IC    R6,TIMEDATE         Get first byte/second nibble.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME+1          Store byte of time.
+         MVI   @TIME+2,C':'        Store literal ':'
+*
+* Convert to zoned decimal: Minute
+         IC    R6,TIMEDATE+1       Get 2nd byte.
+         SRL   R6,4                Get 1st nibble.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME+3          Store byte of time.
+         IC    R6,TIMEDATE+1       Get 2nd byte.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME+4          Store byte of time.
+         MVI   @TIME+5,C':'
+*
+* Convert to zoned decimal: Seconds
+         IC    R6,TIMEDATE+2       Get 3rd byte.
+         SRL   R6,4                Get 1st nibble.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME+6          Store byte of time.
+         IC    R6,TIMEDATE+2       Get 2nd byte.
+         O     R6,=X'000000F0'     Set zone for numeric.
+         STC   R6,@TIME+7          Store byte.
+TIMECONT DS    0H
+*        TPUT  @@HEADER,70
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* @@JCM1 - Fix PRI field to remove blanks.                            *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Make some checks and adjustments for the PRI value.  We do this now *
+* because PRI is at the front of the buffer, and so all the other     *
+* fields have to slide to the "left" to account for a PRI len < 3.    *
+* e.g. is user coded "PRI  35" then the @PRI field looks like: <35 >aaa
+* This code changes the @PRI field to look like: <35>.                *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+         L     R5,BUFFERL          @JCM1 Get buffer length.
+         LA    R4,@PRI             @JCM1 -> PRI in buffer.
+         LA    R4,3(R4)            @JCM1 -> first blank to delete.
+         CLI   0(R4),C' '          @JCM1 2 or fewer chars?
+         BNE   @@JCM1Z             @JCM1 No, do nothing.
+         BCTR  R5,0                @JCM1 Len - 1.
+         ST    R5,BUFFERL          @JCM1 Store new shorter length.
+         LA    R6,1(R4)            @JCM1 -> data to move.
+         S     R5,=AL4(2)          @JCM1 Adjust length of move.
+         LR    R7,R5               @JCM1 Get MVCL len in other len reg.
+         MVCL  R4,R6               @JCM1 Shift buffer left.
+@@JCM1Z  DS    0H
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Set up for write.                                                   *
+* EZACIC04 converts EBCDIC to ASCII text.                             *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+DOASCII  DS    0H
+         CALL  EZACIC04,(@@HEADER,BUFFERL),VL,MF=(E,PARMLST)
+         MVC   TYPE,MWRITE         MOVE 'WRITE ' TO MESSAGE
+         LA    R4,@@HEADER         -> field to write.
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* Write to the TCP or UDP socket.                                     *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+* The RETCODE field contains the number of bytes written on the       *
+* WRITE call.  This may or may not be the number of bytes that we     *
+* requested to be written.  Shorter messages are usually written      *
+* with one call, but there is no guarantee that this will be so.      *
+* To account for this, we need to compare the bytes written with      *
+* the bytes requested to be written, and if all the bytes were not    *
+* written, we need to do another WRITE invocation.  Before we do      *
+* this, we have to calculate the remaining number of bytes that       *
+* still need to be written, and update the pointer to point to the    *
+* start of the unwritten data.                                        *
+*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*
+WRITE    DS    0H
+         EZASMI TYPE=WRITE,        Issue WRITE.                        X
+               S=S,                STREAM socket.                      X
+               NBYTE=BUFFERL,      Size of message buffer.             X
+               BUF=(R4),           Data to write.                      X
+               ERRNO=ERRNO,        Output field: ERRNO.                X
+               RETCODE=RETCODE,    Output field: RETCODE.              X
+               ERROR=ERROR         Abend if Macro error
+*        MVC   BUFFER,=CL80'WRITE:::'
+*        BAL   R14,PUTLINE
+         CLC   RETCODE,MINUSONE    Error on write?
+         BE    ERROR               Return indicating an error.
+         CLC   RETCODE,BUFFERL     Bytes written=bytes requested?
+         BNL   EXIT                Yes, we're finished with the write.
+*
+* Bytes written (RETCODE) less than bytes requested (BUFFERL).  Need to
+* prepare for a partial buffer write next time we're called.
+* BUFFERL and BUFFERP are in the common DSECT, & so will still be here
+* next time through.
+*
+         OI    FLAG,FPARTWRT       Turn on partial write needed bit.
+         A     R4,RETCODE          Add length of data that was written.
+         ST    R4,BUFFERP          Store ptr to next data to write.
+         L     R5,BUFFERL          Get length into reg.
+         S     R5,RETCODE          Subtract length of data written.
+         ST    R5,BUFFERL          Save length back in length field.
+         B     ERROR               Drive partial write.
+*
+* Entry point for a partial write.
+*
+REWRITE  DS    0H
+         NI    FLAG,X'FF'-FPARTWRT Turn off partial write needed bit.
+         L     R4,BUFFERP          -> data to write.
+*        BUFFERL already has new partial length from last time we ran.
+         B     WRITE               Go do write
+*---------------------------------------------------------------------*
+* Return.  CC is in common storage, and contains return code.         *
+*---------------------------------------------------------------------*
+ERROR    DS    0H
+         MVI   CC,X'08'            Set RC=8.
+         B     EXIT0               Go exit.
+EXIT     DS    0H
+         MVI   CC,X'00'            Set zero return code.
+EXIT0    DS    0H
+         LR    R1,R13              Get address of RELEASE.
+         STORAGE RELEASE,LENGTH=DYNL,ADDR=(1)
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*   Constants and LTORG
+*---------------------------------------------------------------------*
+@MONS    DC    C'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec '
+         LTORG
+         RLCOMM CONST
+WTOPLM   WTO TEXT=,DESC=(7),MF=L   WTO parm list.
+WTOPLL   EQU *-WTOPLM
+*---------------------------------------------------------------------*
+* MSG subroutine.  WTO the text, and write it to SYSPRINT if open.
+*---------------------------------------------------------------------*
+MSG      DS      0H
+         BAKR    R14,0             Save callers environment.
+         SAC     0                 Set primary mode.
+         SYSSTATE ASCENV=P         Tell macros PRIMARY mode.
+         MVC     WTOPL,WTOPLM      Set up parm list.
+         LR      R2,R1             Point R2 to msg text passed in R1.
+         WTO     TEXT=(R2),        WTO the message.                    X
+               MF=(E,WTOPL)
+         CLI   SYSPOK,C'Y'         OK to write to SYSPRINT?
+         BNE   NOSYSP0             No, branch around.
+         MVC   BUFFER,BLANKS       Clear message buffer.
+         LA    R4,BUFFER           -> buffer.
+         SR    R5,R5               Clear reg.
+         LH    R5,0(R2)            Len of MVCL.
+         LR    R7,R5               Len of MVCL.
+         LA    R8,2(R2)            -> message text.
+         MVCL  R4,R8
+         PUT   GTEXTOUT,BUFFER     Write data to SYSPRINT.
+NOSYSP0  DS    0H
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+* Write a line to SYSPRINT.
+*---------------------------------------------------------------------*
+PUTLINE  DS    0H
+         BAKR    R14,0             Save callers environment.
+         PUT   GTEXTOUT,BUFFER     Write data to SYSPRINT.
+         PR                        Return to caller.
+*---------------------------------------------------------------------*
+*   Private working storage.
+*---------------------------------------------------------------------*
+DATD     DSECT                     Dynamic area.
+SAVE     DS    18F                 Register save area.
+TIMEDATE DS    4F
+WTOPL    DS    CL(WTOPLL)          WTO parm list.
+JANDATE  DS    CL11
+DWORK    DS    D
+TMP1     DS    F
+TMP2     DS    F
+TMP3     DS    F
+TMP4     DS    F
+TMP5     DS    F
+TMP6     DS    F
+WRK      DS    CL8
+WTOLL    DS    CL2
+WTOLR    DS    CL2
+*
+*---------------------------------------------------------------------*
+*   End on doubleword boundary.                                       *
+*---------------------------------------------------------------------*
+         DS    0D
+ENDDATD  EQU   *
+DYNL     EQU    *-DATD
+*        DCBD    DSORG=QS
+         RLCOMM DSECT
+         IKJCPPL
+         END   RLWRITE
+*---------------------------------------------------------------------*
+*   PUNCH the linkedit control statements here.                       *
+*---------------------------------------------------------------------*
+         PUNCH ' SETCODE  AC(1)        '
+         PUNCH ' ENTRY    RLWRITE      '
+         PUNCH ' NAME     RLWRITE(R)   '
+         END

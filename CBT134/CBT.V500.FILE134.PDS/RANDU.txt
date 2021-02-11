@@ -1,0 +1,8 @@
+        SUBROUTINE RANDU(IX,IY,YR)
+        IY=IX*65539
+        IF(IY)5,6,6
+ 5      IY=IY+2147483647+1
+ 6      YR=IY
+        YR=YR*.4656613E-9
+        RETURN
+        END

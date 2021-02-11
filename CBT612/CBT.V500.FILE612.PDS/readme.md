@@ -1,0 +1,142 @@
+
+## @FILE612.txt
+```
+//***FILE 612 is from Albert Cheng and contains handy TSO utilities *   FILE 612
+//*           that run on MVS.  DSPACE, DUASD and LOCATE are        *   FILE 612
+//*           originally from the CBT Tape.  They have been         *   FILE 612
+//*           enhanced to support the new functions of MVS such as  *   FILE 612
+//*           4-digit unit numbers, dynamic link libraries, and     *   FILE 612
+//*           so forth.  The utilities are described below.         *   FILE 612
+//*                                                                 *   FILE 612
+//*              email:   albertcpcheng@hotmail.com                 *   FILE 612
+//*                                                                 *   FILE 612
+//*           AVAILAS  - A REXX utility to display the current      *   FILE 612
+//*                      available address spaces.  As some task    *   FILE 612
+//*                      terminates, its address space is no longer *   FILE 612
+//*                      available for re-use and the number of     *   FILE 612
+//*                      available address space is decreased by    *   FILE 612
+//*                      one.  If it is dropped to zero, no new     *   FILE 612
+//*                      address space can be created.              *   FILE 612
+//*                                                                 *   FILE 612
+//*           BLOCATE  - Locate can find a module at LPA and it     *   FILE 612
+//*                      cannot find out which LPA libraries.       *   FILE 612
+//*                      BLOCATE is a batch program which scans     *   FILE 612
+//*                      the load module in DDNAME SYSLIB and then  *   FILE 612
+//*                      dynamic linklist libraries.                *   FILE 612
+//*                                                                 *   FILE 612
+//*           CATNEWDS - Generates IDCAMS DEFINE NONVSAM control    *   FILE 612
+//*                      statements to define only the new datasets *   FILE 612
+//*                      at the new IPL pack. It also generates     *   FILE 612
+//*                      IDCAMS CONTROL statements to re-catalog    *   FILE 612
+//*                      the datasets that are not catalog with     *   FILE 612
+//*                      DEVT(0000) and VOLUME(******).             *   FILE 612
+//*                                                                 *   FILE 612
+//*           DSPACE   - An assembler program to display the free   *   FILE 612
+//*                      space of a dasd.  This program is          *   FILE 612
+//*                      enhanced to used to PUTLINE and supports   *   FILE 612
+//*                      4 digits unit number. It is enhanced to    *   FILE 612
+//*                      display the 3390 model type. It is also    *   FILE 612
+//*                      enhanced to display the freespace by 3390  *   FILE 612
+//*                      model type.  (ie M09/M27/M54 which         *   FILE 612
+//*                      display the freespace the 3390 model       *   FILE 612
+//*                      type). EMPTYDSK is the new enhancement to  *   FILE 612
+//*                      display volume list with used utilization  *   FILE 612
+//*                      is zero. This utility is similar to CBT    *   FILE 612
+//*                      utility FREESPC.                           *   FILE 612
+//*                                                                 *   FILE 612
+//*           DUDASD   - An assembler prgram to display status of   *   FILE 612
+//*                      all the disk (ie ONLINE and OFFLINE).      *   FILE 612
+//*                      This has been enhanced to support wild     *   FILE 612
+//*                      card volume serial or by unit address      *   FILE 612
+//*                      range (ie DUO 1A20:1CFF or DUA 1B20:2FFF)  *   FILE 612
+//*                      for disaster recovery preparation.         *   FILE 612
+//*                      Download the output of DUA from            *   FILE 612
+//*                      production LPAR.  Load it into your smart  *   FILE 612
+//*                      phone and you can refer the the            *   FILE 612
+//*                      production dasd list in DR site without    *   FILE 612
+//*                      access the production LPAR.                *   FILE 612
+//*                                                                 *   FILE 612
+//*                      Tips: Copy TRAP macro into your SYSPROC    *   FILE 612
+//*                      Edit a new member and issue 'TRAP DUDASD'  *   FILE 612
+//*                      and save the file.                         *   FILE 612
+//*                                                                 *   FILE 612
+//*           ISPFST   - REXX to list all splits in your ISPF       *   FILE 612
+//*                      session, and what is in each split.        *   FILE 612
+//*                                                                 *   FILE 612
+//*           LISTPDS  - Enhance LISTPDS (CBT FILE 316). Add new    *   FILE 612
+//*                      option to unload a PDS to sequential file  *   FILE 612
+//*                      with exactly the same attribute as the     *   FILE 612
+//*                      source PDS.                                *   FILE 612
+//*                                                                 *   FILE 612
+//*           LOAD     - Programs load library in TSO XMIT format.  *   FILE 612
+//*                                                                 *   FILE 612
+//*           LOAD$    - JCL to restore load library.               *   FILE 612
+//*                                                                 *   FILE 612
+//*           LOCATE   - An assembler program to locate named       *   FILE 612
+//*                      command in either Nucleus, F/MLPA, LIBDEF  *   FILE 612
+//*                      ISPLLIB, ISPLLIB, TASKLIB, STEPLIB, LPA    *   FILE 612
+//*                      and Linklist libraries, SYSEXEC and        *   FILE 612
+//*                      SYSPROC.  Define RACF Facility profile     *   FILE 612
+//*                      CSVDYNL.*.TEST and grant yourself with     *   FILE 612
+//*                      READ access to this profile. The LOCATE    *   FILE 612
+//*                      command is no longer required to register  *   FILE 612
+//*                      as authorised program in IKJTSO00.         *   FILE 612
+//*                                                                 *   FILE 612
+//*                      The program is enhanced to use PUTLINE API *   FILE 612
+//*                      to display the output and you can run      *   FILE 612
+//*                      LOCATE as a batch job.                     *   FILE 612
+//*                                                                 *   FILE 612
+//*                      LOCATE HAS TWO ALIASes                     *   FILE 612
+//*                      ALIAS  FINDCMD - Search CLIST and EXEC     *   FILE 612
+//*                      ALIAS  FINDPRG - Search TASKLIB/LPA/       *   FILE 612
+//*                      LINKLST                                    *   FILE 612
+//*                                                                 *   FILE 612
+//*           QIODF    - A REXX utility display the currnet IODF    *   FILE 612
+//*                      name                                       *   FILE 612
+//*                                                                 *   FILE 612
+//*           REGSIZE  - A REXX utility display the in used region  *   FILE 612
+//*                      size                                       *   FILE 612
+//*                                                                 *   FILE 612
+//*           SHOWPPT  - An assembler batch program to display PPT  *   FILE 612
+//*                      and the orginal source is from CBT 835.    *   FILE 612
+//*                                                                 *   FILE 612
+//*           SRCHLOG  - MVS SYSLOG message can have more than one  *   FILE 612
+//*                      line. This utility can display multiple    *   FILE 612
+//*                      lines if the string is found from SYSLOG   *   FILE 612
+//*                      with RECFM VB or VBA                       *   FILE 612
+//*                                                                 *   FILE 612
+//*           SRCHLOGF - MVS SYSLOG message can have more than one  *   FILE 612
+//*                      line. This utility can display multiple    *   FILE 612
+//*                      lines if the string is found from SYSLOG   *   FILE 612
+//*                      with RECFM FB or FBA                       *   FILE 612
+//*                                                                 *   FILE 612
+//*           SVCNO    - A REXX utility to display SVC description  *   FILE 612
+//*                                                                 *   FILE 612
+//*           SVCUPDTE - A REXX utility to display SVC recording    *   FILE 612
+//*                      table to find out which SVC EPA are        *   FILE 612
+//*                      modified by third party software after     *   FILE 612
+//*                      IPL.                                       *   FILE 612
+//*                                                                 *   FILE 612
+//*           SYSINCRD - STC does not support in-stream data (ie    *   FILE 612
+//*                      SYIN DD *).  This program generates SYSIN  *   FILE 612
+//*                      control statement from PARM for STC.       *   FILE 612
+//*                                                                 *   FILE 612
+//*           HDSPACE  - HELP member of DSPACE                      *   FILE 612
+//*                                                                 *   FILE 612
+//*           HDUDASD  - HELP member of DUDASD                      *   FILE 612
+//*                                                                 *   FILE 612
+//*           HLOCATE  - HELP member of LOCATE                      *   FILE 612
+//*                                                                 *   FILE 612
+//*           TRAP     - ISPF EDIT MACRO to trap the output of      *   FILE 612
+//*                      DUDASD and DSPACE. Note LOCATE use TPUT    *   FILE 612
+//*                      so the output cannot be trap.              *   FILE 612
+//*                                                                 *   FILE 612
+//*           VIEWPARM - REXX to allow you to look at (VIEW)        *   FILE 612
+//*                      any valid PARMLIB member, directly         *   FILE 612
+//*                      from the IPA.                              *   FILE 612
+//*                                                                 *   FILE 612
+//*     MACRO - $EPILOG, $PROLOG, @ENT, @RET, JVDENTER, JVDEQU and  *   FILE 612
+//*             JVDLEAVE are obsolete.                              *   FILE 612
+//*                                                                 *   FILE 612
+```
+

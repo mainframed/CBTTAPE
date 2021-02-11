@@ -1,0 +1,294 @@
+         MACRO
+&NAME    ALLOC &DUMMY,&PERM,&DSN=,&DDN=,&DDNRET=,&MEMBER=,&DISP=,      X
+               &VOL=,&UNIT=,&SYSOUT=,&FREE=,&COPIES=,&LABEL=,          X
+               &BLKSIZE=,&DEN=,&DSORG=,&KEYLEN=,&LRECL=,&RECFM=,       X
+               &PASWORD=,&DSNRET=,&MF=AUTO,&PREFIX=,&ERROR=,           X
+               &SPACE=,&F=,&FILE=,&DA=,&QNAME=,&DSORGRT=,              X
+               &VOLRET=,&DCBDSN=,&DCBDDN=,&SPECIAL=,&DDNTO=,           X
+               &FORMS=,&DEST=,&SSREQ=,&FORUSER=,&TU=,&DSNPDE=
+.**********************************************************************
+.*                                                                    *
+.*    THIS MACRO PROVIDES A DYNAMIC ALLOCATION FUNCTION BY BUILDING   *
+.*    A DYNAMIC ALLOCATION PARAMETER LIST AND INVOKING SVC 99.        *
+.*    IT FIRST SETS UP A WORKAREA ENVIRONMENT FOR THE PARAMETER LIST  *
+.*    AND THEN TESTS THE KEYWORDS SUPPLIED AND INVOKES INNER MACROS   *
+.*    TO BUILD THE TEXT UNITS. THE INNER MACROS THEMSELVES USE INNER  *
+.*    MACROS TO UPDATE GLOBAL VARIABLES, STORE TEXT UNIT POINTERS ETC *
+.*    THERE ARE THREE WAYS OF SPECIFYING THE WORK AREA ADDRESS.       *
+.*    A) MF=AUTO, MF=G, MF=(E,ADDRESS,LNTHSYMB).                      *
+.*    IN THE FIRST FORM, AN INNER MACRO DYNSPACE IS CALLED TO NAME    *
+.*    A WORK AREA, THE NAME BEING RETURNED IN THE GLOBAL SETC         *
+.*    VARIABLE &DYNSP. A DSECT IS CREATED TO MAP THIS AREA.           *
+.*    THE GLOBAL VARIABLES &DTUO (TEXT UNIT OFFSET COUNTER) AND       *
+.*    &DTUPO (TEXT UNIT POINTER OFFSET ACCUMULATOR) ARE SET TO ZERO.  *
+.*    THESE ACCUMULATORS ARE UPDATED AS EACH TEXT UNIT PROCESSOR      *
+.*    AQUIRES STORAGE. AFTER ALL TEXT UNITS HAVE BEEN BUILT, THE      *
+.*    AMOUNT OF SPACE USED IS CALCULATED, AND THE DYNSPACE MACRO IS   *
+.*    THEN CALLED AGAIN TO LOG THE AMOUNT NEEDED. DYNSPACE SETS A     *
+.*    GLOBAL VARIABLE &DYNSPQ TO THE HIGHEST AMOUNT ANY ALLOC OR      *
+.*    FREE MACRO REQUESTED, AND WHEN CALLED WITH THE EXPAND OPTION,   *
+.*    (NO OPERANDS OR NAME FIELD SUPPLIED), EXPANDS INTO A DS FOR     *
+.*    THAT QUANTITY. (SEE DYNSPACE)                                   *
+.*    MF=G SPECIFIES THAT THE ALLOC MACRO ENTER THE BEGIN MACRO       *
+.*    WORKAREA TO ACQUIRE THE STORAGE NECESSARY. IT DOES THIS VIA     *
+.*    THE RCPDS MACRO. (SEE RCPDS). HOWEVER, IF THE ALLOC MACRO IS    *
+.*    CALLED SEVERAL TIMES WITH THIS OPTION, A LOT OF STORAGE WILL BE *
+.*    USED UP, AS THE STORAGE WILL NOT BE SHARED. THUS, THIS FORM     *
+.*    SHOULD ONLY BE USED IF THE ALLOC/FREE MACRO IS ONLY TO BE USED  *
+.*    ONCE OR TWICE DURING AN ASSEMBLY.                               *
+.*    MF=E CAUSES THE MACRO TO USE A USER SPECIFIED WORK AREA. THE    *
+.*    SECOND PARAMETER GIVES THE NAME OF THE WORKAREA, AND AN         *
+.*    OPTIONAL THIRD PARAMETER IS THE NAME OF A SYMBOL TO BE EQUATED  *
+.*    TO THE LENGTH OF THE REQUIRED WORK AREA.                        *
+.*                                                                    *
+.*    DYNAMIC ALLOCATION FUNCTIONS ARE SIMILAR TO THOSE AVAILABLE    *
+.*    WITH JCL, USING THE SAME KEYWORDS. HOWEVER, CERTAIN FORMATS    *
+.*    ARE SLIGHTLY DIFFERENT. FOR INSTANCE, CERTAIN KEYWORDS CAN     *
+.*    HAVE VARYING PARAMETERS, EG DATASET NAME, DDNAME, VOLSER ETC.  *
+.*    PROVISION IS MADE FOR BOTH VARIABLE SPECIFICATION.             *
+.*    IN THE ABSOLUTE FORM, THE PARAMETER IS ENTERED IN QUOTES,      *
+.*    E.G.   ALLOC DSN='SYS1.LINKLIB',DISP=SHR                       *
+.*    HOWEVER, THIS NAME REMAINS FIXED FOR THE ASSEMBLY.             *
+.*    IN THE VARIABLE FORMAT, THE ADDRESS OF A LOCATOR IS SPECIFIED, *
+.*    WHERE THE LOCATOR CONSISTS OF A SIX BYTE FIELD, THE FIRST 4    *
+.*    BYTES OF WHICH POINT TO THE PARAMETER, WHILE THE NEXT TWO      *
+.*    CONTAIN THE LENGTH.                                            *
+.*    EG          ALLOC DSN=LOCATOR                                  *
+.*       LOCATOR  DC    A(DSN),Y(12)                                 *
+.*       DSN      DC    C'SYS1.LINKLIB'                              *
+.*                                                                   *
+.*       NUMERIC QUANTITIES E.G. COPIES= FOR SYSOUT, SHOULD EITHER   *
+.*       SPECIFY A NUMERIC VALUE, COPIES=3,                          *
+.*       A VALUE IN A REGISTER, COPIES=(R3),                         *
+.*       OR THE NAME OFF A FULLWORD CONTAINING THE VALUE,            *
+.*          COPIES=NUMCOPYS, WHERE NUMCOPYS IS THE NAME OF A         *
+.*       FULLWORD FIELD.                                             *
+.*                                                                   *
+.*       OTHER KEYWORDS SUCH AS DISP= CAN ONLY HAVE THE ABSOLUTE     *
+.*       FORM, AND VALUES SHOULD NOT BE ENTERED WITHIN QUOTES.       *
+.*       ADDITIONAL FACILITIES NOT AVAILABLE WITH JCL ARE THE        *
+.*       RETURN BY THE SYSTEM OF INFORMATION ON THE DATASET, EG      *
+.*       DSORG. THIS IS DONE BY SPECIFYING DSORGRT=SYMBOL, WHERE     *
+.*       SYMBOL IS A SYMBOL WHICH WILL BE EQUATED TO A TWO BYTE      *
+.*       FIELD CONTAINING THE DSORG TYPE (SEE JOB MANAGEMENT,        *
+.*       SUPERVISOR AND TSO).                                        *
+.*       THE SYSTEM CAN ALSO GENERATE AND RETURN A DDNAME. THIS IS   *
+.*       CARRIED OUT BY ENTERING DDNTO=(ADDR1,ADDR2,,...)            *
+.*       WHERE ADDR1,ADDR2 ETC ARE THE NAMES OF 8 BYTE FIELDS WHICH  *
+.*       ARE TO RECEIVE THE DDNAME.                                  *
+.*       FOR FURTHER INFORMATION ON DYNAMIC ALLOCATION, SEE          *
+.*       JOB MANAGEMENT, SUPERVISOR AND TSO.                         *
+.*                                                                   *
+.**********************************************************************
+         GBLA  &RCPDYN            COUNTER FOR NO ENTRIES TO MACRO
+         GBLA  &DTUO              OFFSET TO TEXT UNITS
+         GBLA  &DTUPO             OFFSET TO TEXT UNIT POINTERS
+         GBLB  &RCPS99(2)         TELL RCPDSECT NEED DSECTS
+         GBLC  &DYNP              PREFIX FOR LABELS FOR THIS CALL
+         GBLC  &DYNSP         NAME FOR AUTOMATIC STORAGE ALLOC
+         LCLA  &DDNRTO,&DSNRTO         FOR EQUATES FOR RETURNED FLDS
+         LCLA  &VOLRTO,&DSRGRTO        FOR EQUATES FOR RETURNED FIELDS
+         LCLA  &I                 COUNTER
+         LCLB  &DSECT             DSECT NEEDED FOR STORAGE, MF=E
+         LCLC  &C,&T,&PAR
+.*
+.*   THE ALLOC MACRO PROVIDES A DYNAMIC ALLOCATION FUNCTION,
+&RCPS99(1)     SETB           1
+&RCPDYN  SETA  &RCPDYN+1          INCEREMENT COUNTER
+&DYNP    SETC  'DYN&RCPDYN' SET DEFAULT PREFIX
+&NAME    DS    0H
+         AIF   ('&PREFIX' EQ '').TMF
+         AIF   (K'&PREFIX LT 4).POK
+         MNOTE 4,'PREFIX TOO LONG, 1ST 4 CHARS USED'
+&DYNP    SETC  '&PREFIX'(1,4)
+         AGO   .TMF
+.POK     ANOP
+&DYNP    SETC  '&PREFIX'
+.TMF     AIF   ('&MF(1)' EQ 'G').GEN
+         AIF   ('&MF' NE 'AUTO').TMFE
+NAME     DYNSPACE             GET NAME FOR SPACE
+         LA    R1,&DYNSP               LOAD ADDRESS OF PARAM LIST
+         USING &DYNP.DS,R1             USE GENERATED DSECT
+&T       SETC  'A'
+&PAR     SETC  '&DYNSP+4'
+&DSECT   SETB  1
+         AGO   .START
+.TMFE    AIF   ('&MF(2)' NE '').E2OK
+         MNOTE 4,'PLIST ADDRESS OMITTED, MF=G USED'
+         AGO   .GEN
+.E2OK    ANOP
+&DSECT   SETB  1
+         AIF   ('&MF(2)' EQ '(').RMFE
+         LA    R1,&MF(2)               LOAD PARAM LIST ADDRESS
+         USING &DYNP.DS,R1             USE GENERATED DSECT
+         AGO   .START
+.RMFE    AIF   ('&MF(2)' EQ '(R1)' OR '&MF(2)' EQ '(1)').START
+         LR    R1,&PAR                 LOAD S99 PARAM LIST ADDRESS
+         AGO   .START
+.GEN     LA    R1,&DYNP.RBP            LOAD ADDRESS OF S99 RBP
+.START   LA    R15,&DYNP.RB            LOAD ADDRESS OF S99 RB
+         USING S99RB,R15
+         ST    R15,0(R1)               AND STORE IN RB POINTER
+         XC    4(&DYNP.LEN-4,R1),4(R1) ZERO PARAMETER LIST
+         MVI   S99RBLN,20              MOVE IN LIST LENGTH
+         MVI   S99VERB,S99VRBAL        MOVE IN VERB CODE
+         LA    R14,&DYNP.TUP           LOAD ADDRESS OF TU POINTERS
+         ST    R14,S99TXTPP            STORE ADDRESS IN S99 RB
+         LA    R15,&DYNP.TU            POINT TO SPACE FOR TEXT UNITS
+         USING S99TUNIT,R15
+&DTUO    SETA  0
+&DTUPO   SETA  0
+         AIF   ('&SSREQ' EQ 'YES').SSREQ
+.TDSN    AIF   ('&DSN&DA' NE '').DSN
+         AIF   ('&DSNPDE' NE '').DSNPDE
+         AIF   ('&DSNRET' NE '').DSNRT
+         AIF   ('&SYSOUT' NE '').SYSOUT
+         AIF   ('&DUMMY' NE '').DUMMY
+         AIF   ('&QNAME' NE '').QNAME
+.TDDN    AIF   ('&DDN&FILE&F' NE '').DDN
+         AIF   ('&DDNRET&DDNTO' NE '').DDNRT
+.TUNIT   AIF   ('&UNIT&VOL' NE '').UNIT
+.TVOLRET AIF   ('&VOLRET' NE '').VOLRET
+.TDSRGO  AIF   ('&DSORGRT' NE '').DSORGRT
+.TLABEL  AIF   ('&LABEL' NE '').LABEL
+.TPSWD   AIF   ('&PASWORD' NE '').PASWORD
+.TFORUSE AIF   ('&FORUSER' NE '').FORUSER
+.TTU     AIF   ('&TU' NE '').TU
+.TDISP   AIF   ('&DISP' NE '').DISP
+.TSPACE  AIF   ('&SPACE' NE '').SPACE
+.TLRECL  AIF   ('&LRECL' NE '').DCB
+         AIF   ('&DEN' NE '').DCB
+         AIF   ('&RECFM' NE '').DCB
+         AIF   ('&BLKSIZE' NE '').DCB
+         AIF   ('&DSORG' NE '').DCB
+         AIF   ('&KEYLEN' NE '').DCB
+.TDCBDSN AIF   ('&DCBDSN' NE '').DCBDSN
+.TDCBDDN AIF   ('&DCBDDN' NE '').DCBDDN
+.TFREE   AIF   ('&FREE' EQ 'CLOSE').FREE                         TE7343
+.TPERM   AIF   ('&PERM' EQ 'PERM' OR '&PERM' EQ 'PERMANENT').PERM
+         AIF   ('&DUMMY' EQ 'PERM' OR '&DUMMY' EQ 'PERMANENT').PERM
+.TSPECI  AIF   ('&SPECIAL' NE '').SPECIAL
+         AGO   .SVC99
+.SSREQ   RCPSSREQ
+         AGO   .TDSN
+.DSN     RCPDSN &DSN&DA,&MEMBER
+         AGO   .TDDN
+.DSNPDE  RCPDSNPD &DSNPDE
+         AGO   .TDDN
+.DSNRT   RCPDSNRT &DSNRET
+&DSNRTO  SETA  &DTUO-46
+         AGO   .TDDN
+.SYSOUT  RCPSYSOU &SYSOUT,COPIES=&COPIES,FREE=&FREE,DEST=&DEST,        X
+               FORMS=&FORMS
+         AGO   .TDDN
+.DUMMY   RCPDUMMY &DUMMY
+         AGO   .TDDN
+.QNAME   RCPQNAME &QNAME
+         AGO   .TDDN
+.DDN     RCPDDN &DDN&F&FILE
+         AGO   .TUNIT
+.DDNRT   RCPDDNRT &DDNRET
+&DDNRTO  SETA  &DTUO-10
+         AGO   .TUNIT
+.UNIT   RCPUNIT &UNIT,&VOL
+         AGO   .TVOLRET
+.VOLRET  RCPVOLRT &VOLRET
+&VOLRTO  SETA  &DTUO-8
+         AGO   .TDSRGO
+.DSORGRT RCPDSRGR
+&DSRGRTO SETA  &DTUO-2
+         AGO   .TLABEL
+.LABEL   RCPLABEL &LABEL
+         AGO   .TPSWD
+.PASWORD RCPPSWD &PASWORD
+         AGO   .TFORUSE
+.FORUSER RCPFORUS &FORUSER
+         AGO   .TTU
+.TU      RCPTU &TU
+         AGO   .TDISP
+.DISP    RCPDISP &DISP
+         AGO   .TSPACE
+.SPACE   RCPSPACE &SPACE
+         AGO   .TLRECL
+.DCB     RCPDDCB LRECL=&LRECL,DEN=&DEN,RECFM=&RECFM,BLKSIZE=&BLKSIZE,  X
+               DSORG=&DSORG,KEYLEN=&KEYLEN
+         AGO .TDCBDSN
+.DCBDSN  RCPDCBDS &DCBDSN
+         AGO .TDCBDDN
+.DCBDDN  RCPDCBDD &DCBDDN
+         AGO .TFREE                                              TE7343
+.FREE    RCPFREE  &FREE                                          TE7343
+         AGO   .TPERM
+.PERM    RCPPERM
+         AGO   .TSPECI
+.SPECIAL RCPSPEC &SPECIAL
+.SVC99   ANOP
+&DTUPO   SETA  &DTUPO-4
+         SPACE
+         MVI   &DYNP.TUP+&DTUPO,X'80'  SET HIGH ORDER BIT ON TEXT PTRS
+         MVI   &DYNP.RBP,X'80'         SET HIGH ORDER BIT ON RB PTR
+         RCPSR2 UNSAVE
+&DTUPO   SETA  &DTUPO+4
+         AIF   (NOT &DSECT).DYNA
+         DROP  R1,R15                  DEACTIVATE ADDRESSABILITY
+         LA    R14,4(R1)               POINT TO REQUEST BLOCK
+.DYNA    DYNALLOC
+         AIF   (NOT &DSECT).LTR
+         USING &DYNP.RB,R14            SET UP ADDRESSABILITY
+**       NOTE  R14 HAS RB ADDRESS, R15 HAS SVC 99 RETURN CODE        **
+.LTR     AIF   ('&ERROR' EQ '').TDDTO
+         LTR   R15,R15                 TEST RETURN CODE
+         BNZ   &ERROR                  BRANCH IF NON ZERO
+.TDDTO   AIF   ('&DDNTO' EQ '').RESERVE
+&I       SETA  0
+.DDNTOL  ANOP
+&I       SETA  &I+1
+         AIF   ('&DDNTO(&I)' EQ '').RESERVE
+         AIF   ('&DDNTO(&I)'(1,1) EQ '(').DDNTOR
+         MVC   &DDNTO(&I).(8),&DYNP.TU+&DDNRTO+2
+         AGO   .DDNTOL
+.DDNTOR  ANOP
+&C       SETC  '&DDNTO(&I)'(2,K'&DDNTO(&I)-2)
+         MVC   0(8,&C),&DYNP.TU+&DDNRTO+2
+         AGO   .DDNTOL
+.RESERVE AIF   (&DSECT).RESDS
+         SPACE 1
+***********************************************************************
+**       RESERVE SPACE FOR DYNALLOC PARAMETER LIST                   **
+***********************************************************************
+         RCPDS
+.SSP     ANOP
+&DYNP.RBP DS   F                       SVC 99 REQ BLOCK POINTER
+&DYNP.RB  DS   5F                      SVC 99 REQUEST BLOCK
+&DYNP.TUP DS   CL&DTUPO                SPACE FOR TEXT POINTERS
+         AIF   (&DTUO EQ 0).DTU21
+&DYNP.TU  DS   CL&DTUO                 SPACE FOR TEXT UNITS
+         AIF   (&DSNRTO EQ 0).TDDNRTO
+&DSNRET  EQU   &DYNP.TU+&DSNRTO        OFFSET TO RETURNED DSN
+.TDDNRTO AIF   ('&DDNRET' EQ '').DTU11
+&DDNRET  EQU   &DYNP.TU+&DDNRTO        OFFSET TO RETURNED DDNAME
+.DTU11   AIF   (&VOLRTO EQ 0).DTU12
+&VOLRET  EQU   &DYNP.TU+&VOLRTO        OFFSET TO RETURNED VOLSER
+.DTU12   AIF   (&DSRGRTO EQ 0).DTU10
+&DSORGRT EQU   &DYNP.TU+&DSRGRTO       OFFSET TO RETURNED DSORG
+         AGO   .DTU10
+.DTU21   ANOP
+&DYNP.TU  DS   0C                      NO SPACE NEEDED FOR TEXT UNITS
+.DTU10   ANOP
+&DYNP.LEN EQU  *-&DYNP.RBP             LENGTH OF SPACE USED
+         AIF   (&DSECT).DSP
+         RCPDS
+         SPACE 3
+         AGO   .EXIT
+.RESDS   ANOP
+         AIF   ('&DYNSP' EQ '').SP3
+         DYNSPACE ADD
+.SP3     SPACE
+&DYNP.DS DSECT                         DSECT TO MAP SVC 99 DATA
+         AGO   .SSP
+.DSP     AIF   ('&MF(3)' EQ '').END1
+&MF(3)   EQU   &DYNP.LEN               LENGTH OF AREA
+.END1    ANOP
+&SYSECT  CSECT
+         SPACE 3
+.EXIT    MEND

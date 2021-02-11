@@ -1,0 +1,287 @@
+STCPOPR  TITLE 'TCP/IP operator interface'
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+         U#SET FUNC=STCP
+*----------------------------------------------------------------------
+* Function:    TCP/IP operator interface
+*
+*   Main task  - Called by main to initialize ourselves by
+*                passing a WUD to TSKM
+*
+*                Entry:  R0 ignored
+*                        R1 ignored
+*
+*         If STPFLG1.STP1INIT is on, we're coming up
+*         If STPFLG1.STP1SHUT is on, we're shutting down
+*
+* -------------------------------------------------------------------
+*
+*   Sub task   - Enable & disable operator interface
+*              - START command handled here (parse operands)
+*              - Accept MVS operator command(s)
+*              - STOP command causes us to terminate our subtask
+*
+*                Entry:  R0 @ WUD
+*                        R1 = WUDWORD
+*
+*         If neither of these bits is on, we have a CIB to process
+*
+* Exit:   R15 =  0 - OK
+*
+* Diagnostics:
+*               1 - main    - INIT/SHUT
+*               2 -
+*               3 -
+*               4 - subtask - CIB @ entry
+*               5 - subtask - WUD @ exit
+*               6 - subtask - FREECIB - CIB before QEDIT
+*               7 - subtask - SUBWAIT - COMLIST + ECB
+*               8 -
+*               9 -
+*
+* Notes:
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    Usage
+*----------------------------------------------------------------------
+* R2            CIB length
+* R3            CIBDATA length
+* R4            scratch
+* R5
+* R6   WUD      RWUD
+* R7   CIB      IEZCIB - MVS operator command
+* R8   COMLIST  IEZCOM - CIB anchor
+* R9            reserved for TPU
+* R10           internal linkage
+* R11           STCPWA
+* R12           base reg
+* R13  SAVEAREA SA
+*----------------------------------------------------------------------
+RWUD     EQU   6        0 or @ WUD
+RCIB     EQU   7        0 or @ CIB
+RCOM     EQU   8        0 or @ COMLIST
+X8       EQU   3        shift factor to multiply by 8
+ENDOLIST EQU   X'80'    hi bit - end of list
+STCPOPR  UPROC ID=SOPR,L=L$SA
+*----------------------------------------------------------------------
+ERR#1    EQU   1        invalid subtask entry parms
+ERR#2    EQU   2
+ERR#3    EQU   3        COMCIBPT null
+ERR#4    EQU   4        COMECBPT null
+ERR#5    EQU   5        CIB makes no sense
+ERR#6    EQU   6        CIB START operand parse error
+ERR#7    EQU   7        STCPTSKM error
+*
+         STM   R0,R1,SAENTRY           save entry parms
+         USING PSA,0
+         SLR   RWUD,RWUD
+*
+         TM    STPFLG1,STP1INIT        initialize?
+         BO    INIT
+         TM    STPFLG1,STP1SHUT        shutdown?
+         BO    SHUT
+         B     SUBTASK
+*
+EXIT     DS    0H
+         LTR   RWUD,RWUD
+         BZ    EX99
+         UDIAG 5,'OPR exit WUD',(RWUD),L$WUD
+EX99     UPEND RC=*SARC
+         EJECT ,
+*----------------------------------------------------------------------
+*  Initialize
+*----------------------------------------------------------------------
+INIT     DS    0H
+         UDIAG 1,'OPR init'
+*
+*  Create WUD - TSKM will ATTACH us to accept CIBs from MVS
+*
+         MVC   SAWID,=C'OPR'                identify creator (briefly)
+         MVC   SAWLOGD,=CL8'OPRLOG'         opr log ddname
+         MVC   SAWNAME,ID                   my CSECT name
+         ST    RBASE,SAW@CODE               @ my CSECT
+         ICM   R0,8,=AL1(TSKM$ADD)          ADD WUD to WIB
+         LA    R1,SAW                       @ WUD to add
+         MVI   SAREASON,ERR#7               STCPTSKM error
+         UCALL STCPTSKM,ERR=DIE             create OPR subtask
+         LR    RWUD,R1                      @ subtask WUD
+         L     R2,=A(POST$WRK)              work-waiting POST code
+         POST  WUDRUN-WUD(RWUD),(R2)        kick subtask for START CIB
+         B     EXIT                         next OPR call: subtask
+*----------------------------------------------------------------------
+*  Shutdown operator interface
+*----------------------------------------------------------------------
+SHUT     DS    0H
+         UDIAG 1,'OPR shut'
+         UWTO  0,'TCP/IP shutdown complete'
+         B     EXIT
+         EJECT ,
+*----------------------------------------------------------------------
+*  Process CIB (MVS operator command)
+*----------------------------------------------------------------------
+SUBTASK  DS    0H
+         MVI   SAREASON,ERR#1          invalid subtask entry parms
+         ICM   RWUD,15,SAR0            @ WUD
+         BZ    DIE
+         USING WUD,RWUD
+         BAL   R10,FINDCOM             RCOM @ COMLIST
+         USING COMLIST,RCOM
+         UPSR  2,'OPR subtask FINDCOM RCOM',(RCOM)
+         MVI   SAREASON,ERR#3          COMCIPT null @ SUBTASK entry
+         ICM   RCIB,15,COMCIBPT        @ CIB or 0
+         BZ    DIE
+         USING CIB,RCIB
+*
+NEWCIB   DS    0H
+         SLR   R2,R2
+         IC    R2,CIBLEN               CIB length in doublewords
+         SLL   R2,X8
+         UDIAG 4,'OPR newcib CIB',(RCIB),(R2)
+         LR    R3,R2
+         LA    R0,CIBDATA-CIB          overhead length
+         SR    R3,R0                   = # bytes of CIBDATA
+*
+*  Route command to appropriate routine
+*
+         TM    CIBVERB,CIBMODFY        test multiple bits
+         BO    OCF
+         BM    OCP
+OCBAD    MVI   SAREASON,ERR#5          MOUNT?!?
+         B     DIE
+         EJECT ,
+*----------------------------------------------------------------------
+*  Subtask - MVS operator MODIFY command
+*----------------------------------------------------------------------
+OCF      CLI   CIBVERB,CIBMODFY        MODIFY?
+         BNE   OCBAD
+         CLC   =C'DRAIN',CIBDATA
+         BNE   OCFBAD
+         UCALL STCPSS99                drain subsys
+         B     SUBWAIT
+OCFBAD   UWTO  0,'TCP/IP modify command invalid'
+         B     SUBWAIT                 wait for another CIB
+*----------------------------------------------------------------------
+*  Subtask - MVS operator STOP command
+*----------------------------------------------------------------------
+OCP      CLI   CIBVERB,CIBSTOP         STOP?
+         BNE   OCS
+         OI    STPFLG1,STP1OPRX        shutdown request
+         UWTO  1,'TCP/IP opr cmds disabled'
+         QEDIT ORIGIN=COMCIBPT,CIBCTR=0
+         LR    R4,R15
+         UPSR  1,'OPR cibctr=0 rc',(R4)
+         UWTO  0,'TCP/IP shutdown initiated'
+         L     R4,=A(POST$SHU)              tell myself to shutdown
+         POST  WUDRUN-WUD(RWUD),(R4)        TSKM will not call again
+         B     SUBWAIT                 opr task completion
+*----------------------------------------------------------------------
+*  Subtask - MVS operator START command
+*----------------------------------------------------------------------
+OCS      CLI   CIBVERB,CIBSTART        START?
+         BNE   OCBAD
+         QEDIT ORIGIN=COMCIBPT,CIBCTR=1
+         UWTO  1,'TCP/IP opr cmds enabled'
+         LTR   R3,R3                   START operands?
+         BZ    OCS3088
+         MVI   SAREASON,ERR#6          START operand error
+         CLM   R3,3,=AL2(3)            one cuu?
+         BNE   DIE
+         LA    R1,CIBDATA
+         LR    R0,R3
+         ICM   R0,8,=AL1(CHAR$HEX)     hex chars allowed
+         UCALL U370CHAR,ERR=DIE
+         L     R15,STP@SGD
+         N     R0,=X'00000FFF'         make valid S/370 cuu
+         STH   R0,SGDCUU-SGD(,R15)     save 3088 base cuu
+OCS3088  DS    0H
+*        UCALL STCP3088                start I/O subtask(s)
+         B     SUBWAIT
+*----------------------------------------------------------------------
+*  SUBWAIT - Subtask - Return to TSKM to WAIT for next CIB
+*----------------------------------------------------------------------
+SUBWAIT  DS    0H     it's fairly safe to use 20, CIB is in a CSCB
+         UDIAG 7,'OPR subwait COMLIST+ECB',(RCOM),20
+         BAL   R10,FREECIB             release CIB (if we have one)
+*
+*  Add COMLIST's ECB to the ECBLIST that TSKM uses to WAIT for work
+*  so we get POSTed when a new CIB arrives
+*
+SUBEXIT  DS    0H
+         MVI   SAREASON,ERR#4
+         ICM   R0,15,COMECBPT          @ COMLIST's ECB
+         BZ    DIE
+         ST    R0,WUD@2ECB             add COMLIST ECB to TSKM ECBLIST
+         NI    WUD@1ECB,255-ENDOLIST   turn off hi bit
+         OI    WUD@2ECB,ENDOLIST       turn on hi bit
+         B     EXIT
+*----------------------------------------------------------------------
+*  FREECIB - Free one CIB control block or ABEND
+*----------------------------------------------------------------------
+FREECIB  DS    0H
+         LTR   RCIB,RCIB
+         BZR   R10
+         UDIAG 6,'OPR freecib CIB',(RCIB),(R2)
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(RCIB)      free CIB control block
+         LTR   R4,R15
+         BZR   R10
+         UPSR  1,'OPR freecib RC',(R4)
+         BR    R10                               return
+*----------------------------------------------------------------------
+*  FINDCOM - Locate COMLIST - Returns RCOM @ COMLIST
+*----------------------------------------------------------------------
+FINDCOM  DS    0H
+         ICM   RCOM,15,WUD@COM
+         BNZR  R10
+         MVC   SAEXTR(L$EXTR),MDLEXTR
+         EXTRACT WUD@COM,'S',FIELDS=(COMM),MF=(E,SAEXTR)
+         L     RCOM,WUD@COM
+         BR    R10
+*
+DIE      UABEND SAREASON
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+MDLEXTR  EXTRACT *-*,*-*,FIELDS=(COMM),MF=L
+L$EXTR   EQU   *-MDLEXTR
+         LTORG ,
+*
+*----------------------------------------------------------------------
+*  Savearea & workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F
+SARC     DS    F
+SAENTRY  DS    2F                      R0:R1 from entry
+SAR0     EQU   SAENTRY+00,4
+SAR1     EQU   SAENTRY+04,4
+SAEXTR   EXTRACT *-*,*-*,FIELDS=(COMM),MF=L
+SAREASON DS    X                       UABEND reason code
+SADEC    DS    PL2                     3088 cuu
+SAW      DSWUD PFX=SAW,SECT=LABEL
+*
+         DS    0D                      align
+L$SA     EQU   *-SAVEAREA              length of savearea
+*
+         DSWUD ,
+WUDFLG2  EQU   WUDSCR,1
+OPR2STRT EQU   128                     START command processed
+OPR2STOP EQU   64                      STOP  command processed
+WUD@COM  EQU   WUDUSR1,4               @ COMLIST
+WUD@CIB  EQU   WUDUSR2,4               @ last-processed CIB
+         DSSSGD ,
+         WASTCP ,
+*
+         PRINT NOGEN
+         IHAPSA ,
+IEZCOM   DSECT ,
+         IEZCOM ,                      COMLIST
+L$COM    EQU   *-IEZCOM
+*
+CIB      DSECT ,
+         IEZCIB ,                      MVS opr Command Input Buffer
+*
+         PRINT GEN
+STCPOPR  UFINI DXDSOPR,L$SA
+         END   ,

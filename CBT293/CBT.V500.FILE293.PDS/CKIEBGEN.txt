@@ -1,0 +1,819 @@
+   TITLE 'CKIEBGEN -- GENERAL QSAM FILE COPY PROGRAM  '
+* ----------------------------------------------------------------- *
+*     CKIEBGEN   -   ORIGINAL PROGRAM WAS BY BALDOMERO CASTILLA     *
+*                                                                   *
+*                    "PRETTIFIED BY SAM GOLOB"                      *
+*                    "IMPROVED BY WARREN WHITFORD"                  *
+*                                                                   *
+*     Function:      General QSAM file copying program that         *
+*                    copies records.                                *
+*                                                                   *
+*     Date Written:  August 25, 2000                                *
+*                                                                   *
+*     Change Levels:                                                *
+*                                                                   *
+*     Level 007 -    Introduce selection criteria to copy only      *
+*      (Nov 2011)    part of a file by counting records.            *
+*                    If SYSIN DD is present, the program looks      *
+*                    for SKIP=mmmmmmm or COPY=nnnnnnn or both,      *
+*                    starting in column 1, to first skip mmmmmmm    *
+*                    records in the file, and then copy the next    *
+*                    nnnnnnn records afterwards.  (S.Golob)         *
+*                                                                   *
+*     Level 008 -    Return code processing for missing DCB         *
+*      (Nov 2017)    attribues.  Fix reporting of RECFM errors.     *
+*                    Get rid of RETURN macro.                       *
+*                    Fix errors in SKIP= and COPY= processing.      *
+*                    Later SKIP=,COPY= overrides earlier coding.    *
+*                    Allow 12 packed digits for SKIP=,COPY=,        *
+*                     so the largest numbers allowed are            *
+*                     999999999999 (12 digits).  Ignore binary      *
+*                     numbers greater than 2,147,483,647, because   *
+*                     the CVB instruction can't handle them, but    *
+*                     the packed numbers are the ones used here     *
+*                     for comparison, not the binary numbers.       *
+*                    If a SKIP= or COPY= card has a numeric error,  *
+*                     then stop the processing with RC=12, and      *
+*                     abort the copy.                               *
+*                    Increased report number size for skipped       *
+*                     or copied records, in or out records.         *
+*                    Fixed possible catastrophic error when you     *
+*                     try and process numbers much greater than 12  *
+*                     digits in SKIP and COPY SYSIN statements.     *
+*                     (Limit number scan to 12 digits only.)        *
+*                                                                   *
+*     Note:  (To test what happens when JFCB fields have NOT YET    *
+*             been filled in, move the OPEN macros for SYSUT1       *
+*             and SYSUT2 to after the GO label, so the RDJFCB       *
+*             is done BEFORE the OPEN.  Then you'll have to fill    *
+*             in all the DCB values in your JCL, in order to get    *
+*             the program to run.  The catalog won't help you       *
+*             then.  This is for diagnosis purposes only.)          *
+* ----------------------------------------------------------------- *
+         MACRO
+&NAME    HEX   &TO,&LEN,&FROM
+&NAME    DS    0H
+         STM   R15,R1,HEXSAVE
+         LA    R1,&FROM
+         LA    R0,&LEN
+         LA    R15,&TO
+         BAL   R7,HEX
+         LM    R15,R1,HEXSAVE
+         MEND
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+         GBLC  &LLEV
+&LLEV    SETC  '008'                SET PROGRAM LEVEL
+*
+CKIEBGEN CSECT
+         YREGS
+         USING *,R15
+         B     EYECATCH
+         DC    C'--- '              MAKE EYECATCHER VISIBLE
+         DC    C'CKIEBGEN - GENERAL QSAM COPY PGM   - '
+         DC    C'&SYSDATE',C'  ',C'&SYSTIME ',C'--- '
+         DC    C'LEVEL &LLEV '
+         DC    C'--- '              MAKE EYECATCHER VISIBLE
+SAVEAREA DC    18F'0'
+EYECATCH DS    0H                   ENSURE ALIGNMENT
+         SAVE  (14,12)
+         LR    R5,R1                SAVE PARM POINTER
+         LA    R1,SAVEAREA          NEW SAVE-AREA ADDR
+         ST    R1,8(,R13)           FORWARD SAVE-AREA CHAIN PTR
+         ST    R13,4(,R1)           BACKWARD SAVE-AREA CHAIN PTR
+         LR    R13,R1               NEW SAVE AREA ADDRESS
+         DROP  R15
+* -----                             SET UP THREE BASE REGISTERS
+         USING CKIEBGEN,R12,R11,R10
+         LR    R12,R15
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+         LA    R10,4095(,R11)
+         LA    R10,1(,R10)
+         LR    R1,R5                RESTORE PARM POINTER
+         PRINT GEN
+***********************************************************************
+*                    GET SYSTEM DATE AND TIME                         *
+***********************************************************************
+         STM   R14,R2,SAVE1402
+         TIME  DEC,DATETIME,LINKAGE=SYSTEM,DATETYPE=MMDDYYYY
+         OI    DATE+4,X'0F'
+         UNPK  DATED,DATE
+         OI    TIME+3,X'0F'
+         UNPK  TIMED,TIME
+*                          FILL HEADDATE AREA WITH INFO TO REUSE
+         MVC   HEADDATE(2),DATED
+         MVI   HEADDATE+2,C'/'
+         MVC   HEADDATE+3(2),DATED+2
+         MVI   HEADDATE+5,C'/'
+         MVC   HEADDATE+6(4),DATED+4
+         MVC   HEADDATE+12(2),TIMED
+         MVI   HEADDATE+14,C':'
+         MVC   HEADDATE+15(2),TIMED+2
+         MVI   HEADDATE+17,C':'
+         MVC   HEADDATE+18(2),TIMED+4
+         MVC   HEADER+54(23),HEADDATE
+         MVI   HEADER+38,C'-'
+         MVC   HEADER+40(6),=C'LEVEL '
+         MVC   HEADER+46(3),=C'&LLEV'
+         LM    R14,R2,SAVE1402
+***********************************************************************
+* ------------------------------------------------------------------- *
+INITCON  DS    0H                   Initialize constants.
+         MVI   FLAGSYSN,X'00'       Initialize SYSIN flag.
+         MVI   ABORTFLG,X'00'       Initialize ABORT flag.
+         MVI   BLNKLINE-1,X'40'     Initial blank for BLNKLINE.
+* ------------------------------------------------------------------- *
+*   Check to see if there are SYSIN cards, and process their values.  *
+* ------------------------------------------------------------------- *
+         OPEN  (SYSPRINT,OUTPUT)
+         BAL   R7,TIOTSCAN          Scan if SYSIN DD is there.
+         TM    FLAGSYSN,X'01'       Is SYSIN DD there?
+         BZ    NOSYSIN              No. Just copy the entire file.
+         BAL   R7,DOSYSIN           Yes. Process all the SYSIN cards.
+* ------------------------------------------------------------------- *
+*   SYSIN, if it exists, has been processed, and its values saved,    *
+*          and the SYSIN DDname has been already CLOSEd.              *
+* ------------------------------------------------------------------- *
+NOSYSIN  DS    0H                   All ABORTs are before the OPENs
+         TM    INVNFLG,X'01'        Invalid SKIP or COPY?
+         BO    ABORT                Yes. Error. ABORT NOW..!!
+         TM    INVNFLG,X'02'        More than 12 digits coded?
+         BO    EXCESS               Yes. Kill it before it multiplies.
+*
+         MVC   OUTLINE,OUTLINE-1    Print program header.
+         MVC   OUTLINE(133),HEADER
+         PUT   SYSPRINT,OUTLINE
+* -------
+         MVC   OUTLINE,OUTLINE-1    Print underlines.
+         MVC   OUTLINE(133),HEADERJ
+         PUT   SYSPRINT,OUTLINE
+*-------------------------------------------------------------------- *
+*  Comment on the placement of OPEN before/after the RDJFCB.          *
+*                                                                     *
+*  In this program, we OPEN the SYSUT1 and SYSUT2 DCB's before        *
+*  doing the RDJFCB to find out the files' characteristics.  OPEN     *
+*  fills in the DCB information from the catalog and the VTOC of      *
+*  the pack, pointed to by the catalog, and adds it to the JFCB.      *
+*  This makes it easier to run the program.  If there is anything     *
+*  REAL that is missing from the JFCB information, then OPEN will     *
+*  usually itself flag the error (producing an invalid OPEN or an     *
+*  abend of the Sx13 type), so our error correction mechanism will    *
+*  not usually work when OPEN comes first.  But if OPEN comes after   *
+*  the RDJFCB, then only the JCL information will show up in the      *
+*  JFCB.  So any DCB information that was not supplied by the JCL,    *
+*  and is therefore missing from the JFCB, will be apparent.          *
+*                                                                     *
+*  Therefore I have an identical version of this program, called      *
+*  CKIEBTST, with no differences except to put the OPEN after the     *
+*  GO label, which is after the RDJFCB.  Then the RDJFCB happens      *
+*  BEFORE the OPEN in that program, and if there is any DCB info      *
+*  missing from the JCL itself, it will now show up.  So we can use   *
+*  the CKIEBTST program to test our error reporting, to see if it     *
+*  is accurate.  And CKIEBTST serves to debug our error-detecting     *
+*  mechanisms in CKIEBGEN.                                            *
+*-------------------------------------------------------------------- *
+PRLMJFCB DS    0H                   Preliminary RDJFCB to determine
+*                                   available DCB field information.
+*
+* -------                           OPEN input and output files.
+* -------                           OPEN is BEFORE the RDJFCB.
+         OPEN  (SYSUT1,(INPUT))
+         OPEN  (SYSUT2,(OUTPUT))
+         RDJFCB SYSUT1
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGDSN
+         MVI   OUTLINE+11,C'1'            Show SYSUT1
+         BAL   R7,PRTJFCB           Print available information.
+         RDJFCB SYSUT2
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGDSN
+         MVI   OUTLINE+11,C'2'            Show SYSUT2
+         BAL   R7,PRTJFCB           Print available information.
+         TM    FLAG1,X'0F'          No problems? Not missing JCL info?
+         BZ    GO                   Then go copy the file.
+         B     ABSTART              Otherwise report errors and exit.
+* ------------------------------------------------------------------- *
+GO       DS    0H                   Proceed to do the file copy.
+* ------------------------------------------------------------------- *
+*   To test for missing DCB attributes, move the SYSUTx OPENS here.   *
+* ------------------------------------------------------------------- *
+         ZAP   INRCDS,=P'0'               Initialize counters.
+         ZAP   OUTRCDS,=P'0'
+         ZAP   SKIPRCDS,=P'0'
+         ZAP   COPYRCDS,=P'0'
+* ------------------------------------------------------------------- *
+READWRIT DS    0H                         Main processing loop.
+         GET   SYSUT1,AREA                Get a new record.
+         AP    INRCDS,=P'1'               Count it as incoming.
+         TM    SKIPFLG,X'01'              Was SKIP coded?
+         BO    CNTSKIP                    Yes. Handle the skipping.
+         TM    SKIPFLG,X'02'              Was COPY coded?
+         BO    CNTCOPY                    Yes. Handle that.
+         B     PUTITOUT                   Neither. Copy all records.
+*
+*                                         PACKED NUMBERS USED FOR SKIP
+CNTSKIP  DS    0H                         Handle record skipping
+         CP    PKSKIP,INRCDS              Have we exceeded threshold?
+         BL    CNTCOPY                    Yes. See if copy was coded.
+         AP    SKIPRCDS,=P'1'             No. Count this skipped rcrd.
+         B     READWRIT                   And get another one.
+*
+*                                         PACKED NUMBERS USED FOR COPY
+CNTCOPY  DS    0H                         Handle subsequent copy.
+         TM    SKIPFLG,X'02'              Was COPY coded?
+         BZ    CNTCOPYA                   No. Then there's no limit.
+         CP    PKCOPY,COPYRCDS            Limit exceeded?
+         BNH   FIN                        Yes. Get out altogether.
+CNTCOPYA DS    0H
+         AP    COPYRCDS,=P'1'             Count record copied.
+PUTITOUT DS    0H                         And actually copy it.
+         PUT   SYSUT2,AREA
+         AP    OUTRCDS,=P'1'              Output record count.
+         B     READWRIT                   Loop back. Get another record
+* -------
+FIN      DS    0H                         Print Summary report and Exit
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(133),MSG01
+         MVC   OUTLINE+19(20),EDPAT2
+         ED    OUTLINE+20(20),INRCDS+0    Number of records input
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(133),MSG02
+         MVC   OUTLINE+19(20),EDPAT2
+         ED    OUTLINE+20(20),OUTRCDS+0   Number of records output
+         PUT   SYSPRINT,OUTLINE
+         TM    SKIPFLG,X'03'              Were SKIP= or COPY= coded?
+         BZ    GOCLOSE                    No. Extra print unnecessary.
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(133),MSG03
+         MVC   OUTLINE+19(20),EDPAT2
+         ED    OUTLINE+20(20),SKIPRCDS+0  Number of records skipped
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(133),MSG04
+         MVC   OUTLINE+19(20),EDPAT2
+         ED    OUTLINE+20(20),COPYRCDS+0  Number of records copied
+         PUT   SYSPRINT,OUTLINE
+GOCLOSE  DS    0H                        Close input and output files
+         CLOSE SYSUT1
+         CLOSE SYSUT2
+* -------
+THEEND   DS    0H                        Normal Return
+         CLOSE SYSPRINT
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'0'           Return code 0 in R15
+         LM    R14,R12,12(R13)           RESTORE THE REGISTERS
+         BR    R14                       RETURN
+EXCESS   DS    0H                        Excess digits coded
+         MVC   OUTLINE,OUTLINE-1         Clear line
+         MVC   OUTLINE(133),EXCESMSG     Move excess message
+         PUT   SYSPRINT,OUTLINE
+         B     CLOSPRNT                  Close SYSPRINT
+ABORT    DS    0H                        Normal Return
+         MVC   OUTLINE,OUTLINE-1         Clear line
+         MVC   OUTLINE(133),ABORTMSG     Move abort message
+         PUT   SYSPRINT,OUTLINE
+CLOSPRNT DS    0H                        Close SYSPRINT
+         CLOSE SYSPRINT
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'12'          Return code 12 in R15
+         LM    R14,R12,12(R13)           RESTORE THE REGISTERS
+         BR    R14                       RETURN
+         EJECT
+* ------------------------------------------------------------------- *
+*  Come here if not enough DCB attributes to feed QSAM to make a copy *
+* ------------------------------------------------------------------- *
+ABSTART  DS    0H                        Missing DCB attributes....
+         CLOSE SYSUT1
+         CLOSE SYSUT2
+         MVC   OUTLINE,OUTLINE-1         Tell em....
+         MVC   OUTLINE(133),ABENDMSG
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1         Tell em....
+         MVC   OUTLINE(133),ABENDMS2
+         PUT   SYSPRINT,OUTLINE
+GOABS    DS    0H                        Abnormal Return
+         CLOSE SYSPRINT
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'12'          Return code 12 in R15
+         LM    R14,R12,12(R13)           RESTORE THE REGISTERS
+         BR    R14                       RETURN
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                 S  U  B  R  O  U  T  I  N  E  S                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* -- BELOW ---------------  SUBROUTINE TO PRINT JFCB INFORMATION ---- *
+* ------------------------------------------------------------------- *
+PRTJFCB  DS    0H                         DSN MESSAGE MOVED BEFORE.
+         MVC   OUTLINE+19(44),JFCBDSNM    MOVE DSNAME.
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGMBR
+         MVC   OUTLINE+19(8),JFCBELNM     MOVE MEMBER NAME.
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGVOLSR           MOVE VOLSER MESSAGE.
+         MVC   OUTLINE+19(6),JFCBVOLS       MOVE UP TO 5 VOLUMES.
+         MVC   OUTLINE+26(6),JFCBVOLS+6
+         MVC   OUTLINE+33(6),JFCBVOLS+12
+         MVC   OUTLINE+40(6),JFCBVOLS+18
+         MVC   OUTLINE+47(6),JFCBVOLS+24
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGDSORG           MOVE DSORG MESSAGE.
+*                                         FIGURE OUT THE DSORG...
+         MVC   OUTLINE+19(3),=C'IS '      ASSUME ISAM.
+         CLI   JFCDSRG1,JFCORGIS          IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'ISU'      ASSUME ISAM UNMOVABLE.
+         CLI   JFCDSRG1,JFCORGIS+JFCORGU  IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'PS '      ASSUME PHYSICAL SEQUENTIAL.
+         CLI   JFCDSRG1,JFCORGPS          IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'PSU'      ASSUME PS UNMOVABLE.
+         CLI   JFCDSRG1,JFCORGPS+JFCORGU  IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'DA '      ASSUME DIRECT ACCESS.
+         CLI   JFCDSRG1,JFCORGDA          IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'DAU'      ASSUME DA UNMOVABLE.
+         CLI   JFCDSRG1,JFCORGDA+JFCORGU  IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'PO '      ASSUME PARTITIONED.
+         CLI   JFCDSRG1,JFCORGPO          IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         MVC   OUTLINE+19(3),=C'POU'      ASSUME PO UNMOVABLE.
+         CLI   JFCDSRG1,JFCORGPO+JFCORGU  IS IT?
+         BE    PUTDSRG                    YES, AND PUT MESSAGE.
+*
+         OI    FLAG1,X'01'                FLAG DSORG MISSING
+         MVC   OUTLINE+19(15),=C'MISSING OR VSAM'   MOVE TO MSG.
+PUTDSRG  PUT   SYSPRINT,OUTLINE
+* ------------------------------------------------------------------- *
+RECFM    DS    0H                         TEST FOR RECFM.
+         OI    FLAG1,X'08'                ASSUME NO RECFM & DISPROVE.
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MSGRECFM           MOVE RECFM MESSAGE.
+         LA    R4,OUTLINE+19              POINT TO RECFM REPORT AREA.
+* ------------------------------------------------------------------- *
+*   TEST FOR UNDEFINED FIRST, BECAUSE LRECL=0 IS THEN A VALID VALUE.  *
+* ------------------------------------------------------------------- *
+         TM    JFCRECFM,JFCUND            IS IT UNDEFINED?
+         BNO   NOTUND                     NO. LRECL=0 NOT VALID.
+         MVI   0(R4),C'U'                 MARK AS UNDEFINED.
+         OI    FLAG2,X'01'                FLAG RECFM=U (SPECIAL CASE)
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+         B     CHKB
+NOTUND   TM    JFCRECFM,JFCFIX            FIXED RECORDS?
+         BNO   NOTFIX                     NO. TRY NEXT.
+         MVI   0(R4),C'F'                 YES. MARK FIXED.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+*
+NOTFIX   TM    JFCRECFM,JFCVAR            VARIABLE RECORDS?
+         BNO   CHKB                       NO. TRY NEXT.
+         MVI   0(R4),C'V'                 YES. MARK VARIABLE.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+*
+CHKB     TM    JFCRECFM,JFCRFB            BLOCKED RECORDS?
+         BNO   NOTBLK                     NO. TRY NEXT.
+         MVI   0(R4),C'B'                 YES. MARKED BLOCKED.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+*
+NOTBLK   TM    JFCRECFM,JFCRFS            SPANNED RECORDS?
+         BNO   NOTSCN                     NO. TRY NEXT.
+         MVI   0(R4),C'S'                 YES. MARK SPANNED.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+*
+NOTSCN   TM    JFCRECFM,JFCASA            ASA CONTROL CHARACTERS?
+         BNO   NOTASA                     NO. TRY NEXT.
+         MVI   0(R4),C'A'                 YES. MARK ASA.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+         A     R4,ONE                     BUMP ONE PLACE.
+*
+NOTASA   TM    JFCRECFM,JFCMAC            MACHINE CONTROL CHARS?
+         BNO   PUTRECFM                   NO. CHECK IF NO RECFM.
+         MVI   0(R4),C'M'                 YES. MARK MACHINE.
+         NI    FLAG1,X'FF'-X'08'          TURN OFF NO RECFM.
+*
+PUTRECFM TM    FLAG1,X'08'                IS RECFM MISSING?
+         BNO   PUTRCFM                    NO. PRINT THE RECFM.
+         MVC   OUTLINE+19(14),=C'NO RECFM CODED'  YES. MARK MISSING.
+PUTRCFM  PUT   SYSPRINT,OUTLINE
+* ------------------------------------------------------------------- *
+LRECL    DS    0H                         TEST FOR LRECL.
+         MVC   OUTLINE,OUTLINE-1          CLEAR OUTPUT.
+         MVC   OUTLINE,MSGLRECL           MOVE LRECL MESSAGE.
+         SR    R4,R4                      CLEAR WORK REGISTER.
+         LH    R4,JFCLRECL                LOAD IT WITH JFCB LRECL.
+         C     R4,=F'0'                   IS THE VALUE ZERO?
+         BNE   LRECPRT                    NO. DON'T TEST FOR RECFM=U.
+         TM    FLAG2,X'01'                IS IT RECFM=U?
+         BO    LRECPRT                    YES. 0 IS LEGITIMATE.
+         OI    FLAG1,X'04'                NO. INDICATE LRECL MISSING.
+         MVC   OUTLINE+19(7),=C'MISSING'  SHOW IT IN MESSAGE.
+         B     LRECPUT                    WRITE LRECL MESSAGE
+*
+LRECPRT  DS    0H                         LRECL PRINT.
+         CVD   R4,DECVALUE                CONVERT BINARY TO PACKED.
+         MVC   OUTLINE+19(12),EDPAT       EDIT.
+         ED    OUTLINE+19(12),DECVALUE+3  DISPLAY LRECL VALUE IN MSG.
+LRECPUT  PUT   SYSPRINT,OUTLINE
+* ------------------------------------------------------------------- *
+*                                         PRINT BLOCKSIZE MESSAGE.
+BLKSIZE  MVC   OUTLINE,OUTLINE-1          CLEAR OUTPUT LINE.
+         MVC   OUTLINE,MSGBLKSZ           MOVE IN BLOCKSIZE MESSAGE.
+         SR    R4,R4                      CLEAR WORK REGISTER.
+         LH    R4,JFCBLKSI                LOAD BINARY BLKSZ FROM JFCB.
+         C     R4,=F'0'                   IS IT ZERO?
+         BNE   BLKSIZEG                   NO. BLOCK SIZE IS GOOD.
+         OI    FLAG1,X'02'                YES. FLAG BLKSIZE MISSING.
+         MVC   OUTLINE+19(15),=C'ZERO OR MISSING'   AND PRINT ERRMSG.
+         B     BLKSZPUT                   GO PRINT BLOCKSIZE ERRMSG.
+BLKSIZEG CVD   R4,DECVALUE                GOOD VALUE, CONVERT TO PACKED
+         MVC   OUTLINE+19(12),EDPAT       BLKSIZE EDIT PATTERN
+         ED    OUTLINE+19(12),DECVALUE+3  DISPLAY VALUE IN MESSAGE.
+BLKSZPUT PUT   SYSPRINT,OUTLINE           PRINT BLOCKSIZE MSG OUT.
+*
+         BR    R7                         RETURN TO CALLER.
+* -- ABOVE ---------------  SUBROUTINE TO PRINT JFCB INFORMATION ---- *
+* ------------------------------------------------------------------- *
+TIOTSCAN DS    0H                Determine the presence of Optional   *
+*                                DDNAME:   SYSIN                      *
+* ----->                         OPEN SYSIN if there is JCL for it.   *
+* ------------------------------------------------------------------- *
+         ST    R7,SAVER7TT               SAVE BAL REGISTER
+         ST    R3,SAVER3TT               SAVE WORK REGISTERS
+         ST    R5,SAVER5TT
+         L     R5,16                     R5=CVT
+         L     R5,0(,R5)                 R5=TCB WORDS
+         L     R5,4(,R5)                 R5=MY TCB
+         L     R5,12(,R5)                R5=TIOT
+         LA    R5,24(,R5)                R5=FIRST DD ENTRY
+TIOTLOOP CLC   0(4,R5),=XL4'00'          END OF TIOT?
+         BE    TIOTSEND                  YES
+TIOTSYSN CLC   4(8,R5),SYSIN+40          ENTRY MATCH?
+         BNE   TIOTNEXT                  NO. TRY NEXT ONE.
+         OI    FLAGSYSN,X'01'            YES-SHOW PRESENCE OF SYSIN DD
+         B     TIOTNEXT
+TIOTNEXT SR    R3,R3
+         IC    R3,0(,R5)                 R3=LENGTH OF DD ENTRY
+         AR    R5,R3                     R5=NEXT DD ENTRY
+         B     TIOTLOOP                  GO CHECK IT
+TIOTSEND DS    0H
+         L     R3,SAVER3TT               RESTORE WORK REGISTERS
+         L     R5,SAVER5TT
+         L     R7,SAVER7TT               RESTORE BAL REGISTER
+         BR    R7                        R7 IS THE BAL REGISTER
+* ------------------------------------------------------------------- *
+SAVER3TT DS    F
+SAVER5TT DS    F
+SAVER7TT DS    F
+FLAGSYSN DC    X'00'
+* ------------------------------------------------------------------- *
+*                    PROCESS THE SYSIN RECORDS                        *
+* ------------------------------------------------------------------- *
+DOSYSIN  DS    0H                        Process SYSIN records.
+         ST    R7,SAVER7SY
+         OPEN  (SYSIN,(INPUT))
+         STM   R3,R4,SAVE34              Save the work registers.
+         MVC   BLNKLINE,BLNKLINE-1       Clear blank line
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+1(65),=C'   Display SYSIN Cards and Conversions x
+                (Later overrides Earlier)'
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+1(65),=C'   ------- ----- ----- --- ----------- x
+                 ----- --------- ------- '
+         PUT   SYSPRINT,OUTLINE
+SYINLOOP DS    0H                        Read all the SYSIN cards.
+         GET   SYSIN,INSYSIN             GET a card.
+         NI    NUMCFLG,X'FF'-X'07'       Assume number on card is valid
+         MVC   WRKSYSIN(80),INSYSIN      Make a copy of it.
+         OC    WRKSYSIN,BLNKLINE         Uppercase the copy.
+* ------------------------------------------------------------------ *
+*           DISPLAY SYSIN CARDS AS THEY WILL BE LOOKED AT            *
+* ------------------------------------------------------------------ *
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+4(80),WRKSYSIN    Move uppercased card image.
+         MVC   OUTLINE+39(21),=C'<--- (Value as coded)'
+         PUT   SYSPRINT,OUTLINE
+* ------------------------------------------------------------------ *
+*           Test the uppercased card for keywords                    *
+*           And afterwards do the proper displacements               *
+* ------------------------------------------------------------------ *
+         LA    R3,WRKSYSIN               Point R3 to the uppercased.
+         LA    R4,INSYSIN                Point R4 to the original.
+         CLC   =C'COPY= ',0(R3)           COPY= followed by space?
+         BE    SYINLOOP                   No number there, so ignore.
+         CLC   =C'SKIP= ',0(R3)           SKIP= followed by space?
+         BE    SYINLOOP                   No number there, so ignore.
+         CLC   =C'COPY=',0(R3)            COPY= keyword?
+         BE    HCOPY                      Yes. Handle it.
+         CLC   =C'SKIP=',0(R3)            SKIP= keyword?
+         BE    HSKIP                      Yes. Handle it.
+         B     SYINLOOP
+HCOPY    DS    0H                         Handle COPY=
+         OI    SKIPFLG,X'02'              Indicate its presence.
+         LA    R4,5(,R4)                  Point to the number.
+         LA    R3,5(,R3)
+         BAL   R7,NUMBRGET                Extract the number.
+         MVC   CHCOPY(12),CHARNUM         Display value
+         MVC   BICOPY(4),BINVALUE         Binary  value
+         TM    NUMCFLG,X'01'              INVALID?
+         BO    HNZCOPY                    DON'T PACK IF INVALID !!
+         ZAP   PKCOPY,PACKNUM             Packed  value
+HNZCOPY  DS    0H
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINET(7),=C'COPY=  '
+         MVC   OUTLINE+20(8),=C'Binary: '
+         HEX   OUTLINE+29,4,BICOPY
+         MVC   OUTLINE+45(8),=C'Decimal:'
+         MVC   OUTLINE+55(12),CHCOPY
+         TM    NUMCFLG,X'01'
+         BZ    HCOPYGD
+         MVC   OUTLINE+68(15),=C'Invalid Numeric'
+HCOPYGD  DS    0H
+         TM    NUMCFLG,X'02'
+         BZ    HCOPYGD1
+         MVC   OUTLINE+68(21),=C'Binary Limit Exceeded'
+HCOPYGD1 DS    0H
+         PUT   SYSPRINT,OUTLINE
+         B     SYINLOOP                   Look for next card.
+*
+HSKIP    DS    0H                         Handle SKIP=
+         OI    SKIPFLG,X'01'              Indicate its presence.
+         LA    R4,5(,R4)                  Bump the pointers.
+         LA    R3,5(,R3)
+         BAL   R7,NUMBRGET                Extract the number.
+         MVC   CHSKIP(12),CHARNUM         Display value
+         MVC   BISKIP(4),BINVALUE         Binary  value
+         TM    NUMCFLG,X'01'              INVALID?
+         BO    HNZSKIP                    DON'T PACK IF INVALID !!
+         ZAP   PKSKIP,PACKNUM             Packed  value
+HNZSKIP  DS    0H
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINET(7),=C'SKIP=  '
+         MVC   OUTLINE+20(8),=C'Binary: '
+         HEX   OUTLINE+29,4,BISKIP
+         MVC   OUTLINE+45(8),=C'Decimal:'
+         MVC   OUTLINE+55(12),CHSKIP
+         TM    NUMCFLG,X'01'           Invalid numeric character coded
+         BZ    HSKIPGD
+         MVC   OUTLINE+68(15),=C'Invalid Numeric'
+HSKIPGD  DS    0H
+         TM    NUMCFLG,X'02'           Binary equivalent > X'7FFFFFFF'
+         BZ    HSKIPGD1                (Doesn't cause abend or RC>0.)
+         MVC   OUTLINE+68(21),=C'Binary Limit Exceeded'
+HSKIPGD1 DS    0H                      PUT error message out.
+         PUT   SYSPRINT,OUTLINE
+         B     SYINLOOP                Look for next card.
+SYSINEND DS    0H
+         MVC   OUTLINE,OUTLINE-1
+*        PUT   SYSPRINT,OUTLINE
+* ----- >
+         CLOSE (SYSIN)
+         LM    R3,R4,SAVE34
+SYSINENX DS    0H
+         MVC   OUTLINE,OUTLINE-1       Print a blank line.
+         PUT   SYSPRINT,OUTLINE
+         L     R7,SAVER7SY
+         BR    R7
+*------------------------  Constants needed for this routine -----*
+SAVE34   DS    2F                Save work registers for routine.
+SAVER7SY DS    F                 Save BAL register.
+INSYSIN  DC    CL80' '           Buffer for SYSIN card image.
+WRKSYSIN DC    CL80' '           Buffer to uppercase SYSIN image.
+         DC    X'40'
+BLNKLINE DC    CL80' '           Place to supply blanks for pgm.
+CHCOPY   DC    CL12' '           CHARACTER NUMBER JUSTIFIED LEFT
+BICOPY   DS    F                 FULLWORD BINARY NUMBER
+PKCOPY   DS    PL8               Packed Decimal records to copy.
+CHSKIP   DC    CL12' '           CHARACTER NUMBER JUSTIFIED LEFT
+BISKIP   DS    F                 FULLWORD BINARY NUMBER
+PKSKIP   DS    PL8               Packed Decimal records to skip.
+*-----------------------------------------------------------------*
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*     Routine to get the numeric values from the SYSIN keywords.  *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*-----------------------------------------------------------------*
+NUMBRGET DS    0H                   Initialize for each SYSIN card.
+         ST    R7,SAVER7NG          Save BAL register.
+         ST    R4,SAVER4A           Save address of number in original
+         ST    R3,SAVER3A           Save address of number in copy
+         NI    NUMCFLG,X'FF'-X'07'  Turn off "not numeric" flag.
+         MVC   CHARNUM(12),BLNKLINE   Initialize character field
+         XC    BINVALUE,BINVALUE      Clear binary value
+         LA    R6,12                Limit the search to 12 numbers.
+* ----------------------------------------------------------------- *
+*    Upon entry, R4 points to "number" in original.
+*    Upon entry, R3 points to "number" in copy.
+* ----------------------------------------------------------------- *
+         CLI   0(R4),C' '        Is the first number value blank?
+         BE    NUMBRCLG          Yes. Ignore the entire card.
+* --
+* ----------------------------------------------------------------- *
+*    At this point, we are looking at the first character after     *
+*     the particular keyword, and we want to test it and extract    *
+*     its value.                                                    *
+* ----------------------------------------------------------------- *
+         CLI   0(R4),X'F0'       Smaller than character 0?
+         BL    NUMBRNVL          Yes. Mark as invalid.
+         CLI   0(R4),X'F9'       Bigger than 9?
+         BH    NUMBRNVL          Yes. Mark as invalid.
+         B     NUMBRVLD          Didn't fail, consider the number valid
+*                   Remember that R4 is start address for "number".
+NUMBRNVL DS    0H                Mark the character as invalid number.
+         OI    NUMCFLG,X'01'     Set "invalid flag" for this number.
+         OI    INVNFLG,X'01'     Show there's an invalid number coded.
+         MVI   0(R4),C'*'        Mark invalid digit in the report.
+NUMBRVLD DS    0H
+* ----------------------------------------------------------------- *
+NUMBRNUM DS    0H                Loop to extract the number.
+         LA    R4,1(,R4)         Bump R4 to point to next character.
+         C     R4,INSYSIN+71     End of card?
+         BH    NUMBRGNM          Yes, Get number.
+         CLI   0(R4),C' '        Blank here?
+         BE    NUMBRGNM          Yes, Get number.
+** ----- >>   Validity Check - below
+* --
+         CLI   0(R4),X'F0'       Smaller than C'0'?
+         BL    NUMBINVL          Yes. Mark as invalid.
+         CLI   0(R4),X'F9'       Bigger than C'9'?
+         BH    NUMBINVL          Yes. Mark as invalid.
+         B     NUMBVALD          None of above, don't mark invalid.
+NUMBINVL DS    0H                Mark the character as invalid number.
+         OI    NUMCFLG,X'01'     Set "invalid flag" for this number.
+         OI    INVNFLG,X'01'     Show there's an invalid number coded.
+         MVI   0(R4),C'*'        Mark invalid digit in the report.
+NUMBVALD DS    0H
+** ----- >>   Validity Check - above
+         BCT   R6,NUMBRNUM       Step up one place.
+         OI    INVNFLG,X'02'     Show we've coded more than 12 numbers
+* ----------------------------------------------------------------- *
+*  This is a serious error, and we abort the COPY with a message.   *
+* ----------------------------------------------------------------- *
+NUMBRGNM DS    0H
+         L     R2,SAVER4A        Load R2 with address of number start
+         SR    R4,R2             How big is the number?
+         BCTR  R4,0              Lower by one for EXECUTE.
+         TM    NUMCFLG,X'01'     Was any digit of the number invalid?
+         BO    NUMBRNPK          Yes, don't try to pack it. S0C7.
+         XC    PACKWORK,PACKWORK   Clear the work area.
+         EX    R4,PACKIT         Pack the number into work area.
+         MVC   OUTLINE,OUTLINE-1
+         HEX   OUTLINE+20,8,PACKWORK     Test display
+*        PUT   SYSPRINT,OUTLINE          For diagnosis of packed no.
+         ZAP   PACKNUM,PACKWORK
+         MVC   OUTLINE,OUTLINE-1
+         HEX   OUTLINE+20,8,PACKNUM      Test display
+*        PUT   SYSPRINT,OUTLINE          For diagnosis of packed no.
+NUMBRNPK DS    0H
+         MVC   CHARNUM(12),BLNKLINE   Clear the display area.
+         EX    R4,MVNUMBER       Move the display value to display.
+         TM    NUMCFLG,X'01'     Was any digit of the number invalid?
+         BO    NUMBRCLG          Yes, don't try to convert it. S0C7.
+* ----------------------------------------------------------------- *
+*      Prevent S0C9 abend if binary number exceeds X'7FFFFFFF'      *
+* ----------------------------------------------------------------- *
+         CP    PACKWORK,=P'2147483647'   Saves S0C9 for big number
+         BH    NUMBRCLY          CVB has upper limit of X'7FFFFFFF'
+         CVB   R0,PACKWORK       Convert the packed version to binary.
+         ST    R0,BINVALUE       Store the binary value for later use.
+         B     NUMBRCLG
+NUMBRCLY DS    0H
+         OI    NUMCFLG,X'02'     CVB limit exceeded. Flag it.
+NUMBRCLG DS    0H                End of routine to extract numbers.
+         L     R3,SAVER3A
+         L     R7,SAVER7NG       Restore BAL register.
+         BR    R7
+* ----------------------------------------------------------------- *
+PACKIT   PACK  PACKWORK,0(0,R2)      <<< EXECUTED >>>
+MVNUMBER MVC   CHARNUM(0),0(R2)      <<< EXECUTED >>>
+SAVER7NG DS    F
+SAVER3A  DS    F
+SAVER4A  DS    F
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+PACKWORK DC    2D'0'             PACK WORK AREA (expanded to 2D)
+CHARNUM  DC    CL12' '           CHARACTER NUMBER JUSTIFIED LEFT
+BINVALUE DS    F                 FULLWORD BINARY NUMBER
+PACKNUM  DS    PL8               Packed number.
+*
+NUMCFLG  DS    X                 Error flag FOR EACH SYSIN card
+*              X'01'             Error present in THIS card
+*              X'02'             Number exceeds CVB limit
+*
+INVNFLG  DS    X                 Error present in ANY card-ABORT..
+*              X'01'             Non-numeric in any card.
+*              X'02'             A coded number exceeds 12 digits.
+*
+SKIPFLG  DC    X'00'
+*                                X'01' - SKIP coded
+*                                X'02' - COPY coded
+* ----------------------------------------------------------------- *
+HEX      DS    0H                    Hex Number Display Routine.
+         ST    R7,SAV7HEX
+         MVC   1(1,R15),0(R1)        Move byte
+         UNPK  0(3,R15),1(2,R15)     Unpack
+         TR    0(2,R15),HEXTAB-240
+         LA    R15,2(,R15)           Increment output pointer
+         LA    R1,1(,R1)             Increment input pointer
+         BCT   R0,HEX                Decrement length, then loop
+         MVI   0(R15),C' '           Blank the trailing byte
+         L     R7,SAV7HEX
+         BR    R7                    Return to caller
+HEXTAB   DC    C'0123456789ABCDEF'   Translate table
+* ----------------------------------------------------------------- *
+HEXSAVE  DS    3F                    Register save for HEX macro
+SAV7HEX  DC    F'0'
+         SPACE
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*-----------------------------------------------------------------*
+*
+* ----- WORK AREA ------ *
+FLAG1    DC    X'00'          For PRTJFCB routine.
+*              X'01'          DSORG is missing or in error
+*              X'02'          BLKSIZE is missing or in error
+*              X'04'          LRECL is missing or in error
+*              X'08'          RECFM is missing or in error
+FLAG2    DC    X'00'          X'01' shows RECFM=U, LRECL=0 is valid
+ABORTFLG DC    X'00'
+* ----- CONSTANTS ------ *
+PKZERO   DC    PL8'0'
+ONE      DC    F'1'
+DECVALUE DS    CL8
+EDPAT    DC    X'402020206B2020206B202120'
+EDPAT2   DC    X'402020206B2020206B2020206B2020206B202120'
+         DC    C' '
+BLANKS   DC    CL133' '
+OUTLINE  DS    CL133
+OUTLINET EQU   OUTLINE+7
+HEADER   DC    CL133'1  CKIEBGEN - SEQUENTIAL COPY PROGRAM'
+HEADERJ  DC    CL133'-   JFCB REPORT OF DATASET CHARACTERISTICS '
+MSGDSN   DC    CL133'-     SYSUTX DSN ='
+MSGVOLSR DC    CL133'         VOLSER  ='
+MSGMBR   DC    CL133'         MEMBER  ='
+MSGDSORG DC    CL133'         DSORG   ='
+MSGBLKSZ DC    CL133'         BLKSIZE ='
+MSGLRECL DC    CL133'         LRECL   ='
+MSGRECFM DC    CL133'         RECFM   ='
+MSG01    DC    CL133'-    RECORDS  IN ='
+MSG02    DC    CL133'     RECORDS OUT ='
+MSG03    DC    CL133'     SKIPPED     ='
+MSG04    DC    CL133'     COPIED      ='
+ABENDMSG DC    CL133'-   JFCB IS MISSING VALUES - CORRECT YOUR JCL '
+ABENDMS2 DC    CL133'-         ***  NO DATA WAS COPIED  *** '
+ABORTMSG DC    CL133'-   SYSIN CARDS INVALID - COPY ABORTED '
+EXCESMSG DC    CL133'-   SYSIN CARDS INVALID - MORE THAN 12 DIGITS   '
+INRCDS   DC    PL8'0'
+OUTRCDS  DC    PL8'0'
+SKIPRCDS DC    PL8'0'
+COPYRCDS DC    PL8'0'
+         LTORG
+SYSUT1   DCB   DDNAME=SYSUT1,MACRF=GM,EODAD=FIN,DSORG=PS,EXLST=JFCB1
+SYSUT2   DCB   DDNAME=SYSUT2,MACRF=PM,DSORG=PS,EXLST=JFCB1
+SYSPRINT DCB   DDNAME=SYSPRINT,DSORG=PS,MACRF=PM,LRECL=133,RECFM=FBA
+SYSIN    DCB   MACRF=GM,DDNAME=SYSIN,DSORG=PS,RECFM=FB,LRECL=80,       X
+               EODAD=SYSINEND
+         DC    CL8' '
+SAVE1402 DS    6F                 ONE MORE FOR SAFETY
+* ----------------------------------------------------------------- *
+*          Work area for time and date display routine              *
+* ----------------------------------------------------------------- *
+TIMED    DS    CL7
+DATED    DS    CL9
+DATETIME DS    4F
+         ORG   DATETIME
+TIME     DS    CL4
+         DS    CL4
+DATE     DS    CL5
+         DS    CL3
+HEADDATE DC    CL23' '
+         DC    CL8' '
+* ----------------------------------------------------------------- *
+*                    R D J F C B  Work Area                         *
+* ----------------------------------------------------------------- *
+         DS    0F
+JFCB1    DC    X'87'
+         DC    AL3(INFMJFCB)
+         IEFJFCBN LIST=YES
+* ----------------------------------------------------------------- *
+*                         Copy Buffer                               *
+* ----------------------------------------------------------------- *
+AREA     DS    CL32768
+         END   CKIEBGEN

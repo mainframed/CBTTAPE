@@ -1,0 +1,968 @@
+//jobname JOB (account),userid,CLASS=S,MSGCLASS=Y,REGION=4M
+//*
+//* First modify JOB card and data set names to your environment
+//* Assemble and Link program/module
+//*
+//ASMH EXEC PGM=ASMA90,REGION=4M,
+// PARM='RENT,OBJECT,NODECK,NOXREF,BATCH'
+//SYSLIB   DD DISP=SHR,DSN=SYS3.UTILITY.MACLIB.TEST      <== hlq.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MODGEN
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//SYSIN    DD *
+*---------------------------------------------------------------------
+     TITLE 'SVM0033  external module for IRXL@DDN and IRXF@DSN'
+*---------------------------------------------------------------------
+* History of Changes (last comes first):
+*
+* 05-16-2003 SVM Added SYSMEMBER for dsn(member)
+* 05-14-2003 SVM Updated to process VIO datasets
+* 05-02-2003 SVM Added 4-digit unit processing
+* 02-27-2003 SVM Added limited processing for non-DASD
+*                    and RACF verification
+* 01-03-2003 SVM Created from old LISTDSN (SVM0025)
+*.....................................................................
+*
+* FUNCTION:
+*               Gets parms: DDN, DSN, UNIT, VOL, UCBTYP, JFCB addr
+*               Reads DSCB1 from disk or JFCB from SWA
+*               Inquires REXX DSN access level for current userid
+*
+* INPUT:
+*               R0 -> IRXENVB (environment block)
+*               R1 -> A1,A2,A3,A4,A5,A6 (parameter list)
+*               A1 = addr(DDN)    (length = 8)
+*               A2 = addr(DSN)    (length = 44)
+*               A3 = addr(UNIT)   (length = 4)
+*               A4 = addr(VOL)    (length = 6)
+*               A5 = addr(UCBTYP) (length = 4)
+*               A6 = addr(JFCB)   (length = 4) or 0
+*
+* OUTPUT:
+*               R15 = 0
+*               Created and assigned REXX variables (see list below)
+* ATTRIBUTES:
+*        REENTRANT, AMODE=31, RMODE=ANY
+*
+* EXTERNALS:
+*               SVM0028 - read PDS directory
+*                  $OPEN - dynalloc/read interface
+*               RACFCHK - inquire RACF protection level interface
+*                  SVM0010 - inquire RACF protection level
+*---------------------------------------------------------------------
+         EJECT
+*---------------------------------------------------------------------
+.* Macro to help clear variable: &N is a name of var name constant
+         MACRO
+         STORE &N,&C=SHVSTORE
+         AIF   ('&N' EQ '').NON
+         LA    R1,&N
+         ST    R1,SHVNAMA               --> store name addr
+         LA    R1,L'&N
+         ST    R1,SHVNAML               --> Store name length
+         MVI   SHVCODE,&C               --> Set "store" code
+         BAL   R14,CALLXCOM             - create variable
+.NON     ANOP
+         MEND
+*
+SVM0033  BEGIN A=31,R=31                                                 0000062
+WRK      WORK  LV=WRKL,LOC=BELOW
+         B     START
+EXIT     SR    R15,R15
+         FIN
+*--------------------
+* REGISTER EQUATES:
+* R6  -> JFCB/DSCB1
+* R8  -> SHVBLOCK
+* R9  -> EVALBLOCK result block
+* R10 -> IRXEFPL   parm block
+* R11 -> ENVBLOCK  environment block
+*---------------------------------------------------------------------
+START    EQU   *
+*- Receive parameters:
+         L     R2,0(R1)                A1
+         MVC   DDN(8),0(R2)
+         L     R2,4(R1)                A2
+         MVC   DSN(44),0(R2)
+         L     R2,8(R1)                A3
+         MVC   UNIT(4),0(R2)
+         L     R2,12(R1)               A4
+         MVC   VOL(6),0(R2)
+         L     R2,16(R1)               A5
+         MVC   UTYPE(4),0(R2)
+         L     R2,20(R1)               A6
+         ST    R2,JFCBA
+*- Set REXX environment:
+*        LR    R10,R1                  IRXEFPL
+*        USING EFPL,R10                - parm list
+         LR    R11,R0                  ENVBLOCK
+         USING ENVBLOCK,R11            - externals
+*        L     R9,EFPLEVAL
+*        L     R9,0(R9)                EVALBLOCK
+*        USING EVALBLOCK,R9            - result
+         LA    R8,SHVBLK
+         USING SHVBLOCK,R8
+         BAL   R14,SETSHV
+*---------------------------------------------------------------------*
+*- Process DDNAME:
+*
+RDDN     EQU   *
+*        WTO   'RDDN...',ROUTCDE=11
+         LA    R3,DDN-1
+         LA    R1,DDN+7
+         LA    R2,1                     increment
+         LNR   R2,R2                    -1
+LOOPDDN  CLI   0(R1),C' '
+         BNE   LOOPEDDN
+         BXH   R1,R2,LOOPDDN
+*  R1-> blank or next char after DDNAME
+LOOPEDDN SR    R1,R3                   length of DDNAME
+         ST    R1,SHVVALL              --> store value length
+         LA    R1,DDN
+         ST    R1,SHVVALA              --> store value addr
+         STORE #DDN
+*---------------------------------------------------------------------*
+*- process SYSUTYPE (UCBTYP)
+*        WTO 'Processing UTYPE...',ROUTCDE=11
+         MVC   VALUE(4),=C'DISK'
+         LA    R1,4
+         TM    UTYPE+2,X'20'           disk?
+         BO    PUTYPE
+         MVC   VALUE(4),=C'TAPE'
+         TM    UTYPE+2,X'80'           tape?
+         BO    PUTYPE
+         MVC   VALUE(4),=C'COMM'
+         TM    UTYPE+2,X'40'
+         BO    PUTYPE
+         MVC   VALUE(5),=C'DISPL'
+         LA    R1,5
+         TM    UTYPE+2,X'10'
+         BO    PUTYPE
+         MVC   VALUE(5),=C'OTHER'
+PUTYPE   EQU   *
+         ST    R1,SHVVALL              --> store value length
+         LA    R1,VALUE
+         ST    R1,SHVVALA              --> store value addr
+         STORE #UTYPE
+*---------------------------------------------------------------------*
+*  Now it is either Disk or Tape dataset:
+*
+         TM    UTYPE+2,X'20'           disk?
+         BO    CONT1
+         TM    UTYPE+2,X'80'           tape?
+         BNO   ALLDONE                 Exit if not TAPE or DASD
+CONT1    EQU   *
+*---------------------------------------------------------------------*
+*- process VOLUME:
+*        WTO   'Processing VOLSER...',ROUTCDE=11
+         LA    R3,VOL-1                VOLSER-1
+         LA    R1,VOL+5                VOLSER+5
+         LA    R2,1
+         LNR   R2,R2                   incr = -1
+VOLLOOP  CLI   0(R1),C' '
+         BNE   VOLLOOPE
+         BXH   R1,R2,VOLLOOP
+* R1 = VOL Length
+VOLLOOPE SR    R1,R3                   VOL length
+         ST    R1,SHVVALL              --> store value length
+         LA    R3,VOL
+         ST    R3,SHVVALA              --> store value addr
+         STORE #VOL
+*---------------------------------------------------------------------*
+*- process UNIT:
+GETUNIT  EQU   *
+*        WTO 'Processing UNIT...',ROUTCDE=11
+         LA    R1,UNIT                 UNIT
+         ST    R1,SHVVALA              --> store value addr
+         LA    R1,4
+         ST    R1,SHVVALL              --> store value length
+         STORE #UNIT
+*---------------------------------------------------------------------*
+*- process DSNAME:
+*        WTO 'Processing DSN...',ROUTCDE=11
+         LA    R3,DSN-1
+         LA    R1,DSN+43
+         LA    R2,1                    increment
+         LNR   R2,R2                   -1
+LOOP     CLI   0(R1),C' '
+         BNE   LOOPE
+         BXH   R1,R2,LOOP
+*  R1-> blank or next char after DSN
+LOOPE    SR    R1,R3                   length of DSNAME
+         ST    R1,SHVVALL              --> store value length
+         STH   R1,LDSN                 ==> store for further use
+         LA    R1,DSN
+         ST    R1,SHVVALA              --> store value addr
+         STORE #DSN
+*---------------------------------------------------------------------*
+*- Get RACF RC:
+GETRACF  LH    R1,LDSN                 take DSN length
+         LA    R1,L'PARPFX(,R1)        add length of PARPFX
+         STH   R1,LPAR                 set LPAR
+         LA    R1,LPAR
+         ST    R1,APAR                 set APAR
+         MVC   PARPFX(2),=C',,'        set PARPFX
+         LA    R1,APAR
+         CALL  RACFCHK                 Get RACROUTE rc
+         ST    R15,RACFRC              store rc for future use
+*=====================================================================*
+*- If Disk, goto LOCATE DSCB1:
+*
+         CLC   UNIT+1(3),=C'VIO'       VIO?
+         BE    TAKEJFCB                - yes
+         TM    UTYPE+2,X'20'           Disk ?
+         BO    LOCATEIT                - yes
+*=====================================================================*
+*  For Tape dataset and VIO take data fields from JFCB:
+*
+TAKEJFCB CLC   JFCBA(4),=A(0)          JFCB available ?
+         BE    ALLDONE                 - no
+         CLC   RACFRC(4),=F'0'         if 'NO ACCESS'
+         BE    ALLDONE                 skip opening dataset
+*        WTO  'Processing JFCB...',ROUTCDE=11
+         L     R6,JFCBA
+         USING JFCB,R6
+         SR    R7,R7                   flag "was opened"
+         CLI   JFCDSORG,X'00'          If opened
+         BNE   OPENED                  - yes: skip OPEN
+*        WTO   'Opening dataset...',ROUTCDE=11
+         MVC   DCB(#DCBSIZE),#DCB
+         LA    R1,DCB
+         USING IHADCB,R1
+         MVC   DCBDDNAM(8),DDN         Set dcbddnam
+         ST    R1,DCBADDR
+         MVI   DCBADDR,X'80'           Set input
+         LA    R1,DCBADDR
+         SVC   19                      OPEN
+         LA    R1,DCB
+         TM    DCBOFLG,DCBOFOPN        Opened ?
+         BNO   ALLDONE                 Cannot open
+         LA    R7,1                    flag "was not opened"
+*        WTO   'Opened OK...',ROUTCDE=11
+         DROP  R1                      USING
+*- when dataset is in dd concatenation, JFCB will not be updated:
+OPENED   CLI   JFCDSORG,X'00'          If JFCB updated?
+         BE    ALLDONE                 - not quite: skip
+*
+*  copy data from JFCB to workarea and close DCB:
+COPYJ    MVC   @DSORG(1),JFCDSORG      copy DSORG
+         MVC   @RECFM(1),JFCRECFM      copy RECFM
+         MVC   @BLKSI(2),JFCBLKSI      copy BLKSIZE
+         MVC   @LRECL(2),JFCLRECL      copy LRECL
+         MVC   @CRDT(3),JFCBCRDT       copy CRDT
+         MVC   @XPDT(3),=F'0'
+         TM    JFCBFLG3,JFCBEXP
+         BNO   NOEXDT
+         MVC   @XPDT(3),JFCBXPDT       copy EXPDT
+NOEXDT   MVC   @UNITS(1),JFCBCTRI      copy Space Units
+         MVC   @PQTY(3),JFCBPQTY       copy primary units
+         MVC   @SQTY(3),JFCBSQTY       copy secondary units
+         MVC   @KEYLE(1),JFCKEYLE      copy key length
+         MVI   FROMJFCB,YES            Set From JFCB flag
+         DROP  R6                      USING
+         LTR   R7,R7                   If "was opened"
+         BZ    CONT2                   - yes, do not close
+         LA    R1,DCBADDR
+         MVI   DCBADDR,X'80'           set VL bit
+         SVC   20                      CLOSE
+         B     CONT2
+*=====================================================================*
+*  locate datatset on DASD volume and use DSCB1:
+*
+LOCATEIT EQU   *
+*        WTO 'Locating DSCB on VOLUME...',ROUTCDE=11
+         MVC   LISTD(4),#LISTD          const
+         LA    R1,DSN
+         ST    R1,LISTD+4               DSN
+         LA    R1,VOL
+         ST    R1,LISTD+8               VOL
+         LA    R1,W140
+         ST    R1,LISTD+12              DSCB area
+*        WTO   'Obtaining DSCB...',ROUTCDE=11
+         OBTAIN LISTD
+         LTR   R15,R15
+         BNZ   EXIT                     Obtain failed
+*        WTO   'Obtain successful',ROUTCDE=11
+         LA    R6,W140
+         USING DS1+44,R6
+*  copy data from DS1 to workarea:
+         MVC   @DSORG(1),DS1DSORG      copy DSORG
+         MVC   @RECFM(1),DS1RECFM      copy RECFM
+         MVC   @BLKSI(2),DS1BLKL       copy BLKSIZE
+         MVC   @LRECL(2),DS1LRECL      copy LRECL
+         MVC   @CRDT(3),DS1CREDT       copy CRDT
+         MVC   @XPDT(3),DS1EXPDT       copy EXPDT
+         MVC   @UNITS(1),DS1SCAL1      copy units
+         MVC   @KEYLE(1),DS1KEYL       copy key length
+PRIM     SR    R2,R2
+         ICM   R2,3,DS1EXT1+2          lower CC
+         TM    DS1SCAL1,DS1CYL         in Cylinders?
+         BO    PRIM1                   - no
+         LR    R1,R2                   calculate tracks:
+         SLL   R1,4                    *16
+         SR    R1,R2                   *15
+         SR    R2,R2
+         ICM   R2,3,DS1EXT1+4          lower HH
+         AR    R2,R1                   Lower relative track #
+*
+PRIM1    SR    R1,R1
+         ICM   R1,3,DS1EXT1+6          higher CC
+         TM    DS1SCAL1,DS1CYL         in Cylinders?
+         BO    PRIM2                   - no
+         LR    R3,R1
+         SLL   R3,4                    *16
+         SR    R3,R1                   *15
+         SR    R1,R1
+         ICM   R1,3,DS1EXT1+8          higher HH
+         AR    R1,R3                   higher relative track #
+PRIM2    SR    R1,R2
+         LA    R1,1(,R1)               higher - lower + 1 (trks)
+         STCM  R1,7,@PQTY              copy PRIMARY
+         MVC   @SQTY(3),DS1SCAL3       copy Secondatry
+*
+         MVI   FROMJFCB,0              set From JFCB flag
+*=====================================================================*
+*- common continuation for DSCB1 and JFCB processing:
+*
+CONT2    EQU   *
+*---------------------------------------------------------------------*
+*- process MEMBER:
+*        WTO 'Processing MEMBER...',ROUTCDE=11
+         CLC   JFCBA(4),=A(0)          JFCB available ?
+         BE    NOMEMB                  - no JFCB
+         L     R4,JFCBA
+         USING JFCB,R4
+*
+         TM    @DSORG,DS1DSGPO
+         BNO   NOMEMB                  - not PDS
+         LA    R3,JFCBELNM-1
+         LA    R1,JFCBELNM+7
+         LA    R2,1                    increment
+         LNR   R2,R2                   -1
+MLOOP    CLI   0(R1),C' '
+         BNE   MLOOPE
+         BXH   R1,R2,MLOOP
+*  R1-> blank or next char after MEMBER
+MLOOPE   SR    R1,R3                   length of MEMBER name
+         ST    R1,SHVVALL              --> store value length
+         LA    R1,JFCBELNM
+         ST    R1,SHVVALA              --> store value addr
+         STORE #MEMNM
+         DROP  R4                      USING
+NOMEMB   DS    0H
+*---------------------------------------------------------------------*
+*- process DSORG:
+DSORG    EQU   *
+*        WTO 'DSORG...',ROUTCDE=11
+         LA    R1,2                    DSORG value length
+         MVC   VALUE(2),=C'PS'
+         TM    @DSORG,DS1DSGPS
+         BO    SETORG
+         MVC   VALUE(2),=C'PO'
+         TM    @DSORG,DS1DSGPO
+         BNO   DSORG1
+         TM    DS1SMSFG,DS1PDSEX
+         BNO   DSORG01
+         LA    R1,3
+         MVC   VALUE(3),=C'HFS'
+         B     SETORG
+DSORG01  TM    DS1SMSFG,DS1PDSE
+         BNO   SETORG
+         LA    R1,4
+         MVC   VALUE(4),=C'PDSE'
+         B     SETORG
+*
+DSORG1   MVC   VALUE(2),=C'IS'
+         TM    @DSORG,DS1DSGIS
+         BO    SETORG
+         MVC   VALUE(2),=C'DA'
+         TM    @DSORG,DS1DSGDA
+         BO    SETORG
+* Check for VSAM:
+         LA    R1,4
+         MVC   VALUE(4),=C'VSAM'
+         TM    DS1DSORG+1,DS1ORGAM
+         BNO   RECFM                  Unknown
+SETORG   TM    @DSORG,DS1DSGU
+         BNO   SETORG1
+         LA    R2,VALUE
+         AR    R2,R1                   Next char in VALUE
+         MVI   0(R2),C'U'              Unmovable
+         LA    R1,1(R1)                DSORG length
+SETORG1  ST    R1,SHVVALL               --> store value length
+         LA    R1,VALUE
+         ST    R1,SHVVALA               --> store value addr
+         STORE #DSORG
+*---------------------------------------------------------------------*
+*- process RECFM:
+RECFM    DS    0H
+*        WTO 'RECFM...',ROUTCDE=11
+         LA    R1,1
+         LA    R2,VALUE
+         MVI   VALUE,C'U'
+         TM    @RECFM,DS1RECFU
+         BO    RECFM4
+         MVI   VALUE,C'F'
+         TM    @RECFM,DS1RECFF
+         BO    RECFM2
+         MVI   VALUE,C'V'
+         TM    @DSORG,DS1RECFV
+         BO    RECFM2
+         B     LRECL
+RECFM2   TM    @RECFM,DS1RECFB       Blocked?
+         BNO   RECFM3
+         LA    R1,1(R1)
+         LA    R2,1(R2)
+         MVI   0(R2),C'B'
+RECFM3   TM    @RECFM,DS1RECFS       Std blocks(F)
+         BNO   RECFM4
+         LA    R1,1(R1)
+         LA    R2,1(R2)
+         MVI   0(R2),C'S'
+RECFM4   TM    @RECFM,DS1RECFT       Trk overflow?
+         BNO   RECFM5
+         LA    R1,1(R1)
+         LA    R2,1(R2)
+         MVI   0(R2),C'T'
+RECFM5   TM    @RECFM,DS1RECFA       CC in ASCII?
+         BNO   RECFM51
+         LA    R1,1(R1)
+         LA    R2,1(R2)
+         MVI   0(R2),C'A'
+         B     RECFM6
+RECFM51  TM    @RECFM,DS1RECMC       CC in Machine code?
+         BNO   RECFM6
+         LA    R1,1(R1)
+         LA    R2,1(R2)
+         MVI   0(R2),C'M'
+RECFM6   ST    R1,SHVVALL               --> store value length
+         LA    R1,VALUE
+         ST    R1,SHVVALA               --> store value addr
+         STORE #RECFM
+*---------------------------------------------------------------------*
+*- process LRECL:
+*        WTO 'LRECL...',ROUTCDE=11
+LRECL    SR    R1,R1
+         ICM   R1,3,@LRECL
+         CVD   R1,VALUE                convert
+         UNPK  D(5),VALUE(8)           to char
+         OI    D+4,C'0'                suppress sign
+         LA    R1,5                    Data length
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #LRECL
+*---------------------------------------------------------------------*
+*- process BLKSIZE:
+*        WTO 'BLKSI...',ROUTCDE=11
+BLKSIZE  SR    R1,R1
+         ICM   R1,3,@BLKSI
+         CVD   R1,VALUE                convert
+         UNPK  D(5),VALUE(8)           to char
+         OI    D+4,C'0'                suppress sign
+         LA    R1,5                    Data length
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #BLKSI
+*---------------------------------------------------------------------*
+*- process CREATION date:
+*        WTO 'CREAT...',ROUTCDE=11
+CREATE   SR    R1,R1
+         ICM   R1,1,@CRDT              YY
+         LTR   R1,R1
+         BZ    NOCRDT                  0 - undefined
+         LA    R1,1900(R1)             1900+yy
+         CVD   R1,VALUE                convert
+         UNPK  D(4),VALUE(8)           to char
+         OI    D+3,C'0'                suppress sign
+         L     R2,D                    save year
+         ICM   R1,3,@CRDT+1            DDDD
+         CVD   R1,VALUE                convert
+         UNPK  D+4(4),VALUE(8)         to char
+         OI    D+7,C'0'                suppress sign
+         ST    R2,D
+         MVI   D+4,C'/'
+         LA    R1,8                    Data length
+         LA    R2,D
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #CRDT
+NOCRDT   EQU   *
+*---------------------------------------------------------------------*
+*- process EXIRATION date:
+*        WTO 'EXPDT...',ROUTCDE=11
+EXPDT    SR    R1,R1
+         ICM   R1,1,@XPDT              YY
+         LTR   R1,R1
+         BZ    EEXPDT
+         LA    R1,1900(R1)             1900+yy
+         CVD   R1,VALUE                convert
+         UNPK  D(4),VALUE(8)           to char
+         OI    D+3,C'0'                suppress sign
+         L     R2,D                    save year
+         ICM   R1,3,@XPDT+1            DDDD
+         CVD   R1,VALUE                convert
+         UNPK  D+4(4),VALUE(8)         to char
+         OI    D+7,C'0'                suppress sign
+         ST    R2,D
+         MVI   D+4,C'/'
+         LA    R1,8                    Data length
+         B     EXPDT1
+NOEXPDT  CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,1                    Data length
+EXPDT1   LA    R2,D
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #EXPDT
+EEXPDT   DS    0H
+*---------------------------------------------------------------------*
+*- process RACF protection flags:
+*        WTO 'RACF....',ROUTCDE=11
+RACF     DS    0H
+* process rc = offset (0, 4, ..., 24):
+         LA    R2,#RA0                 list of value addresses
+         A     R2,RACFRC               add offset (from call)
+         L     R2,0(R2)                addr of value length
+         SR    R1,R1
+         ICM   R1,B'0011',0(R2)        load value length
+         LA    R2,2(,R2)               load value addr
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #RACF
+*=====================================================================*
+*- quit processing if TAPE:
+*
+         TM    UTYPE+2,X'20'
+         BNO   ALLDONE                 Exit, if non-DASD
+*=====================================================================*
+*- process PASSWORD protection flags:
+*        WTO 'PASSW...',ROUTCDE=11
+PASSWD   TM    FROMJFCB,YES
+         BO    EPASSWD
+         LA    R1,4
+         LA    R2,VALUE
+         MVC   VALUE(4),=C'NONE'
+         TM    DS1DSIND,DS1IND10
+         BNO   PASSWD1
+         MVC   VALUE(4),=C'READ'
+         TM    DS1DSIND,DS1IND04
+         BO    PASSWD1                 1 - read/write protected
+         MVC   VALUE(4),=C'WRITE'      0 - write protected
+         LA    R1,5
+PASSWD1  ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #PASSW
+EPASSWD  DS    0H
+*---------------------------------------------------------------------*
+*- process KEYLEN (?):
+*        WTO 'KEYLE...',ROUTCDE=11
+KEYLEN   SR    R1,R1
+         IC    R1,@KEYLE
+         CVD   R1,VALUE                convert
+         UNPK  D(5),VALUE(8)           to char
+         OI    D+4,C'0'                suppress sign
+         LA    R1,2                    Data length
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #KEYLE
+*---------------------------------------------------------------------*
+*- process ALLOC UNITS:
+*        WTO 'UNITS...',ROUTCDE=11
+UNITS    MVC   VALUE(8),=C'CYLINDER'
+         LA    R1,8
+         TM    @UNITS,DS1CYL
+         BO    UNITS1
+         MVC   VALUE(5),=C'TRACK'
+         LA    R1,5
+         TM    @UNITS,DS1TRK
+         BO    UNITS1
+         MVC   VALUE(5),=C'BLOCK'
+         LA    R1,5
+         TM    @UNITS,DS1AVR
+         BO    UNITS1
+         MVC   VALUE(5),=C'ABSTR'
+         LA    R1,5
+         CLI   DS1SCAL1,DS1DSABS
+         BE    UNITS1
+         B     EUNITS                   not recognized ?
+*        LA    R1,8
+UNITS1   ST    R1,SHVVALL               --> store value length
+         LA    R2,VALUE
+         ST    R2,SHVVALA               --> store value addr
+         STORE #UNITS
+EUNITS   DS    0H
+*---------------------------------------------------------------------*
+*- process LAST REFERENCED date:
+*        WTO 'REFDT...',ROUTCDE=11
+REFD     TM    FROMJFCB,YES
+         BO    EREFD
+         SR    R1,R1
+         ICM   R1,1,DS1REFD            YY
+         LTR   R1,R1
+         BZ    EREFD                   0 - undefined
+         LA    R1,1900(R1)             1900+yy
+         CVD   R1,VALUE                convert
+         UNPK  D(4),VALUE(8)           to char
+         OI    D+3,C'0'                suppress sign
+         L     R2,D                    save year
+         ICM   R1,3,DS1REFD+1          DDDD
+         CVD   R1,VALUE                convert
+         UNPK  D+4(4),VALUE(8)         to char
+         OI    D+7,C'0'                suppress sign
+         ST    R2,D
+         MVI   D+4,C'/'
+         LA    R1,8                    Data length
+         LA    R2,D
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #REFD
+EREFD    EQU   *
+*---------------------------------------------------------------------*
+*- process number of extents:
+*        WTO 'EXTEN...',ROUTCDE=11
+EXTENTS  TM    FROMJFCB,YES
+         BO    EEXTENTS
+         SR    R1,R1
+         ICM   R1,1,DS1NOEPV
+         LTR   R1,R1
+         BZ    EEXTENTS                0 - undefined
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #EXTEN
+EEXTENTS DS    0H
+*---------------------------------------------------------------------*
+*- process PRIMARY Allocation: 15 tracks on Cylinder:
+* (anybody is welcome to code DASD type recognition here)
+*        WTO 'PRIMA...',ROUTCDE=11
+PRIMARY  SR    R1,R1
+         ICM   R1,7,@PQTY
+         LTR   R1,R1
+         BNP   EPRIMARY                - undefined
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #PRIMA
+EPRIMARY DS    0H
+*---------------------------------------------------------------------*
+*- process SCONDARY Allocation:
+*        WTO 'SECON...',ROUTCDE=11
+SECONDS  SR    R1,R1
+         ICM   R1,7,@SQTY
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #SECND
+ESECONDS DS    0H
+*---------------------------------------------------------------------*
+*- process Updated flags:
+*        WTO 'UPDAT...',ROUTCDE=11
+UPDAT    TM    FROMJFCB,YES
+         BO    EUPDAT
+         LA    R1,2
+         LA    R2,VALUE
+         MVC   VALUE(2),=C'NO'
+         TM    DS1DSIND,DS1IND02
+         BNO   UPDAT1
+         MVC   VALUE(3),=C'YES'
+         LA    R1,3
+UPDAT1   ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #UPDAT
+EUPDAT   DS    0H
+*---------------------------------------------------------------------*
+*- process DIRECTORY blocks Allocation:
+DIRBA    EQU   *
+*        WTO 'DIRBA...',ROUTCDE=11
+         CLC   RACFRC(4),=F'0'
+         BE    NODIRBA                 No read access
+         TM    @DSORG,DS1DSGPO
+         BNO   NODIRBA                 It is not PO dataset
+         LA    R1,DSN
+         ST    R1,P1
+         LA    R1,VOL
+         ST    R1,P2
+         LA    R1,DIRBLKS
+         ST    R1,P3
+         LA    R1,UDIRBLK
+         ST    R1,P4
+         LA    R1,MEMBERS
+         ST    R1,P5
+         LA    R1,P1
+         CALL  SVM0028                 Get dir blk #
+* total:
+         SR    R1,R1
+         LH    R1,DIRBLKS
+         LTR   R1,R1
+         BZ    NODIRBA                 0 - undefined
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #DIRBA
+* used:
+         SR    R1,R1
+         LH    R1,UDIRBLK
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #DIRBU
+* members:
+         SR    R1,R1
+         LH    R1,MEMBERS
+         CVD   R1,VALUE                convert
+         UNPK  D(7),VALUE(8)           to char
+         OI    D+6,C'0'                suppress sign
+         LA    R1,7                    Data length
+         LA    R2,D
+         BAL   R14,STRIPL              Remove zeros at left
+         ST    R1,SHVVALL               --> store value length
+         ST    R2,SHVVALA               --> store value addr
+         STORE #MEMBS
+NODIRBA  EQU   *
+ALLDONE  EQU   *
+*        WTO   'All done...',ROUTCDE=11
+         B     EXIT
+*=====================================================================*
+*        S U B R O U T I N E S                                        *
+*---------------------------------------------------------------------*
+* Set IRXEXCOM parameters:
+*---------------------------------------------------------------------*
+SETSHV   EQU   *
+* (re)make addr list:
+         LA    R1,#EXCOM
+         ST    R1,A1                   A1 = Addr of module name
+         XC    A2(8),A2                clear A2 and A3
+         LA    R1,SHVBLK
+         ST    R1,A4                   A4 -> SHVBLOCK
+         OI    A4,X'80'                set VL bit
+* (re)fill SHVBLOCK:
+         XC    SHVNEXT(SHVBLEN),SHVNEXT clear it all
+         BR    R14
+*--------------------------------------------------------------------*
+* Call IRXEXCOM:
+*--------------------------------------------------------------------*
+CALLXCOM ST    R14,SAVER14
+         L     R15,ENVBLOCK_IRXEXTE    addr IRXEXTE
+         USING IRXEXTE,R15
+         L     R15,IRXEXCOM            addr IRXEXCOM
+         DROP  R15                     USING
+         LA    R1,A1                   parm list addr
+         LR    R0,R11                  point to ENVBLOCK
+         BALR  R14,R15                 Call IRXEXCOM
+         ST    R15,SAVERC              save return code
+         L     R14,SAVER14             restore return address
+         BR    R14
+*---------------------------------------------------------------------*
+* Strip number left: value: D, length: R1.
+*    Set R1 to new length, set R2 to new addr
+*---------------------------------------------------------------------*
+STRIPL   STM   R3,R5,WRKSAVE2
+         LA    R2,D                     start with 1st char
+         LA    R5,1                     Min result length
+         LNR   R4,R5                    Increment = -1
+LOOPN    CLI   0(R2),C'0'
+         BNE   CUTN
+         LA    R2,1(R2)                 put start to next char
+         BXH   R1,R4,LOOPN              cut length by 1
+*  R2-> leftmost non-zero, R1 = new length
+CUTN     LM    R3,R5,WRKSAVE2
+         BR    R14
+*=====================================================================*
+*        CONSTANTS                                                    *
+*---------------------------------------------------------------------*
+YES      EQU   X'01'                        flag
+         DS    0F
+PARMEND  DC    8X'FF'
+MVCNN    MVC   0(0,R1),0(R6)                move parm to D
+#EXCOM   DC    C'IRXEXCOM'                  REXX module name
+#DSN     DC    C'SYSDSNAME'                 variable name
+#DDN     DC    C'SYSDDNAME'                 variable name
+#VOL     DC    C'SYSVOLUME'                 variable name
+#UNIT    DC    C'SYSUNIT'                   variable name
+#DSORG   DC    C'SYSDSORG'                  variable name
+#RECFM   DC    C'SYSRECFM'                  variable name
+#LRECL   DC    C'SYSLRECL'                  variable name
+#BLKSI   DC    C'SYSBLKSIZE'                variable name
+#KEYLE   DC    C'SYSKEYLEN'                 variable name
+#UNITS   DC    C'SYSUNITS'                  variable name
+#PRIMA   DC    C'SYSPRIMARY'                variable name
+#SECND   DC    C'SYSSECONDS'                variable name
+#DIRBA   DC    C'SYSADIRBLK'                variable name
+#DIRBU   DC    C'SYSUDIRBLK'                variable name
+#MEMBS   DC    C'SYSMEMBERS'                variable name
+#CRDT    DC    C'SYSCREATE'                 variable name
+#EXPDT   DC    C'SYSEXDATE'                 variable name
+#REFD    DC    C'SYSREFDATE'                variable name
+#EXTEN   DC    C'SYSEXTENTS'                variable name
+#PASSW   DC    C'SYSPASSWORD'               variable name
+#RACF    DC    C'SYSRACFA'                  variable name
+#UPDAT   DC    C'SYSUPDATED'                variable name
+#UTYPE   DC    C'SYSUTYPE'                  variable name (added)
+#MEMNM   DC    C'SYSMEMBER'                 variable name (added)
+#ZERO    DC    F'0'
+#ZEROES  DC    C'00000000'
+#BLANKS  DC    C'        '                  const
+#8       DC    F'8'
+#DCB     DCB   DDNAME=SYSUT1,MACRF=(R),DSORG=PS
+#DCBSIZE EQU   *-#DCB
+         DS    0F
+* Macro  CAMLST SEARCH,...   to read DSCB
+#LISTD   DC    AL1(193)
+         DC    AL1(0)
+         DC    AL1(0)
+         DC    AL1(0)
+* RACF access constants:
+#RA0     DC    A(#NA)
+#RA4     DC    A(#RA)
+#RA8     DC    A(#UA)
+#RA12    DC    A(#CA)
+#RA16    DC    A(#AA)
+#RA20    DC    A(#TA)
+#RA24    DC    A(#ER)
+#NA      DC    AL2(L'##NA)
+##NA     DC    CL2'No'
+#RA      DC    AL2(L'##RA)
+##RA     DC    CL4'Read'
+#UA      DC    AL2(L'##UA)
+##UA     DC    CL6'Update'
+#CA      DC    AL2(L'##CA)
+##CA     DC    CL7'Control'
+#AA      DC    AL2(L'##AA)
+##AA     DC    CL5'Alter'
+#TA      DC    AL2(L'##TA)
+##TA     DC    CL9'Unlimited'
+#ER      DC    AL2(L'##ER)
+##ER     DC    CL5'????'
+         LTORG
+         EJECT
+*---------------------------------------------------------------------*
+*        LOCAL WORK AREA                                              *
+*---------------------------------------------------------------------*
+         SPACE 1
+WRK      DSECT
+WRKSAVE  DS    18F                     REGISTER SAVE AREA
+WRKSAVE2 DS    18F                     REGISTER SAVE AREA
+DDN      DS    CL8
+VALUE    DS    D
+D        DS    2D
+DIR      DS    D
+DIRBLKS  EQU   DIR
+UDIRBLK  EQU   DIR+2
+MEMBERS  EQU   DIR+4
+RACFRC   DS    F
+*- Function call parameter:
+*- R1 -> following parameter list for SVM0028:
+P1       DS    A
+P2       DS    A
+P3       DS    A
+P4       DS    A
+P5       DS    A
+*- R0 -> env block IRXENVB
+*- R1 -> following parameter list:
+A1       DS    A
+A2       DS    A
+A3       DS    A
+A4       DS    A
+A5       DS    A
+A6       DS    A
+* parameter values:
+SHVBLK   DS    8F'0'                   IRXSHVB instance
+*
+SAVERC   DS    F                       retcode from IRXEXCOM
+SAVER14  DS    F                       save R14
+SAV2R14  DS    F                       save R14
+*LISTD    CAMLST SEARCH,DSN,WVOL,W140
+LISTD    DS    0F                      CAMLST
+         DS    A                       = #LISTD
+         DS    A                       (DSN)
+         DS    A                       (VOL)
+         DS    A                       (W140)
+*
+W140     DS    140C                    96 bytes F1 DSCB, 5 bytes CCHHR
+UNIT     DS    F
+UTYPE    DS    4C
+JFCBA    DS    A
+* Next 4 fields must go together, used as a parm for RACFCHK call
+APAR     DS    A
+LPAR     DS    H
+PARPFX   DS    CL2
+DSN      DS    44C
+*
+LDSN     DS    H
+VOL      DS    6C
+DCBADDR  DS    A
+DCB      DCB   DDNAME=SYSUT1,MACRF=(R),DSORG=PS
+@DSORG   DS    X
+@RECFM   DS    X
+@BLKSI   DS    H
+@LRECL   DS    H
+@CRDT    DS    XL3
+@XPDT    DS    XL3
+@UNITS   DS    X
+@PQTY    DS    XL3
+@SQTY    DS    XL3
+@KEYLE   DS    X
+FROMJFCB DS    X
+WRKL     EQU   (*-WRK+7)/8*8           WORK AREA LENGTH, words
+         EJECT
+*---------------------------------------------------------------------*
+*        DSECTS                                                       *
+*---------------------------------------------------------------------*
+         PRINT NOGEN
+         REGS
+* REXX specific DSECTs:
+         IRXEFPL DSECT=YES             REXX parameter list
+         IRXEVALB                      REXX evaluation block EVALBLOCK
+         IRXEXTE                       REXX vector of external ep
+         IRXENVB                       REXX environment block ENVBLOCK
+         IRXSHVB                       REXX shared variables block
+* SYSTEM SPECIFIC DSECTS:
+         DCBD DSORG=PS,DEVD=TA
+         PRINT GEN
+DS1      DSECT
+         IECSDSL1 (1)
+*UCB      DSECT
+*         IEFUCBOB
+JFCB     DSECT
+         IEFJFCBN
+JFCBL    EQU   *-JFCB
+         END
+//*
+//LKED    EXEC PGM=HEWLKED,PARM='RENT,NCAL,MAP,RMOD=ANY,AMOD=31',
+//        COND=(8,LE)
+//SYSLMOD  DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST(SVM0033) <= *.LOAD  0351000
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//
+//* Test with IRXF@DDN, IRXF@DSN

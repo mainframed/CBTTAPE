@@ -1,0 +1,233 @@
+CICS start-up and shutdown
+
+We run VSE 3.2 with three production CICS partitions, and
+two development partitions.  I have tried to make CICS start-up
+and shutdown as automatic and as fast as possible by using
+VSE conditional JCL statements.  The major question that
+arose during this exercise was how to determine how CICS
+would restart or how it had terminated (ie would a cold, warm,
+or emergency restart occur), because, of course, all my
+DFHSIT table entries contained the START=AUTO parameter.
+
+After some investigation, I found that a special record in the
+restart dataset looked different in each case.  I wrote a little
+PL/I program to examine this record and tell me about the
+expected method of start-up.
+
+There are five situations:
+
+1      Control record with warm start bit  P warm start
+
+2      Control record without warm start bit P emergency restart
+
+3      No control record in file P cold start
+
+4      Bad restart file
+
+5      No restart file P unable to start at all!
+
+Using it in CICS JCL allows me to perform an IDCAMS
+VERIFY on files only in the event of an emergency restart,
+which saves me 10 to 15 percent of CICS start-up time, and to
+print dump datasets only after a crash, so I'm sure to receive
+the listing, as shown in the sample JCL.
+
+
+SAMPLE CICS START-UP JCL
+
+* $$ JOB   JNM=PRODCICS,CLASS=C
+* $$ LST   CLASS=C
+// JOB     PRODCICS PRODUCTION CICS
+* ******** PRODCICS CONDITIONAL IDCAMS VERIFY
+// ON      $RC LE 16 CONTINUE
+// DLBL    CICSRSD,'PRODCICS.RESTART',,VSAM,CAT=VSESPUC
+// EXEC    PGM=SYSTRSD,SIZE=64K
+// IF      $RC EQ 0 THEN
+// GOTO    NOVERIFY
+* ******** PRODCICS IDCAMS VERIFY MUST RUN
+// EXEC    PGM=IDCAMS,SIZE=AUTO
+   VERIFY  FILE(DFHNTRA)
+   AND SO ON ...
+/*
+// IF      $RC LE 4 THEN
+// GOTO    NOVERIFY
+* ******** PRODCICS IDCAMS VERIFY BAD - CAN'T CONTINUE
+// GOTO    $EOJ
+/. NOVERIFY
+// DLBL    CICSRSD,'PRODCICS.RESTART',,VSAM,CAT=VSESPUC
+   AND SO ON ...
+// UPSI    00000000
+* ******** PRODCICS STARTING UP NOW
+// EXEC    PGM=DFHSIP,SIZE=5120K
+/*
+* ******** PRODCICS STOPPED
+/&
+// JOB     PRODDUMP PRINT DUMP DATASET IF CICS CRASHED
+* ******** PRODCICS CONDITIONAL DUMP DATASET PRINT
+// ON      $RC LE 16 CONTINUE
+// DLBL    CICSRSD,'PRODCICS.RESTART',,VSAM,CAT=VSESPUC
+// EXEC    PGM=SYSTRSD,SIZE=64K
+// IF      $RC EQ 0 THEN
+// GOTO    NOPRINT
+* ******** PRODCICS DUMP DATASET PRINT IN PROGRESS
+// ASSGN   SYSLST,00E
+// ASSGN   SYS010,DISK,VOL=DISK01,SHR
+// DLBL    DFHDUMP,'PRODCICS.DUMPA'
+// EXTENT  SYS010,DISK01,1,0,1000,100
+// EXEC    PGM=DFHDUP,SIZE=300K
+/*
+/. NOPRINT
+/&
+* $$ EOJ
+
+As there is no command for setting the $RC JCL return code
+value in COBOL, nor in PL/I, I wrote a small Assembler
+routine to do that called SPIGJCL.  You just have to Assemble
+it and generate an object deck, which is used subsequently at
+SYSTRSD link-edit time.
+
+
+SOURCE CODE FOR SPIGJCL
+
+**********************************************************************
+*        THIS PROGRAM IS TO BE CALLED FROM COBOL OR PL/I PROGRAMS    *
+*        WITH A FULLWORD BINARY ARGUMENT, CONTAINING A RETURN CODE.  *
+*        IF THE ARGUMENT VALUE IS LESS THAN ZERO, A CANCEL MACRO IS  *
+*        ISSUED. ELSE, THE EOJ MACRO WITH THAT VALUE AS RETURN CODE  *
+*        IS ISSUED.                                                  *
+*        THIS VALUE IS ASSIGNED TO $RC VSE JCL VARIABLE              *
+**********************************************************************
+*        COBOL CALLING CONVENTIONS :                                 *
+*        WSS :                                                       *
+*          01  RETCODE PIC S9(9) COMP.                               *
+*        PROCEDURE :                                                 *
+*          MOVE NNNN TO RETCODE.                                     *
+*          CALL 'SPIGJCL' USING RETCODE.                             *
+**********************************************************************
+*        PL/I CALLING CONVENTIONS :                                  *
+*        DCL RETCODE BIN FIXED(31);                                  *
+*        RETCODE=NNNN;                                               *
+*        CALL SPIGJCL(RETCODE);                                      *
+**********************************************************************
+         TITLE 'RETURN CODE SUBROUTINE IN COBOL PROGRAMS'
+SPIGJCL  CSECT                    PROGRAM START
+         BALR  12,0               SET BASE REGISTER
+         USING *,12               TELL ASSEMBLER
+         B     SPIGDEB            SKIP HEADER
+SPIGCPY  DC    CL16'* * SPIGJCL  * *'
+SPIGDEB  DS    0H
+         L     1,0(1)             ARGUMENT ADDRESS
+         L     15,0(1)            LOAD R15 WITH IT
+         LTR   15,15              TEST SIGN
+         BM    SPIGCAN            JUMP TO CANCEL IF NEGATIVE
+         EOJ   RC=(15)            ELSE RETURN TO VSE
+SPIGCAN  DS    0H                 CANCEL THE JOB
+         CANCEL
+         END
+
+
+SOURCE CODE FOR SYSTRSD
+
+Take care when typing the SYSTRSD source code P you must
+enter the 22 bytes of the INIT parameter for CLEFRSD in
+hexadecimal to conform with the comment above it.  Compile
+and link-edit it with SPIGJCL.OBJ.
+
+/*      SYSTRSD  : CHECK RESTART DATASET CONTROL RECORD.          */
+/******************************************************************/
+/*      THIS PROGRAM TRIES TO READ CICS RESTART DATASET CONTROL   */
+/*      RECORD, AND TELLS VSE OPERATOR ABOUT THE RESULT, THEN     */
+/*      RETURNS TO VSE WITH A SIGNIFICANT RETURN CODE.            */
+/******************************************************************/
+/*      THE DIFFERENCE BETWEEN A WARM START AND AN EMERGENCY      */
+/*      IS ONE BIT IN THE CONTROL RECORD.                         */
+/******************************************************************/
+SYSTRSD:PROC OPTIONS(MAIN);
+        DCL CICSRSD         FILE INPUT RECORD DIRECT ENV(VSAM);
+        /* CLEFRSD=X'0FC3E3D30000C3E3D340404040404040404040404040'*/
+        DCL CLEFRSD         CHAR(22) INIT(' CTL  CTL             ');
+        DCL 1 ENRGRSD,
+              5 FILLER1     CHAR(32),
+              5 TESTRSD(8)  BIT,
+              5 FILLER2     CHAR(991);
+        DCL PLANTED         BIN FIXED(15) INIT(0);
+        DCL RETCODE         BIN FIXED(31);
+        DCL ONCODE          BUILTIN;
+        DCL DSPLCOD         PIC'BBZZZ9';
+        DCL SPIGJCL         ENTRY OPTIONS(ASM INTER);
+/******************************************************************/
+/*                          PRELIMINARY PART :                    */
+/*                          AVOID PROGRAM CANCEL ...              */
+/*      IF THERE IS NO RECORD WITH THAT KEY ...                   */
+        ON KEY(CICSRSD) BEGIN;
+          PLANTED=3;
+          DSPLCOD=ONCODE;
+        END;
+/*      IF THE FORMAT OF THE RECORD DOESN'T MATCH ...             */
+        ON RECORD(CICSRSD) BEGIN;
+          PLANTED=4;
+          DSPLCOD=ONCODE;
+        END;
+/*      IF THE RSD FILE DOESN'T EXIST ...                         */
+        ON UNDEFINEDFILE(CICSRSD) BEGIN;
+          PLANTED=5;
+          DSPLCOD=ONCODE;
+        END;
+/******************************************************************/
+/*                          PROCESSING PART :                     */
+/*                          TRY TO OPEN AND READ THE FILE         */
+/*                          THEN CHECK EMERGENCY RESTART BIT      */
+        OPEN FILE(CICSRSD);
+        IF PLANTED=0
+        THEN READ FILE(CICSRSD) INTO(ENRGRSD) KEY(CLEFRSD);
+        IF PLANTED=0
+        THEN PLANTED=2-1*(TESTRSD(3)='1'B);
+        IF PLANTED<5
+        THEN CLOSE FILE(CICSRSD);
+        SELECT(PLANTED);
+/*                          EVERYTHING IS OK MEANS WARM START     */
+          WHEN(1) DO;
+            RETCODE=0;
+            DISPLAY('SYSTRSD : RC=0  - CICS WARM STARTUP');
+          END;
+/*                          EMERGENCY RESTART BIT SET             */
+          WHEN(2) DO;
+            RETCODE=4;
+            DISPLAY('SYSTRSD : RC=4  - CICS EMERGENCY STARTUP');
+          END;
+/*                          RECORD NOT FOUND MEANS COLD START     */
+          WHEN(3) DO;
+            RETCODE=8;
+            DISPLAY('SYSTRSD : RC=8  - CICS COLD START FORCED');
+          END;
+/*                          RECORD ERROR MEANS DISEASE            */
+          WHEN(4) DO;
+            RETCODE=12;
+            DISPLAY('SYSTRSD : RC=12 - RSD FORMAT ERROR');
+          END;
+/*                          FILE ERROR AS RECORD ERROR            */
+          WHEN(5) DO;
+            RETCODE=12;
+            DISPLAY('SYSTRSD : RC=12 - RSD FILE NOT FOUND');
+          END;
+/*                          SOMETHING IS ROTTEN HERE              */
+          OTHERWISE DO;
+            RETCODE=16;
+            DISPLAY('SYSTRSD : RC=16 - INTERNAL ERROR');
+          END;
+        END;
+/*                          GIVE ADDITIONAL INFORMATION           */
+        IF PLANTED>2
+        THEN DISPLAY('        : PL/I ON CODE VALUE :'!!DSPLCOD);
+/******************************************************************/
+/*                          LAST PART :                           */
+/*                          RETURN TO DOS WITH RETURN CODE SET    */
+        CALL SPIGJCL(RETCODE);
+END SYSTRSD;
+
+
+Thierry Itty
+Service Informatique
+Mairie de Besan on (France)
+
+

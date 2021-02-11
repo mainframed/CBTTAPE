@@ -1,0 +1,547 @@
+*ASM XOPTS(SP)
+*
+**       Program:  CGUDYNA
+**       Function: Dynamically Allocate/Deallocate/Inform on datasets
+**                 in CICS through a formatted screen.
+**                 Will also provide similar details to 'CEMT I FI(X)'.
+**                 This program links to program 'CGUDYNA1' and passes
+**                 the following parameter list .....
+**
+**       Parameters (to CGUDYNA1):
+**              IN:
+**                 1 byte  - Action (operation)
+**                           'I' - Information
+**                           'D' - Dealloc (online) writes TS record
+**                           'F' - Free (batch) no TS record
+**                           'N' - New allocation (free then allocate)
+**                           'A' - Allocate
+**                           'R' - Realloc
+**                 8 bytes - DDNAME
+**                 1 byte  - Disposition
+**                           'O' - old
+**                           'S' - shr
+**                           'M' - mod
+**                           NOTE - NEW is not available
+**                 1 byte  - Rcode (return code (asis))
+**                If action is "Alloc"
+**                44 bytes - DSNAME
+**              OUT:
+**                 1 byte   - Action             (left asis)
+**                 8 bytes  - DDNAME             (left asis)
+**                 1 byte   - Disposition (if oper is I/A/R and
+**                            rcode=0)
+**                 1 byte   - Rcode
+**                            0 = action O.K.
+**                            4 = error detected
+**                44 bytes  - DSNAME (if oper is I/F/D and rcode=0)
+**                    or
+**                 4 bytes  - Ecode (error code)
+**                            Syntax errors:
+**                              'DAER' = invalid action value
+**                              'DDER' = invalid ddname value
+**                              'DSER' = invalid dsname value
+**                              'DIER' = invalid disposition value
+**                            Processing errors:
+**                              All other errors refer to SVC 99 error
+**                               codes.
+**                 4 bytes  - Rcode (reason code)
+**                            Syntax errors
+**                              not used
+**                            Processing errors
+**                              Refer to SVC 99 reason codes
+**                 36 bytes - Message if ecode = syntax error
+**
+**               NOTE - If the operation is deallocate/free, initially
+**                        'INFO' is invoked to get the DSNAME and disp
+**                        details to return to the invoker.
+**                        Then the action code (oper) is set to
+**                        U(nallocate) and the dataset is then actually
+**                        Deallocated/freed.
+**                      If the operation is deallocate (not free)
+**                        a record is written to temp storage que
+**                        'CGUDYNA' so that the dataset may be
+**                        reallocated without having to type in the
+**                        full dsname and risking a typo.
+**
+**       Parameters (to CGUDYOC1):
+**                 IN   : byte  1      Operation - (O)pen (C)lose
+**                        byteS 7 - 8  DDNAME
+**
+**                 OUT  : byte  1      ASIS
+**                        byte  7 - 8  ASIS
+**                        byteS 9 - 10 Return code
+**                                    '00' - Operation O.K.
+**                                    '04' - Operation failed
+**                                    'IO' - Invalid opcode
+**                                    'ID' - Invalid DDNAME
+**
+**
+**       Reference - MVS SPL: Job management, Ch.3 page 23.......,
+**                   Requesting SVC 99 functions (prior MVS 2.1. for
+**                   MVS 2.2 its under System Macros and Facilities
+**                   Volume 1, page 1-262.
+*
+**       Author:   A. Kara.
+**       Date:     19/10/89
+*
+*=====================================================================*
+*
+FCTDSBAR EQU   3
+EIBREG1  EQU   10
+CODEREG1 EQU   11                  BASE REGISTER 1
+CODEREG2 EQU   12                  BASE REGISTER 2
+DATAREG1 EQU   13                  DYNAMIC STORAGE REGISTER
+         YREGS
+*---------------------------------------------------------------------*
+DFHEISTG DSECT                     DYNAMIC STORAGE
+PARMLIST DS    0CL55               PARAMETER LIST ADDRESSES
+OPER     DS    CL1
+DDNAME   DS    CL8
+DISP     DS    CL1
+RCODE    DS    CL1
+DSNAME   DS    CL44
+         ORG   DSNAME
+ECODE99  DS    CL4
+RCODE99  DS    CL4
+         ORG
+PARMLEN  EQU   *-PARMLIST
+DUMPCODE DS    CL4
+DWORK8   DS    D
+DWORK    DS    D
+ADDOPT   DS    F
+BROOPT   DS    F
+DELOPT   DS    F
+ENAOPT   DS    F
+EXCOPT   DS    F
+LSRP     DS    F
+OPEOPT   DS    F
+REAOPT   DS    F
+UPDOPT   DS    F
+CSR      DS    H
+*---------------------------------------------------------------------*
+         COPY  CGUDMS               I/O BMS MAP
+         COPY  CGUDHS               HELP BMS MAP
+         COPY  CGUDES               ERROR CODES BMS MAP
+*---------------------------------------------------------------------*
+         COPY  DFHAID
+*
+*---------------------------------------------------------------------*
+* Interface with CICS                                                 *
+*---------------------------------------------------------------------*
+CGUDYNA DFHEIENT CODEREG=(CODEREG1,CODEREG2),                          X
+               DATAREG=DATAREG1,EIBREG=EIBREG1
+*
+*---------------------------------------------------------------------*
+*     HANDLE CONDITIONS                                               *
+*---------------------------------------------------------------------*
+HANDCOND DS    0H                   ERROR PROCEDURES
+         EXEC  CICS HANDLE CONDITION                                   X
+            ERROR(DUMPIT) MAPFAIL(DUMPMAP)
+*
+*        EXEC  CICS HANDLE ABEND LABEL(ABENDIT)
+*
+*---------------------------------------------------------------------*
+*     GET WORKING STORAGE                                             *
+*---------------------------------------------------------------------*
+INITIALZ DS    0H
+         MVC   #DDNAMEI,SPACES           INITIALISE FIELDS
+         MVC   #DISPI,SPACES             INITIALISE FIELDS
+         MVC   #DSNAMEI,SPACES           INITIALISE FIELDS
+         MVC   SCRNMSGO,SPACES           INITIALISE FIELDS
+         MVI   ACTIONI,C' '              INITIALISE FIELDS
+         MVI   KEEPI,C'Y'                KEEP INFORMATION
+         MVC   CSR(2),ACCSR              PUT CURSOR ON ACTION
+SENDMAP  DS    0H
+SHRTST   DS    0H
+         CLI   #DISPI,C'S'               Q. THIS CHARACTER
+         BNE   MODTST                       N. NEXT TEST
+         MVC   #DISPI+1(2),=C'HR'        MOVE REMAINING CHARACTERS
+         B     CONT#000                  CONTINUE
+MODTST   DS    0H
+         CLI   #DISPI,C'M'               Q. THIS CHARACTER
+         BNE   OLDTST                       N. NEXT TEST
+         MVC   #DISPI+1(2),=C'OD'        MOVE REMAINING CHARACTERS
+         B     CONT#000                  CONTINUE
+OLDTST   DS    0H
+         CLI   #DISPI,C'O'               Q. THIS CHARACTER
+         BNE   CONT#000                     N. CONTINUE
+         MVC   #DISPI+1(2),=C'LD'        MOVE REMAINING CHARACTERS
+CONT#000 DS    0H
+         BAL   R8,ASKTIME                GO AND GET TIME
+         MVC   #DISPO,#DISPI             MOVE INPUT TO OUTPUT
+         MVC   #DDNAMEO,#DDNAMEI         MOVE INPUT TO OUTPUT
+         MVC   #DSNAMEO,#DSNAMEI         MOVE INPUT TO OUTPUT
+         OC    #DDNAMEI,SPACES           CONVERT TO UPPER CASE
+         CLC   #DDNAMEI,SPACES           Q. DDNAME ENTERED
+         BE    CONT#050                     N. CONTINUE
+         BAL   R8,GETFCT                 GO AND GET FCT DETAILS
+CONT#050 DS    0H
+         EXEC  CICS ASSIGN APPLID(REGIONO)
+         MVC   ACTIONO,ACTIONI           MOVE INPUT TO OUTPUT
+         EXEC  CICS SEND MAP('CGUDMP') MAPSET('CGUDMS') FREEKB ERASE   X
+               CURSOR(CSR)
+*        EXEC  CICS WAIT TERMINAL
+GETAREA  DS    0H                        GET WORKING STORAGE AREA
+         MVC   DUMPCODE,=C'RM01'
+         EXEC  CICS RECEIVE MAP('CGUDMP') MAPSET('CGUDMS') ASIS
+         CLI   EIBAID,X'F3'              Q. PF3 ENTERED
+         BE    EXITPROG                     Y. EXIT PROGRAM
+         CLI   EIBAID,X'C3'              Q. PF15 ENTERED
+         BE    EXITPROG                     Y. EXIT PROGRAM
+         CLI   EIBAID,X'F1'              Q. PF1 ENTERED
+         BE    TUTOR#10                     Y. DISPLAY TUTOR#10
+         CLI   EIBAID,X'C1'              Q. PF15 ENTERED
+         BE    TUTOR#10                     Y. DISPLAY TUTOR#10
+         CLI   EIBAID,X'F9'              Q. PF9 ENTERED
+         BE    TUTOR#20                     Y. DISPLAY TUTOR#20
+         CLI   EIBAID,X'C9'              Q. PF21 ENTERED
+         BE    TUTOR#20                     Y. DISPLAY TUTOR#20
+         MVC   SCRNMSGO,SPACES           CLEAR SCREEN MESSAGE AREA
+         MVC   SCREMSGO,SPACES           CLEAR ERROR SCREEN MESSAGE
+         CLI   EIBAID,X'7D'              Q. <ENTER> ENTERED
+         BE    CONT#100                     Y. CONTINUE
+         MVC   SCRNMSGO(20),=C'Invalid key entered.'
+         B     SENDMAP                   GO AND SEND ERROR
+CONT#100 DS    0H
+         MVI   FCTDETO,C' '            Ripple clear the field
+         MVC   FCTDETO+1(L'FCTDETO-1),FCTDETO with spaces
+         OC    #DISPI,SPACES             LOWER TO UPPER CASE
+         OC    #DDNAMEI,SPACES           LOWER TO UPPER CASE
+         OC    #DSNAMEI,SPACES           LOWER TO UPPER CASE
+         OC    #DSNAMEI,SPACES           LOWER TO UPPER CASE
+         OC    ACTIONI,SPACES            LOWER TO UPPER CASE
+         OC    KEEPO,SPACES              LOWER TO UPPER CASE
+         CLI   ACTIONI,C'O'              Q. ACTION OPEN
+         BE    OPCLFILE                     Y. GO PROCESS
+         CLI   ACTIONI,C'C'              Q. ACTION CLOSE
+         BE    OPCLFILE                     Y. GO PROCESS
+         CLI   ACTIONI,C'Z'              Q. ACTION CLOSE/FREE
+         BE    OPCLFILE                     Y. GO PROCESS
+         B     CONT#300     =======>     LET CGUDYNA1 PARSE IT
+*---------------------------------------------------------------------*
+TST4ACT1 DS    0H
+         CLI   ACTIONI,C'A'              Q. VALID ACTION FIELD
+         BE    TST4DD                       Y. CONTINUE
+         CLI   ACTIONI,C'F'              Q. VALID ACTION FIELD
+         BE    TST4DD                       Y. CONTINUE
+         CLI   ACTIONI,C'D'              Q. VALID ACTION FIELD
+         BE    TST4DD                       Y. CONTINUE
+         CLI   ACTIONI,C'I'              Q. VALID ACTION FIELD
+         BE    TST4DD                       Y. CONTINUE
+INVALACT DS    0H
+         MVC   SCRNMSGO(23),=C'Invalid action entered.'
+         MVI   ACTIONI,C' '              INITIALISE FIELDS
+         MVC   CSR(2),ACCSR              PUT CURSOR ON DSNAME
+         B     SENDMAP                   GO AND SEND ERROR
+TST4DD   DS    0H
+         CLC   #DDNAMEI,SPACES           Q. DDNAME ENTERED
+         BNE   TST4ACT2                     Y. NEXT TEST
+         MVC   SCRNMSGO(23),=C'DDNAME must be entered.'
+         MVC   CSR(2),DDCSR              PUT CURSOR ON DSNAME
+         B     SENDMAP                   GO AND SEND ERROR
+TST4ACT2 DS    0H
+         CLI   ACTIONI,C'A'              Q. ALLOCATE FIELD
+         BNE   CONT#300                     N. CONTINUE
+TST4DSN  DS    0H
+         CLC   #DSNAMEI,SPACES           Q. DDNAME ENTERED
+         BNE   TST4DISP                     Y. NEXT TEST
+         MVC   SCRNMSGO(23),=C'DSNAME must be entered.'
+         MVC   CSR(2),DSCSR              PUT CURSOR ON DSNAME
+         B     SENDMAP                   GO AND SEND ERROR
+TST4DISP DS    0H
+         CLI   #DISPI,C' '               Q. DISP ENTERED
+         BNE   CONT#200                     Y. CONTINUE
+         MVC   SCRNMSGO(28),=C'Disposition must be entered.'
+         MVC   CSR(2),DICSR              PUT CURSOR ON DISPOSITION
+         B     SENDMAP                   GO AND SEND ERROR
+CONT#200 DS    0H
+         CLI   #DISPI,C'S'               Q. VALID DISP FIELD
+         BE    CONT#300                     Y. CONTINUE
+         CLI   #DISPI,C'O'               Q. VALID DISP FIELD
+         BE    CONT#300                     Y. CONTINUE
+         CLI   #DISPI,C'M'               Q. VALID DISP FIELD
+         BE    CONT#300                     Y. CONTINUE
+         MVC   SCRNMSGO(34),=C'Invalid disposition value entered.'
+         MVC   CSR(2),DICSR              PUT CURSOR ON DISPOSITION
+         B     SENDMAP                   GO AND SEND ERROR
+*---------------------------------------------------------------------*
+CONT#300 DS    0H
+         CLI   KEEPI,C'Y'                Q. VALID KEEP FIELD
+         BE    CONT#400                     Y. CONTINUE
+         CLI   KEEPI,C'N'                Q. VALID KEEP FIELD
+         BE    CONT#400                     Y. CONTINUE
+         MVC   SCRNMSGO(33),=C'Invalid ''remember'' value entered.'
+         MVC   CSR(2),KPCSR              PUT CURSOR ON DISPOSITION
+         B     SENDMAP                   GO AND SEND ERROR
+CONT#400 DS    0H
+         MVC   PARMLIST(PARMLEN),SPACES  CLEAR PARAMETER LIST
+         MVC   DDNAME,#DDNAMEI           MOVE INPUT FIELD
+         MVC   DSNAME,#DSNAMEI           MOVE INPUT FIELD
+         MVC   OPER,ACTIONI              MOVE INPUT FIELD
+         MVC   DISP,#DISPI               MOVE INPUT FIELD
+         CLI   ACTIONI,C'A'               Q. IS ACTION ALLOCATE
+         BE    CALLPROG                     N. BYPASS
+         CLI   ACTIONI,C'N'               Q. IS ACTION NEW ALLOCATE
+         BE    CALLPROG                     N. BYPASS
+         MVC   #DISPI,SPACES             INITIALISE FIELDS
+         MVC   #DSNAMEI,SPACES           INITIALISE FIELDS
+CALLPROG DS    0H
+         MVC   DUMPCODE(4),=C'LKE1'      SET ERROR CODE
+         CLI   ACTIONI,C'Z'              Q. ACTION CLOSE/FREE
+         BNE   CONT#510                     N. CONTINUE
+         MVC   OPER,=C'D'                MOVE DEALLOC INDICATOR
+CONT#510 DS    0H
+         EXEC CICS LINK PROGRAM('CGUDYNA1') COMMAREA(PARMLIST)         X
+              LENGTH(PARML1)
+         MVC   CSR(2),ACCSR              PUT CURSOR ON ACTION
+         CLI   RCODE,C'0'                Q. ZERO RETURN CODE
+         BNE   RETWERR                      N. PROCESS ERROR RETUR
+         MVC   SCRNMSGO(18),=C'Action successful.'
+         MVC   #DSNAMEI(44),DSNAME       MOVE DATASET NAME
+         MVC   #DISPI(3),DISP            MOVE DATASET NAME
+         B     SENDMAP                   GO AND SEND ERROR
+RETWERR  DS    0H
+         CLC   ECODE99(2),=C'DA'         Q. ACTION ERROR
+         BE    DAERROR                      Y. GO AND PROCESS
+         CLC   ECODE99(2),=C'DD'         Q. DDNAME ERROR
+         BE    DDERROR                      Y. GO AND PROCESS
+         CLC   ECODE99(2),=C'DS'         Q. DSNAME ERROR
+         BE    DSERROR                      Y. GO AND PROCESS
+         CLC   ECODE99(2),=C'DI'         Q. DISPOSITION ERROR
+         BE    DIERROR                      Y. GO AND PROCESS
+         MVC   SCRNMSGO(13),=C'Action error:'
+         MVC   SCRNMSGO+14(13),=C'Error code X'''
+         MVC   SCRNMSGO+27(4),ECODE99
+         MVC   SCRNMSGO+31(17),=C''', reason code X'''
+         MVC   SCRNMSGO+48(4),RCODE99
+         MVC   SCRNMSGO+52(02),=C'''.'
+         MVC   SCREMSGO,SCRNMSGO         MOVE MAIN 'ERROR' MESSAGE
+         B     SENDMAP                   GO AND SEND ERROR
+DAERROR  DS    0H
+         MVC   CSR(2),ACCSR              PUT CURSOR ON ACTION
+         B     CONT#700                  CONTINUE
+DDERROR  DS    0H
+         MVC   CSR(2),DDCSR              PUT CURSOR ON DDNAME
+         B     CONT#700                  CONTINUE
+DSERROR  DS    0H
+         MVC   CSR(2),DSCSR              PUT CURSOR ON DSNAME
+         B     CONT#700                  CONTINUE
+DIERROR  DS    0H
+         MVC   CSR(2),DICSR              PUT CURSOR ON DISP
+CONT#700 DS    0H
+         MVC   SCRNMSGO+14(40),DSNAME+4  MOVE ERROR MESSAGE
+         MVC   SCRNMSGO(13),=C'Syntax error:'
+         B     SENDMAP                   GO AND SEND ERROR
+*---------------------------------------------------------------------*
+OPCLFILE DS    0H
+         MVC   DDNAME,#DDNAMEI           MOVE INPUT FIELD
+         MVC   OPER,ACTIONI              MOVE INPUT FIELD
+         MVC   DWORK8(1),#DISPI          SAVE DISP IN WORK AREA
+         MVC   DUMPCODE(4),=C'LKE2'      SET ERROR CODE
+         CLI   ACTIONI,C'Z'              Q. ACTION CLOSE/FREE
+         BNE   CONT#810                     N. CONTINUE
+         MVI   OPER,C'C'                 MOVE CLOSE INDICATOR
+CONT#810 DS    0H
+         EXEC CICS LINK PROGRAM('CGUDYOC1') COMMAREA(PARMLIST)         X
+              LENGTH(PARML2)
+         MVC   #DISPI(1),DWORK8          RESTORE DISP IN WORK AREA
+*  RETURN CODES:
+*     '00' OPERATION O.K.
+*     '04' OPERATION FAILED
+*     'IO' INVALID OPCODE
+*     'ID' INVALID DDNAME
+         CLI   RCODE,C'0'                Q. ZERO RETURN CODE
+         BNE   RETWERR1                     N. PROCESS ERROR RETUR
+         CLI   ACTIONI,C'Z'              Q. ACTION CLOSE/FREE
+         BE    CONT#300                     N. CONTINUE
+         MVC   SCRNMSGO(18),=C'Action successful.'
+         B     SENDMAP                   GO AND SEND ERROR
+RETWERR1 DS    0H
+         CLI   RCODE,C'D'                Q. ACTION ERROR
+         BE    IDERROR                      Y. GO AND PROCESS
+         MVC   CSR(2),ACCSR              PUT CURSOR ON DDNAME
+         MVC   SCRNMSGO(13),=C'Action error:'
+         MVC   SCRNMSGO+14(26),=C'Selected operstion failed.'
+         B     SENDMAP                   GO AND SEND ERROR
+IDERROR  DS    0H
+         MVC   CSR(2),DDCSR              PUT CURSOR ON DDNAME
+         MVC   SCRNMSGO+14(24),=C'Invalid DDNAME supplied.'
+         MVC   SCRNMSGO(13),=C'Syntax error:'
+         B     SENDMAP                   GO AND SEND ERROR
+*---------------------------------------------------------------------*
+TUTOR#10 DS    0H
+         EXEC  CICS SEND MAP('CGUDH1') MAPSET('CGUDHS') FREEKB
+         MVC   DWORK8(2),=H'1'
+         EXEC  CICS RECEIVE INTO(DWORK8) LENGTH(DWORK8)
+         CLI   EIBAID,X'F3'              Q. PF3 ENTERED
+         BE    TUTEN#10                     Y. EXIT TUTORIAL
+         CLI   EIBAID,X'C3'              Q. PF15 ENTERED
+         BE    TUTEN#10                     Y. EXIT TUTORIAL
+TUTOR#11 DS    0H
+         EXEC  CICS SEND MAP('CGUDH2') MAPSET('CGUDHS') FREEKB
+         MVC   DWORK8(2),=H'1'
+         EXEC  CICS RECEIVE INTO(DWORK8) LENGTH(DWORK8)
+         CLI   EIBAID,X'F3'              Q. PF3 ENTERED
+         BE    TUTEN#10                     Y. EXIT TUTORIAL
+         CLI   EIBAID,X'C3'              Q. PF15 ENTERED
+         BE    TUTEN#10                     Y. EXIT TUTORIAL
+         B     TUTOR#10                  WRAP ARROUND
+TUTEN#10 DS    0H
+         MVC   SCRNMSGO,SPACES           CLEAR SCR CORRUPTION BY TUTE
+         EXEC  CICS ASSIGN APPLID(REGIONO)
+         B     CONT#000                  GO REDISPLAY MAIN SCREEN
+*---------------------------------------------------------------------*
+TUTOR#20 DS    0H
+         EXEC  CICS SEND MAP('CGUDEM') MAPSET('CGUDES') FREEKB ERASE
+         MVC   DWORK8(2),=H'1'
+         EXEC  CICS RECEIVE INTO(DWORK8) LENGTH(DWORK8)
+         MVC   SCRNMSGO,SPACES           CLEAR SCR CORRUPTION BY TUTE
+         EXEC  CICS ASSIGN APPLID(REGIONO)
+         MVC   SCREMSGO,SPACES           CLEAR MESSAGE OUTPUT AREA
+         B     CONT#000                  GO REDISPLAY MAIN SCREEN
+*---------------------------------------------------------------------*
+DUMPIT   DS    0H
+         MVC   DUMPCODE(4),=C'ERR?'      "OTHER" ERROR
+         B     ABENDIT
+*---------------------------------------------------------------------*
+DUMPMAP  DS    0H
+         CLI   EIBAID,X'6D'              Q. CLEAR ENTERED
+         BE    EXITPROG                     Y. EXIT PROGRAM
+         B     ABENDIT                    GO WRITE AN ABEND
+RETURNX  DS    0H
+         EXEC  CICS SEND CONTROL FREEKB ERASE
+         EXEC CICS RETURN
+*---------------------------------------------------------------------*
+ABENDIT  DS    0H
+         EXEC  CICS ABEND ABCODE(DUMPCODE)
+*---------------------------------------------------------------------*
+EXITPROG DS    0H
+         CLI   KEEPI,C'Y'                 Q. KEEP TEMP STORAGE Q DETS
+         BE    CONTEXIT                      Y. BYPASS
+         EXEC  CICS HANDLE CONDITION  QIDERR(CONTEXIT)
+         EXEC  CICS DELETEQ TS QUEUE('CGUDYNA')
+CONTEXIT DS    0H
+         EXEC  CICS SEND CONTROL ERASE FREEKB
+         EXEC  CICS RETURN
+*---------------------------------------------------------------------*
+*   GET THE CURRENT TIME                                              *
+*---------------------------------------------------------------------*
+ASKTIME  DS    0H
+         LA    R2,CURTIMEO                  POINT TO OUTPUT DESTINATION
+         EXEC  CICS ASKTIME
+         OI    EIBTIME+3,X'0F'              CONVERT RIGHT NIBBLE
+         UNPK  DWORK8(8),EIBTIME(4)         UNPACK TIME
+         MVC   0(2,R2),DWORK8+2             MOVE HH
+         MVI   2(R2),C':'                   DELIMITER
+         MVC   3(2,R2),DWORK8+4             MOVE MM
+         MVI   5(R2),C':'                   DELIMITER
+         MVC   6(2,R2),DWORK8+6             MOVE SS
+         BR    R8                           RETURN
+*---------------------------------------------------------------------*
+*   GET THE FCT DETAILS                                               *
+*---------------------------------------------------------------------*
+GETFCT   DS    0H
+         CLI   RCODE,C'0'                Q. ZERO RETURN CODE
+         BNE   RETFRFCT                     N. Do not get info
+         LA    R2,FCTDETO              POINT TO OUTPUT BUFFER
+*
+         EXEC  CICS INQUIRE FILE(#DDNAMEI)                             +
+               ADD(ADDOPT)                                             +
+               BROWSE(BROOPT)                                          +
+               DELETE(DELOPT)                                          +
+               ENABLESTATUS(ENAOPT)                                    +
+               EXCLUSIVE(EXCOPT)                                       +
+               LSRPOOLID(LSRP)                                         +
+               OPENSTATUS(OPEOPT)                                      +
+               READ(REAOPT)                                            +
+               UPDATE(UPDOPT)                                          +
+               NOHANDLE
+*
+         CLC   EIBRESP,DFHRESP(NORMAL)       Q. Normal return code
+         BE    T170TSTA                         Y. Go test attributes
+         CLC   EIBRESP,DFHRESP(FILENOTFOUND) Q. File not found
+         BE    DDNOTFND                         Y. Go tell of error
+*---------------------------------------------------------------------*
+T170TSTA DS    0H
+T170OPEN DS    0H
+         MVC   00(3,R2),=C'Ope'        Move status
+         CLC   OPEOPT,DFHVALUE(OPEN)   Q. File open
+         BE    T170ENAB                   Y. Next test
+         CLC   OPEOPT,DFHVALUE(OPENING) Q. File open
+         BE    T170ENAB                   Y. Next test
+         MVC   00(3,R2),=C'Clo'        Move status
+T170ENAB DS    0H
+         MVC   04(3,R2),=C'Dis'        Indicate enabled status
+         CLC   ENAOPT,DFHVALUE(DISABLED)  Q. Match
+         BE    OPTS17R                       Y. Next test
+         MVC   04(3,R2),=C'Dig'        Indicate enabled status
+         CLC   ENAOPT,DFHVALUE(DISABLING) Q. Match
+         BE    OPTS17R                       Y. Next test
+         MVC   04(3,R2),=C'Une'            Indicate Unenabled
+         CLC   ENAOPT,DFHVALUE(UNENABLED)  Q. Match
+         BE    OPTS17R                       Y. Next test
+         MVC   04(3,R2),=C'Ung'            Indicate Unenabled
+         CLC   ENAOPT,DFHVALUE(UNENABLING) Q. Match
+         BE    OPTS17R                       Y. Next test
+         MVC   04(3,R2),=C'Ena'            Indicate Enabled
+OPTS17R  DS    0H
+         CLC   REAOPT,DFHVALUE(READABLE)   Q. Match
+         BNE   OPTS17U                       N. Next test
+         MVC   08(4,R2),=C'Read'           Set option
+OPTS17U  DS    0H
+         CLC   UPDOPT,DFHVALUE(UPDATABLE)  Q. Match
+         BNE   OPTS17A                       N. Next test
+         MVC   13(6,R2),=C'Update'     SET UP OPTION
+OPTS17A  DS    0H
+         CLC   ADDOPT,DFHVALUE(ADDABLE)    Q. Match
+         BNE   OPTS17B                       N. Next test
+         MVC   20(3,R2),=C'Add'        SET UP OPTION
+OPTS17B  DS    0H
+         CLC   BROOPT,DFHVALUE(BROWSABLE)  Q. Match
+         BNE   OPTS17D                       N. Next test
+         MVC   24(6,R2),=C'Browse'     SET UP OPTION
+OPTS17D  DS    0H
+         CLC   DELOPT,DFHVALUE(DELETABLE)  Q. Match
+         BNE   OPTS17E                       N. Next test
+         MVC   31(3,R2),=C'Del'        SET UP OPTION
+OPTS17E  DS    0H
+         CLC   EXCOPT,DFHVALUE(EXCTL)      Q. Match
+         BNE   LSR17                         N. Next test
+         MVC   35(4,R2),=C'Excl'       SET UP OPTION
+LSR17    DS    0H
+         L     R1,LSRP                 Laod LSR Poll value
+         LTR   R1,R1                   Q. Zero (Non-LSR)
+         BNZ   LSR17YES                   N. Continue
+         MVC   40(7,R2),=C'Non-LSR'    Not Shared
+         B     RETFRFCT                RETURN
+LSR17YES DS    0H
+         MVC   40(4,R2),=C'LSR-'       SHARED
+         CVD   R1,DWORK8               CONVERT TO DECIMAL
+         OI    DWORK8+7,X'0F'          FORCE RIGHT NIBBLE
+         UNPK  DWORK(8),DWORK8+7(1)    UNPACK 1 BYTE
+         MVC   44(1,R2),DWORK+7        MOVE TO OUTPUT
+         B     RETFRFCT                RETURN
+*---------------------------------------------------------------------*
+OTHERERR DS    0H
+         MVC   FCTDETO(23),=C'*** Abnormal Error ***.'
+         B     RETFRFCT                GoTo common return
+DDNOTFND DS    0H
+         MVC   FCTDETO(31),=C'*** DD not defined to CICS ***.'
+RETFRFCT DS    0H
+         BR    R8                      RETURN
+*=====================================================================*
+*---------------------------------------------------------------------*
+         LTORG
+*---------------------------------------------------------------------*
+STARTST  DS    0D
+PARML1   DC    AL2(PARMLEN)
+PARML2   DC    H'16'
+SPACES   DC    CL256' '
+ACCSR    DC    H'493'
+DDCSR    DC    H'653'
+DSCSR    DC    H'813'
+DICSR    DC    H'1053'
+KPCSR    DC    H'1293'
+CARED    DC    X'2842F2'               RED CHARACTER ATTRIBUTES
+CADEF    DC    X'284200'               DEFAULT HARACTER ATTRIBUTES
+         END

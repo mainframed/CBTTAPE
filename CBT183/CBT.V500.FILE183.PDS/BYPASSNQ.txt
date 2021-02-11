@@ -1,0 +1,351 @@
+//GILBERTQ JOB (ACCT#),BYPASSNQ,
+// NOTIFY=&SYSUID,
+//*RESTART=CREATE,
+// CLASS=A,MSGCLASS=H,COND=(0,NE)
+//HLASM EXEC PGM=ASMA90,PARM=(OBJECT,NODECK,NOESD,NORLD,NOXREF,BATCH)
+***********************************************************************
+*                                                                     *
+* MODULE NAME = BYPASSNQ                                              *
+*                                                                     *
+* DESCRIPTIVE NAME = SCRATCH/RENAME A DATA SET WITHOUT ENQ            *
+*                                                                     *
+* STATUS = R102                                                       *
+*                                                                     *
+* FUNCTION = This program was designed for systems programmers        *
+*            who install a new version of MVS or another software     *
+*            product.  They sometimes face a situation where they     *
+*            have to delete or rename a data set not currently        *
+*            allocated to anyone but which they can't delete          *
+*            because it has the same name as another data set         *
+*            which (1) exists on a different disk volume and          *
+*            (2) is currently allocated to a long-running task.       *
+*                                                                     *
+*            BYPASSNQ is a driver that allows you to run any          *
+*            utility program (such as IEHPROGM or IDCAMS) and         *
+*            bypass dsname ENQ that is normally performed by          *
+*            the DYNALLOC, SCRATCH and RENAME SVCs.                   *
+*            This technique allows data sets to be deleted or         *
+*            renamed using standard MVS services and is fully         *
+*            compatible with indexed VTOCs and SMS.                   *
+*                                                                     *
+*            The invoker of BYPASSNQ must have Update authority       *
+*            to SYS1.PARMLIB                                          *
+*                                                                     *
+* AUTHOR = Gilbert Saint-Flour <carlos@gsf-soft.com>                  *
+*          http://gsf-soft.com/Freeware/                              *
+*                                                                     *
+* ENVIRONMENT = SEE BELOW                                             *
+*                                                                     *
+*    DEPENDENCIES: MVS/ESA OR OS/390                                  *
+*                                                                     *
+* MODULE TYPE = PROCEDURE, (CSECT TYPE)                               *
+*                                                                     *
+*    PROCESSOR = Assembler H Version 2 or                             *
+*                High Level Assembler/MVS                             *
+*                                                                     *
+*    MODULE SIZE = 2K                                                 *
+*                                                                     *
+*    ATTRIBUTES = REENTERABLE, RMODE ANY, AMODE 31                    *
+*                 SUPERVISOR STATE, KEY 8                             *
+*                 APF AUTHORIZATION: YES                              *
+*                 Invoker must have Update authority to SYS1.PARMLIB  *
+*                                                                     *
+* SYNTAX = SEE BELOW                                                  *
+*                                                                     *
+*          The name of the utility program is passed in the PARM      *
+*                                                                     *
+*          Examples:                                                  *
+*                                                                     *
+*               //SCRATCH EXEC PGM=BYPASSNQ,PARM=IEHPROGM             *
+*               //DD1      DD UNIT=3390,VOL=SER=OS39R3,DISP=OLD       *
+*               //SYSPRINT DD SYSOUT=*                                *
+*                 RENAME DSNAME=GILBERT.TEST29,VOL=3390=OS39R3,      X*
+*                              NEWNAME=GILBERT.TEST29B                *
+*                SCRATCH DSNAME=GILBERT.TEST29B,VOL=3390=OS39R3       *
+*                                                                     *
+*               //ALTER   EXEC PGM=BYPASSNQ,PARM=IDCAMS               *
+*               //SYSPRINT DD SYSOUT=*                                *
+*                 ALTER IBMUSER.TEST29 NEWNAME(IBMUSER.TEST29B)       *
+*                 DELETE IBMUSER.TEST29B                              *
+*                                                                     *
+* OPERATION = SEE BELOW                                               *
+*                                                                     *
+*            1. Retrieve the name of the utility program              *
+*               from the PARM field.                                  *
+*            2. Fix myself in memory                                  *
+*            3. Set up an SVC screening environment to intercept      *
+*               ENQ and DEQ SVC requests                              *
+*            4. Issue XCTL to pass control to the utility program     *
+*
+*         Note: Each time it is invoked, the SVC screening routine    *
+*               checks the first QNAME in the ENQ/DEQ parm list.      *
+*               If it is equal to SYSDSN, it changes it to SYSNOENQ.  *
+*                                                                     *
+*         Credits: The idea of using SVC screening to bypass          *
+*                  DSN ENQ was borrowed from the SYSIEH               *
+*                  utility (author unknown).                          *
+*                                                                     *
+* ABENDS = See below                                                  *
+*                                                                     *
+*            U1001  Invalid Parm                                      *
+*                                                                     *
+*            U1002  User is not authorized                            *
+*                                                                     *
+* CHANGE ACTIVITY                                                     *
+*                                                                     *
+* 100 Initial release                                                 *
+* 101 Use ASMH and ISGPEL macro                                       *
+* 102 Issue PGFIX before setting TCBSVCS                              *
+*                                                                     *
+***********************************************************************
+BYPASSNQ RSECT
+BYPASSNQ RMODE ANY
+         DC    C'GSF UTILITIES - BYPASSNQ R102 '
+BEGIN    LR    R10,R15
+         USING BEGIN,R10
+         LR    R11,R1                  SAVE PARM ADDRESS
+         USING FSA,R13
+         MODESET MODE=SUP              SUPERVISOR MODE
+*
+*        Check that the user has update authority to SYS1.PARMLIB
+*
+         L     R15,=V(RACHECK)         addr of RACHECK routine
+         SYNCH (15),STATE=SUPV,RESTORE=YES Issue RACHECK
+         LTR   R15,R15                 USER AUTHORIZED?
+         BNZ   ABEND2                  no, abend
+*
+*        Retrieve the name of the utility program from the parm
+*
+         L     R2,0(,R11)              addr of the PARM
+         LH    R3,0(,R2)               parm length
+         LTR   R3,R3                   parm missing?
+         BNP   ABEND1                  yes, abend
+         CH    R3,=H'8'                parm too long?
+         BH    ABEND1                  yes, abend
+         LA    R14,PGMNAME             "to" addr
+         LA    R15,L'PGMNAME           "to" length
+         LA    R2,2(,R2)               "from" address
+         ICM   R3,B'1000',=C' '        padding
+         MVCL  R14,R2                  move pgm name
+*
+*        Make sure I don't disappear
+*
+         PGSER R,FIX,                  PREVENT S07C ABEND              X
+               A=SVCA2,                FROM                            X
+               EA=SVCARRAY+255,        TO                              X
+               LONG=Y,                                                 X
+               ECB=0
+         LOAD  EP=BYPASSNQ             bump my own use count for XCTL
+*
+*        Set up the SVC screening environment
+*
+         MODESET EXTKEY=ZERO
+         L     R4,X'21C'               A(TCB) from PSATOLD
+         USING TCB,R4
+         LA    R0,SVCA2                ADDR OF SVC SCREENING ROUTINE
+         ST    R0,TCBSVCA2
+         OI    TCBFLGS7,TCBSVCS        SVC SCREENING ON
+         MODESET KEY=NZERO,MODE=PROB
+*
+*        XCTL to utility program with PARM=''
+*
+         LR    R1,R11                  restore R1
+         L     R2,0(,R1)               addr of the PARM
+         MVI   1(R2),0                 zero parm length
+         XCTL  EPLOC=PGMNAME,SF=(E,XCTLL)
+*
+ABEND1   ABEND 1001,REASON=(R3)        bad parm
+*
+ABEND2   ABEND 1002,REASON=(R15)       RACHECK failed
+***********************************************************************
+*                                                                     *
+*        SVC SCREENING ARRAY                                          *
+*                                                                     *
+***********************************************************************
+         DC    0D'0'
+         EXTRN SCREEN
+SVCA2    DC    A(SCREEN+X'80000000')
+         DC    X'80,00',X'0000'        SVC TYPE, LOCKS
+SVCARRAY DC    256X'80'                SVC ARRAY
+         ORG   SVCARRAY+48
+         DC    X'00'                   DEQ
+         ORG   SVCARRAY+56
+         DC    X'00'                   ENQ
+         ORG
+***********************************************************************
+*        Work area (First Save Area)                                  *
+***********************************************************************
+FSA      DSECT
+         DS    3F                      first 3 words of FSA
+PGMNAME  DS    CL8                     name of utility program
+XCTLL    XCTL  EPLOC=PGMNAME,SF=L
+*
+         IKJTCB DSECT=YES
+         YREGS
+         END   BEGIN
+***********************************************************************
+*                                                                     *
+*        SVC SCREENING ROUTINE                                        *
+*                                                                     *
+*        This routine is invoked as a T3-SVC each time                *
+*        the ENQ or DEQ SVCs are issued.                              *
+*                                                                     *
+***********************************************************************
+SCREEN   RSECT
+SCREEN   RMODE ANY
+         USING CVTMAP,R3               CVT
+         USING TCB,R4                  TCB
+         USING RBBASIC,R5              SVRB
+         USING SCREEN,R6               Local Base
+**       USING ASCB,R7                 ASCB
+         LR    R9,R1                   point to ENQ/DEQ parm list
+         USING PELBASIC,R9
+*---------------------------------------------------------------------*
+*                                                                     *
+*        If the first QNAME in the ENQ/DEQ parm list is "SYSDSN",     *
+*        change it to "SYSNOENQ".                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+         MODESET EXTKEY=RBT234,WORKREG=2 SWITCH TO CALLER'S KEY
+         L     R2,PELMAJA              ADDR OF THE QNAME
+         CLC   OLDQNAME,0(R2)          QNAME=SYSDSN?
+         BNE   SCREEN45                NO, IGNORE
+         LA    R2,NEWQNAME             NEW QNAME
+         ST    R2,PELMAJA              UPDATE ADDR OF THE QNAME
+SCREEN45 EQU   *
+*---------------------------------------------------------------------*
+*                                                                     *
+*        XCTL TO SVC ROUTINE                                          *
+*                                                                     *
+*              1. LOCATE SVC ENTRY IN SVC TABLE                       *
+*              2. RESTORE R15,R0,R1                                   *
+*              3. BRANCH TO SVC ROUTINE                               *
+*                                                                     *
+*---------------------------------------------------------------------*
+         L     R8,CVTABEND             SECONDARY CVT
+         USING SCVTSECT,R8
+         LA    R2,RBBASIC-RBINTCOD     offset to interrupt code
+         LNR   R2,R2                   make it negative
+         AL    R2,RBLINK               point at RBINTCOD in the PRB
+         LH    R9,0(,R2)               Interrupt code (SVC num: 48,56)
+         SLL   R9,3                    MULT BY 8
+         AL    R9,SCVTSVCT             ADD ORIGIN OF SVC TABLE
+         USING SVCENTRY,R9
+*
+         L     R6,SVCEP                GET EP ADDR OF SVC RTNE
+         DROP  R6                      MAIN BASE REG
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Exit to the ENQ/DEQ SVC Routine                              *
+*                                                                     *
+*---------------------------------------------------------------------*
+         MODESET EXTKEY=ZERO           switch back to key=zero
+         L     R14,CVTEXP1             ADDR OF EXIT PROLOGUE
+         L     R15,RBGRS15             Restore R15 from SVRB
+         LM    R0,R1,RBGRS0            Restore R0,R1 from SVRB
+         BSM   0,R6                    GO TO THE SVC ROUTINE
+*
+OLDQNAME DC    CL8'SYSDSN'             OLD QNAME
+NEWQNAME DC    CL8'SYSNOENQ'           NEW QNAME
+         PRINT NOGEN
+PRINT    OPSYN ANOP
+         CVT   DSECT=YES
+         IHASCVT DSECT=YES,LIST=NO     SECONDARY CVT
+         IHASVC                        SVC TABLE ENTRY
+         IKJTCB DSECT=YES
+         IKJRB DSECT=YES
+         ISGPEL                        Parameter Element List
+         YREGS
+         END
+***********************************************************************
+*                                                                     *
+*        RACHECK Sub-routine                                          *
+*                                                                     *
+*        Check that the user has UPDATE authority to SYS1.PARMLIB.    *
+*                                                                     *
+*        R15 on exit contains the return code:                        *
+*                                                                     *
+*              R15=0   the user is authorized                         *
+*              R15>0   the user is not authorized                     *
+*                                                                     *
+*        Must be invoked via  SYNCH (15),STATE=SUPV,RESTORE=YES       *
+*                                                                     *
+***********************************************************************
+RACHECK  RSECT
+RACHECK  RMODE ANY
+         LR    R12,R15                 local base
+         USING RACHECK,R12
+         STORAGE OBTAIN,LENGTH=RACDYNL,SP=230,KEY=1
+         LR    R13,R1                  A(DYN)
+         USING RACDYNAM,R13
+         MODESET EXTKEY=SCHED          switch to KEY=1
+*
+         L     R14,RACCAML             CAMLST 1ST WORD
+         LA    R15,RACDSN              DATA SET NAME
+         SLR   R0,R0
+         LA    R1,RACWK512             WORK AREA
+         STM   R14,R1,RACWK512+400     STORE RELOCATED CAMLST
+         LOCATE RACWK512+400           GET VOLSER AND DEVICE TYPE
+         LTR   R15,R15                 CHECK FOR SUCCESSFUL COMPLETION
+         BNZ   RACEXIT                 LOCATE FAILED, EXIT
+         MVC   RACVOL,RACWK512+6       VOLSER
+*
+         MVC   RACPLIST,RACMODL        move model to dynamic
+         RACROUTE REQUEST=AUTH,                                        X
+               WORKA=RACWK512,         512-byte work area              X
+               VOLSER=RACVOL,          VOLSER                          X
+               MF=(E,RACPLIST)
+*
+RACEXIT  LR    R2,R15                  save return code
+         STORAGE RELEASE,LENGTH=RACDYNL,ADDR=(R13),SP=230,KEY=1
+         LR    R15,R2                  restore return code
+         SVC   3                       goback to caller
+*
+RACCAML  CAMLST NAME,*-*,,*-*          CAMLST FOR LOCATE
+RACMODL  RACROUTE REQUEST=AUTH,        CHECK AUTHORIZATION             X
+               LOG=NONE,               DO NOT LOG FAILURES             X
+               CLASS='DATASET',        CHECK FOR DATASET AUTHORITY     X
+               ENTITY=RACDSN,          DATA SET NAME                   X
+               VOLSER=*-*,             volser                          X
+               ATTR=UPDATE,            MUST BE ALLOWED TO UPDATE       X
+               MF=L
+RACMODLL EQU   *-RACMODL
+RACDSN   DC    CL44'SYS1.PARMLIB'
+*
+RACDYNAM DSECT
+         DS    18F
+RACPLIST DS    XL(RACMODLL)            RACROUTE parm list
+RACVOL   DS    CL6
+RACWK512 DS    64D                     512 bytes
+RACDYNL  EQU   *-RACDYNAM
+*
+         PRINT NOGEN
+PRINT    OPSYN ANOP
+         YREGS
+         END
+//SYSLIB   DD DSN=SYS1.MACLIB,DISP=SHR
+//         DD DSN=SYS1.MODGEN,DISP=SHR
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),BLKSIZE=3200
+//*
+//LKED    EXEC PGM=HEWLKED,PARM='MAP,RENT,AC=1'
+//SYSLIN   DD DSN=*.HLASM.SYSLIN,DISP=(OLD,PASS)
+//SYSLMOD  DD DSN=SYS1.P390.LINKLIB(BYPASSNQ),DISP=SHR
+//SYSPRINT DD SYSOUT=*
+//*
+//CREATE EXEC PGM=IEHMOVE
+//SYSUT1 DD DISP=OLD,UNIT=SYSALLDA,VOL=SER=OS39R3
+//DD1    DD DSN=GILBERT.X80,DISP=SHR
+//DD2    DD DISP=OLD,UNIT=SYSALLDA,VOL=SER=OS39R3
+//SYSPRINT DD SYSOUT=*
+     COPY      DSNAME=GILBERT.X80,                                     X
+               TO=3390=OS39R3,                                         X
+               RENAME=GILBERT.TEST29
+//*
+//GO      EXEC PGM=BYPASSNQ,PARM=IEHPROGM
+//STEPLIB  DD DSN=SYS1.P390.LINKLIB,DISP=SHR
+//SYSPRINT DD SYSOUT=*
+  RENAME DSNAME=IBMUSER.TEST29,VOL=3390=OS39R3,NEWNAME=GILBERT.TEST29B
+ SCRATCH DSNAME=IBMUSER.TEST29B,VOL=3390=OS39R3
+//DD1      DD UNIT=3390,VOL=SER=OS39R3,DISP=OLD

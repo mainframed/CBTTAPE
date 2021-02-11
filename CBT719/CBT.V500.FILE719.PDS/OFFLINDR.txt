@@ -1,0 +1,2264 @@
+*/* -------------------------------------------------------------------
+*   Dump/Restore an offline eckd dasd device to/from a backup file
+*
+*   Invocation:
+*      //step   EXEC PGM=OFFLINDR,
+*      //       PARM='function,unit,locyl,hicyl,bkddn,msgddn'
+*      //STEPLIB  DD DISP=SHR,DSN=apf.authorized.loadlib
+*      //msgddn   DD SYSOUT=*
+*      //bkddn    DD . . . .
+*
+*     function  Required. 'DUMP' or 'RESTORE', or a prefix of either;
+*               can be mixed case.
+*
+*     unit      Required. Specifies the logically offline eckd dasd
+*               device address that will be dumped or restored.
+*               If 'ASIS' (mixed case) is specified for RESTORE
+*               then the address from the backup file will be used.
+*
+*     locyl     Optional. Specifies the starting cylinder on the unit
+*               (in hex) for the dump or restore.
+*               Default for DUMP is cylinder 0; default for RESTORE
+*               is the low cylinder dumped on the backup file.
+*
+*     hicyl     Optional. Specifies the last cylinder on the unit
+*               (in hex) for the dump or restore.
+*               Default for DUMP is the last primary cylinder on the
+*               unit; default for RESTORE is the last cylinder dumped
+*               on the backup file.
+*
+*     bkddn     Optional.  Specifies the ddname for the backup file.
+*               Default is SYSUT1.  DCB attributes do not have to be
+*               specified, and are ignored if they are.
+*
+*     msgddn    Optional.  Specifies the ddname for the message file.
+*               Default is SYSPRINT.
+*
+*   This program *requires* apf-authorization.  The program only
+*   runs in supervisor state and/or key 0 during initialization and
+*   termination.  During the actual dump or restore the program runs
+*   in key 8 problem state.
+*
+*   The backup file is written/read using QSAM and is a physical
+*   sequential file (dsorg=ps) and contains undefined blocks (recfm=u).
+*   The blocksize is the maximum blocksize allowed for the backup
+*   device (usually blksize=32760).
+*
+*   The first block on the backup file is a 512 byte block that
+*   describes the offline device.  Restores must be made to a like
+*   device type (eg you cannot restore a dumped 3380 to a 3390).
+*
+*   The remainder of the file contains track images as read by the
+*   Read Track (RT) CCW.  A track image is contained in an integral
+*   number of blocks.  Generally, a track image dumped to tape will
+*   contain 1 or 2 blocks, and a track image dumped to dasd will
+*   contain 1 or 2 or 3 blocks.  The extra block for dasd can occur
+*   when a short block is written at the end of the current track,
+*   a 32k block is written at the beginning of the next track, and
+*   the remainder of the track image is written after the 32k block;
+*   that is, there is track balance logic to maximize track
+*   utilization during DUMP.
+*
+*   Dual IOBs are used for the offline dasd unit to allow I/O
+*   concurrency.  Note that DUMP reads a cylinder per EXCP and
+*   RESTORE writes a track per EXCP, so restores will take longer
+*   than dumps.
+*
+*   Notes:
+*   1.  Assembly requires SYS1.MACLIB and SYS1.MODGEN.
+*       Linkedit the program with the RENT and AC(1) options.
+*   2.  The program uses a feature introduced by release 3 of
+*       the High Level Assembler (HLASM).  If your high level
+*       assembler is below this level then you will probably
+*       have to change the several lines that read
+*         USING (OFFLINDR+4095,mainend),ra
+*       to
+*         USING OFFLINDR+4095,ra
+*       This in turn will cause the assembly step to return code 4
+*       instead of code 0, which can be ignored.
+*
+*   Changelog:
+*   0.1.1 29 Nov 2000  -  IDAWs are now used to reduce the virtual
+*                         storage footprint below the 16M line.
+*
+*   Greg Smith
+*   gsmith@nc.rr.com
+*
+* ------------------------------------------------------------------ */
+
+*/* -------------------------------------------------------------------
+*   local macros
+* ------------------------------------------------------------------ */
+         MACRO
+&L      #MSG   &MSG,&TYPE=CALL
+         LCLA  &A,&N,&O
+         LCLC  &C
+         GBLA  &MSG_IX
+         GBLC  &MSGS(256)
+         AIF   ('&TYPE' EQ 'CALL').CALL,                               x
+               ('&TYPE' EQ 'GEN').GEN
+         MNOTE 8,'Invalid type specified'
+         MEXIT
+.*
+.CALL    ANOP
+&MSG_IX  SETA  &MSG_IX+1
+&MSGS(&MSG_IX) SETC '&MSG'
+&L       L     re,=A(#MSG&MSG_IX)
+         LA    rf,L'#MSG&MSG_IX
+&A       SETA  2
+&O       SETA  0
+&N       SETA  N'&SYSLIST
+         AGO   .PL0
+.PLLOOP  ANOP
+         LA    re,&SYSLIST(&A)
+&A       SETA  &A+1
+         AIF   (&A GT &N).PLX14
+         LA    rf,&SYSLIST(&A)
+&A       SETA  &A+1
+.PL0     ANOP
+         AIF   (&A GT &N).PLX15
+         LA    r0,&SYSLIST(&A)
+&A       SETA  &A+1
+         AIF   (&A GT &N).PLX0
+         LA    r1,&SYSLIST(&A)
+&A       SETA  &A+1
+         AIF   (&A GT &N).PLX1
+         STM   re,r1,drwmsgpl+&O
+&O       SETA  &O+16
+         AGO   .PLLOOP
+.PLX14   ST    re,drwmsgpl+&O
+         AGO   .CALL2
+.PLX15   STM   re,rf,drwmsgpl+&O
+         AGO   .CALL2
+.PLX0    STM   re,r0,drwmsgpl+&O
+         AGO   .CALL2
+.PLX1    STM   re,r1,drwmsgpl+&O
+.CALL2   LA    r1,drwmsgpl
+         L     rf,=a(msgr)
+         BALR  re,rf
+         MEXIT
+.*
+.GEN     ANOP
+         AIF   ('&L' EQ '').GENNOL
+&L       DS    0H
+.GENNOL  ANOP
+&A       SETA  1
+.GENLOOP AIF   (&A GT &MSG_IX).MEND
+#MSG&A   DC    C&MSGS(&A)
+&A       SETA  &A+1
+         AGO   .GENLOOP
+.MEND    MEND
+
+*/* -------------------------------------------------------------------
+*   mainline routine
+* ------------------------------------------------------------------ */
+OFFLINDR CSECT ,
+OFFLINDR AMODE 31
+OFFLINDR RMODE ANY
+         B     init-*(,rf)
+         DC    AL1(init-*)
+pgmid    DC    CL8'offlindr'
+vrm      DC    X'000101'          version 0 release 1 modlvl 1
+         DC    C' &SYSDATE &SYSTIME '
+init     SAVE  (14,12)
+         LR    rc,rf              set base reg
+         USING OFFLINDR,rc
+         LA    ra,4095(,rc)       set 2nd base reg
+         USING OFFLINDR+4095,ra
+         LR    r2,r1              copy parm reg
+
+*/* -------------------------------------------------------------------
+*   obtain and initialize workareas
+* ------------------------------------------------------------------ */
+         STORAGE OBTAIN,LENGTH=drwl get work area
+         ST    r1,8(,rd)          chain save areas
+         ST    rd,4(,r1)
+         LR    rd,r1              set area base
+         USING odrw,rd
+         MVC   drwid,=C'odrw'     set area identifier
+         LA    r0,odrw+8          clear the area
+         L     r1,=a(drwl-8)
+         SLR   rf,rf
+         MVCL  r0,re
+         STORAGE OBTAIN,LENGTH=o24wl,LOC=BELOW get 24-bit work area
+         ST    r1,drwo24w         save address
+         LR    rb,r1              set 24-bit area base
+         USING o24w,rb
+         MVC   o24wid,=C'o24w'    set 24-bit area identifier
+         LA    r0,o24w+4          clear the 24-bit area
+         L     r1,=a(o24wl-4)
+         SLR   rf,rf
+         MVCL  r0,re
+
+*/* -------------------------------------------------------------------
+*   process PARM= : <function>,<unit>,<locyl>,<hicyl>,<bkddn>,<msgddn>
+* ------------------------------------------------------------------ */
+         N     r2,=A(X'7fffffff') test parameter reg
+         BZ    Enoparm             invalid parameter list
+         L     r3,0(,r2)          point to parameters
+         N     r3,=A(X'7fffffff')  test parameter reg
+         BZ    Enoparm              invalid parameter list
+         LH    r4,0(,r3)          get length of parameters
+         LTR   r4,r4               test length
+         BNP   Enoparm              invalid parameter list
+         BCTR  r4,0               decrement for EX
+         LA    r3,2(,r3)          point past length
+         SLR   r2,r2              clear TRT register
+
+*/* 1st parm is 'DUMP' or 'RESTORE' or a prefix of either            */
+         XC    drwdw,drwdw        clear double-word work area
+         LA    r1,1(r3,r4)        point to parameter end
+         EX    r4,delimtrt        search for ','
+*/*      TRT   0(0,r3),delimtab   *** executed ***                   */
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    Ebadparm           error if 1st parm is missing
+         CH    r1,=Y(8)           check length
+         BNL   Ebadparm            jumps if not too high
+         EX    r1,parmmvc         copy the parm
+*/*      MVC   drwdw(0),0(r3)     *** executed ***                   */
+         TR    drwdw,upcase       translate to uppercase
+         LA    rf,RESTORE         test for RESTORE
+         EX    r1,parmclc         compare for RESTORE
+*/*      CLC   0(0,rf),drwdw      *** executed ***                   */
+         BE    parm1ok            continue if match
+         OI    drwflags,drwdump   presume dump
+         LA    rf,DUMP            test for DUMP
+         EX    r1,parmclc         compare for DUMP
+         BNE   Ebadparm           error if neither
+parm1ok  LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/*      2nd parm is hex unit address of the offline device or 'ASIS'*/
+         LTR   r4,r4              test for 2nd parm
+         BM    Ebadparm            error if offline device is missing
+         XC    drwdw,drwdw        clear double-word work area
+         LA    r1,1(r3,r4)        point to parameter end
+         EX    r4,delimtrt        search for ','
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    Ebadparm           error if 1st parm is missing
+         CH    r1,=Y(4)           check 2nd parm length
+         BNL   Ebadparm           error if too long
+         EX    r1,parmmvc         copy 2nd parameter
+         TR    drwdw,upcase       convert to uppercase
+         SLR   r5,r5              clear unit address
+         CLC   ASIS,drwdw         'ASIS' specified ?
+         BNE   getunit             no, continue
+         TM    drwflags,drwdump   is this a DUMP ?
+         BO    Ebadparm            yes, 'ASIS' is only good for restore
+         BCTR  r5,0               set unit to x'ffff'
+         B     gotunit            continue
+getunit  EX    r1,parmhexc        test if all hex digits
+*/*      TRT   drwdw(0),hexchars  *** executed ***                   */
+         BNZ   Ebadparm            error if not
+         EX    r1,parmhex         convert to hex digits
+*/*      TR    drwdw(0),hextab    *** executed ***                   */
+         LA    rf,1(,r1)          need an extra byte for pack
+         EX    rf,parmpack        get hex value
+*/*      PACK  drwdw2,drwdw(0)    *** executed ***                   */
+         ICM   r5,3,drwdw2+5      load hex value
+gotunit  STCM  r5,3,drwunit       save unit address
+         LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/*      3rd parm is low cylinder to dump/restore                    */
+         SLR   r1,r1              clear reg 1
+         SLR   r5,r5              init to
+         BCTR  r5,0                -1
+         LTR   r4,r4              test for low cylinder
+         BM    gotlocyl            continue if missing
+         LA    r1,1(r3,r4)        point to parameter end
+         EX    r4,delimtrt        search for ','
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    gotlocyl             continue if missing
+         XC    drwdw,drwdw        clear double-word work area
+         CH    r1,=Y(4)           check 2nd parm length
+         BNL   Ebadparm           error if too long
+         EX    r1,parmmvc         copy 3rd parameter
+         TR    drwdw,upcase       convert to uppercase
+         EX    r1,parmhexc        test if all hex digits
+         BNZ   Ebadparm            error if not
+         EX    r1,parmhex         convert to hex digits
+         LA    rf,1(,r1)          need an extra byte for pack
+         EX    rf,parmpack        get hex value
+         SLR   r5,r5              clear low cylinder
+         ICM   r5,3,drwdw2+5      load hex value
+gotlocyl STCM  r5,3,drwlocyl      save low cylinder
+         LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/*      4th parm is high cylinder to dump/restore                   */
+         SLR   r1,r1              clear reg 1
+         SLR   r5,r5              init to
+         BCTR  r5,0                -1
+         LTR   r4,r4              test for high cylinder
+         BM    gothicyl            continue if missing
+         LA    r1,1(r3,r4)        point to parameter end
+         EX    r4,delimtrt        search for ','
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    gothicyl            continue if missing
+         CH    r1,=Y(4)           check 2nd parm length
+         BNL   Ebadparm           error if too long
+         XC    drwdw,drwdw        clear double-word work area
+         EX    r1,parmmvc         copy 3rd parameter
+         TR    drwdw,upcase       convert to uppercase
+         EX    r1,parmhexc        test if all hex digits
+         BNZ   Ebadparm            error if not
+         EX    r1,parmhex         convert to hex digits
+         LA    rf,1(,r1)          need an extra byte for pack
+         EX    rf,parmpack        get hex value
+         SLR   r5,r5              clear low cylinder
+         ICM   r5,3,drwdw2+5      load hex value
+gothicyl STCM  r5,3,drwhicyl      save high cylinder
+         LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/*      5th parm is the backup ddname                               */
+         SLR   r1,r1              clear reg 1
+         MVC   drwbuddn,=CL8'SYSUT1' init backup ddname
+         LTR   r4,r4              test length left
+         BM    gotbuddn            continue if nothing left
+         LA    r1,1(r3,r4)        point to parameter end
+         EX    r4,delimtrt        search for ','
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    gotbuddn            continue if missing
+         CH    r1,=Y(8)           test length
+         BNL   Ebadparm            error if too long
+         XC    drwdw,drwdw        clear double word work area
+         EX    r1,parmmvc         copy 3rd parameter
+         TR    drwdw,upcase       convert to uppercase
+         MVC   drwbuddn,drwdw     copy the backup ddname
+gotbuddn LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/*      6th (and last) parm is the message ddname                   */
+         SLR   r1,r1              clear reg 1
+         MVC   drwprddn,=CL8'SYSPRINT' init message ddname
+         LTR   r4,r4              test length left
+         BM    gotprddn            continue if nothing left
+         LA    r1,1(r3,r4)        point to parameter end
+****     EX    r4,delimtrt        search for ','
+         SR    r1,r3              calculate parameter length
+         SH    r1,=Y(1)            minus one
+         BM    gotprddn            continue if missing
+         CH    r1,=Y(8)           test length
+         BNL   Ebadparm            error if too long
+         XC    drwdw,drwdw        clear double word work area
+         EX    r1,parmmvc         copy 3rd parameter
+         TR    drwdw,upcase       convert to uppercase
+         MVC   drwprddn,drwdw     copy the message ddname
+gotprddn LA    r1,2(,r1)          length of parm + ','
+         AR    r3,r1              point to 2nd parameter
+         SR    r4,r1              readjust length left
+
+*/* -------------------------------------------------------------------
+*   print initialization message
+* ------------------------------------------------------------------ */
+         TIME  DEC
+         STM   r0,r1,drwctime     get time and date of dump/restore
+         LA    r1,drwctime
+         LA    r0,drwdtime
+         BAL   re,dtime
+         MVC   drwfcn,=CL8'dump'  set function to DUMP
+         TM    drwflags,drwdump    dump function ?
+         BO    *+10                 jumps if yes
+         MVC   drwfcn,=CL8'restore'  else set function to RESTORE
+        #MSG   '%s:8 %d:1.%d:1.%d:1 %s starting on %s:20',             X
+               pgmid,vrm,vrm+1,vrm+2,drwfcn,drwdtime
+
+*/* -------------------------------------------------------------------
+*   open the backup file
+* ------------------------------------------------------------------ */
+         MVC   drwbdcb,budcbo    presume dump dcb
+         TM    drwflags,drwdump   dump function ?
+         BO    *+10                yes, continue
+         MVC   drwbdcb,budcbi       else copy restore dcb
+bdcb     USING IHADCB,drwbdcb
+bdcbe    USING DCBE,drwbdcbe
+         MVC   bdcb.DCBDDNAM,drwbuddn set backup ddname
+         MVC   drwbdcbe,budcbe   copy the backup dcbe
+         LA    r1,drwbdcbe       set backup dcbe address
+         ST    r1,bdcb.DCBDCBE    in the backup dcb
+         DEVTYPE bdcb.DCBDDNAM,drwdevta get device info, max blk size
+         LTR   rf,rf             test devtype return code
+         BNZ   Edevterr           error if non-zero
+         L     r0,drwdevta+4     load maximum block size
+         STCM  r0,3,bdcb.DCBBLKSI      set dcb block size
+         MVC   drwopenl,openl    copy open list
+         TM    drwflags,drwdump  dump function ?
+         BNO   *+8                jumps if not
+         OI    drwopenl,15         else turn on 'output' bits
+         OPEN  (drwbdcb),MODE=31,MF=(E,drwopenl) open the backup file
+         TM    bdcb.DCBOFLGS,DCBOFOPN did backup file open ?
+         BNO   Eopenerr                 no, open error
+
+*/* -------------------------------------------------------------------
+*   if restore, read the header block
+* ------------------------------------------------------------------ */
+         TM    drwflags,drwdump  is this a restore ?
+         BO    notrest            no, continue
+         MVC   bdcbe.DCBEEODA,=A(Einnull)  set end-of-data exit addr
+         GET   drwbdcb            read 1st block
+         CLC   bdcb.DCBLRECL,=Y(odhdrl) check block length
+         BNE   Ebadhdr            error if bad
+         MVC   drwodhdr(256),0(r1) copy the header
+         MVC   drwodhdr+256(256),256(r1)
+         CLC   drwunit,=Y(-1)     default unit ?
+         BNE   *+10                no, continue
+         USING odhdr,drwodhdr
+         MVC   drwunit,odunit       else use dumped unit
+notrest  DS    0H
+
+*/* -------------------------------------------------------------------
+*   enq on the program id and the device name
+* ------------------------------------------------------------------ */
+         UNPK  drwdw(5),drwunit(3) convert the unit address to char
+         MVC   drwminor,drwdw
+         TR    drwminor,hex2char
+         MVC   drwmajor,pgmid    get program id uppercased
+         TR    drwmajor,upcase
+         MVC   drwenql,enql      copy enq parameter list
+         TM    drwflags,drwdump  dump function ?
+         BO    *+8                yes, shared request
+         NI    drwenql+2,X'7f'     else change to exclusive request
+         ENQ   (drwmajor,drwminor,,L'drwminor,SYSTEMS),                X
+               MF=(E,drwenql)
+         OI    drwflags,drwenqd  indicate resource enqueued
+
+*/* -------------------------------------------------------------------
+*   'fake-open' the offline device
+* ------------------------------------------------------------------ */
+
+*/* -------------------------------------------------------------------
+*   look for the ucb for the unit & make sure it's an offline dasd
+* ------------------------------------------------------------------ */
+         MVC   drwulpl,ulpl       copy ucblook parameter list
+         MODESET MODE=SUP
+         UCBLOOK DEVN=drwunit,UCBPTR=drwucba,PIN,PTOKEN=drwptok,       X
+               DYNAMIC=YES,RANGE=ALL,LOC=ANY,MF=(E,drwulpl),           X
+               TEXT==C'OFFLINDR offline dasd lookup'
+         STM   rf,r0,drwretcd     save ret/rsn codes across MODESET
+         MODESET MODE=PROB
+         LM    rf,r0,drwretcd     restore ret/rsn codes
+         LTR   rf,rf              test ucblook return code
+         BNZ   Ebaducbl           ucblook error
+         OI    drwflags,drwpin    indicate ucb has been pinned
+         L     r2,drwucba         load ucb addr
+         USING UCBOB,r2
+         CLI   UCBTBYT3,UCB3DACC  check for dasd ucb
+         BNE   Ebaducbt            not a dasd unit
+         TM    UCBSTAT,UCBONLI    is device online ?
+         BO    Ebaducbs            dasd unit is not offline
+
+*/* -------------------------------------------------------------------
+*   if we got a 31-bit address then we need to 'capture' a 24-bit addr
+* ------------------------------------------------------------------ */
+         MVC   drwcucba,drwucba   copy ucb address
+         TM    drwucba,X'ff'      is it a 31 bit address ?
+         BZ    cucbok              no, continue
+         MVC   drwcupl,cupl       copy isocapu parameter list
+         MODESET MODE=SUP
+         IOSCAPU CAPTUCB,UCBPTR=drwucba,CAPTPTR=drwcucba,              X
+               MF=(E,drwcupl)     capture a 24-bit ucb addr
+         STM   rf,r0,drwretcd     save ret/rsn codes across MODESET
+         MODESET MODE=PROB
+         LM    rf,r0,drwretcd     restore ret/rsn codes
+         LTR   rf,rf              test ioscapu return code
+         BNZ   Ebaducbc           ioscapu error
+         OI    drwflags,drwcucb   indicate ucb has been captured
+cucbok   DS    0H
+
+*/* -------------------------------------------------------------------
+*   build a dcb for the offline dasd
+* ------------------------------------------------------------------ */
+         MVC   drwodcb,oddcb      copy otptut model dcb
+odcb     USING IHADCB,drwodcb
+         MVC   odcb.DCBMACRF,odcb.DCBMACR copy macro reference bits
+
+*/* -------------------------------------------------------------------
+*   build a deb for the offline dasd
+* ------------------------------------------------------------------ */
+         MODESET MODE=SUP,KEY=ZERO
+         GETMAIN RU,LV=DEBLENGTH,SP=230,LOC=BELOW
+         ST    r1,drwdeba         save deb address
+         XC    0(DEBLENGTH,r1),0(r1) clear the deb
+         LR    r3,r1              appendage vector table/basic sections
+         USING DEBAVT,r3
+         LA    r4,DEBBASND-DEBAVT(,r3) debdasd section
+         USING DEBDASD,r4
+         LA    r5,DEBDASDE-DEBDASD(,r4) deb extension section
+         USING DEBXTN,r5
+         L     r6,CVTPTR          get cvt address
+         USING CVT,r6
+         L     rf,CVTXAPG         ios appendage vector table
+         MVC   DEBAVT(DEBPREFX-DEBAVT),0(rf) copy vector table
+         ST    r5,DEBXTNP         set extension address
+         USING PSA,r0
+         L     r7,PSATOLD         get tcb address
+         USING TCB,r7
+         ST    r7,DEBTCBAD        set tcb address
+         OI    DEBFLGS1,DEBXTNIN  indicate extension exists
+         LA    r0,drwodcb         get dcb address
+         ST    r0,DEBDCBAD        set dcb address
+         MVI   DEBDEBID,15        set deb identifier
+         OC    DEBPROTG,TCBPKF    set protection key
+         ST    r3,DEBAPPAD        set appendage table address
+         MVC   DEBUCBA,drwcucba+1 set ucb address
+         MVC   DEBXLNGH,=Y(DEBXLEN) set extension length
+         LA    r1,DEBBASIC        get basic section address
+         STCM  r1,7,odcb.DCBDEBA  set deb address in the dcb
+         SETLOCK OBTAIN,TYPE=LOCAL,REGS=STDSAVE,MODE=UNCOND
+         MVC   DEBDEBB,TCBDEB+1   set address next deb
+         LA    r1,DEBBASIC        get basic section address
+         ST    r1,TCBDEB          chain deb to the tcb
+         SETLOCK RELEASE,TYPE=LOCAL,REGS=STDSAVE
+
+*/* -------------------------------------------------------------------
+*   add the deb to the deb list
+* ------------------------------------------------------------------ */
+         DEBCHK drwodcb,TYPE=ADD,AM=EXCP
+         STM   rf,r0,drwretcd
+         MODESET MODE=PROB,KEY=NZERO
+         LM    rf,r0,drwretcd
+         LTR   rf,rf              test debchk add return code
+         BNZ   Ebaddeba            debchk add failed
+         OI    drwflags,drwdebad  indicate deb was added
+
+*/* -------------------------------------------------------------------
+*   build the dasd extent
+* ------------------------------------------------------------------ */
+         MODESET MODE=SUP,KEY=ZERO
+         MVC   DEBUCBAD,drwcucba  set 24-bit ucb addr
+         MVI   DEBDVMOD,0         set device modifier
+         MVC   DEBENDCC,=X'7fff'  set end cylinder
+         MVC   DEBENDHH,=X'00ff'  set end head
+         MVC   DEBNMTRK,=X'7fff'  set number tracks in extent
+         MODESET MODE=PROB,KEY=NZERO
+
+         DROP  r0,r2,r3,r4,r6,r7
+
+*/* -------------------------------------------------------------------
+*   build a couple of iobs
+* ------------------------------------------------------------------ */
+i1       USING IOBSTDRD,drwiob1
+         OI    i1.IOBFLAG1,IOBDATCH+IOBCMDCH+IOBUNREL
+         LA    r1,drwoecb1
+         ST    r1,i1.IOBECBPT
+         LA    r1,drwoccw1
+         ST    r1,i1.IOBSTART
+         LA    r1,drwodcb
+         ST    r1,i1.IOBDCBPT
+i2       USING IOBSTDRD,drwiob2
+         OI    i2.IOBFLAG1,IOBDATCH+IOBCMDCH+IOBUNREL
+         LA    r1,drwoecb2
+         ST    r1,i2.IOBECBPT
+         LA    r1,drwoccw1
+         LA    r1,drwoccwl(,r1)
+         ST    r1,i2.IOBSTART
+         LA    r1,drwodcb
+         ST    r1,i2.IOBDCBPT
+
+*/* -------------------------------------------------------------------
+*   turn off the 'not ready' bit
+* ------------------------------------------------------------------ */
+         L     r2,drwucba        load ucb addr
+         USING UCBOB,r2
+         TM    UCBFLA,UCBNRY     is 'not ready' bit on ?
+         BNO   nryok              no, continue
+         MODESET MODE=SUP,KEY=ZERO
+         NI    UCBFLA,255-UCBNRY turn off 'not ready' bit
+         MODESET MODE=PROB,KEY=NZERO
+         DROP  r2
+         OI    drwflags,drwnry   indicate we turned the bit off
+nryok    DS    0H
+
+*/* -------------------------------------------------------------------
+*   sense the offline device
+* ------------------------------------------------------------------ */
+         LA    r2,drwoccw1
+         USING CCW0,r2
+
+         MODESET MODE=SUP,KEY=ZERO
+         OI    DEBXFLG2,DEBCHCMP+DEBBYP bypass excp prefixing
+         MODESET MODE=PROB,KEY=NZERO
+
+*/* seek                                                            */
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,SK         set seek command
+         LA    r1,drwzeros
+         STCM  r1,7,CCW0ADDR      set data address
+         MVI   CCW0FLAG,CCW0SLI   set sli flag bit
+         MVC   CCW0CNT,=Y(6)      set count
+         EXCP  drwiob1
+         WAIT  1,ECB=drwoecb1     wait for SK
+         CLI   drwoecb1,ECBNORM  test post code
+         BNE   Esnserr            error
+
+*/* Sense ID                                                        */
+         XC    drwoecb1,drwoecb1  clear the ecb
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,SNSID      set sense-id command
+         LA    r1,drwsnsid
+         STCM  r1,7,CCW0ADDR      set data address
+         MVI   CCW0FLAG,CCW0SLI   set sli flag bit
+         MVC   CCW0CNT,=Y(L'drwsnsid) set count
+         EXCP  drwiob1
+         WAIT  1,ECB=drwoecb1     wait for SNSID
+         CLI   drwoecb1,ECBNORM  test post code
+         BNE   Esnserr            error
+
+*/* Sense                                                           */
+         XC    drwoecb1,drwoecb1  clear the ecb
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,SNS        set sense command
+         LA    r1,drwsns
+         STCM  r1,7,CCW0ADDR      set data address
+         MVI   CCW0FLAG,CCW0SLI   set sli flag bit
+         MVC   CCW0CNT,=Y(L'drwsns) set count
+         EXCP  drwiob1
+         WAIT  1,ECB=drwoecb1     wait for SNS
+         CLI   drwoecb1,ECBNORM  test post code
+         BNE   Esnserr            error
+
+*/* Read Device Characteristics                                     */
+         XC    drwoecb1,drwoecb1  clear the ecb
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,RDC        set read-characteristics command
+         LA    r1,drwrdc
+         STCM  r1,7,CCW0ADDR      set data address
+         MVI   CCW0FLAG,0         clear flag bits
+         MVC   CCW0CNT,=Y(L'drwrdc) set count
+         EXCP  drwiob1
+         WAIT  1,ECB=drwoecb1     wait for RDC
+         CLI   drwoecb1,ECBNORM  test post code
+         BNE   Esnserr            error
+
+*/* Sense Subsystem Status
+         XC    drwoecb1,drwoecb1  clear the ecb
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,SNSS       set sense-subsystem-status command
+         LA    r1,drwsnss
+         STCM  r1,7,CCW0ADDR      set data address
+         MVI   CCW0FLAG,CCW0SLI   set sli flag bit
+         MVC   CCW0CNT,=Y(L'drwsnss)  set count
+         EXCP  drwiob1
+         WAIT  1,ECB=drwoecb1     wait for SNSS
+         CLI   drwoecb1,ECBNORM  test post code
+         BNE   Esnserr            error
+
+         MODESET MODE=SUP,KEY=ZERO
+         NI    DEBXFLG2,255-DEBBYP turn off debbyp bit
+         MODESET MODE=PROB,KEY=NZERO
+         DROP  r2,r5
+
+*/* -------------------------------------------------------------------
+*   call the function
+* ------------------------------------------------------------------ */
+
+         L     rf,=A(dumpr)      presume backup function
+         TM    drwflags,drwdump
+         BO    *+8                jumps if backup
+         L     rf,=A(restorer)     otherwise restore function
+         BALR  re,rf             call the function
+
+*/* function was successful !!                                       */
+        #MSG   '%s:8 %d:1.%d:1.%d:1 %s successful: device %x4:2  cylindX
+               ers 0x%x4:2 thru 0x%x4:2',                              X
+               pgmid,vrm,vrm+1,vrm+2,drwfcn,drwunit,drwlocyl,drwhicyl
+
+*/* -------------------------------------------------------------------
+*   cleanup and terminate
+* ------------------------------------------------------------------ */
+
+terminat DS    0H
+
+*/* close the backup file                                            */
+bdcb     USING IHADCB,drwbdcb
+         TM    bdcb.DCBOFLGS,DCBOFOPN is backup file open ?
+         BNO   term1                   no, continue
+         CLOSE (drwbdcb),MODE=31,MF=(E,drwopenl)
+term1    DS    0H
+
+*/* free the i/o areas                                               */
+         L     r1,drwioa         load i/o area addr
+         LTR   r1,r1              any i/o area ?
+         BZ    term2               no, continue
+         L     r2,drwiol            load i/o area length
+         SLL   r2,1                  length of two i/o areas
+         STORAGE RELEASE,ADDR=(1),LENGTH=(r2)
+term2    DS    0H
+
+*/* call debchk to delete the deb                                    */
+         TM    drwflags,drwdebad was deb added to the deb chain ?
+         BNO   term3              no, continue
+         MODESET MODE=SUP,KEY=ZERO
+         DEBCHK drwodcb,TYPE=DELETE,AM=EXCP delete the deb
+         MODESET MODE=PROB,KEY=NZERO
+term3    DS    0H
+
+         L     r2,drwdeba        load deb area addr
+         LTR   r2,r2              any deb area ?
+         BZ    term4               no, continue
+
+*/*      remove the deb from the deb chain                           */
+         USING DEBAVT,r2
+         LA    r3,DEBBASIC
+         DROP  r2
+         L     r4,PSATOLD-PSA    get tcb addr
+         USING TCB,r4
+         LA    r5,TCBDEB-(DEBDEBAD-DEBBASIC)
+         USING DEBBASIC,r4
+         MODESET MODE=SUP,KEY=ZERO
+         SETLOCK OBTAIN,TYPE=LOCAL,REGS=STDSAVE,MODE=UNCOND
+         SPKA  X'80'
+termdeb  LR    r4,r5
+         SLR   r5,r5
+         ICM   r5,7,DEBDEBB      addr next deb
+         BZ    termdebx           exit if we didn't found ours
+         CLR   r3,r5             found our deb ?
+         BNE   termdeb            no, keep looking
+         SPKA  0                   need key 0 to update a deb
+         MVC   DEBDEBB,DEBDEBB-DEBBASIC(r5) remove the deb
+         DROP  r4
+termdebx SPKA  0                   need key 0 to update a deb
+         SETLOCK RELEASE,TYPE=LOCAL,REGS=STDSAVE
+         MODESET MODE=PROB,KEY=NZERO
+
+*/*      free deb storage                                            */
+         MODESET MODE=SUP,KEY=ZERO
+         FREEMAIN RU,A=(r2),LV=DEBLENGTH,SP=230 free the deb storage
+         MODESET MODE=PROB,KEY=NZERO
+term4    DS    0H
+
+*/*      turn the ucb 'not ready' bit back on if we turned it off    */
+         TM    drwflags,drwnry   did we turn the bit off ?
+         BNO   term5              no, continue
+         L     r2,drwucba        load ucb address
+         USING UCBOB,r2
+         MODESET MODE=SUP,KEY=ZERO
+         OI    UCBFLA,UCBNRY     turn the bit back on
+         MODESET MODE=PROB,KEY=NZERO
+         DROP  r2
+term5    DS    0H
+
+*/*      uncapture the ucb                                           */
+         TM    drwflags,drwcucb  was ucb captured ?
+         BNO   term6              no, continue
+         MVC   drwcupl,cupl        copy isocapu parameter list
+         MODESET MODE=SUP
+         IOSCAPU UCAPTUCB,CAPTPTR=drwcucba,                            X
+               MF=(E,drwcupl)       uncapture the 24-bit ucb addr
+         MODESET MODE=PROB
+term6    DS    0H
+
+*/*      unpin the ucb                                               */
+         TM    drwflags,drwpin   was ucb pinned ?
+         BNO   term7              no, continue
+         MVC   drwuupl,uupl        copy ucbpin unpin  parameter list
+         MODESET MODE=SUP
+         UCBPIN UNPIN,PTOKEN=drwptok,MF=(E,drwuupl)  unpin the ucb
+         MODESET MODE=PROB
+term7    DS    0H
+
+*/* close the sysprint file                                          */
+pdcb     USING IHADCB,drwpdcb
+         TM    pdcb.DCBOFLGS,DCBOFOPN is sysprint file open ?
+         BNO   term8                    no, continue
+         CLOSE (drwpdcb),MODE=31,MF=(E,drwopenl)
+term8    DS    0H
+
+*/*      release the enq                                             */
+         TM    drwflags,drwenqd   was enq issued ?
+         BNO   term9
+         DEQ   (drwmajor,drwminor,L'drwminor,SYSTEMS),                 X
+               MF=(E,drwenql)
+term9    DS    0H
+
+*/*      free the work areas                                         */
+         STORAGE RELEASE,ADDR=(rb),LENGTH=o24wl free 24-bit area
+         LR    r1,rd
+         L     r2,drwrsult
+         L     rd,4(,rd)
+         STORAGE RELEASE,ADDR=(1),LENGTH=drwl   free work area
+
+         LR    rf,r2                            copy result reg
+         RETURN (14,12),RC=(15)
+
+*/* -------------------------------------------------------------------
+*   calculate length of a track image
+* ------------------------------------------------------------------ */
+trklen   STM   r0,r2,12(rd)       save some regs
+         LR    rf,r1              copy image addr
+tlloop   CLC   =X'ffffffffffffffff',0(rf)  at the end ?
+         BE    tlexit                         yes, exit
+         SLR   r0,r0
+         IC    r0,5(,rf)          key length
+         SLR   r2,r2
+         ICM   r2,3,6(rf)         data length
+         AR    rf,r0              add key length
+         LA    rf,8(rf,r2)        add count and data length
+         B     tlloop
+tlexit   LA    rf,8(,rf)          point past end of track indicator
+         SR    rf,r1              calculate track image length
+         LM    r0,r2,12(rd)       restore work regs
+         BR    re                 return
+
+*/* -------------------------------------------------------------------
+*   return nbr records for a track image or 0 for an incomplete image
+* ------------------------------------------------------------------ */
+chktrk   STM   r0,r3,12(rd)       save some regs
+         SLR   rf,rf              init record count
+         LR    r2,r1              calculate ending address
+         AR    r2,r0               of the track image
+         SH    r2,=Y(8)           backup to beginning of the ff..ff
+ctloop   CLC   =X'ffffffffffffffff',0(r1)  at the end ?
+         BE    ctexit                         yes, exit
+         LA    rf,1(,rf)          increment number of records
+         SLR   r0,r0
+         IC    r0,5(,r1)          key length
+         SLR   r3,r3
+         ICM   r3,3,6(r1)         data length
+         AR    r1,r0              add key length
+         LA    r1,8(r1,r3)        add count and data length
+         CR    r1,r2              past end of the buffer ?
+         BNH   ctloop              no, continue
+         SLR   rf,rf              indicate image incomplete
+ctexit   LM    r0,r3,12(rd)       restore work regs
+         BR    re                 return
+
+*/* -------------------------------------------------------------------
+*   format date & time
+* ------------------------------------------------------------------ */
+dtime    STM   re,r2,12(rd)       save some regs
+         LR    r2,r0              copy output area address
+         MVI   0(r2),C' '         blank the output area
+         MVC   1(19,r2),0(r2)
+         MVC   11(9,r2),=X'4021207a20207a2020' edit pattern for time
+         ED    11(9,r2),0(r1)     edited time
+         XC    drwdw,drwdw        clear double word work area
+         SLR   rf,rf
+         ICM   rf,3,4(r1)         decimal year
+         SLL   rf,4               shift over a nibble
+         ST    rf,drwdw+4         store in the double word
+         OI    drwdw+7,X'0f'      set bottom nibble
+         AP    drwdw,=P'1900'     calculate the year
+         OI    drwdw+7,X'0f'      fix bottom nibble for unpk
+         UNPK  7(4,r2),drwdw      set the year
+         CVB   rf,drwdw           get binary year
+         N     rf,=A(3)           test for leap year
+         BZ    *+8                 jumps if leap year
+         LA    rf,2                 else set non-leapyr offset
+         ZAP   drwdw,6(2,r1)      get julian day in double word
+         CVB   r0,drwdw           get julian day binary
+         LA    re,dtjtab          point to julian table
+dtfind   CH    r0,8(rf,re)        found table entry ?
+         BNH   dtfound             yes, exit loop
+         LA    re,8(,re)          point to next entry
+         B     dtfind              and loop back
+dtfound  MVC   3(3,r2),4(re)      set month from the table
+         SH    r0,0(rf,re)        calculate day of month
+         CVD   r0,drwdw           get day of month packed
+         L     r0,drwdw+4         load packed day
+         SLL   r0,20              shift out hi bits
+         SRL   r0,28              shift down
+         STC   r0,0(,r2)          set 1st digit of the month
+         OI    0(r2),C'0'         convert to ebcdic character
+         L     r0,drwdw+4         load packed day
+         SLL   r0,24              shift out hi bits
+         SRL   r0,28              shift down
+         STC   r0,1(,r2)          set 2nd digit of the month
+         OI    1(r2),C'0'         convert to ebcdic character
+         LM    re,r2,12(rd)       restore regs
+         BR    re                  and thankfully return
+dtjtab   DC    Y(0,0),C'Jan '     Julian date table
+         DC    Y(31,31),C'Feb '
+         DC    Y(60,59),C'Mar '
+         DC    Y(91,90),C'Apr '
+         DC    Y(121,120),C'May '
+         DC    Y(152,151),C'Jun '
+         DC    Y(182,181),C'Jul '
+         DC    Y(213,212),C'Aug '
+         DC    Y(244,243),C'Sep '
+         DC    Y(274,273),C'Oct '
+         DC    Y(305,304),C'Nov '
+         DC    Y(335,334),C'Dec '
+         DC    Y(999,999),C'??? '
+
+*/* -------------------------------------------------------------------
+*   error routines
+* ------------------------------------------------------------------ */
+
+bdc      USING RDCinfo,odrdc
+odc      USING RDCinfo,drwrdc
+
+Enoparm #MSG   'No parameters were specified'
+         B     Eexit
+Ebadparm MVC   drwdw4,=CL8' '     init dw to blanks
+         CH    r4,=Y(8)           test parameter length left
+         BNH   *+8                 continue if not too long
+         LA    r4,8                 else reset length
+         SH    r4,=Y(1)           decrement for EX
+         BM    *+4+4+6             bypass copy if nothing left
+         EX    r4,*+4               copy area near the error
+         MVC   drwdw4(0),0(r3)       (executed)
+        #MSG   '** Error in parameters near %s:8',drwdw4
+         B     Eexit
+Edevterr STM   rf,r0,drwretcd
+         CLC   drwretcd(8),=A(4,4)  missing ddname ?
+         BE    Enoddn                yes, noddn error
+        #MSG   '** %s DEVTYPE error, rc=%d, reason=%d',                X
+               drwbuddn,drwretcd,drwrsncd
+         B     Eexit
+Enoddn  #MSG   '** Backup ddname %s not found',drwbuddn
+         B     Eexit
+Eopenerr #MSG  '** Backup file %s did not open',drwbuddn
+         B     Eexit
+Ebadhdr #MSG   '** Backup file %s header record is not valid',drwbuddn
+         B     Eexit
+Ebadvrm #MSG   '** Backup file created by newer dump program: %s %d:1.%X
+               d:1.%d.1',odhdrid,odvrm,odvrm+1,odvrm+2
+         B     Eexit
+Ebadloc #MSG   '** Requested low cylinder 0x%x4:2 is before dump low cyX
+               linder 0x%x4:2',drwlocyl,odlocyl
+         B     Eexit
+Ebadhic #MSG   '** Requested high cylinder 0x%x4:2 is after dump high cX
+               ylinder 0x%x4:2',drwhicyl,odhicyl
+         B     Eexit
+Ebadcyl #MSG   '** Requested low cylinder 0x%x4:2 is after requested hiX
+               gh cylinder 0x%x4:2',drwlocyl,drwhicyl
+         B     Eexit
+Ebaducbl CH    RF,=Y(4)
+         BE    Enoucb
+        #MSG   '** UCBLOOK error for unit %x4:2: rc 0x%x rsn 0x%x',    X
+               drwunit,drwretcd,drwrsncd
+         B     Eexit
+Enoucb  #MSG   '** UCB not found for output unit %x4:2',drwunit
+         B     Eexit
+Ebaducbt L     r2,drwucba
+         USING UCBOB,r2
+        #MSG   '** UCB for unit %x4:2 is not dasd, type is %x:1',      X
+               drwunit,UCBTBYT3
+         B     Eexit
+Ebaducbs #MSG  '** Device %x4:2 is not offline',drwunit
+         B     Eexit
+Ebaducbc #MSG  '** IOSCAPU CAPTUCB failed for %x4:2; rc=0x%x rsn=0x%x',X
+               drwunit,drwretcd,drwrsncd
+         B     Eexit
+Ebaddeba #MSG  '** DEBCHK ADD for %x4:2 failed; rc=0x%x',              X
+               drwunit,drwretcd
+         B     Eexit
+Esnserr #MSG   '** Sense failed for 0x%x4:2: command %x2:1, CC 0x%x2:1,X
+                Stat 0x%x4:2',drwunit,drwoccw1,drwoecb1,i1.IOBSTBYT
+         B     Eexit
+Eioerr   SLR   r2,r2
+         ICM   r2,7,drwtecb+1
+         LA    r0,drwoecb1
+         LA    r3,drwiob1
+         CLR   r0,r2
+         BE    *+8
+         LA    r3,drwiob2
+         USING ECB,r2
+         USING IOBSTDRD,r3
+         MVC   drwdw4,=CL8'reading'
+         TM    drwflags,drwdump
+         BO    *+10
+         MVC   drwdw4,=CL8'writing'
+        #MSG   '** I/O error %s %x4:2 CCHH %x8: CC %x2:1, Stat %x4:2', X
+               drwdw4,drwunit,drwpcchh,ECBCC,IOBSTBYT
+         DROP  r2,r3
+         B     Eexit
+Ebadtrk #MSG   '** Bad track image returned by RT on %x4:2',drwunit
+         B     Eexit
+Emisdevt #MSG  '** Device type mis-match: backup file is %x4:2 and unitX
+                %x4:2 is %x4:2',bdc.RDCdevt,drwunit,odc.RDCdevt
+         B     Eexit
+Emishds #MSG  '** Device number of heads mis-match: backup file has %d:X
+               2 and unit %x4:2 has %d',                               X
+               bdc.RDCheads,drwunit,odc.RDCheads
+         B     Eexit
+Emiscyl  SLR   r2,r2
+         ICM   r2,3,odc.RDCprime
+         BCTR  r2,0
+         ST    r2,drwretcd
+        #MSG   '** Requested high cylinder 0x%x4:2 exceeds highest cyliX
+               nder 0x%x4 on unit %x4:2',drwhicyl,drwretcd,drwunit
+         B     Eexit
+Ebadlen #MSG   '** Track image size exceeded read cchh %x8 on %s',     X
+               0(r3),drwbuddn
+         B     Eexit
+Einnull #MSG   '** Input file %s is empty',drwbuddn
+         B     Eexit
+Einctrk #MSG   '** %s end-of-file detected while reading track image', X
+               drwunit
+         B     Eexit
+Efileinc #MSG  '** File %s was incomplete, trying to restore to cylindeX
+               r 0x%x4:2 but last CCHH read was 0x%x8',                X
+               drwbuddn,drwhicyl,drwcchh
+         B     Eexit
+
+Eexit    MVC   drwrsult,=A(16)    error return code
+         B     terminat           terminate
+
+*/* -------------------------------------------------------------------
+*   literals and constants
+* ------------------------------------------------------------------ */
+         LTORG ,
+RESTORE  DC    C'RESTORE',X'00'
+DUMP     DC    C'DUMP',X'00'
+ASIS     DC    C'ASIS',X'00'
+delimtrt TRT   0(0,r3),delimtab   *** executed ***
+parmmvc  MVC   drwdw(0),0(r3)     *** executed ***
+parmclc  CLC   0(0,rf),drwdw      *** executed ***
+parmhexc TRT   drwdw(0),hexchars  *** executed ***
+parmhex  TR    drwdw(0),hextab    *** executed ***
+parmpack PACK  drwdw2,drwdw(0)    *** executed ***
+oddcb    DCB   DDNAME=0,DSORG=PS,MACRF=E
+oddcbl   EQU   *-oddcb
+budcbi   DCB   DDNAME=SYSUT1,DSORG=PS,MACRF=GL,RECFM=U,DCBE=budcbe
+budcbl   EQU   *-budcbi
+budcbo   DCB   DDNAME=SYSUT1,DSORG=PS,MACRF=PL,RECFM=U,DCBE=budcbe
+budcbe   DCBE  RMODE31=BUFF
+budcbel  EQU   *-budcbe
+prtdcb   DCB   DDNAME=SYSPRINT,DSORG=PS,MACRF=PL,DCBE=PRTDCBE
+prtdcbl  EQU   *-prtdcb
+prtdcbe  DCBE  RMODE31=BUFF
+prtdcbel EQU   *-prtdcbe
+openl    OPEN  (0),MODE=31,MF=L
+openll   EQU   *-openl
+enql     ENQ   (0,0,S,0,SYSTEMS),MF=L
+enqll    EQU   *-enql
+         UCBLOOK MF=(L,ulpl)
+         UCBPIN MF=(L,uupl)
+         IOSCAPU MF=(L,cupl)
+tbpl     TRKCALC MF=L
+tbpll    EQU   *-tbpl
+hextab   DC    256X'00'
+         ORG   hextab+C'0'
+         DC    AL1(0,1,2,3,4,5,6,7,8,9)
+         ORG   hextab+C'a'
+         DC    AL1(10,11,12,13,14,15)
+         ORG   hextab+C'A'
+         DC    AL1(10,11,12,13,14,15)
+         ORG   hextab+256
+delimtab DC    256x'0'
+         ORG   delimtab+C','
+         DC    X'ff'
+         ORG   delimtab+256
+         DROP  ,
+hexchars DC    256x'ff'
+         ORG   hexchars+C'a'
+         DC    6x'0'
+         ORG   hexchars+C'A'
+         DC    6x'0'
+         ORG   hexchars+C'0'
+         DC    10x'0'
+         ORG   hexchars+256
+upcase   DC    C' ',255AL1(*-upcase)
+         ORG   upcase+c'a'
+         DC    C'ABCDEFGHI'
+         ORG   upcase+c'j'
+         DC    C'JKLMNOPQR'
+         ORG   upcase+c's'
+         DC    C'STUVWXYZ'
+         ORG   upcase+256
+hex2char EQU   *-240
+         DC    C'0123456789ABCDEF'
+         DROP  ,
+mainend  DS    0D
+
+*/* -------------------------------------------------------------------
+*   Dump routine
+* ------------------------------------------------------------------ */
+         USING odrw,rd
+         USING o24w,rb
+         USING OFFLINDR,rc
+         USING (OFFLINDR+4095,mainend),ra
+         USING dumpr,r9
+odc      USING RDCinfo,drwrdc
+
+dumpr    STM   r0,rf,drwsave0     save caller's registers
+         LR    r9,rf              set local base
+
+*/* -------------------------------------------------------------------
+*   set defaults
+* ------------------------------------------------------------------ */
+         CLC   drwlocyl,=Y(-1)    default low cylinder ?
+         BNE   *+10                no, continue
+         XC    drwlocyl,drwlocyl    else use cylinder 0
+
+         CLC   drwhicyl,=Y(-1)    default high cylinder ?
+         BNE   d_hicok             no, continue
+         SLR   r1,r1                else use
+         ICM   r1,3,odc.RDCprime     primary cylinders
+         BCTR  r1,0                   decrement (relative to 0)
+         STCM  r1,3,drwhicyl
+d_hicok  DS    0H
+
+*/* -------------------------------------------------------------------
+*   build the offline dump header
+* ------------------------------------------------------------------ */
+         USING odhdr,drwodhdr
+         MVC   odhdrid,pgmid     set identifier
+         MVC   odvrm,vrm         set version/release/modlvlv
+         MVC   odtime(8),drwctime set time and date
+         MVC   odunit,drwunit    set offline unit address
+         MVC   odlocyl,drwlocyl  set low cylinder
+         MVC   odhicyl,drwhicyl  set high cylinder
+         MVC   odsnsid,drwsnsid  set sense-id info
+         MVC   odsns,drwsns      set sense info
+         MVC   odrdc,drwrdc      set device characteristics info
+         MVC   odsnss,drwsnss    set sense-subsystem info
+
+        #MSG   'device %x4:2 is a %x4:2 and has %d:2 cylinders',       X
+               drwunit,odc.RDCdevt,odc.RDCprime
+
+*/* -------------------------------------------------------------------
+*   get i/o buffers
+* ------------------------------------------------------------------ */
+         SLR   r3,r3              clear reg 3
+         ICM   r3,7,odc.RDCtrkln  load track size
+         LA    r3,4095(,r3)       round-up
+         SRL   r3,12               to a 4K
+         SLL   r3,12                boundary
+         ST    r3,drwtrksz        remember track size
+         SLR   r4,r4              clear r4
+         ICM   r4,3,odc.RDCheads  load tracks/cylinder
+         ST    r4,drwheads        remember tracks/cylinder
+         MR    r2,r4              size of an i/o area
+         ST    r3,drwiol          save i/o area size
+         SLL   r3,1               size of 2 i/o areas
+         STORAGE OBTAIN,LENGTH=(r3) get the i/o areas
+         ST    r1,drwioa          save i/o area addr
+
+*/* -------------------------------------------------------------------
+*   build the channel programs
+* ------------------------------------------------------------------ */
+         LA    r2,drwoccw1        point to 1st channel program
+         USING CCW0,r2
+         LA    r3,drwlrp1         point to 1st locate record parms
+         USING LRparm,r3
+         L     r4,drwioa          point to 1st i/o area
+         LA    r5,drwoida1        point to 1st idaw list
+         LA    rf,2               build two channel programs
+d_bldcp  XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,DX         set define extent command
+         LA    r1,drwdxa          address of dx area
+         STCM  r1,7,CCW0ADDR      set address
+         MVI   CCW0FLAG,CCW0CC    command chaining
+         MVC   CCW0CNT,=Y(L'drwdxa) set length
+         LA    r2,CCW0END         to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,TIC        set transfer-in-control command
+         LA    r1,CCW0END         address of next ccw
+         STCM  r1,7,CCW0ADDR      set next ccw address
+         LA    r2,CCW0END         to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,LR         set locate record command
+         STCM  r3,7,CCW0ADDR      set address in locate record ccw
+         OI    CCW0FLAG,CCW0CC    command chaining
+         MVC   CCW0CNT,=Y(LRparml) set length
+         MVI   LRop,LRohome+LRrt  set operation byte
+         L     r0,drwheads        number trks/cyls
+         STC   r0,LRcount         set number reads
+         L     r6,drwtrksz        load track size
+d_bldcp2 LA    r2,CCW0END         point to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,RT         set read track command
+         ST    r4,0(,r5)          set address for track image in idaw
+         STCM  r5,7,CCW0ADDR      set address for idaw
+         OI    CCW0FLAG,CCW0SLI+CCW0CC+CCW0IDA set flags
+         STCM  r6,3,CCW0CNT       set size
+         ALR   r4,r6              point to next track image
+         LA    r5,4(,r5)          point to next idaw
+         BCT   r0,d_bldcp2        loop for each track in a cylinder
+         NI    CCW0FLAG,255-CCW0CC unchain last ccw
+         LA    r2,drwoccw1        point to 2nd
+         LA    r2,drwoccwl(,r2)    channel program
+         LA    r3,drwlrp2         point to 2nd locate record parms
+         L     r4,drwioa          point to 2nd
+         AL    r4,drwiol           i/o area
+         LA    r5,drwoida2        point to 2nd idaw list
+         BCT   rf,d_bldcp         build 2nd channel program
+         DROP  r2,r3
+
+*/* -------------------------------------------------------------------
+*   setup the define extent area
+* ------------------------------------------------------------------ */
+         MVI   drwdxa,X'40'       inhibit write operations
+         MVI   drwdxa+1,X'c0'     eckd
+         MVC   drwdxa+8(2),drwlocyl set extents
+         MVC   drwdxa+12(2),drwhicyl
+         SLR   r1,r1
+         ICM   r1,3,odc.RDCheads
+         BCTR  r1,0
+         STCM  r1,3,drwdxa+14
+
+*/* -------------------------------------------------------------------
+*   read a cylinder at a time, flip/flopping iobs
+* ------------------------------------------------------------------ */
+         SLR   r2,r2              iob indicator
+         MVC   drwcchh,=A(-1)     init last cylinder/head
+         SLR   r3,r3
+         ICM   r3,3,drwlocyl      load low cylinder
+         SLR   r4,r4
+         ICM   r4,3,drwhicyl      load hicyl
+
+d_rdloop MVC   drwpcchh,drwcchh   save previous cchh read
+         LR    r0,r3
+         SLL   r0,16
+         STCM  r0,15,drwcchh      set current cchh
+         LA    r5,drwiob1         presume reading from iob 1
+         LTR   r2,r2               test flip/flop indicator
+         BZ    *+8                  jumps if zero
+         LA    r5,drwiob2            otherwise use iob 2
+         USING IOBSTDRD,r5
+
+*/*      read using iob 1 and wait for iob 2 to finish               */
+         CLR   r3,r4              all cylinders dumped ?
+         BH    d_rdwait            yes, bypass excp
+         MVC   IOBCC(4),drwcchh   set seek address
+         SLR   r6,r6
+         ICM   r6,7,IOBSTRTB      get channel program address
+         USING CCW0,r6
+         LA    r6,CCW0END         point past dx ccw
+         LA    r6,CCW0END         point past tic ccw
+         SLR   r7,r7
+         ICM   r7,7,CCW0ADDR      get locate record parm address
+         USING LRparm,r7
+         MVC   LRseek,IOBCC
+         MVC   LRsearch,IOBCC
+         DROP  r6,r7
+         EXCP  IOBSTDRD           read the cylinder
+d_rdwait SLR   r6,r6
+         ICM   r6,7,drwtecb+1     get ecb address to wait on
+         MVC   drwtecb,IOBECBPT    set next ecb address
+         LTR   r6,r6              need to wait ?
+         BZ    d_rdnext            no, bypass the wait
+         USING ECB,r6
+         WAIT  1,ECB=ECB          wait for previous i/o to finish
+         CLI   ECBCC,ECBNORM       test completion code
+         BNE   Eioerr               exit if i/o error
+         DROP  r5,r6
+
+         L     r1,drwioa          point to first i/o area
+         LTR   r2,r2               test flip/flop indicator
+         BNZ   *+8                  jumps if not zero
+         A     r1,drwiol             else point to 2nd i/o area
+
+*/*      write track images for the iob that just finished           */
+         L     r0,drwheads        get number of areas
+         L     rf,=A(d_writer)     addr of write routine
+d_wrtrk  BALR  re,rf                write the area
+         AL    r1,drwtrksz           to next i/o area
+         BCT   r0,d_wrtrk             loop if more areas
+
+d_rdnext X     r2,=A(1)           flip/flop iob indicator
+         CLR   r3,r4               finished reading ?
+         LA    r3,1(,r3)            increment cylinder if not
+         BNH   d_rdloop              loop back
+
+*/* -------------------------------------------------------------------
+*   return
+* ------------------------------------------------------------------ */
+         LM    r0,rf,drwsave0    restore regs
+         BR    re                 and return
+
+         LTORG ,
+         DROP
+
+*/* -------------------------------------------------------------------
+*   dump write routine
+* ------------------------------------------------------------------ */
+         USING odrw,rd
+         USING o24w,rb
+         USING OFFLINDR,rc
+         USING (OFFLINDR+4095,mainend),ra
+         USING d_writer,r9
+         USING IHADCB,drwbdcb
+
+d_writer STM   r0,rf,drwsave1     save regs
+         LR    r9,rf              set local base reg
+         LR    r2,r1              copy area address
+         TM    drwflags,drwhdrw   has the header been written ?
+         BO    d_hdrok             yes, continue
+
+*/*      write the header                                            */
+         LA    r5,odhdrl          length of header
+         STCM  r5,3,DCBLRECL      set lrecl to the length
+         PUT   drwbdcb            issue put
+         LR    r0,r1              copy the header into the buffer
+         LR    r1,r5
+         LA    r4,drwodhdr
+         MVCL  r0,r4
+         OI    drwflags,drwhdrw   indicate header has been written
+
+*/*      calculate track capacity if dasd                            */
+         CLI   drwdevta+2,UCB3DACC is output a dasd ?
+         BNE   d_hdrok              no, continue
+         MVI   drwr,1              record 1
+         MVC   drwdd,=Y(L'drwodhdr) length of record
+         L     r3,DCBDVTBL         device table
+         MVC   drwtbpl,tbpl        copy the parmlist
+         TRKCALC FUNCTN=TRKBAL,DEVTAB=(r3),RKDD=drwrkdd,               X
+               REGSAVE=YES,MF=(E,drwtbpl)
+         STCM  r0,3,drwtkbal      save the track balance
+d_hdrok  DS    0H
+
+*/*      get length of the track image                               */
+         LR    r1,r2              track image address
+         BAL   re,trklen          get track length
+         LTR   r3,rf              test length
+         BZ    Ebadtrk             error if invalid
+
+         USING STAR,drwtbpl
+
+*/*      write the track image, may require multiple puts            */
+d_wloop  LTR   r4,r3              check length left
+         BZ    d_exit              return if everything written
+         CL    r4,drwdevta+4      check length against max length
+         BNH   *+8                 else use
+         L     r4,drwdevta+4        max length
+
+*/*      if dasd, see if it will fit on the track                    */
+         CLI   drwdevta+2,UCB3DACC is output a dasd ?
+         BNE   d_lenok              no, continue
+         SLR   rf,rf
+         IC    rf,drwr             increment record number
+         LA    rf,1(,rf)
+         STC   rf,drwr
+         STCM  r4,3,drwdd          set data length
+         L     r5,DCBDVTBL         device table
+         SLR   r6,r6
+         ICM   r6,3,drwtkbal       get track balance
+         BZ    d_newtrk            new track if no balance
+         MVC   drwtbpl,tbpl        copy the parmlist
+         TRKCALC FUNCTN=TRKBAL,DEVTAB=(r5),RKDD=drwrkdd,BALANCE=(r6),  X
+               MAXSIZE=YES,REGSAVE=YES,MF=(E,drwtbpl)
+         STCM  r0,3,drwtkbal       save the track balance
+         CH    rf,=Y(4)            test return code
+         BL    d_lenok             block fits
+         BE    d_newtrk            no room left on the track
+         LR    r4,r0               copy max length
+         XC    drwtkbal,drwtkbal   zero track balance
+         B     d_lenok             use a shorter block
+d_newtrk MVI   drwr,1              set to record 1
+         TRKCALC FUNCTN=TRKBAL,DEVTAB=(r5),RKDD=drwrkdd,               X
+               REGSAVE=YES,MF=(E,drwtbpl)
+         STCM  r0,3,drwtkbal      save the track balance
+d_lenok  DS    0H
+
+*/*      put the track image                                         */
+         STCM  r4,3,DCBLRECL      set block length
+         PUT   drwbdcb
+         LR    r0,r1              copy the track image
+         LR    r1,r4
+         LR    re,r2
+         LR    rf,r4
+         MVCL  r0,re
+
+         AR    r2,r4              point past data written
+         SR    r3,r4              adjust length left
+         B     d_wloop            loop
+
+*/*      return from writer                                          */
+d_exit   LM    r0,rf,drwsave1     restore regs
+         BR    re                 return
+
+         LTORG ,
+
+*/* -------------------------------------------------------------------
+*   Restore routine
+* ------------------------------------------------------------------ */
+         USING odrw,rd
+         USING o24w,rb
+         USING OFFLINDR,rc
+         USING (OFFLINDR+4095,mainend),ra
+         USING restorer,r9
+         USING IHADCB,drwbdcb
+         USING DCBE,drwbdcbe
+         USING odhdr,drwodhdr
+bdc      USING RDCinfo,odrdc
+odc      USING RDCinfo,drwrdc
+
+restorer STM   r0,rf,drwsave0     save caller's registers
+         LR    r9,rf              set local base
+
+*/* -------------------------------------------------------------------
+*   describe the backup file
+* ------------------------------------------------------------------ */
+         LA    r1,odtime
+         LA    r0,drwdtime
+         BAL   re,dtime
+        #MSG   'backup taken by %s:8 %d:1.%d:1.%d:1 on %s:20',         X
+               odhdrid,odvrm,odvrm+1,odvrm+2,drwdtime
+        #MSG   'backup unit %x4:2 devtype %x4:2 cyl 0x%x4:2 - 0x%x4:2',X
+               odunit,bdc.RDCdevt,odlocyl,odhicyl
+
+*/* -------------------------------------------------------------------
+*   set defaults
+* ------------------------------------------------------------------ */
+         CLC   drwunit,=Y(-1)     default unit ?
+         BNE   *+10                no, continue
+         MVC   drwunit,odunit       else use dumped unit
+
+         CLC   drwlocyl,=Y(-1)    default low cylinder ?
+         BNE   *+10                no, continue
+         MVC   drwlocyl,odlocyl     else use dumped low cylinder
+
+         CLC   drwhicyl,=Y(-1)    default high cylinder ?
+         BNE   *+10                no, continue
+         MVC   drwhicyl,odhicyl     else use dumped high cylinder
+
+*/* -------------------------------------------------------------------
+*   perform some checks
+* ------------------------------------------------------------------ */
+         CLC   pgmid,odhdrid      header id match ?
+         BNE   Ebadhdr             error if not
+         CLC   vrm(2),odvrm       check version and release
+         BL    Ebadvrm             error if we're back-level
+         CLC   drwlocyl,odlocyl   check low cylinder
+         BL    Ebadloc             error if too low
+         CLC   drwhicyl,odhicyl   check high cylinder
+         BH    Ebadhic             error if too high
+         CLC   drwlocyl,drwhicyl  check specified cylinders
+         BH    Ebadcyl             error if low cyl > high cyl
+
+        #MSG   'device %x4:2 is a %x4:2 and has %d:2 cylinders',       X
+               drwunit,odc.RDCdevt,odc.RDCprime
+
+         CLC   bdc.RDCdevt,odc.RDCdevt check device types
+         BNE   Emisdevt                 error if they don't match
+         CLC   bdc.RDCheads,odc.RDCheads check trks/cyl
+         BNE   Emishds                    error if they don't match
+         CLC   drwhicyl,odc.RDCprime   check hi cylinder
+         BNL   Emiscyl                  error if high cyl too high
+
+*/* -------------------------------------------------------------------
+*   get i/o buffers
+* ------------------------------------------------------------------ */
+         SLR   r2,r2
+         ICM   r2,7,bdc.RDCtrkln       total track length
+         LA    r2,4095(,r2)             round up to a page boundary
+         SRL   r2,12
+         SLL   r2,13                   size for two areas
+         STORAGE OBTAIN,LENGTH=(r2)
+         SRL   r2,1                    get size for one area
+         STM   r1,r2,drwioa            save i/o address, length
+
+*/* -------------------------------------------------------------------
+*   setup the output channel programs
+* ------------------------------------------------------------------ */
+         LA    r2,drwoccw1        point to 1st ccws
+         USING CCW0,r2
+         LA    r3,drwlrp1         point to 1st LR parameters
+         USING LRparm,r3
+         LA    r4,drwoida1        point to 1st idaw list
+         LA    rf,2               build 2 sets of ccws
+r_bldcp  XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,DX         set define extent command
+         LA    r1,drwdxa          address of dx area
+         STCM  r1,7,CCW0ADDR      set address
+         MVI   CCW0FLAG,CCW0CC    command chaining
+         MVC   CCW0CNT,=Y(L'drwdxa) set length
+         LA    r2,CCW0END         to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,TIC        set transfer-in-control command
+         LA    r1,CCW0END         address of next ccw
+         STCM  r1,7,CCW0ADDR      set next ccw address
+         LA    r2,CCW0END         to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         MVI   CCW0CMD,LR         set locate record command
+         STCM  r3,7,CCW0ADDR      set address in locate record ccw
+         OI    CCW0FLAG,CCW0CC    command chaining
+         MVC   CCW0CNT,=Y(LRparml) set length
+         MVI   LRop,LRohome+LRfwrite set operation byte
+         LA    r0,255             build 255 write ccws
+         LA    r1,WR0             1st command is write record zero
+r_bldcp2 LA    r2,CCW0END         point to next ccw
+         XC    CCW0(8),CCW0       clear the ccw
+         STC   r1,CCW0CMD         set read track command
+         STCM  r4,7,CCW0ADDR      set address for idaw
+         LA    r1,WCKD            remaining commands are write ckd
+         LA    r4,4(,r4)          point to next idaw
+         BCT   r0,r_bldcp2        loop back
+         LA    r2,drwoccw1        point to 2nd
+         LA    r2,drwoccwl(,r2)    channel program
+         LA    r3,drwlrp2         point to 2nd LR parameters
+         LA    r4,drwoida2        point to 2nd idaw list
+         BCT   rf,r_bldcp         build 2nd channel program
+         DROP  r2,r3
+
+*/* -------------------------------------------------------------------
+*   setup the define extent area
+* ------------------------------------------------------------------ */
+         MVI   drwdxa,X'c0'       permit all write operations
+         MVI   drwdxa+1,X'c0'     eckd
+         MVC   drwdxa+8(2),drwlocyl set extents
+         MVC   drwdxa+12(2),drwhicyl
+         SLR   r1,r1
+         ICM   r1,3,odc.RDCheads
+         BCTR  r1,0
+         STCM  r1,3,drwdxa+14
+
+*/* -------------------------------------------------------------------
+*   read track images
+* ------------------------------------------------------------------ */
+         SLR   r2,r2                   i/o flip/flop inidicator
+         MVC   drwcchh,=A(-1)          init read cylinder/head
+
+r_rdloop LM    r3,r4,drwioa            point to 1st i/o area
+         LTR   r2,r2                   test indicator
+         BZ    *+6                      jumps if zero
+         AR    r3,r4                     else point to 2nd area
+         LR    r4,r3                   set working area pointer
+         SLR   r5,r5                   set length read
+
+*/* read 1 or more blocks for the current track image                */
+         MVC   DCBEEODA,=A(r_rdeof)    set end-of-data exit addr
+r_rdblk  GET   drwbdcb                 read next block
+         MVC   DCBEEODA,=A(Einctrk)    set end-of-data exit addr
+         SLR   r6,r6
+         ICM   r6,3,DCBLRECL           load length read
+         AR    r5,r6                   length of track image so far
+         C     r5,drwiol               check length
+         BH    Ebadlen                 error if too long
+         LR    re,r4                   copy the block
+         LR    rf,r6
+         LR    r0,r1
+         LR    r1,r6
+         MVCL  re,r0
+         AR    r4,r6                   addr for next block
+         LR    r0,r5
+         LR    r1,r3
+         BAL   re,chktrk               check for entire track
+         LTR   rf,rf
+         BZ    r_rdblk                 loop back
+
+*/* check the cylinder just read                                     */
+         MVC   drwpcchh,drwcchh        remember previous cyl/head
+         MVC   drwcchh,0(r3)           remember cylinder/head read
+         CLC   drwlocyl,drwcchh        at low cylinder yet ?
+         BH    r_rdloop                 no, loop back
+         CLC   drwhicyl,drwcchh        past high cylinder ?
+         BL    r_rdeof                  yes, logical end-of-file
+
+*/* build the output channel program                                 */
+         LA    r4,drwiob1              presume 1st iob
+         LTR   r2,r2                   test indicator
+         BZ    *+8                      jumps if zero
+         LA    r4,drwiob2                else use 2nd iob
+         USING IOBSTDRD,r4
+         MVC   IOBCC(4),drwcchh
+         SLR   r1,r1
+         ICM   r1,7,IOBECBPB           get ecb address
+         XC    0(4,r1),0(r1)           clear the ecb
+         SLR   r5,r5
+         ICM   r5,7,IOBSTRTB           get channel program address
+         USING CCW0,r5
+         LA    r5,CCW0END              point past dx ccw
+         LA    r5,CCW0END              point past tic ccw
+         SLR   r6,r6
+         ICM   r6,7,CCW0ADDR           get locate record parm addr
+         USING LRparm,r6
+         STC   rf,LRcount              set number write ccws
+         MVC   LRseek,IOBCC
+         MVC   LRsearch,IOBCC
+         DROP  r6
+r_wrtcp  LA    r5,CCW0END              point to next ccw
+         SLR   re,re
+         ICM   re,7,CCW0ADDR
+         ST    r3,0(,re)               set address in the idaw
+         SLR   r0,r0
+         IC    r0,5(,r3)               get key length
+         SLR   r1,r1
+         ICM   r1,3,6(r3)              get data length
+         AR    r1,r0
+         LA    r1,8(,r1)               count-key-data length
+         STCM  r1,3,CCW0CNT            set data length
+         MVI   CCW0FLAG,CCW0CC+CCW0IDA set chaining bit and idaw bit
+         AR    r3,r1                   point to next record
+         BCT   rf,r_wrtcp              loop back if more
+         NI    CCW0FLAG,255-CCW0CC     unchain the last ccw
+         DROP  r5
+
+*/* schedule this channel program and wait for the previous one      */
+         EXCP  IOBSTDRD                schedule the channel program
+         SLR   r5,r5
+         ICM   r5,7,drwtecb+1          get wait ecb address
+         MVC   drwtecb,IOBECBPT         set next wait ecb address
+         DROP  r4
+         LTR   r5,r5                     any wait ecb ?
+         BZ    r_rdnext                   no, continue
+         USING ECB,r5
+         WAIT  1,ECB=ECB               wait for previous i/o
+         CLI   ECBCC,ECBNORM           test completion code
+         BNE   Eioerr                  exit if i/o error
+         DROP  r5
+
+r_rdnext X     r2,=A(1)                flip/flop the indicator
+         B     r_rdloop                loop back
+
+*/* -------------------------------------------------------------------
+*   finished reading
+* ------------------------------------------------------------------ */
+
+*/* wait for the last write                                          */
+r_rdeof  SLR   r2,r2
+         ICM   r2,7,drwtecb+1    get ecb addr for last write
+         BZ    r_rdeof1          continue if nothing to wait for
+         XC    drwtecb,drwtecb   clear wait ecb
+         USING ECB,r2
+         WAIT  1,ECB=ECB         wait for last i/o
+         CLI   ECBCC,ECBNORM     check completion code
+         BNE   Eioerr            exit if i/o error
+         DROP  r2
+
+*/* make sure we wrote the last expected track                       */
+r_rdeof1 ICM   r2,3,drwhicyl     get hi cyl
+         SLL   r2,16             shift to upper two bytes
+         SLR   r1,r1
+         ICM   r1,3,odc.RDCheads get number heads
+         BCTR  r1,0              decrement
+         OR    r2,r1             reg 2 has last cchh
+         CL    r2,drwpcchh       was last cchh read ?
+         BE    r_rdeof2           yes, continue
+         CL    r2,drwcchh          was last cchh read ?
+         BNE   Efileinc             no, incomplete file
+r_rdeof2 DS    0H
+
+*/* return                                                           */
+         LM    r0,rf,drwsave0    restore regs
+         BR    re                 and return
+
+         LTORG ,
+         DROP
+
+*/* -------------------------------------------------------------------
+*        subroutine to issue messages
+* ------------------------------------------------------------------ */
+          USING msgr,r9
+          USING odrw,rd
+          USING o24w,rb
+          USING OFFLINDR,rc
+          USING (OFFLINDR+4095,mainend),ra
+msgr      STM  r0,rf,drwsave1
+          LR   r9,rf
+          USING IHADCB,drwpdcb
+          TM   DCBOFLGS,DCBOFOPN
+          BO   mr_opened            continue if message file is opened
+
+          LR   r2,r1                save reg 1
+          TM   drwflags,drwnoprt    test if no print file
+          BO   mr_ret                return if not
+          CLI  drwprddn,0           print ddname specified yet ?
+          BNE  mr_open2              yes, continue
+          DEVTYPE =C'SYSPRINT',drwdw  is SYSPRINT available ?
+          LR   r1,r2                   restore reg 1
+          LTR  rf,rf                    no, issue WTO
+          BNZ  mr_opened
+          MVC  drwprddn,=C'SYSPRINT'     else use SYSPRINT ddname
+mr_open2  MVC  drwpdcb,prtdcb       copy the model print dcb
+          MVC  DCBDDNAM,drwprddn    set the print ddname
+          MVC  drwpdcbe,prtdcbe     copy model print dcbe
+          LA   r1,drwpdcbe          set dcbe address
+          ST   r1,DCBDCBE            in the dcb
+          OI   drwflags,drwnoprt    presume no print
+          DEVTYPE DCBDDNAM,drwdw    issue devtype for the ddname
+          LTR  rf,rf                test devtype return code
+          BNZ  mr_ret                return if some error
+          L    r1,=A(mr_oxit)       get address of the open exit
+          LA   rf,mr_oxitl          get open exit length
+          BCTR rf,0                 decrement
+          EX   rf,*+4               copy the open exit
+          MVC  drwoxit(0),0(r1)     *** executed ***
+          LA   r1,drwoxit           get open exit addr
+          ST   r1,drwexlst          set in exit list
+          MVI  drwexlst,x'85'       set exit type
+          LA   r1,drwexlst          point to exit list
+          STCM r1,7,DCBEXLSA        set exlst addr in the dcb
+          MVC  drwopenl,openl       copy model open list
+          OPEN (drwpdcb,OUTPUT),MODE=31,MF=(E,drwopenl)
+          TM   DCBOFLGS,DCBOFOPN    did the file open ?
+          BNO  mr_ret                no, return
+          NI   drwflags,255-drwnoprt  else turn off 'noprt' bit
+          LR   r1,r2                restore reg 1
+
+mr_opened LM   r4,r5,0(r1)          pattern addr, length
+
+          BCTR r5,0
+          LA   r3,8(,r1)            first parameter
+          LA   r6,drwmsg
+          MVI  drwmsg,C' '          init msg to blanks
+          MVC  drwmsg+1(L'drwmsg-1),drwmsg
+
+mr_loop   LTR  r5,r5
+          BM   mr_exit
+          LA   r1,1(r4,r5)
+          SLR  r2,r2
+          EX   r5,mr_trt1
+          SR   r1,r4                length scanned
+          BNP  mr_skip1
+          LR   rf,r1
+          BCTR rf,0
+          EX   rf,mr_mvc1           copy literal text
+          AR   r6,r1
+mr_skip1  AR   r4,r1
+          SR   r5,r1
+          BM   mr_exit
+          BP   mr_skip2
+
+          MVC  0(1,r6),0(r4)        string ends in special char
+          LA   r6,1(,r6)
+          B    mr_exit
+
+mr_skip2  B    *(r2)                br on special char type
+          B    mr_pct               '%'
+          B    mr_bs                '\'
+
+mr_pct    CLI  1(r4),C's'
+          BE   mr_pct_s
+          CLI  1(r4),C'x'
+          BE   mr_pct_x
+          CLI  1(r4),C'd'
+          BE   mr_pct_d
+          MVC  0(1,r6),0(r4)        treat '%' as any other char
+          LA   r6,1(,r6)
+          LA   r4,1(,r4)
+          BCTR r5,0
+          B    mr_loop
+mr_pct_s  L    r7,0(,r3)            load string ptr
+          LA   r3,4(,r3)
+          LA   r4,2(,r4)            point past '%s'
+          SH   r5,=Y(2)
+          BAL  re,mr_op             r1 - target len, r2 - source len
+          LTR  r2,r2
+          BNZ  mr_pct_s3
+          LR   r2,r7                source len = 0, find end of string
+mr_pct_s1 CLI  0(r2),C' '
+          BNH  mr_pct_s2
+          LA   r2,1(,r2)
+          B    mr_pct_s1
+mr_pct_s2 SR   r2,r7
+          BNP  mr_loop
+mr_pct_s3 LR   rf,r2                copy source string to the msg
+          BCTR rf,0
+          EX   rf,mr_mvc2
+          LTR  r1,r1
+          BNZ  mr_pct_s5
+          AR   r6,r2                truncate trailing spaces if
+mr_pct_s4 BCTR r6,0                  target len is 0
+          CLI  0(r6),C' '
+          BNH  mr_pct_s4
+          LA   r6,1(,r6)
+          B    mr_loop
+mr_pct_s5 CR   r1,r2
+          BH   mr_pct_s6
+          AR   r6,r1                truncate the string
+          B    mr_loop
+mr_pct_s6 AR   r6,r2                pad string with trailing blanks
+          SR   r1,r2
+mr_pct_s7 MVI  0(r6),C' '
+          LA   r6,1(,r6)
+          BCT  r1,mr_pct_s7
+          B    mr_loop
+
+mr_pct_x  L    r7,0(,r3)            load hex ptr
+          LA   r3,4(,r3)
+          LA   r4,2(,r4)            point past '%x'
+          SH   r5,=Y(2)
+          BAL  re,mr_op             r1 - target len, r2 - source len
+          LTR  r2,r2
+          BNZ  *+8
+          LA   r2,4                 default source len is 4
+          EX   r2,mr_pct_x_unpk
+          TR   drwdw,mr_hextab
+          LTR  r1,r1
+          BNZ  mr_pct_x1
+          LA   r1,8                 determine default target len
+          CLC  =C'00',drwdw
+          BNE  mr_pct_x1
+          LA   r1,6
+          CLC  =C'0000',drwdw
+          BNE  mr_pct_x1
+          LA   r1,4
+          CLC  =C'000000',drwdw
+          BNE  mr_pct_x1
+          LA   r1,2
+mr_pct_x1 LA   r7,drwdw+8           copy the hex string to the msg
+          SR   r7,r1
+          BCTR r1,0
+          EX   r1,mr_mvc2
+          LA   r6,1(r1,r6)
+          B    mr_loop
+
+mr_pct_d  L    r7,0(,r3)            load decimal ptr
+          LA   r3,4(,r3)
+          LA   r4,2(,r4)            point past '%d'
+          SH   r5,=Y(2)
+          BAL  re,mr_op             r1 - target len, r2 - source len
+          LTR  r2,r2
+          BNZ  *+8
+          LA   r2,4                 default source len is 4
+          LA   rf,4
+          SR   rf,r2
+          LA   re,15
+          SRL  re,0(rf)
+          EX   re,mr_pct_d_icm
+          CVD  rf,drwdw
+          MVC  drwdw2(16),=X'40202020202020202020202020202120'
+          ED   drwdw2(16),drwdw
+          LTR  r1,r1
+          BNZ  mr_pct_d2
+          LA   rf,drwdw2+16         default length -
+mr_pct_d1 BCTR rf,0                  truncate leading spaces
+          CLI  0(rf),C' '
+          BH   mr_pct_d1
+          LA   r1,drwdw2+15
+          SR   r1,rf
+mr_pct_d2 LA   r7,drwdw2+16
+          SR   r7,r1
+          BCTR r1,0
+          EX   r1,mr_mvc2
+          LA   r6,1(r1,r6)
+          B    mr_loop
+
+mr_bs     MVC  0(1,r6),1(r4)        copy char following '\'
+          LA   r6,1(,r6)
+          LA   r4,2(,r4)
+          SH   r5,=Y(2)
+          B    mr_loop
+
+mr_exit   LA   r1,drwmsg
+          SR   r6,r1                calculate msg length
+          BNP  mr_ret
+          TM   DCBRECFM,DCBRECCA+DCBRECCM
+          BZ   *+8
+          LA   r6,1(,r6)            increment for carriage control
+
+          TM   DCBOFLGS,DCBOFOPN
+          BNO  mr_wto
+          TM   DCBRECFM,DCBRECU
+          BO   mr_u
+          TM   DCBRECFM,DCBRECF
+          BO   mr_f
+          TM   DCBRECFM,DCBRECV
+          BO   mr_v
+
+mr_u      CH   r6,DCBBLKSI
+          BNH  *+8
+          LH   r6,DCBBLKSI
+          STH  r6,DCBLRECL
+          PUT  IHADCB
+          TM   DCBRECFM,DCBRECCA+DCBRECCM
+          BZ   mr_u1
+          MVI  0(r1),C' '
+          LA   r1,1(,r1)
+          BCTR r6,0
+          TM   DCBRECFM,DCBRECCA
+          BO   mr_u1
+          BCTR r1,0
+          MVI  0(r1),X'09'
+          LA   r1,1(,r1)
+mr_u1     BCTR r6,0
+          EX   r6,mr_mvc3
+          B    mr_ret
+
+mr_f      CH   r6,DCBLRECL
+          BNH  *+8
+          LH   r6,DCBLRECL
+          PUT  IHADCB
+          TM   DCBRECFM,DCBRECCA+DCBRECCM
+          BZ   mr_f1
+          MVI  0(r1),C' '
+          LA   r1,1(,r1)
+          BCTR r6,0
+          TM   DCBRECFM,DCBRECCA
+          BO   mr_f1
+          BCTR r1,0
+          MVI  0(r1),X'09'
+          LA   r1,1(,r1)
+mr_f1     BCTR r6,0
+          EX   r6,mr_mvc3
+          B    mr_ret
+
+mr_v      LA   r6,4(,r6)
+          LH   r1,DCBBLKSI
+          SH   r1,=Y(4)
+          CR   r6,r1
+          BNH  *+6
+          LR   r6,r1
+          STH  r6,DCBLRECL
+          PUT  IHADCB
+          STH  r6,0(,r1)
+          XC   2(2,r1),2(r1)
+          LA   r1,4(,r1)
+          SH   r6,=Y(4)
+          TM   DCBRECFM,DCBRECCA+DCBRECCM
+          BZ   mr_v1
+          MVI  0(r1),C' '
+          LA   r1,1(,r1)
+          BCTR r6,0
+          TM   DCBRECFM,DCBRECCA
+          BO   mr_v1
+          BCTR r1,0
+          MVI  0(r1),X'09'
+          LA   r1,1(,r1)
+mr_v1     BCTR r6,0
+          EX   r6,mr_mvc3
+          B    mr_ret
+
+mr_wto    LA   r6,4(,r6)
+          STH  r6,drwmsgl
+          MVC  drwmsgl+2(2),=X'8000'
+          LA   r1,drwmsg(r6)
+          MVC  0(4,r1),=X'00000020'
+          WTO  MF=(E,drwmsgl)
+
+
+mr_ret    LM   r0,rf,drwsave1
+          BR   re
+
+*/* -------------------------------------------------------------------
+* message subroutine to get operand lengths
+* ------------------------------------------------------------------ */
+
+mr_op     SLR  r1,r1
+          SLR  r2,r2
+mr_op1    LTR  r5,r5                first number is target length
+          BMR  re
+          CLI  0(r4),C'0'
+          BL   mr_op2
+          IC   rf,0(,r4)
+          N    rf,=A(X'0000000f')
+          MH   r1,=Y(10)
+          AR   r1,rf
+          LA   r4,1(,r4)
+          BCTR r5,0
+          B    mr_op1
+mr_op2    CLI  0(r4),C':'          second number follows a ':'
+          BNER re
+mr_op3    LA   r4,1(,r4)           second number is source length
+          SH   r5,=Y(1)
+          BMR  re
+          CLI  0(r4),C'0'
+          BLR  re
+          IC   rf,0(,r4)
+          N    rf,=A(X'0000000f')
+          MH   r2,=Y(10)
+          AR   r2,rf
+          B    mr_op3
+
+*/* ---------------------------------------------------------------- */
+
+mr_mvc1   MVC  0(0,r6),0(r4)
+mr_trt1   TRT  0(0,r4),mr_tab1
+mr_mvc2   MVC  0(0,r6),0(r7)
+mr_mvc3   MVC  0(0,r1),drwmsg
+mr_pct_x_unpk  UNPK drwdw(9),0(0,r7)
+mr_pct_d_icm   ICM rf,0,0(r7)
+mr_tab1   DC   XL256'0'
+          ORG  mr_tab1+C'%'
+          DC   AL1(4)
+          ORG  mr_tab1+C'\'
+          DC   AL1(8)
+          ORG  mr_tab1+256
+mr_hextab EQU  *-240
+          DC   C'0123456789abcdef'
+          LTORG ,
+         #MSG  TYPE=GEN           messages
+          DROP ,
+
+*/* -------------------------------------------------------------------
+*   message open exit - relocated to 24 bit storage
+* ------------------------------------------------------------------ */
+
+         USING mr_oxit,rf
+         USING IHADCB,R1
+mr_oxit  CLI   DCBRECFM,0          any record format ?
+         BNE   *+8                  jumps if yes
+         MVI   DCBRECFM,DCBRECV+DCBRECBR else set to 'vb'
+
+         SLR   r0,r0               get a zero
+         CH    r0,DCBLRECL         any lrecl
+         BNE   *+10                 jumps if yes
+         MVC   DCBLRECL,=Y(125)      copy default lrecl
+
+         CH    r0,DCBBLKSI         any blksize
+         BNE   *+10                 jumps if yes
+         MVC   DCBBLKSI,=Y(4096)     copy default blksize
+
+         TM    DCBRECFM,DCBRECU    test record type
+         BO    mr_oxitu             undefined
+         TM    DCBRECFM,DCBRECV    test record type
+         BO    mr_oxitv             variable
+         TM    DCBRECFM,DCBRECF    test record type
+         BO    mr_oxitf             fixed
+         B     mr_oxit0            unknown, return
+
+mr_oxitu MVC   DCBLRECL,DCBBLKSI   undefined, set lrecl from blksize
+         B     mr_oxit0            return
+
+mr_oxitv LH    r3,DCBBLKSI         variable, load blksize
+         LA    r0,4                calculate maximum
+         SR    r3,r0                lrecl
+         CH    r3,DCBLRECL         check against lrecl
+         BNL   mr_oxit0             return if not too high
+         STH   r3,DCBLRECL           else reset to max
+         B     mr_oxit0            return
+
+mr_oxitf LH    r3,DCBBLKSI         fixed, load blksize
+         SLR   r2,r2               clear for divide
+         LH    r0,DCBLRECL         load lrecl
+         DR    r2,r0               divide lrecl into blksize
+         LTR   r2,r2               test if any remainder
+         BZ    mr_oxit0            return if not
+         MH    r3,DCBLRECL         calculate new blksize
+         STH   r3,DCBBLKSI         set new blksize
+
+mr_oxit0 BR    re
+         LTORG ,
+mr_oxitl EQU   *-mr_oxit
+         DROP  ,
+
+*/* -------------------------------------------------------------------
+*   workareas
+* ------------------------------------------------------------------ */
+odrw     DSECT ,                  offline dump/restore workarea
+drwid    DS    0CL4'odrw'         identifier
+drwsave  DS    18F                standard save area
+drwsave0 DS    16F                save area for dumpr/restorer
+drwsave1 DS    16F                save area for writer
+drwo24w  DS    A                  24-bit work area address
+drwrsult DS    F                  result (return) value
+drwfcn   DS    CL8                function (backup or restore)
+drwflags DS    X                  flag bits
+drwdump  EQU   X'80'              function is backup
+drwpin   EQU   X'40'              offline dasd ucb pinned
+drwcucb  EQU   X'20'              offline dasd ucb captured
+drwdebad EQU   X'10'              offline dasd ucb deb added
+drwnry   EQU   X'08'              offline dasd ucb 'not ready' bit
+drwenqd  EQU   X'04'              offline dasd enqueued
+drwhdrw  EQU   X'02'              backup header has been written
+drwnoprt EQU   X'01'              print ddname not present
+drwunit  DS    H                  offline unit address
+drwlocyl DS    H                  low cylinder to dump
+drwhicyl DS    H                  high cylinder to dump
+drwpcchh DS    F                  previous cchh written
+drwcchh  DS    F                  current cchh being written
+drwtecb  DS    A                  address of ecb to wait on
+drwretcd DS    F                  return code
+drwrsncd DS    F                  reason code
+drwucba  DS    A                  ucb address
+drwcucba DS    A                  captured ucb address
+drwdeba  DS    A                  deb address
+drwmajor DS    CL8                enq major name
+drwminor DS    CL4                enq minor name
+drwioa   DS    A                  i/o area address
+drwiol   DS    F                  i/o area length
+drwtrksz DS    F                  offline dasd unit track size
+drwheads DS    F                  offline dasd unit trks/cyl
+drwptok  DS    D                  ucb pin token
+drwdevta DS    D                  devtype area
+drwtkbal DS    H                  trkcalc balance
+drwrkdd  DS    0F                 trkcalc record key data
+drwr     DS    X                  trkcalc record
+drwk     DS    X                  trkcalc key
+drwdd    DS    XL2                trkcalc data
+drwctime DS    D                  current date/time
+drwdtime DS    CL20               dat/time display area
+drwdw    DS    D                  double word work areas
+drwdw2   DS    D
+drwdw3   DS    D
+drwdw4   DS    D
+drwbuddn DS    CL8                backup ddname
+drwbdcbe DS    XL(budcbel)        backup dcbe
+         DS    0D
+drwprddn DS    CL8                print ddname
+drwpdcbe DS    XL(prtdcbel)       print dcbe
+         DS    0D
+drwopenl DS    XL(openll)         open parameter list
+         DS    0D
+drwulpl  DS    XL(ulpll)          ucblook parameter list
+         DS    0D
+drwuupl  DS    XL(uupll)          ucbpin unpin parameter list
+         DS    0D
+drwcupl  DS    XL(cupll)          ioscapu parameter list
+         DS    0D
+drwtbpl  DS    XL(tbpll)          trkcalc trkbal parameter list
+         DS    0D
+drwenql  DS    XL(enqll)          enq parameter list
+drwodhdr DS    XL512              header record
+drwmsgl  DS    F                  message length (for WTO)
+drwmsg   DS    CL256              message
+drwmsgpl DS    24F                message parameter list
+drwl     EQU   *-odrw
+
+o24w     DSECT ,                  24-bit work area
+o24wid   DC    CL4'o24w'          identifier
+drwzeros DS    XL16               24-bit zeroes
+drwbdcb  DS    XL(budcbl)         backup dcb
+drwodcb  DS    XL(oddcbl)         offline dasd dcb
+drwpdcb  DS    XL(prtdcbl)        print dcb
+drwexlst DS    F                  dcb exit list
+drwsnsid DS    XL20               device snsid info
+drwsns   DS    XL32               device sense
+drwrdc   DS    XL64               device characteristics
+drwsnss  DS    XL40               device snss info
+drwoecb1 DS    F                  output ecb 1
+drwoecb2 DS    F                  output ecb 2
+drwiob1  DS    XL40               output iob 1
+drwiob2  DS    XL40               output iob 2
+drwlrp1  DS    XL16               locate record parameter area 1
+drwlrp2  DS    XL16               locate record parameter area 2
+drwdxa   DS    XL16               define extent area
+drwoxit  DS    XL256              relocated message open exit
+drwoida1 DS    255A               idaws 1
+drwoida2 DS    255A               idaws 2
+drwoccw1 DS    258D               channel program 1
+drwoccwl EQU   *-drwoccw1         channel program length
+drwoccw2 DS    258D               channel program 2
+o24wl    EQU   *-o24w
+
+odhdr    DSECT ,                  offline dump header
+odhdrid  DS    CL8                header identifier
+odvrm    DS    XL3                version release modlvl
+         DS    X                  [reserved]
+odtime   DS    F                  time of dump
+oddate   DS    F                  date of dump
+odunit   DS    H                  offline unit address
+odlocyl  DS    H                  low cylinder to dump
+odhicyl  DS    H                  high cylinder to dump
+         DS    XL6                [reserved]
+odsnsid  DS    XL20               device snsid info
+odsns    DS    XL32               device sense
+odrdc    DS    XL64               device characteristics
+odsnss   DS    XL40               device snss info
+odhdrl   EQU   512
+
+RDCinfo  DSECT ,                  read device characteristics info
+RDCsdt   DS    XL2                storage director type
+RDCsdmi  DS    X                  storage director model information
+RDCdevt  DS    XL2                device type
+RDCdevm  DS    X                  device model
+RDCdasdf DS    XL4                device & storage director facilities
+RDCclass DS    X                  device class code
+RDCtype  DS    X                  device type code
+RDCprime DS    XL2                number of primary cylinders
+RDCheads DS    XL2                tracks per cylinde
+RDCsctrs DS    X                  number of sectors
+RDCtrkln DS    XL3                total track length (usable)
+RDChar0  DS    XL2                length of ha and r0
+RDCtccf  DS    X                  track capacity calculation formula
+RDCfctrs DS    XL5                track capacity calculation factors
+RDCacyl  DS    XL2                address of first alternate cylinder
+RDCacyln DS    XL2                number of alternate tracks
+RDCdcyl  DS    XL2                address of first diagnostic cylinder
+RDCdcyln DS    XL2                number of diagnostic tracks
+RDCscyl  DS    XL2                address of first device support cyl
+RDCscyln DS    XL2                number of device support tracks
+RDCmdrid DS    X                  mdr record id
+RDCobrid DS    X                  obr record id
+RDCsdtc  DS    X                  storage director type code
+RDCrtspl DS    X                  read trackset parameter length
+RDCmaxr0 DS    XL2                maximum record zero data length
+         DS    X                  (reserved)
+RDCtss   DS    X                  track set size
+RDCatccf DS    X                  additional track capacity calc. factr
+RDCrps   DS    XL2                rps sector calculation factors
+         DS    XL3                (reserved)
+RDCgdff  DS    X                  generic device/cu functions/features
+         DS    X                  (reserved -- zeroes)
+RDCrduc  DS    X                  real control unit code
+RDCrdc   DS    X                  real device code
+         DS    XL6                (reserved)
+RDCinfol EQU   *-RDCinfo
+
+LRparm   DSECT ,                  locate record paramete
+LRop     DS    X                  operation byte
+LRocount EQU   B'00000000'        orient count
+LRohome  EQU   B'01000000'        orient home
+LRodata  EQU   B'10000000'        orient data
+LRoindex EQU   B'11000000'        orient index
+LRorient EQU   X'00'              orient
+LRwrite  EQU   X'01'              write data
+LRfwrite EQU   X'03'              format write
+LRread   EQU   X'06'              read data
+LRwt     EQU   X'0b'              write track
+LRrt     EQU   X'0c'              read tracks
+LRrd     EQU   X'16'              read
+LRaux    DS    X                  auxiliary byte
+LRusetlf EQU   B'10000000'        transfer length factor specified
+LRrcccw  EQU   B'00000001'        a read count ccw is suffixed
+         DS    X
+LRcount  DS    X                  count parameter
+LRseek   DS    0XL4               seek addr
+LRseekcc DS    XL2
+LRseekhh DS    XL2
+LRsearch DS    0XL5               search arg
+LRsrchcc DS    XL2
+LRsrchhh DS    XL2
+LRsrchr  DS    X
+LRsector DS    X
+LRtlf    DS    XL2                transfer length factor
+LRparml  EQU   *-LRparm
+
+*/* -------------------------------------------------------------------
+*   dsects
+* ------------------------------------------------------------------ */
+         PRINT NOGEN
+         DCBD  DSORG=PS
+         IHADCBE ,
+UCBDSECT DSECT ,
+         IEFUCBOB ,
+         IEZDEB ,
+DEBLENGTH EQU  (DEBBASND-DEBAVT)+(DEBDASDE-DEBDASD)+DEBXLEN
+         IEZIOB ,
+         IHAECB ,
+         IOSDCCW ,
+         CVT   DSECT=YES
+         IHAPSA ,
+         IKJTCB ,
+STAR     TRKCALC MF=D
+
+*/* -------------------------------------------------------------------
+*   equates
+* ------------------------------------------------------------------ */
+SK    EQU X'07'
+SNSID EQU X'e4'
+SNS   EQU X'04'
+RDC   EQU X'64'
+SNSS  EQU X'54'
+RT    EQU X'de'
+DX    EQU X'63'
+LR    EQU X'47'
+WR0   EQU X'15'
+WCKD  EQU X'1d'
+TIC   EQU X'08'
+
+r0 EQU 0
+r1 EQU 1
+r2 EQU 2
+r3 EQU 3
+r4 EQU 4
+r5 EQU 5
+r6 EQU 6
+r7 EQU 7
+r8 EQU 8
+r9 EQU 9
+ra EQU 10
+rb EQU 11
+rc EQU 12
+rd EQU 13
+re EQU 14
+rf EQU 15
+
+   END ,

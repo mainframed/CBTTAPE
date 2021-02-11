@@ -1,0 +1,564 @@
+Monitoring data tables
+
+The data tables feature was a new feature added to CICS
+Version 2.1.1, which allows the user to specify that records are
+to be stored in, and retrieved from, a 'data table' in storage,
+instead of a VSAM dataset or buffer. Since VSAM is not
+invoked when a data table record is found in storage, data table
+access can be quite a bit faster than VSAM LSR, if you have
+the processor storage to back the data tables up.  The data
+tables feature in effect trades storage for cycles.
+
+Data tables work well in two cases.  A VSAM KSDS can
+benefit if it experiences a lot of full-key reads (data tables only
+satisfy full-key 'key-equal' requests - all others use VSAM)
+but not a lot of update activity. The file is loaded into a data
+table at open time in one-megabyte chunks (the Supplemental
+Data Areas manual calls them 'blobs'). The first blob holds a
+control area and a hash table for the number of entries
+requested by the SIZE parameter in the FCT. The records begin
+after the hash table until the blob is full. Subsequent blobs will
+be acquired and chained together until the entire file is in
+storage or the SIZE limit is reached. Since updates must be
+written to both the file and the data table, they are slightly
+slower but reads bypass VSAM altogether and can be
+significantly faster. This is called a CICS Maintained Data
+Table, since CICS provides back-up and recovery.
+
+User Maintained Data Tables (UMDTs) can hold non-VSAM
+or program-generated records. They support only a subset of
+the CICS API and recovery, if desired, is up to the user.
+Updates go only to the data table, so UMDTs can sustain high
+update and read rates efficiently. They can be used to hold data
+between transactions or to share among users.
+
+When we first implemented several UMDTs in two of our
+operational regions last year we knew we were committing
+quite a bit of storage, but thought the amount would be
+manageable given our supply of central and expanded storage.
+When the regions' working set size quickly exceeded 200
+megabytes, then charged toward 400 megabytes, the system
+went into a thrashing frenzy and shut down completely. We
+were caught off-guard and had to remove the data tables from
+the regions.
+
+Subsequent investigation determined that the data tables feature
+was not re-using space when records were re-written, even
+when the new record length was the same as, or smaller than,
+the old record.  Since these files have entries in the hundreds,
+but experience updates in the tens of thousands, we were
+stranding quite a bit of storage.  A PTF (UL78193) was
+applied, and our allocation dropped from over 400 megabytes
+to around 30 megabytes per region. We were back in business.
+
+The experience left us with a new respect for, as well as a
+slight distrust of, the data tables feature.  We wanted to keep
+an eye on our data tables' storage utilization, but our
+monitoring package (THE MONITOR FOR CICS) didn't break
+out data tables storage for us. We decided to write our own.
+
+The TAPS transaction (named after DTAPS, the acronym used
+in Supplemental Data Areas to describe data tables control
+blocks) will browse the FCT in a CICS region to determine
+which entries are defined as either TYPE=CICSTABLE or
+TYPE=USERTABLE.  The program then analyses the control
+block chains for these files to collect vital allocation and
+utilization statistics. A scrollable summary screen is displayed,
+showing the available and allocated private area storage above
+the 16-megabyte line, and a line for each data table file
+showing storage allocation as well as current entries, reads, and
+updates. A totals line shows the total allocation for the region
+for data tables.
+
+The programs were designed in modular fashion: one program
+(YD26P0M1) browses the FCT, determines which files are
+data tables, and writes the DDNAME and FCT pointer to a
+temporary storage queue (this program is normally invoked
+only once per day, since the temporary storage queue remains
+in place). A second program (YD26P0M2) reads the temporary
+storage queue, collecting and editing the utilization data for
+each data table. An executive (YD26P0M0) handles the
+terminal communication. This design allowed us easily to build
+a program to run at shutdown time to collect data tables'
+statistics. This program (YD26P1M0) was added to the PLTSD
+list and writes a utilization report to the transient data queue
+CSSL.
+
+
+YD26P0M0 SOURCE CODE
+
+* FUNCTION - Browse FCT and compile Data Tables information
+         TITLE 'YD26P0M0 REGISTER USAGE'
+DATAREG  EQU   3    Base for EISTG
+BASREG   EQU   4    BAS Register
+WORKREG  EQU   5    Work register
+BCTREG   EQU   6    BCT register
+TSREG    EQU   7    TS pointer
+CODEREG2 EQU   8    Program Second Base
+COMREG   EQU   9    Commarea register
+CODEREG  EQU   10   Program base
+EIBREG   EQU   11   EIB base register
+MAPREG   EQU   12   Map register
+         TITLE 'YD26P0M0 - Collect Data Tables Utilization Information'
+         COPY  GHICWADS
+         COPY  DTAPS
+         CVT    DSECT=YES          COMMUNICATIONS VECTOR TABLE
+         USING PSA,0
+         IHAPSA DSECT=YES          PREFIXED SAVE AREA
+         IHAASCB                   ADDRESS SPACE CONTROL BLOCK
+         IHALDA                    VSM LOCAL DATA AREA
+         TITLE 'YD26P0M0 - DYNAMIC STORAGE DSECT'
+         DFHEISTG
+@DWD     DS    D
+@TSREG   DS    A
+@BASREG  DS    A
+@BCTREG  DS    A
+@INUSET  DS    A
+@FREET   DS    A
+@ALLOCT  DS    A
+@CRENTT  DS    A
+@READST  DS    A
+@UPDTST  DS    A
+@TSLEN   DS    Y
+@ITEM    DS    Y
+@TSKEY   DS    CL8
+@APPLID  DS    CL8
+@DATEO   DS    CL8
+@TIMEO   DS    CL8
+@TIME    DS    CL6
+@SYSID   DS    CL4
+@FLAG    DS    B
+DATAONLY EQU   B'00000001'
+ERASE    EQU   B'00000010'
+EOQ      EQU   B'00000100'
+@COM1    DS    0F
+         COPY  YZD26000
+COM1LEN  EQU   *-@COM1
+@COM2    DS    0F
+         COPY  YZD26001
+COM2LEN  EQU   *-@COM2
+@COM3    DS    0F
+#COMFCT  DS    A
+#ITEM    DS    Y
+#COMFLAG DS    B
+MORE     EQU   B'10000000'
+COM3LEN  EQU   *-@COM3
+         COPY  TAPS00U
+MAPBUMP  EQU   DDNAM2L-DDNAM1L
+DDNAMED  EQU   DDNAM1L-DDNAM1L
+TYPED    EQU   TYPE1L-DDNAM1L
+INUSED   EQU   INUSE1L-DDNAM1L
+ALLOCD   EQU   ALLOC1L-DDNAM1L
+FREED    EQU   FREE1L-DDNAM1L
+CRENTD   EQU   CRENT1L-DDNAM1L
+READSD   EQU   READS1L-DDNAM1L
+UPDTSD   EQU   UPDTS1L-DDNAM1L
+FLD      EQU   DDNAM1O-DDNAM1L
+C        EQU   DDNAM1R-DDNAM1L
+A        EQU   DDNAM1A-DDNAM1L
+H        EQU   DDNAM1H-DDNAM1L
+F        EQU   DDNAM1F-DDNAM1L
+         COPY  DFHBMSCA
+         COPY  DFHAID
+YD26P0M0 DFHEIENT CODEREG=(CODEREG,CODEREG2),                         X
+               DATAREG=DATAREG,                                       X
+               EIBREG=EIBREG
+         B     START
+         GHIVM YD26P0M0
+START    DS    0H
+         EXEC  CICS IGNORE CONDITION ERROR
+         EXEC  CICS ADDRESS CWA(R13)
+         OC    EIBCALEN,EIBCALEN     ANY COMMAREA?
+         BZ    FIRSTIME              NO, FIRST TIME THROUGH
+         L     COMREG,DFHEICAP       GET COMMAREA ADDRESS
+         MVC   @COM3(COM3LEN),0(COMREG)       MOVE TO DYNAMIC STORAGE
+         B     MAPIN
+         TITLE 'IPMF - BUILD PRIMARY SCREEN'
+FIRSTIME DS    0H
+         MVC   #ITEM,=Y(1)
+         B     ENTER
+MAPIN    DS    0H
+         CLI   EIBAID,DFHCLEAR
+         BE    RETURN
+         OI    EIBAID,X'30'          EQUATE PF13-24 TO PF1-12
+         LA    WORKREG,AIDTABL       -> TABLE OF AIDS
+         LA    BCTREG,AIDT#ENT       LOOP CONTROL
+AIDLOOP  DS    0H
+         CLC   0(1,WORKREG),EIBAID   AID FOUND IN TABLE?
+         BE    FOUNDAID              YES
+         LA    WORKREG,AIDTLENT(,WORKREG) BUMP TO NEXT ENTRY
+         BCT   BCTREG,AIDLOOP
+FOUNDAID ICM   WORKREG,15,1(WORKREG) LOAD ROUTINE ADDRESS
+         BR    WORKREG               GO PROCESS AID
+*        Here if summary screen and ENTER
+ENTER    DS    0H
+         MVC   @TSKEY,=C'TAPS0001'
+         BAS   BASREG,READQTS
+         B     ENT0020(R15)
+ENT0020  DS    0H                    EIBRESP =
+         B     ENT0030               NORMAL
+         BAS   R1,ERROR              ITEMERR
+         NOP   *                     QIDERR (GO BUILD THE QUEUE)
+         EXEC  CICS LINK,                                              -
+               PROGRAM('YD26P0M1'),                                    -
+               COMMAREA(@COM1),                                        -
+               LENGTH(=Y(COM1LEN)),
+ENT0030  DS    0H
+         LH    WORKREG,#ITEM
+         MVC   @TSKEY,=C'TAPS0001'
+         BAS   BASREG,READQTS
+ENT0040  DS    0H                    EIBRESP =
+         B     ENT0050               NORMAL
+         BAS   R1,ERROR              ITEMERR
+         BAS   R1,ERROR              QIDERR (SHOULD BE THERE NOW)
+ENT0050  DS    0H
+         LA    MAPREG,DDNAM1L      START OF DATA PORTION OF MAP
+         LA    BCTREG,TS#FILES     NUMBER OF DATA LINES ON MAP
+ENT0210  DS    0H
+         TM    @FLAG,EOQ           ALREADY REACHED END-OF-QUEUE?
+         BO    MAPOUT              YES, GO SEND MAP
+         CLC   0(8,TSREG),=8X'FF'  END OF QUEUE?
+         BE    ENT0300             YES, GET TOTALS
+         MVC   #DTFCT,8(TSREG)     MOVE FCT ADDRESS TO COMMAREA
+         EXEC  CICS LINK,                                              -
+               PROGRAM('YD26P0M2'),                                    -
+               COMMAREA(@COM2),                                        -
+               LENGTH(=Y(SUMLNLEN)),    SUMMARY LINE LENGTH
+         L     WORKREG,@INUSET     ACCUMULATE TOTALS
+         A     WORKREG,#INUSEB
+         ST    WORKREG,@INUSET
+         L     WORKREG,@ALLOCT
+         A     WORKREG,#ALLOCB
+         ST    WORKREG,@ALLOCT
+         L     WORKREG,@FREET
+         A     WORKREG,#FREEB
+         ST    WORKREG,@FREET
+         L     WORKREG,@CRENTT
+         A     WORKREG,#CRENTB
+         ST    WORKREG,@CRENTT
+         L     WORKREG,@READST
+         A     WORKREG,#READSB
+         ST    WORKREG,@READST
+         L     WORKREG,@UPDTST
+         A     WORKREG,#UPDTSB
+         ST    WORKREG,@UPDTST
+ENT0230  DS    0H
+         MVC   DDNAMED+FLD(L'DDNAM1O,MAPREG),#DDNAME
+         MVC   TYPED+FLD(L'TYPE1O,MAPREG),#TYPE
+         MVC   INUSED+FLD(L'INUSE1O,MAPREG),#INUSE+3
+         MVC   ALLOCD+FLD(L'ALLOC1O,MAPREG),#ALLOC+3
+         MVC   FREED+FLD(L'FREE1O,MAPREG),#FREE+3
+         MVC   CRENTD+FLD(L'CRENT1O,MAPREG),#CRENT+1
+         MVC   READSD+FLD(L'READS1O,MAPREG),#READS+1
+         MVC   UPDTSD+FLD(L'UPDTS1O,MAPREG),#UPDTS+1
+ENT0250  DS    0H
+         LA    MAPREG,MAPBUMP(,MAPREG)
+         LA    TSREG,12(,TSREG)
+         BCT   BCTREG,ENT0210
+         OI    #COMFLAG,MORE       INDICATE MORE DATA
+         B     MAPOUT
+ENT0300  DS    0H
+         NI    #COMFLAG,X'FF'-MORE   INDICATE NO MORE DATA
+         BAS   BASREG,GETTOTS      GET TOTALS AND EDIT
+         OI    @FLAG,EOQ           INDICATE END OF QUEUE REACHED
+         MVC   #DDNAME,=C'*TOTALS*'
+         MVC   #TYPE,=C'****'
+         B     ENT0230             BACK TO LOOP
+MAPOUT   DS    0H
+         BAS   BASREG,BLDSTMP      BUILD THE TIME STAMP HEADER
+         MVC   SYSIDO,@SYSID       MOVE SYSID
+         MVC   APPLIDO,@APPLID     MOVE APPLID
+*        MVC   JOBNAMEO,CWAJOBNM   MOVE JOBNAME
+         MVC   DATEO,@DATEO        CALENDAR DATE
+         MVC   TIMEO,@TIMEO        TIME
+         BAS   BASREG,GETVSM       GET VSM LOCAL DATA
+         EXEC  CICS SEND                                               -
+               MAP('TAPS00U'),                                         -
+               FROM(TAPS00S),                                          -
+               LENGTH(=Y(TAPS00L)),                                    -
+               ERASE
+         B     RETWTRAN
+*        Here if summary screen and PF7
+SB       DS    0H
+         LH    WORKREG,#ITEM
+         BCT   WORKREG,SB0010
+         B     SB0999
+SB0010   DS    0H
+         STH   WORKREG,#ITEM
+SB0999   DS    0H
+         B     ENTER
+*        Here if summary screen and PF8
+SF       DS    0H
+         TM    #COMFLAG,MORE       ANY MORE DATA TO GET?
+         BNO   SF0999              NO
+         LH    WORKREG,#ITEM
+         LA    WORKREG,1(,WORKREG)
+         STH   WORKREG,@ITEM
+         MVC   @TSKEY,=C'TAPS0001'
+         BAS   BASREG,RDQ0010
+         B     SF0010(R15)
+SF0010   DS    0H                    EIBRESP =
+         B     SF0020                NORMAL
+         B     SF0999                ITEMERR
+         BAS   R1,ERROR              QIDERR (SHOULD BE THERE NOW)
+SF0020   DS    0H
+         MVC   #ITEM,@ITEM
+         B     ENT0050
+SF0999   DS    0H
+         B     ENT0030
+*        Here if summary screen and PF4
+REFRESH  DS    0H
+         MVC   @TSKEY,=C'TAPS0001'
+         EXEC  CICS DELETEQ TS,                                        -
+               QUEUE(@TSKEY)
+         CLC   EIBRESP,DFHRESP(NORMAL)
+         BE    REF0010
+         BAS   R1,ERROR
+REF0010  DS    0H
+         B     ENTER
+*        Subroutine to read a temp storage queue
+READQTS  DS    0H
+         MVC   @ITEM,#ITEM
+RDQ0010  DS    0H
+         EXEC  CICS READQ TS,                                          -
+               QUEUE(@TSKEY),                                          -
+               SET(TSREG),                                             -
+               LENGTH(@TSLEN),                                         -
+               ITEM(@ITEM)
+         LA    R15,0
+         CLC   EIBRESP,DFHRESP(NORMAL) READ OK?
+         BER   BASREG
+         LA    R15,4
+         CLC   EIBRESP,DFHRESP(ITEMERR)  END OF QUEUE?
+         BER   BASREG
+         LA    R15,8
+         CLC   EIBRESP,DFHRESP(QIDERR) QUEUE NOT FOUND?
+         BER   BASREG
+         BAS   R1,ERROR
+         SH    R1,=Y(4)
+         EXEC  CICS ABEND ABCODE('TAPS')
+*        Get virtual storage allocation info.  This routine must run
+*        in 31 bit amode because the LDA resides above the line.
+GETVSM   DS    0H
+         L     R2,FLCCVT               LOCATION OF CVT
+         L     R2,CVTTCBP-CVT(,R2)     TCB DOUBLEWORD ADDRESS
+         L     R2,12(,R2)              CURRENT ASCB ADDRESS
+         L     R2,ASCBLDA-ASCB(,R2)    GET LDA ADDRESS
+         USING LDA,R2
+         L     WORKREG,LDAELIM     GET >16M GETMAIN LIMIT
+         LR    R15,WORKREG         GET A COPY       EG: 017F764F
+         SRL   R15,20              DIVIDE BY 1M         00000017
+         SLL   R15,20              SHIFT BACK           01700000
+         CR    R15,WORKREG         MULTIPLE OF A MEG?   (NO)
+         BNE   GETABBYK            NO
+         SRL   WORKREG,20          DISPLAY IN MEG
+         MVI   GETABVO+(L'GETABVO-1),C'M'
+         B     GETAB010
+GETABBYK DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   GETABVO+(L'GETABVO-1),C'K'  DISPLAY IN K
+GETAB010 DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   GETABVO(L'EDPAT),EDPAT  MOVE PATTERN IN
+         ED    GETABVO(L'EDPAT),@DWD+4     EDIT NUMBER
+         L     WORKREG,LDAEVVRG    GET >16M REGION AVAILABLE
+         LR    R15,WORKREG         GET A COPY       EG: 017F764F
+         SRL   R15,20              DIVIDE BY 1M         00000017
+         SLL   R15,20              SHIFT BACK           01700000
+         CR    R15,WORKREG         MULTIPLE OF A MEG?   (NO)
+         BNE   REGABBYK            NO
+         SRL   WORKREG,20          DISPLAY IN MEG
+         MVI   REGABVO+(L'REGABVO-1),C'M'
+         B     REGAB010
+REGABBYK DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   REGABVO+(L'REGABVO-1),C'K'  DISPLAY IN K
+REGAB010 DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   REGABVO(L'EDPAT),EDPAT  MOVE PATTERN IN
+         ED    REGABVO(L'EDPAT),@DWD+4     EDIT NUMBER
+         L     WORKREG,LDAELOAL    GET >16M USER ALLOCATED
+         LR    R15,WORKREG         GET A COPY       EG: 017F764F
+         SRL   R15,20              DIVIDE BY 1M         00000017
+         SLL   R15,20              SHIFT BACK           01700000
+         CR    R15,WORKREG         MULTIPLE OF A MEG?   (NO)
+         BNE   USERABYK            NO
+         SRL   WORKREG,20          DISPLAY IN MEG
+         MVI   USERABVO+(L'USERABVO-1),C'M'
+         B     USERA010
+USERABYK DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   USERABVO+(L'USERABVO-1),C'K' DISPLAY IN K
+USERA010 DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   USERABVO(L'EDPAT),EDPAT MOVE PATTERN IN
+         ED    USERABVO(L'EDPAT),@DWD+4    EDIT NUMBER
+         BR    BASREG
+*        Collect totals and edit for display
+GETTOTS  DS    0H
+         ST    BCTREG,@BCTREG
+         ST    BASREG,@BASREG
+         CLC   #ITEM,=Y(1)         IS THIS THE 1ST (AND ONLY) SCREEN?
+         BE    GTT0050             YES, USE WHAT YOU HAVE.
+         MVC   @ITEM,=Y(1)
+GTT0010  DS    0H
+         MVC   @TSKEY,=C'TAPS0001'
+         B     GTT0020(R15)
+GTT0020  DS    0H                    EIBRESP =
+         B     GTT0030               NORMAL
+         BAS   R1,ERROR              ITEMERR
+         BAS   R1,ERROR              QIDERR
+GTT0030  DS    0H
+         LA    BCTREG,TS#FILES       NUMBER OF DATA LINES ON MAP
+GTT0040  DS    0H
+         MVC   #DTFCT,8(TSREG)     MOVE FCT ADDRESS TO COMMAREA
+         EXEC  CICS LINK,                                              -
+               PROGRAM('YD26P0M2'),                                    -
+               COMMAREA(@COM2),                                        -
+               LENGTH(=Y(TOTSLEN)),    TOTALS ONLY
+         L     WORKREG,@INUSET     ACCUMULATE TOTALS
+         A     WORKREG,#INUSEB
+         ST    WORKREG,@INUSET
+         L     WORKREG,@ALLOCT
+         A     WORKREG,#ALLOCB
+         ST    WORKREG,@ALLOCT
+         L     WORKREG,@FREET
+         A     WORKREG,#FREEB
+         ST    WORKREG,@FREET
+         L     WORKREG,@CRENTT
+         A     WORKREG,#CRENTB
+         ST    WORKREG,@CRENTT
+         L     WORKREG,@READST
+         A     WORKREG,#READSB
+         ST    WORKREG,@READST
+         L     WORKREG,@UPDTST
+         A     WORKREG,#UPDTSB
+         ST    WORKREG,@UPDTST
+         LA    TSREG,12(,TSREG)
+         BCT   BCTREG,GTT0040
+         LH    WORKREG,@ITEM
+         LA    WORKREG,1(,WORKREG)
+         STH   WORKREG,@ITEM
+         CLC   @ITEM,#ITEM
+         BNL   GTT0050             DONE
+         B     GTT0010             MORE
+GTT0050  DS    0H
+         L     WORKREG,@READST     GET # READS
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #READS,EDPAT        MOVE PATTERN IN
+         ED    #READS,@DWD+4       EDIT NUMBER
+         L     WORKREG,@UPDTST     GET # UPDATES
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #UPDTS,EDPAT        MOVE PATTERN IN
+         ED    #UPDTS,@DWD+4       EDIT NUMBER
+         L     WORKREG,@CRENTT     GET # ENTRIES IN DT
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #CRENT,EDPAT        MOVE PATTERN IN
+         ED    #CRENT,@DWD+4       EDIT NUMBER
+         L     WORKREG,@INUSET     GET STORAGE IN-USE SIZE
+         LR    R15,WORKREG         GET A COPY       EG: 017F764F
+         SRL   R15,20              DIVIDE BY 1M         00000017
+         SLL   R15,20              SHIFT BACK           01700000
+         CR    R15,WORKREG         MULTIPLE OF A MEG?   (NO)
+         BNE   INUSEBYK            NO
+         SRL   WORKREG,20          PRINT IN MEG
+         MVI   #INUSEKM,C'M'
+         B     INUSE010
+INUSEBYK DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   #INUSEKM,C'K'       PRINT IN K
+INUSE010 DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #INUSE,EDPAT        MOVE PATTERN IN
+         ED    #INUSE,@DWD+4       EDIT NUMBER
+         L     WORKREG,@ALLOCT     GET TOTAL STORAGE ALLOCATED
+         LR    R15,WORKREG         GET A COPY       EG: 01800000
+         SRL   R15,20              DIVIDE BY 1M         00000018
+         SLL   R15,20              SHIFT BACK           01800000
+         CR    R15,WORKREG         MULTIPLE OF A MEG?   (YES)
+         BNE   ALLOCBYK            NO
+         SRL   WORKREG,20          PRINT IN MEG
+         MVI   #ALLOCKM,C'M'
+         B     ALLOC010
+ALLOCBYK DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   #ALLOCKM,C'K'       PRINT IN K
+ALLOC010 DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #ALLOC,EDPAT        MOVE PATTERN IN
+         ED    #ALLOC,@DWD+4       EDIT NUMBER
+         L     WORKREG,@FREET      GET FREE AREA LENGTH
+         LR    R15,WORKREG         GET A COPY
+         SRL   R15,20              DIVIDE BY 1M
+         SLL   R15,20              SHIFT BACK
+         CR    R15,WORKREG         MULTIPLE OF A MEG?
+         BNE   FREEBYK             NO
+         SRL   WORKREG,20          PRINT IN MEG
+         MVI   #FREEKM,C'M'
+         B     FREE010
+FREEBYK  DS    0H
+         SRL   WORKREG,10          DIVIDE BY A K
+         MVI   #FREEKM,C'K'        PRINT IN K
+FREE010  DS    0H
+         CVD   WORKREG,@DWD        CONVERT TO DECIMAL
+         MVC   #FREE,EDPAT         MOVE PATTERN IN
+         ED    #FREE,@DWD+4        EDIT NUMBER
+         L     BCTREG,@BCTREG
+         L     BASREG,@BASREG
+         BR    BASREG
+*        Build the time/date stamp screen header
+BLDSTMP  DS    0H
+         EXEC  CICS ASSIGN,                                            -
+               APPLID(@APPLID),                                        -
+               SYSID(@SYSID),
+         MVC   @DATEO(2),CWACLDT         CALENDAR DATE MM
+         MVI   @DATEO+2,C'/'             SLASH
+         MVC   @DATEO+3(2),CWACLDT+2     CALENDAR DATE DD
+         MVI   @DATEO+5,C'/'             SLASH
+         MVC   @DATEO+6(2),CWACLDT+4     CALENDAR DATE YY
+         UNPK  @TIME,EIBTIME             UNPACK TIME OF DAY TO HHMMSS
+         OI    @TIME+(L'@TIME-1),X'F0'   SET SIGN TO EBCDIC
+         MVC   @TIMEO(2),@TIME           SET HOURS PART
+         MVI   @TIMEO+2,C':'             MAKE IT PRETTY ON DISPLAY
+         MVC   @TIMEO+3(2),@TIME+2       SET MINUTES TOO
+         MVI   @TIMEO+5,C':'             MAKE IT PRETTY ON DISPLAY
+         MVC   @TIMEO+6(2),@TIME+4       SET SECONDS TOO
+         BR    BASREG
+RETWTRAN DS    0H
+         EXEC  CICS RETURN,                                            -
+               TRANSID(EIBTRNID),                                      -
+               COMMAREA(@COM3),                                        -
+               LENGTH(=Y(COM3LEN))
+*        Here if summary screen and unrecognized AID key
+BADAID   DS    0H
+         MVC   ERRMSGO,AIDMSG
+         B     MAPOUT
+*        AID Table for summary screen
+AIDTABL  DS    0H
+         DC    AL1(DFHENTER),AL4(ENTER)
+AIDTLENT EQU   *-AIDTABL
+*        DC    AL1(DFHPF1),AL4(TUTOR)
+         DC    AL1(DFHPF4),AL4(REFRESH)
+         DC    AL1(DFHPF7),AL4(SB)
+         DC    AL1(DFHPF8),AL4(SF)
+AIDT#ENT EQU   (*-AIDTABL)/AIDTLENT
+         DC    AL1(255),AL4(BADAID)
+EDPAT    DC    X'40206B2020206B202120'
+AIDMSG   DC    CL(L'ERRMSGO)'Invalid PA/PF key'
+PF1MSG   DC    CL(L'ERRMSGO)'Help facility not available'
+*        Here if summary screen and PF1
+TUTOR    DS    0H
+         MVC   ERRMSGO,PF1MSG
+         B     MAPOUT
+*        Here if summary screen and PF3
+END      DS    0H
+ERRRET   DS    0H
+         EXEC  CICS SEND CONTROL ERASE
+RETURN   DS    0H
+         END
+
+
+Steven St Jean
+Systems Programmer                                 c Xephon/BCBSNCA 1992
+Blue Cross/Blue Shield of the National Capitol Area (USA)
+

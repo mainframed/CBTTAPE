@@ -1,0 +1,357 @@
+MVS/XA Cross Memory Services
+
+INTRODUCTION
+
+Cross Memory Services (XMS) is a facility of the 370/XA
+architecture implemented in MVS/XA that some people seem to
+have trouble understanding except at a high level.  I think this is
+due to confusion over a couple of the cross memory concepts.
+
+Hopefully, in this article some of that confusion can be cleared
+up.  My intention is to make the reader more familiar with the
+way XMS is implemented and set up within MVS.  It is assumed
+that the reader has a knowledge of XMS at a conceptual level at
+least.  A thorough knowledge of XMS is also a boon for
+understanding the fundamentals of ESA/370.
+
+XMS - 370/XA PERSPECTIVE
+
+From the hardware perspective, we will be looking primarily at
+five types of data area: the ASN First Table (AFT), the ASN
+Second Table (AST), the Authority Table (AT), the Linkage
+Table (LT), and the Entry Table (ET).  The ASN refers to the
+address space number, which is the halfword identifier which
+MVS calls the ASID (see Figure 1).
+
+There is one AFT for the entire operating system and its origin is
+stored in control register 14 (CR14), bits 13-31.  This is a real
+address and 12 zero bits must be appended to form the full 31-bit
+address (eg if bits 13-31 of CR14 are X'03886', the AFT origin is
+3886000).  This table is fairly small and only contains pointers to
+several ASTs.  ASN bits 0-9 form the index into the AFT, while
+bits 10-15 form the index to the AST.  This means that each AST
+contains 64 AST entries (ASTEs).  Look at the first AFT entry to
+find the ASTs for ASNs 0000-003F, the second for 0040-007F,
+etc (see Figure 2).
+
+The ASTEs contain the information necessary for an address
+space to run (including the segment table origin).  For XMS, we
+are interested chiefly in three fields: the Authority Table Origin
+(ATO), the Authorisation Index (AX), and the Linkage Table
+Origin (LTO).  The ATO and LTO pointers are, of course, real
+addresses.
+
+The AT is typically a 12-byte bit string (although it can be
+longer), consisting of two-bit entries, which are indexed via an
+AX.  An easy way to understand what the AT represents is to
+think of it as the lock on the front door of your house (your
+address space).  You want to let in only certain people (programs
+from other address spaces) for security/integrity reasons.  Hence
+only certain keys will unlock the door and allow access.  This key
+is the AX owned by the person attempting to unlock your door
+(establish cross-memory access to your address space).
+
+The first bit of the AT entry, if 1, says that the requesting address
+space can establish your address space as a Primary ASN (PASN),
+assuming his AX points to the particular AT entry.  Establishing
+your ASN as a primary ASN means that the requestor can issue a
+Program Transfer (PT) instruction to your address space.  The
+second bit of the AT, if 1, allows the requestor to establish your
+address space as a Secondary ASN (SASN).  This means the
+requestor can issue a Set Secondary ASN instruction (SSAR) to
+your address space.
+
+EXAMPLE
+
+Your AT is 12 bytes long (X'300C00000000000000000000').  A
+program running in ASN 0047 issues a SSAR specifying your
+ASN.  His AX value is 6.  Is he authorised?  The answer is “yes”.
+X'300C' breaks down to binary:
+
+    00 11 00 00 00 00 11 00
+
+The seventh AT entry (corresponding to AX=6) has value B'11',
+meaning ASN 0047 is PASN-authorised and SASN-authorised (ie
+SSAR is allowed).  Note that your AX value generally has nothing
+to do with your AT.  Your AX value is used if you attempt to
+unlock someone else's door (access a different address space).
+
+The linkage table pointed to by the ASTE contains fullword
+pointers to Entry Tables (ETs).  ETs consist of 16-byte ET Entries
+(ETEs), which define routines to be executed via Program Calls
+(PCs).  Important fields in an ETE include the ASN and entry
+point that the PC routine will run, the PSW Key Mask (PKM) that
+gives keys with which the program can run, and an Authorisation
+Key Mask (AKM), which acts as the security mechanism for PC.
+The AT and AX don't come into play with the PC.  In problem
+state, the AKM is ANDed with the requesting program's PKM
+and, if the result is zero, the PC will fail with a program interrupt.
+
+Take for instance the case where the requestor's PKM is X'0080'
+(ie key 8 only).  The AKM for the PC routine he is accessing is
+X'FF00'.  Will the request succeed?  The answer is “no if in
+problem state”.  0080 AND FF00 = 0000.  X'FF00' means only
+keys 0-7 (system keys) are allowed in this case.
+
+If the ASN in the ET entry is 0000, the PC represents a PC-
+current primary (ie it isn't really a cross memory call and the
+routine will run in the primary ASN address space).
+
+How are program call numbers formed?  The indexing is very
+similar to ASNs and the AFT/AST.  A PC number is 20 bits long,
+with bits 0-11 forming the linkage index portion (LX) and bits 12-
+19 forming the entry index (EX).  Therefore, the LX is 3
+hexadecimal digits and the EX two (see Figure 3).  The LX is
+used as an index from the LT origin, and the EX is used from the
+ET origin.
+
+PC 00506 breaks down to an LX=5 (the sixth fullword of the LT
+for the issuer's address space), and an EX=6 (the seventh 16-byte
+ET entry pointed to from the LT entry).  Note that for AFT
+entries, AST entries, and LT entries, the high-order bit of the first
+byte will be on if the entry is invalid.  ETs are defined in groups
+of four entries and hence there may be unused entries.  Later we
+will see how MVS handles this condition.
+
+Generally, that is all there is to the XMS areas referenced directly
+by the hardware.  Of course, some bits and bytes have been left
+out, and the control register settings haven't been touched on.  Just
+remember that each address space has associated with it a unique
+ASN, with its own AT and AX, LT, and corresponding ETs.
+These tables and values define the cross memory capabilities of an
+address space.
+
+MVS/XA IMPLEMENTATION OF XMS
+
+First we will look at the control blocks and data areas as defined
+by MVS.  A good control block map is printed in the MVS/XA
+Debugging Handbook volume 1 in chapter 6, under the heading
+PC/AUTH Control Blocks.  You should use this diagram as a
+reference.
+
+To start with, where will you find all of the cross-memory control
+blocks and data areas in storage?  If you look for the ASN first
+table, it is located in the private area of *MASTER* (ASID
+0001).  The ASN second tables are located in the SQA below the
+line.  All other cross-memory control blocks can be found in the
+extended LSQA of the PCAUTH address space (ASID 0002).
+The only exception is the System Function Table (described
+below), which is in the nucleus.
+
+MVS maps the ASTE with just that name, and it appears in
+volume 2 of the Debugging Handbook.  For convenience, the LT
+and AT origins are pointed to by the ASCB (with virtual addresses
+instead of real).  The ASCB also points to the ASTE.
+
+PC numbers must be unique system wide in MVS and hence the
+LX portions of the numbers must be tracked so duplicates don't
+occur.  Similarly, AX values must be known and regulated for
+security purposes.  The method used for keeping track of LXs and
+AXs is via the LXAT and AXAT tables, respectively, both
+pointed at by the Cross Memory Directory (XMD).
+
+The LXAT keeps track of which ASID owns an LX value and
+how many address spaces are 'connected' to it.  An ASID becomes
+the owner of a particular LX value (and hence the PC numbers
+which are formed from the LX value) by issuing the LXRES (LX
+reserve) macro.  If an address space owns an LX, it means that it
+either has or intends to offer a PC routine for other address spaces
+to use.
+
+The AXAT simply is a small table which contains ASID numbers
+of the owners of the AX numbers.  An address space becomes an
+AX owner by issuing the AXRES (AX reserve) macro.
+
+Other MVS control blocks worthy of mention are the Entry Table
+Information Block (ETIB) and the Entry Table Information
+Extension (ETIX) queues, which are pointed to by the XMD.
+These blocks describe the entry tables for an address space (and
+have virtual ET pointers).  For every 'connected' address space,
+there is a pointer to it.
+
+What is a connection?  Once a program has reserved an LX value,
+it must create its own entry table parameters and tell MVS to set
+up the information via the ETCRE (ET create) macro.  MVS does
+not chain the ET entries to the LT entry anywhere until
+specifically requested via the ETCON (ET connect) macro.  It is
+simply the task of adding the LT entry (which points to the ET)
+into the linkage table of the requesting address space.  If the PC
+routine is to be 'public', MVS will ensure that every address
+space's LT will be updated with this entry (in this case the LXRES
+macro must be issued first specifying SYSTEM=YES).  Public LT
+entries are added to the System Linkage Table (SLT), pointed to
+by the XMD.
+
+The AXSET and ATSET macros are used to define an address
+space's current authorisation for issuing PT and SSARs, as
+previously defined.  Before issuing a PC, a program should be
+sure that its address space's AT will allow the PC-routine address
+space to issue a PT back when it is done (ie if you're going to ask
+a workman into your house to do repairs, you'd better be sure he
+can get back out again, otherwise you will have trouble).
+
+It is important to know that in MVS/XA having an AX value of 1
+permits an address space full authority via the AT.  This is
+because all ATs are defined to allow this (ie bits 2 and 3 of the
+AT are B'11' always).  System address spaces generally have an
+AX value of 1 (ie they are like building supervisors with the
+master key).
+
+Before looking at real-life examples, one last control block should
+be examined: the System Function Table (SFT).  This simply
+contains a list of PC numbers (composed of an LX and an EX) at
+fixed offsets.  This is a flexible design needed to protect system
+routines and facilities from having to know exactly what the PC
+number is of the service they want.  Instead, they only keep track
+of a fixed SFT offset.  See volume 1 chapter 5 of the Debugging
+Handbook for a list of all PC numbers (and functions) which are
+mapped by the SFT (Program Call Services in System Function
+Table).
+
+MVS/XA XMS EXAMPLES
+
+Enough theory - who really uses XMS in MVS?  How many PC
+routines actually exist?  I have investigated my own system to
+determine who uses XMS and how they have set it up.
+
+Most systems address spaces have AX = 1 giving them full
+access.  Most other address spaces have AX = 0 by default,
+meaning that they aren't  allowed to issue SSAR or PT and they
+offer no PC routines of their own.
+
+Any address space that will allow others with AX = 1 access via
+SSAR and PT uses the AT known in MVS as the System AT
+(SAT), which is pointed to by the XMD.  Most fall into this
+category.  As far as system LXs go, my system usually has 17 or
+18 active at any time (which boils down to the 9 defined in the
+SFT plus 8 or 9 others).  As stated above, system LXs get
+connected to all address spaces, and hence appear in all LTs.
+Only privately used PC routines necessitate the use of a different
+LT for each address space.
+
+Finally some examples.  Let's look at the cross memory interface
+between JES2 and the PSF address spaces, which controls PSF
+printers.
+
+Interrogating MVS/XA storage on my system reveals that JES2's
+AX is 2.  Its AT is equal to X'30003C0CF000000000000000'
+meaning AX values of 1, 9, A, E,10, and 11 are fully authorised.
+Looking at the JES2 LT shows five LX values defined above and
+beyond the 18 system LX values present in every address space's
+own LT.  The LX values are hexadecimal 80, 81, 85, 87, and 8E.
+Examining the ETs pointed to by the LT entries shows that there
+are two valid ET entries per LT entry.  Hence, valid PC numbers
+for JES2 to issue to PSF are 08000, 08001, 08100, 08101, 08500,
+08501, 08700, 08701, 08E00, 08E01.
+
+Note here that ETs are defined by the architecture to be 64-bytes
+long, hence they hold four ET entries.  If only two are defined by
+PSF, how can you tell if the remaining two are valid or not?  The
+entry is invalid if the routine entry point in the ET entry points in
+module IEAVXEPM (just look at a NUCMAP or in a dump to
+verify the IEAVXEPM module location).
+
+Each set of the two valid ET entries points to two different entry
+points located in the private area of the PSF address spaces.  The
+AKM value for both ET entries is X'C000', meaning the caller
+(JES2) must have access to keys 0 and/or 1 to be able to execute
+the PC.  JES2 has key 1 reserved for it by convention in MVS.
+
+Now onto the PSF address spaces: investigation shows 5 PSFs up
+and running.  Each has a unique AX value, and these values
+correspond to the values defined in JES2's AT, eg PSF1 has
+AX=9, PSF2 has AX=A, etc.
+
+All of the PSFs have identical ATs allowing AX = 1 full access,
+and AX = 2 SASN only authority.  All PSFs also have identical
+LTs and they contain only the standard system linkage entries.
+
+How should this information be interpreted?  It appears that each
+PSF reserved an LX value via LXRES and defined two ET entries
+via ETCRE.  ATSET and ETCON were done for JES2 to put the
+LX in JES2's LT and to allow PSF access with their specified AX
+values.  The environment will allow JES2 to issue PCs to each of
+the five PSFs and also issue SSARs, with the PSFs as the
+secondary address space.  The PSFs will execute the two PC
+routines, and are allowed to issue PT back to JES2, and also issue
+SSAR with JES2 as the secondary address space.
+
+Let's look at one more example involving DB2 and CICS.  A DB2
+subsystem involves three address spaces called IRLM (lock
+manager), MSTR (system services), and DBM (database
+manager).  The following information was found for these address
+spaces:
+
+IRLM: AX = 1 (AX = 8 reserved in AXAT).  AT allows AX = 1
+full access and AX = 8 SASN access only.
+
+MSTR and DBM: AX = 5 (AX = 6 reserved by MSTR in AXAT).
+AT allows AX = 1, 5 full access and AX = 6 SASN only.
+
+All three have standard LTs, including only system linkage
+indices.  The LXAT indicates that MSTR has reserved LX values
+of hexadecimal 6C, 6E-72, 74, 76, 79, and 7A.  DBM has
+reserved 7B-7F.  IRLM has none reserved.
+
+The one CICS address space we will look at has the following set:
+
+AX = 6 and the AT allows AX = 5 full access.
+
+The LT has defined LX values 6C, 6E-72, 74, 76, 79-7F, plus 45
+as well.
+
+The LXAT shows that CICS has reserved its own LX of 83.
+
+This means that CICS has several PCs it can execute, to be run in
+both the MSTR and DBM address spaces.  Because AX = 6 is
+SASN-authorised in MSTR and DBM, CICS can also issue SSAR
+(since its AX value is 6).  DBM and MSTR can, of course, issue
+PT back to CICS and issue SSARs as well, since their AX = 5
+value is found in CICS's AT.  IRLM, with AX = 1, has full access
+everywhere, although it doesn't need any of the DB2 PC routines
+(which aren't defined in its LT anyway).  Note that it isn't really
+CICS code but the DB2 code residing in the CICS address space
+that issues the PCs.
+
+The LX of 45 defined in CICS is for OMEGAMON, which is
+utilised at my installation.  The reserved LX of 83 by CICS turns
+out to be for one PC routine in DFHXMP, the CICS program
+responsible for cross memory access for Multi-Region Operation
+(MRO).
+
+Note that an AX of 5 is included in the AT of both MSTR and
+DBM.  These two address spaces are allowed to issue SSARs and
+PTs among each other, although there are no private PCs available
+to each other.  Also note that investigation shows that there are
+several other CICS/DB2 address spaces connected to this DB2
+subsystem, and they all have AX = 6.
+
+In examining my system, three other prominent users of PCs were
+found: RMF, NetView, and CATALOG.
+
+REFERENCE MATERIALS
+
+A lot of details regarding XMS have been ignored here in order to
+concentrate on the basic control blocks and data areas, the
+authorisation mechanisms, and PC access structures.
+
+To gain a more complete understanding, I suggest starting with
+the following material.
+
+1   MVS/XA SPL, System Macros and Facilities, volume 1
+(complete description of MVS/XA services).
+
+2   MVS/XA Principles of Operation (the hardware perspective).
+
+3   MVS Update, Issue 13 (October 1987) (Writing a cross
+memory program).
+
+4   MVS Update, Issue 3 (December 1986) (Using MVS Cross
+Memory Services).
+
+
+Terry Cumming
+Systems Programmer
+Bank of Montreal (Canada) © Xephon 1989
+
+

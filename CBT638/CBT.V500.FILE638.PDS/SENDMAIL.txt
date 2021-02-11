@@ -1,0 +1,1518 @@
+/*REXX*****************************************************************
+ * Program: SENDMAIL
+ * Author:  Hunter Guanghui Zhou
+ *          Phone: 1-(416)-602-9567
+ *          E-mail: zhough2000@yahoo.com
+ * Date:    October 2004
+ **********************************************************************
+ The SENDMAIL program is designed for zSeries Mainframe.
+ All the mail will be sent via internal SMTP mail server.
+ E-mail messages are given through <B>SYSIN DD</B>.
+ All attachments are given through <B>ATTACH DD</B>.
+
+ <H3>Syntax of SYSIN DD:</H3>
+ There is no restriction on SYSIN DD in record length.
+
+ The SYSIN DD have two sections: Header and Body.
+
+ <B>Header:</B>
+   Header is from the first line to the line begin with Subject:
+   There are 4 keywords supported:
+     1. "From:" The email address to send this email (optional)         )
+     2. "To:" The email list for sending this email to (Madatory).
+     3. "Cc:" The email list for copying this email to (Optional).
+     4. "Bcc:" The email list for copying this email with hide (Optional)
+     5. "Subject:" The email subject.(Mandatory)
+   Header support comments, while the body does not.
+   Any text behind "#" will be interpreted as comments.
+   Except for the keyword "Subject:", the value for the all
+   other keywords support multiple line, but one email address
+   must be in one line.
+
+ <B>Body:</B>
+   Email body is the lines after the line of "Subject:".
+   There is no comment allowed in the body, which will be sent
+   as part of email.
+   The body supports HTML formats
+   You may provide your own signature at the end of body.
+
+ <H3>Syntax of ATTACH DD:</H3>
+  This is a text file to instruct SENMAIL batch to send the attachments.
+  You may send multiple attachments in this DD.
+
+  ATTACH DD is an <B>optional</B>. If you do not code this DD, there will be
+  no attachment in the email batch.
+
+  The file must be sequential file (QSAM) in catalog.
+  Special Files:
+    GDG files: The GDG generations is allowed.
+    DD Name:   You can specify DD Names  to be attached in the email,
+               The DD name must be pre-allocated in submit JCL.
+
+   According to SMTP standard RFC 1521, the attchements will be encoded
+   depending on their formats:
+   <PRE>
+    Format  Encoding Algorithm        Sample data
+    ======  ==================  ========================================
+    TEXT    Quoted Printable    Any plain text, source code
+    BINARY  Base64              Images, program readable data (zip,doc...)
+   </PRE>
+   So, you must correctly specify the format of each attachment, otherwise
+   the receivers will not get what they want.
+
+   <B>Guidelines:</B>
+    Please follow following guidelines while preparing this DD:
+    1. Any lead or tailed space(' ') will be ingored.
+    2. Any test beyond '#' will be comments.
+    3. Each attachment will have a separate section leaded by
+       keyword <FONT FACE="COURIER">ATTACHMENT:</FONT>
+    4. There are four sub-keywords for each attachment:
+       'DATASET     =' PS Dataset name, PDS member, GDG file, or DDNAME
+       'RENAME      =' The new name to be used in e-mail. (optional)
+       'FORMAT      =' The format of the dataset, must be TEXT (Optional)
+       'DESCRIPTION =' The description shown in e-mail. (optional)
+    5. If there is no attachment DD, the email batch will ignore this
+       file, and just sent the e-mail message defined in SYSIN DD.
+
+  SYMBOLS:
+     The SYSIN and ATTACH DD support following symbols:
+
+       The SYSIN DD and ATTACH DD can contain following symbols. They
+       will be replaced by correspondant values:
+       SYMBOL     DESCRIPTION                   VALUE
+       ========  ====================       ================================
+       %DATE%    The current date           Current date in yyyymmdd
+       %TIME%    The current time           Current time in hhmmss
+       %YEAR%    The current year           Current date in yyyy
+       %RAND%    Any random value           number between 100000 to 999999
+
+  For any further support, please contact:
+
+  Hunter Guanghui Zhou
+  Phone: 1-(416)-602-9567
+  E-mail: zhough2000@yahoo.com
+
+ =====================================================================
+ */
+
+ /*==========================================================
+  *=Change Following Value to meet your system configuration
+  *==========================================================
+  */
+
+   /* Tell SMTP server which email address to be sended from.
+    * If the SenderEmail is empty, use the default email address:
+    *
+    *  tsoid@hostname.domain.name
+    */
+   SenderEmail = '"Sobeys Ontario Mainframe" it.ontario@sobeys.com'
+
+   /* SMTP Wirter Name. Refer to your SMTP configurations.     */
+   /* Default is SMTP if its empty.                            */
+   SMTP_Writer = 'SMTP'
+
+   /* SMTP output class, Refer to your SMTP configurations.    */
+   /* Default is B is its empty.                               */
+   SMTP_Class  = 'B'
+
+   /* Tell me the time zone of your location                   */
+   /* Default is EST if its empty.                             */
+   TimeZone    = 'EST'
+
+ /*==========================================================
+  *=Do not change from here.                                =
+  *==========================================================
+  */
+SIGNAL ON NOVALUE
+SIGNAL ON HALT
+main:
+   address tso
+   x = Init_Main()
+   x = GetMailSource();    if exitcode \=0 then Exit_Program()
+   x = GetAttachments();   if exitcode \=0 then Exit_Program()
+   x = SendMail()
+   Exit_Program()
+
+Init_Main:
+
+   exitcode   = 0  /* exit code */
+   x=ShowLogo()
+
+   /* Special Thanks to Mau Tran from RDC to provide following
+      code to resolve the TCP/IP host name dynamically
+    */
+   /* get TCP/IP host name and domain name */
+   parse value Socket('Version') with rc . tcp_info
+   parse value Socket('Initialize','myId') with rc .
+   parse value Socket('GetHostName') with rc hostname .
+   parse value Socket('GetDomainName') with rc domain_name .
+
+   /* Set Host Name with domain */
+   HostName     = hostname"."domain_name
+
+   /* set defaults */
+   if SMTP_Writer=='' then SMTP_Writer='SMTP'
+   if SMTP_Class =='' then SMTP_Class ='B'
+   if TimeZone   =='' then TimeZone   ='EST'
+   if SenderEmail=='' then,
+      SenderEmail= '"Mainframe' hostname'" 'SYSVAR('SYSUID')'@'HostName
+   SenderAddrOnly= ''  /* the email address only, set by ParseEm...() */
+
+   /* Verify and Reformat the default Send From Address */
+   x=ParseEmailAddress(SenderEmail, 'FROM:')
+
+   Drop AttachDataset. AttachRename. AttachFormat. AttachDesp.
+   Drop AttachType. MailMsg. OutLines. iOutLine Header.
+   drop Receiverfull. Receiveraddr. SendCCaddr. SendCCfull.
+   drop SendTOaddr. SendTOfull. SendBCCaddr. SendBCCfull.
+   Header.1 = 'FROM:'
+   Header.2 = 'TO:'
+   Header.3 = 'CC:'
+   Header.4 = 'BCC:'
+   Header.5 = 'SUBJECT:'
+   Header.0 = 5
+   ireceivers = 0  /* the number of receivers */
+   irecto     = 0  /* number of to */
+   ireccc     = 0  /* number of cc */
+   irecbcc    = 0  /* number of bcc users */
+
+   OutLines.0 = 0  /* mail output file array */
+   iOutLine   = 0  /* mail output records    */
+   fOutFileOpen = 0  /* The flag of output file: 0:closed 1: opened */
+   AttachDataset.0= 0
+   SendTOfull.0   = 0
+   SendTOaddr.0   = 0
+   SendCCfull.0   = 0
+   SendCCaddr.0   = 0
+   SendBCCfull.0  = 0
+   SendBCCaddr.0  = 0
+
+   TimeStamp = Date('S')'.'Time('L')
+   DateStamp = 'Date: 'Date('W')',' Date() Time() TimeZone
+   BoundaryA =  '_----_=_ZOS_SENDMAIL.'TimeStamp
+   BoundaryAS=  '--'BoundaryA
+   BoundaryAE=  BoundaryAS'--'
+
+   x=SetMIMETypes()
+   return 0
+
+/*===================================================================*/
+/* Generate the SMTP statements.            */
+/* Send the SMTP statements to SMTP Server. */
+SendMail:
+  X=log('SDM020I Building up the SMTP & MIME statements...')
+  x=allocate_mailfile()     /* allocate and open the mail file  */
+  if exitcode \=0 then return exitcode
+  x=addSMTPCommands()       /* Build up the SMTP HELO commands. */
+  if exitcode \=0 then return exitcode
+  x=addEmailBody()          /* Build up the EMAIL main body     */
+  if exitcode \=0 then return exitcode
+  x=addAttachments()        /* Add all attachement files        */
+  if exitcode \=0 then return exitcode
+  x=CopyMailToSMTP()        /* Copy the email body to SMTP      */
+  if exitcode \=0 then return exitcode
+  x=Clean_mailfile()        /* Remove the mail file             */
+  x=log("SDM801I The SENDMAIL program finished successfully.")
+  return exitcode
+/*===================================================================*/
+
+/* Add SMTP start commands */
+addSMTPCommands:
+  x=add('HELO 'HostName)
+  x=add('MAIL FROM: 'SenderAddrOnly)
+  do irc=1 to ReceiverAddr.0
+    x=add('RCPT TO: 'ReceiverAddr.irc)
+  end
+  x=add('DATA')
+  return 0
+
+/* Add MIME Header: The very first MIME header */
+addEmailBody:
+  x=add('Content-Transfer-Encoding: binary')
+  x=add('Content-Type: multipart/related;')
+  x=add('        boundary="'BoundaryA'"')
+  x=add('MIME-Version: 1.0')
+  x=add('X-Mailer: CBTTAPE # 638 Sendmail Package')
+  x=add(DateStamp)
+  x=PrepareReceiverList()  /* prepare To: and Cc: */
+  x=add('Subject: 'HeaderSubject)
+  x=add('')
+  x=add(BoundaryAS)
+  x=add('Content-Transfer-Encoding: quoted-printable')
+  x=add('Content-Disposition: inline')
+  x=add('Content-Type: text/html; charset="iso-8859-1"')
+  x=add('')
+  x=BuildMailBody()   /* Build the mail body in HTML */
+  x=EncodeMailBody()  /* Encode Mail Body in quoted-printable */
+  /* End Of E-Mail Body. */
+  return 0
+
+/* Build The Main Body of the email in pure text.*/
+/* The result is in array:  MailBody.   */
+BuildMailBody:
+  drop MailBody. ibody
+  MailBody.0 = 0
+  ibody  = 0
+  /* add email body HTML text */
+  x=addbody('<HTML><HEAD>')
+  x=addbody('<TITLE>'HeaderSubject'</TITLE></HEAD>')
+  x=addbody('<BODY><FONT FACE="Arial">')
+  /*
+  x=addbody('<CENTER><font face="Times New Roman,Times"',
+        'size=+1 color="Red">')
+  x=addbody('<B>This is an automatic e-mail from 'SenderName'.<BR>')
+  x=addbody('Please do not reply this mail.</B></FONT></CENTER><HR>')
+  */
+  /* insert the mail body */
+  do Item=1 to MailMsg.0
+    x=addbody(MailMsg.Item)
+  end
+
+  /* Show Email Attachments Info in email body.  */
+  if AttachDataset.0 > 0 then do
+    x=addbody('<HR><FONT SIZE="+1"><B>Attachments: Total',
+          AttachDataset.0)
+    x=addbody(' Files in This Email.</B></FONT><P>')
+    x=addbody('<TABLE BORDER="1" STYLE="font-size=10pt" FRAME="box" ',
+          ||'ALIGN="LEFT"><TBODY>')
+    DO iAtts=1 to AttachDataset.0
+      x=addbody('<TR ALIGN="CENTER" BGCOLOR="#C0C0C0">')
+      x=addbody('<TH COLSPAN=2>Attachment # ',
+          ||iAtts' of 'AttachDataset.0'</TH><TR>')
+      x=addbody('<TR ALIGN="LEFT"><TD>File Name</TD>',
+          ||'<TH><FONT FACE="Courier">')
+      x=addbody('<A HREF="cid:ATTACHID'iAtts,
+          ||'">'AttachRename.iAtts'</A>')
+      x=addbody('</FONT></TH></TR>',
+          ||'<TR ALIGN="LEFT"><TD>Description</TD><TH><I>')
+      x=addbody(AttachDesp.iAtts)
+      x=addbody('</I></TH></TR>',
+          ||'<TR ALIGN="LEFT"><TD>File Format</TD><TH>',
+          ||AttachFormat.iAtts'</TH></TR>')
+    end
+    x=addbody('</TBODY></TABLE><P>')
+  end
+  x=addbody('</FONT></BODY></HTML>')
+  MailBody.0 = ibody
+
+  return 0
+
+addbody:
+  parse arg givenline
+  ibody  = ibody + 1
+  MailBody.ibody = givenline
+return 0
+
+/* Add all attachement files     */
+addAttachments:
+  /* Preparing the email attachment. */
+  if AttachDataset.0 > 0 then do
+    X=log('SDM200I Preparing the attachments...')
+    do iAtts=1 to AttachDataset.0
+      acode = EnCodeAttachment(iAtts)
+      if acode >0 then leave
+    end
+    if acode > 0 then do
+       x=log('SDM250E There is a problem while preparing attachments.')
+       return acode
+    end
+    X=log('SDM280I The attachments are all prepared.')
+  END  /* There is attachments  */
+
+  return 0
+
+/***************************/
+allocate_mailfile:
+  File_mailfile = GetRandomDsn()
+  if File_mailfile=='' then do
+      x=log('SDM012E Cannot get the temporary mail file name.')
+      x=log('SDM011E Send Mail program initialization failed.')
+      exitcode = 8
+      return 8
+  end
+  "ALLOC F(SDM$MAIN) DA('"File_mailfile"') SPACE(15,15) CYLINDERS",
+     "RECFM(F B) LRECL(76) NEW CATALOG"
+  if RC\=0 then do
+      x=log('SDM014E Cannot allocate the temporary mail file.')
+      x=log('SDM015E Send Mail program initialization failed.')
+      exitcode = 8
+      return 8
+  end
+  /* keep the file open */
+  fOutFileOpen = 1
+ return 0
+
+open_mailfile:
+  if fOutFileOpen == 1 then return 0
+  "ALLOC F(SDM$MAIN) DA('"File_mailfile"') MOD REUSE"
+  "EXECIO 0 DISKW SDM$MAIN (OPEN"
+  Drop OutLines. iOutLine
+  OutLines.0 = 0
+  iOutLine   = 0
+  fOutFileOpen = 1
+ return 0
+
+close_mailfile:
+  if fOutFileOpen == 0 then return 0
+  OutLines.0 = iOutLine
+  if iOutLine>0 then    /* save and close the file */
+     "EXECIO * DISKW SDM$MAIN (STEM OutLines. FINIS"
+  else     /* just close the file */
+     "EXECIO 0 DISKW SDM$MAIN (FINIS"
+  "FREE F(SDM$MAIN)"
+  Drop OutLines. iOutLine
+  OutLines.0 = 0
+  iOutLine   = 0
+  fOutFileOpen = 0
+return 0
+
+add:
+  parse arg givenline
+  if givenline == '' then givenline = ' '
+  iOutLine = iOutLine + 1
+  OutLines.iOutLine = givenline
+return 0
+
+clean_mailfile:
+  parse arg msg
+  if Msg \= '' then x=log(Msg)
+  if fOutFileOpen == 1 then x=close_mailfile()
+  if File_mailfile \= '' then do
+     X=MSG('OFF')
+     "DELETE '"File_mailfile"' SCRATCH NONVSAM"
+     X=MSG('ON')
+  end
+return 0
+
+
+/* copy the generated dataset to SMTP */
+CopyMailToSMTP:
+  X=log('SDM300I Sending the SMTP statements to SMTP server...')
+  /* add the end of boundary */
+  x=add(BoundaryAE)
+  x=close_mailfile()        /* Close the mail file              */
+  /*Send The mail message. */
+  x=Msg('off')
+  "FREE F(SYSIN)"
+  "FREE F(SYSUT1)"
+  "FREE F(SYSUT2)"
+  "FREE F(SYSPRINT)"
+  "ALLOC F(SYSUT1) DA('"File_mailfile"') SHR REUSE"
+  "ALLOC F(SYSUT2) SYSOUT("SMTP_Class") WRITER("SMTP_Writer")"
+  "ALLOC F(SYSPRINT) DUMMY"
+  "ALLOC F(SYSIN) DUMMY"
+  "CALL *(IEBGENER)"
+  if rc\=0 then,
+     x=setrc(rc,'SDM304E There is a error while copying data to SMTP')
+  "FREE F(SYSIN)"
+  "FREE F(SYSUT1)"
+  "FREE F(SYSUT2)"
+  "FREE F(SYSPRINT)"
+  x=Msg('ON')
+  X=log('SDM301I E-Mail has been sent to SMTP Server.')
+  return 0
+
+/* add email body HTML text */
+EncodeMailBody:
+  iErr = 0
+  x=close_mailfile()  /* Close the mail file for encode program */
+  x=CleanENC("SDM110I Encoding Email Body in Quoted Printable Mode")
+  "ALLOC F(SDM$INDD) NEW REUSE RECFM(F B) LRECL(255) SPACE(15,15) TRACK"
+  if RC \= 0 then do
+     x=setrc(8,"SDM110E Cannot allocate temporary file for email body.")
+     return exitcode
+  end
+  /* save the email body to the end of current email file.*/
+  "EXECIO * DISKW SDM$INDD (STEM MailBody. FINIS"
+  if RC \= 0 then do
+     x=setrc(8,"SDM110E Cannot update temporary file for email body.")
+     return exitcode
+  end
+  "ALLOC F(SDM$OUDD) DA('"File_mailfile"') MOD REUSE"
+  "ALLOC F(SYSPRINT) DUMMY"
+  rc=EncodeFile('TEXT')
+  if rc\=0 then do
+    x=log("SDM114E Error while encoding email body.")
+    return exitcode
+  end
+  x=CleanENC("SDM118I Finished encoding the email body.")
+  x=open_mailfile()
+  return 0
+
+/*===================================================================*/
+EnCodeAttachment:
+  parse arg iAtts
+  ecode = 0
+  appl = getmimeappl(AttachRename.iAtts,AttachFormat.iAtts)
+  x=add(BoundaryAS)
+  x=add('Content-Type: 'appl)
+  x=add('        name="'AttachRename.iAtts'"')
+  if pos('TEXT',AttachFormat.iAtts)==1 then
+     x=add('Content-Transfer-Encoding: quoted-printable')
+  else
+     x=add('Content-Transfer-Encoding: base64')
+  x=add('Content-Id: ATTACHID'iAtts)
+  x=add('Content-Disposition: attachment;')
+  x=add('        filename="'AttachRename.iAtts'"')
+  x=add(' ')
+  x=close_mailfile()
+  inddname= 'SDM$INDD'
+  /* save the email body to the end of current email file.*/
+  x=CleanENC("SDM200I Encoding" AttachDataset.iAtts' in',
+             AttachFormat.iAtts' mode.')
+  if AttachType.iAtts == 'DDNAME' then
+     inddname = AttachDataset.iAtts
+  else do
+     "ALLOC F(SDM$INDD) DA('"AttachDataset.iAtts"') REUSE SHR"
+     if rc \= 0 then do
+        X = log("SDM202E Cannot allocate "AttachDataset.iAtts)
+        return 8
+     end
+  end
+  "ALLOC F(SDM$OUDD) DA('"File_mailfile"') MOD REUSE"
+  "ALLOC F(SYSPRINT) SPACE(2,2) TRACK RECFM(F B) LRECL(133) NEW DELETE"
+  acode=EncodeFile(AttachFormat.iAtts,inddname)
+  if acode\=0 then do
+    "EXECIO * DISKR SYSPRINT (STEM SYSPOUT. FINIS"
+    if rc ==0 then do
+       X=log('SDM204I The output the email encode program:')
+       do iso=1 to SyspOut.0
+         say '     'strip(SyspOut.iso,'T')
+       end
+    end
+    x=CleanENC("SDM206E Error while encoding " AttachDataset.iAtts)
+    return 8
+  end
+  x=CleanENC("SDM208I Finished encoding" AttachDataset.iAtts)
+  x=open_mailfile()
+return acode
+
+EncodeFile:
+  parse arg dataformat,indd,outdd
+  if indd =='' then indd='SDM$INDD'
+  if outdd=='' then outdd='SDM$OUDD'
+  "CALL *(EMAILENC) '"dataformat","indd","outdd"'"
+  if rc\=0 then x=setrc(rc)
+  return rc
+
+CleanENC:
+  parse arg msg
+  if Msg \= '' then x=log(Msg)
+  X=MSG('OFF')
+  "FREE F(SDM$OUDD)"
+  "FREE F(SDM$INDD)"
+  "FREE F(SYSPRINT)"
+  X=MSG('ON')
+return 0
+
+/*===================================================================*/
+/* Get the SYSIN DD.
+   Header: From:   Somebody <emailaddress>
+           Cc:     "Name1" <email1>,
+                   "Name2" <email2>,
+                   "Name3" <email3>
+           Bcc:    "Name1" <email1>,
+                   "Name2" <email2>,
+                   "Name3" <email3>
+           Subject:  Any subject in one line.
+   Subject will be the last line in the header.
+   Any line after the subject line will be sent as is.
+
+*/
+GetMailSource:
+
+  X=log("SDM030I Reading the data in SYSIN DD...")
+  Drop InSource.   /*The SYSIN lines. */
+  if CheckDDName('SYSIN')==0 then do
+     X=log("SDM032E There is no SYSIN DD.")
+     return 8
+  end
+
+  "EXECIO * DISKR SYSIN (STEM INSource. FINIS"
+  if RC\=0 then do
+     X=log("SDM034E There is a problem while read SYSIN DD.")
+     return 8
+  end
+  EMailSendFrom    = 1
+  EMailSendTo      = 2
+  EMailSendCc      = 3
+  EMailSendBcc     = 4
+  EMailSendSubject = 5
+  EMailSendAllAddr = 6  /*All receivers email address list.*/
+
+  isHeader = 1
+  im       = 1
+  Continue = 0   /* There is no continuation. */
+  iErr     = 0
+  addbr    = 1   /* add <BR> at the end of message body record */
+  itype    = '';
+  DO item=1 to INSource.0
+     /* just get the first 72 characters, column 73-80 are ignored */
+     /*  INSource.Item=replace_symbols(substr(INSource.Item,1,72))
+      */
+
+     if isHeader == 0 then do  /* Normal email body. */
+        MailMsg.im = strip(INSource.item,'T')
+        OneLine = MailMsg.im
+        upper OneLine
+        if pos('<PRE>', OneLine) > 0 then addbr = 0
+        if pos('</PRE>', OneLine) > 0 then addbr= 2
+        if addbr == 1 & right(OneLine,3) \= '<P>' &,
+           right(OneLine,4) \= '<BR>' then
+           MailMsg.im = MailMsg.im||'<BR>'
+        if addbr == 2 then addbr = 1
+        im=im+1
+        iterate
+     end
+
+     /* Processing header only. */
+     Line = strip(INSource.item)
+     if left(line,1) == '#' | line == '' then iterate
+     if pos('#', line) > 0 then
+        Line = strip(substr(Line,1,pos('#',Line)-1))
+     ULine = Line
+     Upper ULine
+
+     /* SUBJECT: is the last line of header */
+     if pos('SUBJECT:', ULine) == 1 then do
+          HeaderSubject = strip(substr(Line,9))
+          isHeader = 0
+          iterate
+     end
+
+     Found = 0
+     if pos(':', line) > 0 then do  /* a new header type */
+       do ih=1 to 4 /* Scan Headers Tags */
+         if pos(Header.ih, Strip(ULine)) == 1 then do
+           Found = 1
+           itype = Header.ih
+           gms1addr=strip(substr(line, pos(itype, ULine)+Length(itype)))
+           x=ParseEmailAddress(gms1addr, itype)
+           leave
+         end
+       end
+     end /* end of if */
+     else do /* continued address or error */
+        if itype \= '' then x=ParseEmailAddress(Line, itype)
+        else do
+            X=log("SDM036E The following head message is invalid:")
+            say INSource.item
+        end
+     end
+
+  END  /* do loop */
+
+  MailMsg.0   = im -1
+  if iErr > 0 then return 8
+
+  if irecto==0 then do  /* no SEND TO.  */
+     X=log('SDM038E There is no email address for TO: in SYSIN DD:.')
+     call HelpMessage
+     return 8
+  end
+
+  Receivers = ''       /* save all addresses. */
+
+  /*Check and reformat the address lists */
+  X=log('SDM040I Inputs from SYSIN DD:')
+  X=log('SDM041I Email Address of From:')
+  say '    'SenderEmail
+
+  X=log('SDM042I Email Address of To:')
+  do irc=1 to  SendTOfull.0
+     if irc == 1 then say '    'SendTOfull.irc
+     else             say '    'SendTOfull.irc
+  end
+  if ireccc > 0 then do
+     X=log('SDM043I Email Address of CC:')
+     do irc=1 to ireccc
+        if irc == 1 then say '    'SendCCfull.irc
+        else             say '    'SendCCfull.irc
+     end
+  end
+
+  if irecbcc > 0 then do
+     X=log('SDM044I Email Address of BCC:')
+     do irc=1 to irecbcc
+        if irc == 1 then say '    'SendBCCfull.irc
+        else             say '    'SendBCCfull.irc
+     end
+  end
+
+  x=log('SDM046I All Receivers lists:')
+  do irc=1 to Receiveraddr.0
+     say '    'Receiveraddr.irc
+  end
+
+  X=log("SDM048I Finished reading the data in SYSIN DD.")
+  if iErr > 0 then return 8
+  return 0
+
+/*
+  add the email address information into array
+    ReceiverAddr and ReceiverFull
+  Type:
+   TO, CC, BCC
+*/
+addreceiver:
+  parse arg emailaddr,emailfull,type
+  if type == '' then type = 'TO'
+  found = 0
+
+  /* remove any duplicate email address */
+  if ireceivers > 0 then do
+     do irc=1 to ireceivers
+        if emailaddr == Receiveraddr.ireceivers then do
+           found = 1
+           leave
+        end
+     end
+  end
+
+  if found then do
+    x=log('SDM050W The duplicated address 'emailaddr' is ignored.')
+    return 0
+  end
+
+  ireceivers = ireceivers + 1
+  Receiverfull.ireceivers = emailfull
+  Receiveraddr.ireceivers = emailaddr
+  Receiverfull.0 = ireceivers
+  Receiveraddr.0 = ireceivers
+
+  if type == 'TO:' then do
+     irecto = irecto + 1
+     SendTOfull.irecto = emailfull
+     SendTOaddr.irecto = emailaddr
+     SendTOfull.0 = irecto
+     SendTOaddr.0 = irecto
+  end
+
+
+  if type == 'CC:' then do
+     ireccc = ireccc + 1
+     SendCCfull.ireccc = emailfull
+     SendCCaddr.ireccc = emailaddr
+     SendCCfull.0 = ireccc
+     SendCCaddr.0 = ireccc
+  end
+
+  if type == 'BCC:' then do
+     irecbcc = irecbcc + 1
+     SendBCCfull.irecbcc = emailfull
+     SendBCCaddr.irecbcc = emailaddr
+     SendBCCfull.0 = irecbcc
+     SendBCCaddr.0 = irecbcc
+  end
+
+  return 0
+
+/*===================================================================*/
+/* add the from: to: cc: bcc: into MIME header. */
+PrepareReceiverList:
+  x=add('From: 'SenderEmail)
+
+  do irc=1 to  SendTOfull.0
+     if SendTOfull.0==1 then x=add('To: 'SendTOfull.irc)
+     else if irc == 1 then x=add('To: 'SendTOfull.irc',')
+     else if irc\=SendTOfull.0 then x=add('    'SendTOfull.irc',')
+     else x=add('    'SendTOfull.irc)
+  end
+
+  do irc=1 to  SendCCfull.0
+     if SendCCfull.0==1 then x=add('Cc: 'SendCCfull.irc)
+     else if irc == 1 then x=add('Cc: 'SendCCfull.irc',')
+     else if irc\=SendCCfull.0 then x=add('    'SendCCfull.irc',')
+     else x=add('    'SendCCfull.irc)
+  end
+
+  do irc=1 to  SendBCCfull.0
+     if SendBCCfull.0==1 then x=add('Bcc: 'SendBCCfull.irc)
+     else if irc == 1 then x=add('Bcc: 'SendBCCfull.irc',')
+     else if irc\=SendBCCfull.0 then x=add('    'SendBCCfull.irc',')
+     else x=add('    'SendBCCfull.irc)
+  end
+
+return 0
+
+/*===================================================================
+  Parse Email Address:
+    Verify the email address format.
+    Reformat the email address as follows:
+        email: <address@company.com>
+        full : "First Last" <address@company.com>
+    Add the email address to send arrays
+*/
+ParseEmailAddress:
+  parse arg AddrSource, AddrType
+  if AddrSource == '' then return 0
+  iErr = 0
+  NoNames=1
+  do while AddrSource \= ''
+     parse var AddrSource OneAddress ';' AddrSource
+     OneAddress = strip(OneAddress)
+     AddrSource = Strip(AddrSource)
+     if pos(' ', OneAddress) >0 then do
+        LastSpace=length(OneAddress)-pos(' ',reverse(OneAddress))
+        EMail = substr(OneAddress, LastSpace+1)
+        Name  = substr(OneAddress, 1, LastSpace)
+     end
+     else do
+        Name = '';
+        Email = OneAddress
+     end
+     Name = Strip(Name)
+     EMail= Strip(EMail)
+     rEMail = reverse(EMail)
+
+     if pos('@', EMail) <= 1 then do
+        X=log("SDM060E The Email address("EMail") in "AddrType" is invalid:",
+              "There is no '@' in address.")
+        iErr = iErr+1
+     end
+
+     if pos('@', EMail) > 1,
+      & pos('@', rEMail) < pos('.', rEMail) then do
+        X=log("SDM062E The Email address("EMail") in "AddrType" is invalid:",
+              "There is no '.' in domain.")
+        iErr = iErr+1
+     end
+
+     if pos('"', Name) > 1,
+      & pos('"', Name) \= length(Name) then do
+        X=log("SDM064E The Email address("EMail") in "AddrType" is invalid:",
+              'The " is improper.')
+        iErr = iErr+1
+     end
+
+     if left(Name,1)== '"',
+      & right(Name,1)\= '"' then do
+        X=log("SDM066E The Email address("EMail") in "AddrType" is invalid:",
+              'The " is unmatch.')
+        iErr = iErr+1
+     end
+
+     if left(Name,1)== "'",
+      & right(Name,1)\= "'" then do
+        X=log("SDM068E The Email address("EMail") in "AddrType" is invalid:",
+              "The ' is unmatch.")
+        iErr = iErr+1
+     end
+
+     if left(Name,1)\='"'&left(Name,1)\="'" then Name = '"'Name
+
+     if right(Name,1)\='"'&right(Name,1)\="'" then do
+        if left(Name, 1) =="'" then Name = Name"'"
+        else Name=Name'"'
+     end
+     if left(EMail,1)  \= '<' then Email = '<'Email
+     if right(EMail,1) == ',' then,
+        Email = substr(Email,1,length(Email)-1)
+     if right(EMail,1) \= '>' then Email = Email'>'
+
+     if AddrType=='TO:' | AddrType=='CC:' | AddrType=='BCC:' then
+        x=addreceiver(EMail, Name' 'Email, AddrType)
+     else do /* send from */
+        SenderEmail= Name' 'Email
+        SenderAddrOnly = Email
+     end
+  end
+
+return iErr
+
+/*===================================================================*/
+/*    AttachDataset. The Dataset name
+      AttachRename.  The new name shown in attachement.
+      AttachFormat.  The format for dataset
+      AttachDesp.    The description for dataset
+*/
+GetAttachments:
+  parse arg AttachDD
+  if AttachDD == '' then AttachDD = 'ATTACH' /*Default is ATTACH DD*/
+  ValidChars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+             '0123456789._@'
+  if CheckDDName(AttachDD)==0 then return 0
+
+  Drop AttachDataset.
+  Drop AttachRename.
+  Drop AttachFormat.
+  Drop AttachDesp.
+  Drop Attachs.     /* Store all source lines in ATTACH DD. */
+  Drop ErrorMsg.    /* Store all Error Messages.            */
+
+  AttachDataset.0 =0
+  AttachRename.0  =0
+  AttachFormat.0  =0
+  AttachDesp.0    =0
+  Attachs.0       =0
+  ErrorMsg.0      =0
+  iErr = 1
+
+  X=log("SDM230I Reading the data in ATTACH DD...")
+
+  "EXECIO * DISKR ATTACH (STEM Attachs. FINIS"
+  if RC\=0 then do
+     X=log("SDM234E There is an error while access ATTACH DD.")
+     X=log("SDM236W All the attachement are ignored.")
+     return 0
+  end
+
+  if RC > 4 then return RC
+
+  if Attachs.0 == 0 then do; AttachDataset.0 = 0; return 0; end
+  iAtts = 0         /* Number of attachments. */
+  NewAttaches  = 0  /* Whether there is a new section. */
+  do il=1 to Attachs.0
+    if left(strip(Attachs.il), 1) == '#' then iterate
+    Attachs.il = replace_symbols(substr(Attachs.il,1,72))
+    OneLine = strip(Attachs.il); upper Oneline
+    if pos('ATTACHMENT:', OneLine) == 1 then do /*New Section*/
+      if iAtts > 0 then do /*validate keywords of previous attach file*/
+           X=ValidateAttachment(iAtts)
+           if x \= 0 then leave /* There is an error. */
+      end
+      NewAttaches  = 1
+      iAtts = iAtts + 1
+      AttachFormat.iAtts = 'TEXT'
+      AttachDesp.iAtts   = ''
+      AttachRename.iAtts = ''
+    end /* if new section. */
+    else do /* Get the keywords and values. */
+      if NewAttaches < 1 then do
+         ErrorMsg.iErr='The line 'il' is invalid:'
+         ErrorMsg.0 = iErr; iErr = iErr + 1
+         ErrorMsg.iErr=Attachs.il
+         ErrorMsg.0 = iErr; iErr = iErr + 1
+      end
+      parse var Attachs.il AttKeyword '=' AttValue
+      AttKeyword = Strip(AttKeyword)
+      upper AttKeyword
+      AttValue   = Strip(AttValue)
+      OneLine    = AttValue
+      upper OneLine
+      SELECT
+        when AttValue=='' then iterate
+        when AttKeyword=='DATASET'     then
+        do
+             AttachDataset.iAtts=AttValue
+             upper AttachDataset.iAtts
+             if length(AttValue) <= 8 & pos('.', AttValue) ==0 then
+                AttachType.iAtts   = 'DDNAME'  /* This is a DD Name */
+             else
+                AttachType.iAtts   = 'DSNAME'  /* This is a Dataset */
+        end
+        when AttKeyword=='RENAME' then AttachRename.iAtts = AttValue
+        when AttKeyword=='FORMAT' then AttachFormat.iAtts = OneLine
+        when AttKeyword=='DESCRIPTION' then AttachDesp.iAtts   =AttValue
+        otherwise do
+          ErrorMsg.iErr='The line 'il' is invalid:'
+          ErrorMsg.0 = iErr; iErr = iErr + 1
+          ErrorMsg.iErr=Attachs.il
+          ErrorMsg.0 = iErr; iErr = iErr + 1
+        end /*Otherwise*/
+      END /*select */
+    end /*else*/
+  END /*do loop*/
+
+  /* Validate the last one. */
+  if NewAttaches > 0 then X=ValidateAttachment(iAtts)
+
+  AttachDataset.0 = iAtts
+  if iAtts > 0 then do
+     if iAtts == 1 then
+          X=log('SDM240I There is just one attachement:')
+     else
+          X=log('SDM242I There are 'AttachDataset.0' attachements in',
+                    'ATTACH DD. Here are they:')
+     do item = 1 to AttachDataset.0
+          say '      Attachment #'item
+          say '        Dataset Name: 'AttachDataset.item
+          say '        Format      : 'AttachFormat.item
+          say '        New Name    : 'AttachRename.item
+          say '        Description : 'AttachDesp.item
+     end
+  end
+  else X=log('SDM244W There is no attachment specified.')
+  X=log("SDM250I Finished reading the data in ATTACH DD.")
+
+  if ErrorMsg.0 > 0 then do
+     x=log('SDM250W There is an error while reading the attachment.')
+     do iErr=1 to ErrorMsg.0
+        X=log(ErrorMsg.iErr)
+     end
+     return 8
+  end
+
+  Drop Attachs.     /* Store all source lines in ATTACH DD. */
+  Drop ErrorMsg.    /* Store all Error Messages.            */
+return 0
+
+/*===================================================================*/
+ValidateAttachment:
+   parse arg iAttach
+   iAtts  = iAttach
+
+   /* If the file is a DD name verify the DD name is allocated. */
+   if AttachType.iAtts == 'DDNAME' then do
+      if CheckDDName(AttachDataset.iAtts)==0 then do
+         ErrorMsg.iErr='SDM260E The DD Name ('AttachDataset.iAtts')',
+                       'in ATTACHMENT #'iAtts 'is not allocated.'
+         ErrorMsg.0 = iErr; iErr = iErr + 1; return iErr
+      end
+      else return 0
+   end
+
+   DSName = GetRealDatasetName(AttachDataset.iAtts)
+
+   if DSName == '' then do
+      ErrorMsg.iErr='SDM262E The dataset ('AttachDataset.iAtts')',
+                    'in ATTACHMENT #'iAtts 'is invalid.'
+      ErrorMsg.0 = iErr; iErr = iErr + 1; return iErr
+   end /* if no dataset name */
+
+   AttachDataset.iAtts = DSName
+   x=listdsi("'"AttachDataset.iAtts"'")
+   if ( SYSDSORG \= 'PO' | pos('(', AttachDataset.iAtts) ==0 ),
+      & SYSDSORG \= 'PS' then do
+        ErrorMsg.iErr='SDM264E The dataset('AttachDataset.iAtts')',
+           'format ('SYSDSORG') is not a sequential file.'
+        ErrorMsg.0 = iErr; iErr = iErr + 1; return iErr
+   end /*if */
+
+   if AttachFormat.iAtts == '' then AttachFormat.iAtts = 'TEXT'
+   upper AttachFormat.iAtts
+   if pos('TEXT', AttachFormat.iAtts)==0,
+    & pos('BINARY', AttachFormat.iAtts) == 0 then do
+      ErrorMsg.iErr='SDM266E The format ('AttachFormat.iAtts,
+            ') of dataset('AttachDataset.iAtts') is not supported.'
+      ErrorMsg.0 = iErr; iErr = iErr + 1; return iErr
+   end
+
+   if AttachRename.iAtts == '' then do
+      if pos('(', AttachDataset.iAtts)>1, /* For PDS member. */
+       & pos(')', AttachDataset.iAtts)>1 then do
+           parse var AttachDataset.iAtts,
+              PDSName '(' AttachRename.iAtts ')'
+           AttachRename.iAtts = AttachRename.iAtts'.txt'
+      end
+      else AttachRename.iAtts=AttachDataset.iAtts
+   end /*if ==0  */
+   else do /*Validate the new name of the attachments. */
+      DO iC1=1 to length(AttachRename.iAtts)
+         Found = 0
+         ThisChar = substr(AttachRename.iAtts, iC1, 1)
+         DO iC2=1 to length(ValidChars)
+            if ThisChar == substr(ValidChars, iC2, 1) then do
+               Found = 1; leave
+            end
+         END
+         if Found == 0 then do
+            ErrorMsg.iErr='SDM268E The rename ('AttachRename.iAtts,
+              ') of dataset('AttachDataset.iAtts') is not invalid.'
+            ErrorMsg.0 = iErr; iErr = iErr + 1; return iErr
+         END /* IF */
+      end /*DO IC1 loop */
+   end   /*else if */
+
+   if AttachDesp.iAtts == '' then,
+       AttachDesp.iAtts = 'The original file: 'AttachDataset.iAtts
+
+return 0
+
+/************************************************
+*  Verify if given DD name is allocated or not. *
+*  If not found, return 0                       *
+*  If found, return nnn dataset names           *
+*     nnn is total number of datasets allocated.*
+*     the dataset names separated by spaces.    *
+*************************************************/
+CheckDDName:
+  parse Arg reqdd .
+  tcb = d2x(C2d(Storage('21c', 4)) + 12)
+  tiot = c2d(Storage(tcb, 4))+24
+  xlen = 0
+  xstring = ''
+  dsnames = 0
+  Do Forever
+    tiot = tiot + xlen
+    addr = tiot
+    xlen = C2d(Storage(D2x(addr), 1))
+    If xlen = 0 Then leave
+    If Bitand(Storage(d2x(addr + 1), 1), '80'x) = '80'x Then iterate
+    addr = tiot + 4
+    ddname = Strip(Storage(D2x(addr), 8))
+    if ddname \='' & dsnames>0 then leave
+    if ddname == reqdd | dsnames>0 then do
+        addr = tiot + 12
+        dsnaddr = d2x(c2d(Storage(d2x(addr),3)) + 16)
+        dsname  = strip(Storage(dsnaddr, 44), 'T')
+        xstring = xstring dsname
+        dsnames = dsnames + 1
+    end
+  End
+  drop tcb tiot xlen addr ddname
+  if dsnames==0 then return 0
+  else Return dsnames||xstring
+
+/*===================================================================*/
+HelpMessage:
+   SAY '**************************************************************'
+   SAY 'Usage of SENDMAIL.'
+   SAY ''
+   SAY 'This is a sendmail program designed for zSeries Mainframe.'
+   SAY 'All the mail will be sent via SMTP internal mail server.'
+   SAY 'Mail message must be given through SYSIN DD.'
+   SAY ''
+   SAY 'Syntax of SYSIN DD:'
+   SAY 'The SYSIN DD have two sections: Header and Body.'
+   SAY ''
+   SAY 'Header:'
+   SAY '  Header is from the first line to the line begin with Subject:'
+   SAY '  There are 4 keywords supported:'
+   SAY '    1. "From:" The email address for the sender.'
+   SAY '    2. "To:" The email list for sending this email to.'
+   SAY '    3. "Cc:" The email list for copying this email to.'
+   SAY '    4. "Bcc:" The email list for copying this email with hide.'
+   SAY '    5. "Subject:" The email subject.'
+   SAY '  Header support comments, while the body does not. '
+   SAY '  Any line begin with "#" will be interpreted as comments.'
+   SAY '  Except for the keyword "Subject:", the value for the all'
+   SAY '  other keywords support multiple line, but one email address'
+   SAY '  must be in one line.'
+   SAY ''
+   SAY 'Body:'
+   SAY '  Body is all lines after the line of "Subject:"'
+   SAY '  There is no comment allowed in the body, which will be sent'
+   SAY '  as part of email.'
+   SAY '  The body support HTML formats'
+   SAY ''
+   SAY 'Symbols:'
+say '  The SYSIN DD and ATTACH DD can contain following symbols. They '
+say '  will be replaced by correspondant values:'
+say '  SYMBOL     DESCRIPTION                   VALUE'
+say '  ========  ====================       ================================'
+say '  %DATE%    The current date           Current date in yyyymmdd'
+say '  %TIME%    The current time           Current time in hhmmss'
+say '  %YEAR%    The current year           Current date in yyyy'
+say '  %RAND%    Any random value           number between 100000 to 999999'
+say ''
+   SAY ''
+   SAY 'For any further support, please contact:'
+   SAY ''
+   SAY 'Hunter Zhou'
+   SAY 'Tel: (905) 671-5208'
+   SAY 'guanghui.zhou@sobeys.com'
+   SAY ''
+   RETURN
+
+/*===================================================================*/
+/******************************************************/
+/* Function: log()                                    */
+/******************************************************/
+debug:
+log:
+   parse arg Msg
+   say date('S')", "time()", "Msg
+   return 0
+
+/******************************************************/
+/* Generate a ramdon dataset name.
+   Format:
+   Prefix.DTyyddd.Nnnnnnnn.Suffix
+     yyyy   : 4 digits of year
+     ddd    : 3 digits of day of the year.
+     nnnnnnn: 7 digits in random number.
+*/
+GetRandomDSN:
+  parse arg rPrefix,rSuffix
+  retrylimit = 20
+  if rPrefix='' then rPrefix=SYSVAR('SYSUID')||'.SENDMAIL.TEMPFILE'
+  /* make sure the dataset does not exists. */
+  do i=0 to retrylimit
+     rDSN = rPrefix||'.S'||rand(6)
+     if rSuffix\='' then rDSN = rDSN||'.'||rSuffix
+     if LISTDSI("'"rDSN"'") > 4 then leave
+     if i==retrylimit then do
+       x=log("SDM080E Cannot allocate the temporary dataset")
+       x=log("SDM082E Dataset: "||rDSN)
+       rDSN = ''
+       leave
+     end
+  end
+return rDSN
+
+/*===================================================================*/
+/*GetRealDatasetName:
+  Get GDG list for given GDG name, the list is in GDGList.
+  The function will return the latest generation of GDG.
+  HLQ....LLQ(-1)
+*/
+GetRealDatasetName:
+  parse arg SrcDSN
+  DROP GDGResult. GDGList. Generation iDGD iTgt DSName Minus
+  iGDG  = 0        /*Number of GDG Generation.*/
+  Minus = 0
+  Generation = 0
+  upper SrcDSN
+  if pos('(', SrcDSN)>0 then
+        parse var SrcDSN DSName '(' Generation ')'
+  else do /* normal sequential file */
+    x=listdsi("'"SrcDSN"'")
+    if x>4 | SYSDSORG \= 'PS' then return ''
+    return SrcDSN
+  end
+
+  /* Test if this is a PDS */
+  if pos('-', Generation)==0 & pos('+', Generation)==0 &,
+     Generation \= '0' then do
+     x=listdsi("'"DSName"'")
+     if x>4 then return '' | SYSDSORG \= 'PO' then return ''
+     return SrcDSN
+  end
+
+  /* Process GDG files */
+  Generation = strip(Generation)
+  if Generation == '' | Generation == '-0' | Generation == '+0' then,
+     Generation=0
+
+  if pos('-', Generation) == 1 then do /* minus */
+     parse var Generation '-' Generation
+     minus = 1
+  end
+  x=Msg('OFF')
+  "FREE F(SYSIN)"
+  "FREE F(SYSPRINT)"
+  "ALLOCATE F(SYSIN) SPACE(1,1) TRACK LRECL(80) NEW DELETE"
+  "ALLOCATE F(SYSPRINT) SPACE(1,2) CYLINDER LRECL(133) NEW DELETE"
+  GDGResult.0 = 1
+  GDGResult.1 = "  LISTCAT ENTRY("DSNAME")"
+  "EXECIO * DISKW SYSIN (STEM GDGRESULT. FINIS"
+  "CALL *(IDCAMS)"
+  "EXECIO * DISKR SYSPRINT (STEM GDGResult. FINIS"
+  "FREE F(SYSIN)"
+  "FREE F(SYSPRINT)"
+  x=Msg('ON')
+  Begin = 0
+  /* This is not a GDG file. */
+  if pos('GDG BASE', GDGResult.4) == 0 then return ''
+
+  DO iG=1 TO GDGResult.0
+    if pos('0   NONVSAM ---- ', GDGResult.iG) ==1 then do
+       parse var GDGResult.iG rest1 '----' GDGName1
+       iGDG=iGDG+1
+       GDGList.iGDG=strip(GDGName1)
+    end
+  END
+  if iGDG == 0 then return ''
+  select
+     when Generation == 0 then iTgt = iGDG
+     when minus then           iTgt = iGDG - Generation
+     otherwise                 iTgt = iGDG + Generation
+  end
+  /* out of range. */
+  if iTgt > iGDG | iTgt < 0 then return ''
+  GDGName = GDGList.iTgt
+  DROP GDGResult. GDGList. Generation iDGD iTgt DSName Minus
+return GDGName
+
+/* ================================================================*/
+/* subroutine: Replace_Symbols() */
+replace_symbols:
+  parse arg record
+  testrec  = record
+  upper testrec
+  today = Date('S')
+  /* convert the date format to standard format yyyymmdd   */
+  if pos('%DATE%', testrec)>0 then
+     record = replace_string(record, '%DATE%', today)
+  /* convert the year format to standard format yyyy  */
+  if pos('%YEAR%', testrec)>0 then
+     record = replace_string(record, '%YEAR%', substr(today,1,4))
+  /* convert the time format to standard format hhmmss */
+  if pos('%TIME%', testrec)>0 then do
+     now = time()
+     thistime = substr(now,1,2)||substr(now,4,2)||substr(now,7,2)
+     record = replace_string(record, '%TIME%', thistime)
+  end
+  if pos('%RAND%', testrec) > 0 then
+     record=replace_string(record, '%RAND%', rand(6))
+return record
+
+/* ================================================================*/
+/* subroutine: Replace_STRING() */
+replace_string:
+  parse arg string,fromstr,tostr
+  strloc = pos(fromstr, string)
+  if strloc == 0 then return fromstr
+  if strloc == 1 then do
+     newstring = tostr||substr(string, length(fromstr)+1)
+  end
+  else do
+     newstring = substr(string, 1, strloc-1)||tostr
+     strloc = strloc + length(fromstr)
+     if strloc < length(string)-1 then,
+       newstring=newstring||substr(string,strloc)
+  end
+return newstring
+
+ShowLogo:
+   x=log('SDM001I Welcome to SENDMAIL for Mainframe.')
+   x=log('SDM002I Purpose : Send mail with attachments via SMTP.')
+   x=log('SDM003I Designer: Hunter Zhou (zhough2000@yahoo.com)'    )
+   x=log('SDM004I Support : Hunter Zhou (905) 671-5208')
+   x=log('SDM005I Update  : October, 2004')
+   return 0
+
+SetMIMETypes:
+ MIMEType.1  ='323';     MIMEAppl.1  ='text/h323'
+ MIMEType.2  ='acx';     MIMEAppl.2  ='application/internet-property-stream'
+ MIMEType.3  ='ai';      MIMEAppl.3  ='application/postscript'
+ MIMEType.4  ='aif';     MIMEAppl.4  ='audio/x-aiff'
+ MIMEType.5  ='aifc';    MIMEAppl.5  ='audio/x-aiff'
+ MIMEType.6  ='aiff';    MIMEAppl.6  ='audio/x-aiff'
+ MIMEType.7  ='asf';     MIMEAppl.7  ='video/x-ms-asf'
+ MIMEType.8  ='asr';     MIMEAppl.8  ='video/x-ms-asf'
+ MIMEType.9  ='asx';     MIMEAppl.9  ='video/x-ms-asf'
+ MIMEType.10 ='au';      MIMEAppl.10 ='audio/basic'
+ MIMEType.11 ='avi';     MIMEAppl.11 ='video/x-msvideo'
+ MIMEType.12 ='axs';     MIMEAppl.12 ='application/olescript'
+ MIMEType.13 ='bas';     MIMEAppl.13 ='text/plain'
+ MIMEType.14 ='bcpio';   MIMEAppl.14 ='application/x-bcpio'
+ MIMEType.15 ='bin';     MIMEAppl.15 ='application/octet-stream'
+ MIMEType.16 ='bmp';     MIMEAppl.16 ='image/bmp'
+ MIMEType.17 ='c';       MIMEAppl.17 ='text/plain'
+ MIMEType.18 ='cat';     MIMEAppl.18 ='application/vnd.ms-pkiseccat'
+ MIMEType.19 ='cdf';     MIMEAppl.19 ='application/x-cdf'
+ MIMEType.20 ='cer';     MIMEAppl.20 ='application/x-x509-ca-cert'
+ MIMEType.21 ='class';   MIMEAppl.21 ='application/octet-stream'
+ MIMEType.22 ='clp';     MIMEAppl.22 ='application/x-msclip'
+ MIMEType.23 ='cmx';     MIMEAppl.23 ='image/x-cmx'
+ MIMEType.24 ='cod';     MIMEAppl.24 ='image/cis-cod'
+ MIMEType.25 ='cpio';    MIMEAppl.25 ='application/x-cpio'
+ MIMEType.26 ='crd';     MIMEAppl.26 ='application/x-mscardfile'
+ MIMEType.27 ='crl';     MIMEAppl.27 ='application/pkix-crl'
+ MIMEType.28 ='crt';     MIMEAppl.28 ='application/x-x509-ca-cert'
+ MIMEType.29 ='csh';     MIMEAppl.29 ='application/x-csh'
+ MIMEType.30 ='css';     MIMEAppl.30 ='text/css'
+ MIMEType.31 ='dcr';     MIMEAppl.31 ='application/x-director'
+ MIMEType.32 ='der';     MIMEAppl.32 ='application/x-x509-ca-cert'
+ MIMEType.33 ='dir';     MIMEAppl.33 ='application/x-director'
+ MIMEType.34 ='dll';     MIMEAppl.34 ='application/x-msdownload'
+ MIMEType.35 ='dms';     MIMEAppl.35 ='application/octet-stream'
+ MIMEType.36 ='doc';     MIMEAppl.36 ='application/msword'
+ MIMEType.37 ='dot';     MIMEAppl.37 ='application/msword'
+ MIMEType.38 ='dvi';     MIMEAppl.38 ='application/x-dvi'
+ MIMEType.39 ='dxr';     MIMEAppl.39 ='application/x-director'
+ MIMEType.40 ='eps';     MIMEAppl.40 ='application/postscript'
+ MIMEType.41 ='etx';     MIMEAppl.41 ='text/x-setext'
+ MIMEType.42 ='evy';     MIMEAppl.42 ='application/envoy'
+ MIMEType.43 ='exe';     MIMEAppl.43 ='application/octet-stream'
+ MIMEType.44 ='fif';     MIMEAppl.44 ='application/fractals'
+ MIMEType.45 ='flr';     MIMEAppl.45 ='x-world/x-vrml'
+ MIMEType.46 ='gif';     MIMEAppl.46 ='image/gif'
+ MIMEType.47 ='gtar';    MIMEAppl.47 ='application/x-gtar'
+ MIMEType.48 ='gz';      MIMEAppl.48 ='application/x-gzip'
+ MIMEType.49 ='h';       MIMEAppl.49 ='text/plain'
+ MIMEType.50 ='hdf';     MIMEAppl.50 ='application/x-hdf'
+ MIMEType.51 ='hlp';     MIMEAppl.51 ='application/winhlp'
+ MIMEType.52 ='hqx';     MIMEAppl.52 ='application/mac-binhex40'
+ MIMEType.53 ='hta';     MIMEAppl.53 ='application/hta'
+ MIMEType.54 ='htc';     MIMEAppl.54 ='text/x-component'
+ MIMEType.55 ='htm';     MIMEAppl.55 ='text/html'
+ MIMEType.56 ='html';    MIMEAppl.56 ='text/html'
+ MIMEType.57 ='htt';     MIMEAppl.57 ='text/webviewhtml'
+ MIMEType.58 ='ico';     MIMEAppl.58 ='image/x-icon'
+ MIMEType.59 ='ief';     MIMEAppl.59 ='image/ief'
+ MIMEType.60 ='iii';     MIMEAppl.60 ='application/x-iphone'
+ MIMEType.61 ='ins';     MIMEAppl.61 ='application/x-internet-signup'
+ MIMEType.62 ='isp';     MIMEAppl.62 ='application/x-internet-signup'
+ MIMEType.63 ='jfif';    MIMEAppl.63 ='image/pipeg'
+ MIMEType.64 ='jpe';     MIMEAppl.64 ='image/jpeg'
+ MIMEType.65 ='jpeg';    MIMEAppl.65 ='image/jpeg'
+ MIMEType.66 ='jpg';     MIMEAppl.66 ='image/jpeg'
+ MIMEType.67 ='js';      MIMEAppl.67 ='application/x-javascript'
+ MIMEType.68 ='latex';   MIMEAppl.68 ='application/x-latex'
+ MIMEType.69 ='lha';     MIMEAppl.69 ='application/octet-stream'
+ MIMEType.70 ='lsf';     MIMEAppl.70 ='video/x-la-asf'
+ MIMEType.71 ='lsx';     MIMEAppl.71 ='video/x-la-asf'
+ MIMEType.72 ='lzh';     MIMEAppl.72 ='application/octet-stream'
+ MIMEType.73 ='m13';     MIMEAppl.73 ='application/x-msmediaview'
+ MIMEType.74 ='m14';     MIMEAppl.74 ='application/x-msmediaview'
+ MIMEType.75 ='m3u';     MIMEAppl.75 ='audio/x-mpegurl'
+ MIMEType.76 ='man';     MIMEAppl.76 ='application/x-troff-man'
+ MIMEType.77 ='mdb';     MIMEAppl.77 ='application/x-msaccess'
+ MIMEType.78 ='me';      MIMEAppl.78 ='application/x-troff-me'
+ MIMEType.79 ='mht';     MIMEAppl.79 ='message/rfc822'
+ MIMEType.80 ='mhtml';   MIMEAppl.80 ='message/rfc822'
+ MIMEType.81 ='mid';     MIMEAppl.81 ='audio/mid'
+ MIMEType.82 ='mny';     MIMEAppl.82 ='application/x-msmoney'
+ MIMEType.83 ='mov';     MIMEAppl.83 ='video/quicktime'
+ MIMEType.84 ='movie';   MIMEAppl.84 ='video/x-sgi-movie'
+ MIMEType.85 ='mp2';     MIMEAppl.85 ='video/mpeg'
+ MIMEType.86 ='mp3';     MIMEAppl.86 ='audio/mpeg'
+ MIMEType.87 ='mpa';     MIMEAppl.87 ='video/mpeg'
+ MIMEType.88 ='mpe';     MIMEAppl.88 ='video/mpeg'
+ MIMEType.89 ='mpeg';    MIMEAppl.89 ='video/mpeg'
+ MIMEType.90 ='mpg';     MIMEAppl.90 ='video/mpeg'
+ MIMEType.91 ='mpp';     MIMEAppl.91 ='application/vnd.ms-project'
+ MIMEType.92 ='mpv2';    MIMEAppl.92 ='video/mpeg'
+ MIMEType.93 ='ms';      MIMEAppl.93 ='application/x-troff-ms'
+ MIMEType.94 ='mvb';     MIMEAppl.94 ='application/x-msmediaview'
+ MIMEType.95 ='nws';     MIMEAppl.95 ='message/rfc822'
+ MIMEType.96 ='oda';     MIMEAppl.96 ='application/oda'
+ MIMEType.97 ='p10';     MIMEAppl.97 ='application/pkcs10'
+ MIMEType.98 ='p12';     MIMEAppl.98 ='application/x-pkcs12'
+ MIMEType.99 ='p7b';     MIMEAppl.99 ='application/x-pkcs7-certificates'
+ MIMEType.100='p7c';     MIMEAppl.100='application/x-pkcs7-mime'
+ MIMEType.101='p7m';     MIMEAppl.101='application/x-pkcs7-mime'
+ MIMEType.102='p7r';     MIMEAppl.102='application/x-pkcs7-certreqresp'
+ MIMEType.103='p7s';     MIMEAppl.103='application/x-pkcs7-signature'
+ MIMEType.104='pbm';     MIMEAppl.104='image/x-portable-bitmap'
+ MIMEType.105='pdf';     MIMEAppl.105='application/pdf'
+ MIMEType.106='pfx';     MIMEAppl.106='application/x-pkcs12'
+ MIMEType.107='pgm';     MIMEAppl.107='image/x-portable-graymap'
+ MIMEType.108='pko';     MIMEAppl.108='application/ynd.ms-pkipko'
+ MIMEType.109='pma';     MIMEAppl.109='application/x-perfmon'
+ MIMEType.110='pmc';     MIMEAppl.110='application/x-perfmon'
+ MIMEType.111='pml';     MIMEAppl.111='application/x-perfmon'
+ MIMEType.112='pmr';     MIMEAppl.112='application/x-perfmon'
+ MIMEType.113='pmw';     MIMEAppl.113='application/x-perfmon'
+ MIMEType.114='pnm';     MIMEAppl.114='image/x-portable-anymap'
+ MIMEType.115='pot,';    MIMEAppl.115='application/vnd.ms-powerpoint'
+ MIMEType.116='ppm';     MIMEAppl.116='image/x-portable-pixmap'
+ MIMEType.117='pps';     MIMEAppl.117='application/vnd.ms-powerpoint'
+ MIMEType.118='ppt';     MIMEAppl.118='application/vnd.ms-powerpoint'
+ MIMEType.119='prf';     MIMEAppl.119='application/pics-rules'
+ MIMEType.120='ps';      MIMEAppl.120='application/postscript'
+ MIMEType.121='pub';     MIMEAppl.121='application/x-mspublisher'
+ MIMEType.122='qt';      MIMEAppl.122='video/quicktime'
+ MIMEType.123='ra';      MIMEAppl.123='audio/x-pn-realaudio'
+ MIMEType.124='ram';     MIMEAppl.124='audio/x-pn-realaudio'
+ MIMEType.125='ras';     MIMEAppl.125='image/x-cmu-raster'
+ MIMEType.126='rgb';     MIMEAppl.126='image/x-rgb'
+ MIMEType.127='rmi';     MIMEAppl.127='audio/mid'
+ MIMEType.128='roff';    MIMEAppl.128='application/x-troff'
+ MIMEType.129='rtf';     MIMEAppl.129='application/rtf'
+ MIMEType.130='rtx';     MIMEAppl.130='text/richtext'
+ MIMEType.131='scd';     MIMEAppl.131='application/x-msschedule'
+ MIMEType.132='sct';     MIMEAppl.132='text/scriptlet'
+ MIMEType.133='setpay';  MIMEAppl.133='application/set-payment-initiation'
+ MIMEType.134='setreg';  MIMEAppl.134='application/set-registration-initiation'
+ MIMEType.135='sh';      MIMEAppl.135='application/x-sh'
+ MIMEType.136='shar';    MIMEAppl.136='application/x-shar'
+ MIMEType.137='sit';     MIMEAppl.137='application/x-stuffit'
+ MIMEType.138='snd';     MIMEAppl.138='audio/basic'
+ MIMEType.139='spc';     MIMEAppl.139='application/x-pkcs7-certificates'
+ MIMEType.140='spl';     MIMEAppl.140='application/futuresplash'
+ MIMEType.141='src';     MIMEAppl.141='application/x-wais-source'
+ MIMEType.142='sst';     MIMEAppl.142='application/vnd.ms-pkicertstore'
+ MIMEType.143='stl';     MIMEAppl.143='application/vnd.ms-pkistl'
+ MIMEType.144='stm';     MIMEAppl.144='text/html'
+ MIMEType.145='sv4cpio'; MIMEAppl.145='application/x-sv4cpio'
+ MIMEType.146='sv4crc';  MIMEAppl.146='application/x-sv4crc'
+ MIMEType.147='t';       MIMEAppl.147='application/x-troff'
+ MIMEType.148='tar';     MIMEAppl.148='application/x-tar'
+ MIMEType.149='tcl';     MIMEAppl.149='application/x-tcl'
+ MIMEType.150='tex';     MIMEAppl.150='application/x-tex'
+ MIMEType.151='texi';    MIMEAppl.151='application/x-texinfo'
+ MIMEType.152='texinfo'; MIMEAppl.152='application/x-texinfo'
+ MIMEType.153='tgz';     MIMEAppl.153='application/x-compressed'
+ MIMEType.154='tif';     MIMEAppl.154='image/tiff'
+ MIMEType.155='tiff';    MIMEAppl.155='image/tiff'
+ MIMEType.156='tr';      MIMEAppl.156='application/x-troff'
+ MIMEType.157='trm';     MIMEAppl.157='application/x-msterminal'
+ MIMEType.158='tsv';     MIMEAppl.158='text/tab-separated-values'
+ MIMEType.159='txt';     MIMEAppl.159='text/plain'
+ MIMEType.160='uls';     MIMEAppl.160='text/iuls'
+ MIMEType.161='ustar';   MIMEAppl.161='application/x-ustar'
+ MIMEType.162='vcf';     MIMEAppl.162='text/x-vcard'
+ MIMEType.163='vrml';    MIMEAppl.163='x-world/x-vrml'
+ MIMEType.164='wav';     MIMEAppl.164='audio/x-wav'
+ MIMEType.165='wcm';     MIMEAppl.165='application/vnd.ms-works'
+ MIMEType.166='wdb';     MIMEAppl.166='application/vnd.ms-works'
+ MIMEType.167='wks';     MIMEAppl.167='application/vnd.ms-works'
+ MIMEType.168='wmf';     MIMEAppl.168='application/x-msmetafile'
+ MIMEType.169='wps';     MIMEAppl.169='application/vnd.ms-works'
+ MIMEType.170='wri';     MIMEAppl.170='application/x-mswrite'
+ MIMEType.171='wrl';     MIMEAppl.171='x-world/x-vrml'
+ MIMEType.172='wrz';     MIMEAppl.172='x-world/x-vrml'
+ MIMEType.173='xaf';     MIMEAppl.173='x-world/x-vrml'
+ MIMEType.174='xbm';     MIMEAppl.174='image/x-xbitmap'
+ MIMEType.175='xla';     MIMEAppl.175='application/vnd.ms-excel'
+ MIMEType.176='xlc';     MIMEAppl.176='application/vnd.ms-excel'
+ MIMEType.177='xlm';     MIMEAppl.177='application/vnd.ms-excel'
+ MIMEType.178='xls';     MIMEAppl.178='application/vnd.ms-excel'
+ MIMEType.179='xlt';     MIMEAppl.179='application/vnd.ms-excel'
+ MIMEType.180='xlw';     MIMEAppl.180='application/vnd.ms-excel'
+ MIMEType.181='xof';     MIMEAppl.181='x-world/x-vrml'
+ MIMEType.182='xpm';     MIMEAppl.182='image/x-xpixmap'
+ MIMEType.183='xwd';     MIMEAppl.183='image/x-xwindowdump'
+ MIMEType.184='z';       MIMEAppl.184='application/x-compress'
+ MIMEType.185='zip';     MIMEAppl.185='application/zip'
+ MIMEType.0 = 185
+ MIMEAppl.0 = 185
+ return 0
+
+getmimeappl:
+  parse arg filename,filetype
+  /* default is text/plain */
+  if pos('.', filename) == 0 then return 'text/plain'
+  extension = filename
+  do while strip(extension) \= ''
+     parse var extension name '.' extension
+     extension = strip(extension)
+     if pos('.', extension) == 0 then leave
+  end
+  upper extension
+  thisappl = 'text/plain'
+  do imt = 1 to MIMEType.0
+     if MIMEType.imt == extension then do
+        thisappl = MIMEAppl.imt
+        leave
+     end
+  end
+  return thisappl
+
+/*===================================================================*/
+/* return a radmon number ranged from the server port */
+rand:
+  parse arg length
+  if length == '' then length = 6
+  if \datatype(length,'NUM') then length = 6
+  min=left(1,length,'0')
+  return left(random(min,min+99999),length,'0')
+
+
+/* set the return code */
+setrc:
+  parse arg thiscode,msg
+  if thiscode==0 then return 0
+  if thiscode<0 | exitcode==0 then exitcode = thiscode
+  if msg\='' then x=log(msg)
+  return exitcode
+
+/* exit program from here. */
+Exit_Program:
+  parse arg msg
+  if msg\='' then x=log(msg)
+  x=Clean_mailfile()             /* Remove the temp mail file */
+  x=log("SDM800I SENDMAIL program is finished with return code",
+        exitcode".")
+  exit(exitcode)
+
+HALT:
+  exitcode = 16
+  x=Exit_Program('SDM074W This program has been halt.')
+
+NOVALUE:
+   if SIGL > 0 then sl = sourceLine(SIGL)
+   else sl=''
+   say condition('C') 'SDM070E Runtime condition has been raised:'
+   say '  variable name   :' condition('D')
+   say '  error line nr   :' SIGL
+   say '  error line text :' sl
+   say 'SDM072I Please contact the Hunter Zhou to fix this problem.'
+   exitcode = 16
+   x=Exit_Program('SDM076W This program is stopped ',
+       'because of internal REXX syntax error.')
+/*************END OF REXX******************************/

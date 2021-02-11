@@ -1,0 +1,374 @@
+Reading a VTOC - quickly
+
+I have used a number of utilities to dump the VTOC for analysis.
+Some utilities, such as IEHLIST and COMPAKTOR, can dump a VTOC
+in a very short time - usually under 5 seconds.  Other programs,
+particularly those which use OBTAIN, take much longer.  In
+addition, some programs produce only part of the information
+which might be desired.
+
+The theoretical minimum time in which a VTOC can be read is
+achieved by using a channel program and reading a cylinder at a
+time.  For a one-cylinder VTOC on a 3380, this would be 16.7
+milliseconds per track or 250.5 milliseconds.  My VTOC-dumping
+routine uses a channel program, which issues a seek cylinder and
+seek head command once at the start and then repeats a set of
+search id, Transfer In Channel (TIC), and read multiple CKD
+commands once for each cylinder (15 times for a 3380).  The
+program first obtains device characteristic information and then
+calculates the memory requirements for the following:
+
+1   To hold the CCWs for a channel program which will read
+one cylinder of the VTOC.
+
+2   To hold the seek and search id equal CCW arguments (in
+the form 00CCHH and CCHHR).
+
+3   To hold the data read from each of the channel programs.
+
+In the case of a two-cylinder VTOC on a 3380, this works out to
+376 bytes for the CCWs, 81 bytes for the seek and search
+arguments, and 235,320 bytes for the VTOC data.  The program
+then GETMAINs the storage needed and enqueues on the VTOC.  You
+can change the program to branch around the ENQ and remove the
+two DEQs in the program if you want to run the program from an
+unauthorised library.  This will allow updates to take place while
+you're reading the data, however.  VTOCDUMP then builds a channel
+program to read the first whole or partial cylinder and creates
+the appropriate seek and search arguments for those CCWs.  The
+channel program is then executed and, if the I/O is error-free,
+another channel program is built  in the same storage as the first
+one.  The VTOC is read in this way until there are no more
+cylinders to be read.  Figure 1 shows how storage is utilised.
+
+What's really nice about the program is that you can request that
+the data be left in storage, where it can be manipulated and
+analysed entirely in memory.  To do this, you need to call the
+program with a parameter list (see program comments).
+
+My original channel program used the read CKD command instead
+of the read multiple CKD command.  This required 53 times 15 (or
+795) read CKD CCWs to read one 3380 cylinder (in contrast to 15
+read multiple CKD CCWs in the final version).  Not one of my
+better prototypes, to say the least!
+
+*  THIS PROGRAM DUMPS THE VTOC ON A CKD DEVICE A CYLINDER AT A TIME.
+*  A 2 CYLINDER VTOC CAN BE READ IN ABOUT 1 SECOND.  THE DATA CAN
+*  THEN BE WRITTEN TO A PS FILE OR KEPT IN MEMORY FOR LATER USE.
+*  >>> THIS PROGRAM SHOULD BE LINK EDITED TO RUN RMODE 24 AND AMODE 24.
+*  >>> THIS PROGRAM HAS ONLY BEEN TESTED ON 3380 DEVICES.  HOWEVER, IT
+*  >>> SHOULD WORK WITHOUT PROBLEMS ON ANY CKD DEVICE.
+*  >>> THIS PROGRAM ENQS ON THE VTOC.  TO PERFORM THIS ENQ, THE PROGRAM
+*  >>> MUST BE AUTHORIZED.  IT REMAINS IN KEY 8, PROBLEM STATE.
+*  YOU MAY WANT REMOVE TO THE ENQ/DEQ LOGIC--IF YOU DO, THE DUMP WILL
+*  STILL WORK BUT THE VTOC MAY BE UPDATED DURING THE DUMP.
+*  THE VTOCS' EXTENT INFO IS OBTAINED FROM THE DEB.  WE COULD READ
+*  THE F4 RECORD FOR THE EXTENT INFO, BUT THIS WASTES ANOTHER I/O.
+*  (OPEN WILL READ THE F4 RECORD TO GET THIS.)  THE F4
+*  RECORD ALSO PROVIDES THE CCHHR OF THE LAST F1 RECORD,
+*  BUT THIS IS SET TO THE LAST PHYSICAL BLOCK IF THE VTOC IS
+*  INDEXED.  SINCE THE PROGRAM SHOULD ENCOUNTER A NON-INDEXED
+*  VTOC RARELY, WE DON'T GET THE F4 RECORD BUT JUST READ
+*  THE VTOC STRAIGHT AWAY.
+*  THIS PROGRAM ALSO DOES NOT USE THE SET SECTOR COMMAND AVAILABLE
+*  WITH LATER-MODEL DASD, IN ORDER TO MAKE IT MORE GENERIC.
+*  THE PROGRAM CAN BE CALLED IN TWO WAYS: IN BATCH, IN WHICH CASE
+*  NO JCL PARM= INFO SHOULD BE SUPPLIED, OR AS A SUBROUTINE IN
+*  WHICH CASE THE PARMLIST MUST BE OF THE FOLLOWING FORM:
+*  R1 --->  PTR 0  --->  A HALF-WORD WITH A NON-ZERO VALUE IN IT
+*           PTR 1  --->  4 FULL WORDS WHICH AT THE END OF THE
+*                        SUBROUTINES' EXECUTION WILL CONTAIN:
+*                WORD 0: ADDR IN MEMORY OF THE CHAN PGM & DUMPED VTOC
+*                WORD 1: LENGTH OF OFFSET W/IN MEMORY TO RESULT (VTOC)
+*                WORD 2: TOTAL NUMBER OF (COUNT+DSCB)'S IN RESULT AREA
+*                WORD 3: LENGTH OF RESULT AREA
+*  ANY CALLING PROGRAM SHOULD EVENTUALLY FREEMAIN THE AREA POINTED TO
+*  BY WORD 0 AND OF A LENGTH DETERMINED BY ADDING WORDS 1 AND 3.
+*  >>> NOTE THAT COUNT INFORMATION IS ALSO INCLUDED IN THE RESULT AREA.
+*  >>> EACH TIME YOU PROCESS A DSCB, YOU SHOULD REMEMBER THAT THE
+*  >>> FIRST 8 BYTES ARE COUNT INFORMATION.  THE NEXT 140 BYTES
+*  >>> ARE THE DSCB INFORMATION.
+*  THIS PROGRAM WAS DEVELOPED ON AN MVS/XA 2.2.0 SYSTEM BUT SHOULD
+*  RUN WITHOUT PROBLEMS ON EARLIER VERSIONS OF MVS.
+         YREGS
+VTOCDUMP CSECT
+         STM   R14,R12,12(R13)           SAVE CALLER'S REGISTERS
+         LR    R12,R15                   ESTABLISH ADDRESSABILITY
+         USING VTOCDUMP,R12
+         LA    R11,SAVE                  SET UP OUR SAVE AREA
+         ST    R11,8(R13)
+         ST    R13,4(R11)
+         LR    R13,R11
+         L     R2,0(R1)                  GET 1ST PARMLIST POINTER
+         LH    R2,0(R2)                  GET 1ST PARM
+         LTR   R2,R2                     IS IT ZERO?
+         BZ    OPENVTOC                  IF YES, GO OPEN THE VTOC
+         L     R2,4(R1)                  ELSE GET 2ND PARMLIST POINTER
+         ST    R2,RETURNSA               SAVE ADDR OF 4 WORD SAVE AREA
+         MVI   MEMYES,C'Y'               IF ANY PARM PASSED,UPDATE FLAG
+*                                TO LEAVE DATA IN MEMORY UPON RETURNING
+OPENVTOC RDJFCB VOLUME                   READ JFCB INFO FOR DSN MOD
+         MVI   JFCBAREA,X'04'
+         MVC   JFCBAREA+1(43),JFCBAREA   SET DSN TO VTOC NAME
+         OPEN  (VOLUME,(INPUT)),TYPE=J   OPEN WITH MODIFIED JFCB
+         LTR   R15,R15                   OPEN SUCCESSFUL?
+         BZ    GETCHAR                   EXIT IF NOT
+         LR    R2,R15                    SAVE R15 TEMPORARILY
+         WTO   'VTOC OPEN PROBLEM--CHECK RETURN CODE',ROUTCDE=11
+         LR    R15,R2                    RESTORE R15
+         B     EXIT1                     EXIT PROGRAM
+*  GET # TRKS/CYL FROM I/O DEVICE CHARACTERISTICS
+GETCHAR  DEVTYPE DDNAME,DEVRESLT,DEVTAB  GET DEVICE CHARACTERISTICS
+         LTR   R15,R15                   MACRO SUCCESSFUL?
+         BZ    MOVDINFO                  IF YES, GO GET INFO
+         LR    R2,R15                    SAVE R15 TEMPORARILY
+         WTO   'DEVTYPE MACRO ERROR--CHECK RETURN CODE',ROUTCDE=11
+         LR    R15,R2                    RESTORE R15
+         B     EXIT1                     EXIT PROGRAM
+MOVDINFO MVC   TRKINCYL(2),DEVRESLT+10   GET # OF TRKS / CYL FOR DEVICE
+*  GET FIRST EXTENT INFO FOR VTOC FROM DEB AND GET UCB ADDRESS
+GETDEB   LA    R2,VOLUME                 POINT AT VOLUME DCB
+         USING IHADCB,R2                 ESTABLISH ADDRESSABILITY
+         L     R2,DCBDEBAD               GET DEB ADDRESS
+         USING DEBBASIC,R2               ESTABLISH DEB ADDRESSABILITY
+         LA    R2,DEBBASND-DEBBASIC(R2)  POINT PAST END OF BASIC SECTN
+         USING DEBDASD,R2                ESTABLISH DEBDASD ADDRSSABLTY
+         MVC   UCBADDR(4),DEBUCBAD       GET UCB ADDRESS
+         MVC   STRTCC(8),DEBSTRCC        GET START CYL/HEAD AND END
+*  SAVE VOLUME SERIAL INFO FROM THE UCB
+         L     R4,UCBADDR                GET UCB ADDRESS
+         USING UCBOB,R4                  ESTABLISH UCB ADDRESSABILITY
+         MVC   RNAME(6),UCBVOLI          GET VOLUME SERIAL NUMBER
+*  CALCULATE # OF VTOC RECORDS WHICH FIT ON A TRACK FOR THIS DEV TYPE
+TRKCALC# TRKCALC FUNCTN=TRKCAP,UCB=(R4),R=1,K=44,DD=96,REGSAVE=YES
+         LTR   R15,R15                   MACRO SUCCESSFUL?
+         BZ    TCOK                      BRANCH IF SO
+         LR    R2,R15                    ELSE SAVE R15 TEMPORARILY
+         WTO   'TRKCALC MACRO ERROR--CHECK RETURN CODE',ROUTCDE=11
+         LR    R15,R2                    RESTORE R15
+         B     EXIT1                     EXIT PROGRAM
+TCOK     STH   R0,RECINTRK               SAVE # RECORDS/TRK
+*  CALC MEMORY NEEDS FOR THE CHAN PROGRAM, SEEK INFO AND RESULT AREA
+DEVOK    LH    R3,STRTCC                 GET STARTING CYL NUMBER
+         LH    R4,ENDCC                  GET ENDING CYL NUMBER
+         MH    R3,TRKINCYL               MULTIPLY BY TRACKS/CYL
+         MH    R4,TRKINCYL               MULTIPLY BY TRACKS/CYL
+         AH    R3,STRTHH                 ADD STARTING TRACK NUMBER
+         AH    R4,ENDHH                  ADD ENDING TRACK NUMBER
+         SR    R4,R3                     SUB START TRACK # FROM END #
+         LA    R4,1(R4)             ADD 1 TO MAKE R4 HAVE TOT # OF TRKS
+         STH   R4,TOTTRACK               SAV TOT # OF TRKS FOR ALL VTOC
+         LH    R5,TRKINCYL               R5 HAS MAX # OF TRACKS IN CYL
+         MH    R5,=H'24'                 MUL R5 BY 3 CCWS BY 8 BYTES
+         AH    R5,=H'16'            R5 HAS BYTES NEEDED FOR CCWS
+         LH    R6,TRKINCYL               R6 HAS MAX # OF TRACKS IN CYL
+         MH    R6,=H'5'                  MUL BY # OF SRCHID= SEEK BYTS
+         AH    R6,=H'6'             R6 HAS BYTES NEEDED FOR SEEK DATA
+         LH    R7,RECINTRK               GET # OF BLOCKS PER TRACK
+         MH    R7,=H'148'                MUL BY CKD SIZE
+         LA    R7,8(R7)                  RND UP TO/PAST MULTIPLE OF 8
+         MH    R7,TOTTRACK          R7 HAS # OF BYTES NEEDED FOR RESULT
+         SR    R2,R2                     ZERO R2
+         AR    R2,R5                     ADD CCW REQUIREMENT
+         AR    R2,R6                     ADD TRACK DATA REQUIREMENT
+         AR    R2,R7                     ADD SEEK DATA MEMORY REQ
+         ST    R2,AMOUNT                 STORE TOTAL REQURMT
+         OI    AMOUNT,X'80'
+         GETMAIN LC,LA=AMOUNT,A=MEMADDR,BNDRY=DBLWD    GET MEMORY
+         LTR   R15,R15
+         BZ    ENQVTOC                   IF OK, GO ENQ ON VTOC
+         LR    R2,R15                    ELSE, SAVE RC AND ISSUE MSG
+         WTO   'GETMAIN MACRO ERROR--CHECK RETURN CODE',ROUTCDE=11
+         LR    R15,R2                    RESTORE RC
+         B     EXIT1                     AND EXIT
+*  ENQ ON THE VTOC (USE OF ENQ/DEQ REQUIRES PROGRAM TO BE AUTHORIZED,
+*                   KEY 8--NOT USING ENQ/DEQ REMOVES AUTHORIZED
+*                   REQUIREMENT BUT YOU MAY NOT GET A TOTALLY
+*                   CORRECT DUMP)
+ENQVTOC  ENQ   (QNAME,RNAME,S,6,SYSTEMS) ENQ SHARED ON SYSVTOC.VOLSER
+         LTR   R15,R15
+         BZ    BLDCCWS                   IF OK, GO BUILD CHAN PGM
+         LR    R2,R15                    ELSE SAVE RC AND ISSUE MSG
+         WTO   'VTOC UNAVAILABLE OR ENQ FAILURE--SEE RETURN CODE',     X
+               ROUTCDE=11
+         LR    R15,R2                    RESTORE RC
+         B     EXIT                      AND EXIT
+*  BUILD CCW'S IN FIRST PART OF MEMORY JUST ACQUIRED
+BLDCCWS  L     R9,MEMADDR                R9 PTS TO CCW AREA
+         LR    R10,R9                    R10 PTS TO CCW AREA
+         AR    R10,R5                    R10 NOW PTS TO SEEK INFO AREA
+         LR    R11,R10                   R11 PTS TO SEEK INFO AREA
+         AR    R11,R6                    R11 NOW PTS TO RESULT AREA
+         LH    R2,STRTCC                 GET START CYL NUMBER
+         LH    R4,STRTHH                 GET START TRACK NUMBER
+CYLLOOP  MVC   SEEKADDR(3),=XL3'000000'  SETUP ABSOLUTE
+         STCM  R2,3,SEEKADDR+3               MBBCCHHR
+         STCM  R4,3,SEEKADDR+5                   ADDRESS
+         MVI   SEEKADDR+7,X'01'                      FOR IOBLOCK
+         CH    R2,ENDCC                  COMPARE CURRENT CYL W/LAST CYL
+         BH    NONELEFT      EXIT CYLLOOP HERE:  IF PAST LAST CYL, EXIT
+         BE    LASTCYL                   IF THIS IS LAST CYL, GET ENDHH
+         LH    R3,TRKINCYL               ELSE GET # OF TRKS / CYL
+         BCTR  R3,R0                     DEC TO GET HI TRACK #
+         B     #TRACKS                   GO CALC # OF TRKS IN THIS CYL
+LASTCYL  LH    R3,ENDHH                  GET LAST (HI) TRACK NUMBER
+#TRACKS  SR    R3,R4                     R3=HI T # - LO T # IN THIS CYL
+         LA    R3,1(R3)                  ADJUST--R3 NOW HAS # OF TRKS
+         MVC   0(16,R9),SEEKCCHH         MOVE SEEK CCWS
+         STCM  R10,7,1(R9)               STOR SEEK DATA ADR IN SEEK CYL
+         STCM  R10,7,9(R9)               STOR SEEK DATA ADR IN SEEKHEAD
+         LA    R9,16(R9)                 INCREMENT CCW AREA POINTER
+         MVC   0(2,R10),=H'0'            CREATE  00
+         STH   R2,2(R10)                           CC
+         STH   R4,4(R10)                             HH SEEK DATA
+         LA    R10,6(R10)                INC FOR SEEK ADDR DATA AREA
+CCWLOOP  MVC   0(24,R9),SRCHREAD         MOVE SEARCH, TIC AND READ CCWS
+         MVI   SRCHREAD,X'B1'            SWITCH SEARCH TO MULTI TRK
+         STCM  R10,7,1(R9)               SAV CCHHR ADDR IN SRCH ID= CCW
+         STCM  R9,7,9(R9)                SAV SEARCH CCW ADDR IN TIC CCW
+         STCM  R11,7,17(R9)              SAV RES AREA ADDR IN READ CCW
+         STH   R2,0(R10)                 CREATE  CC
+         STH   R4,2(R10)                           HH
+         MVI   4(R10),X'00'                          R  SEEK DATA
+         LH    R1,RECINTRK               GET BLKS/TRK
+         MH    R1,=H'148'                MUL BY CKD AMOUNT
+         STH   R1,22(R9)                 SAVE RESULT LENGTH IN READ CCW
+         LA    R4,1(R4)                  INCREMENT TRACK #
+         LA    R9,24(R9)                 INCREMENT CCW AREA POINTER
+         LA    R10,5(R10)                INC FOR SEEK ADDR AREA PTR
+         AR    R11,R1                    ADD RESULT LEN TO RES AREA PTR
+         BCT   R3,CCWLOOP                LOOP TIL NO MORE TRKS IN CYL
+         S     R9,=F'4'                  BACK UP TO LAST CCW FLAGS
+         MVI   0(R9),X'00'               TURN OFF COMMAND CHAIN BIT
+         MVC   ECBX(4),=F'0'             ZERO ECB
+         MVC   CCWADDR(4),MEMADDR        COPY ADDR OF CHAN PGM TO IOB
+         EXCP  IOBX                      EXECUTE I/O
+         WAIT  ECB=ECBX                  WAIT FOR COMPLETION
+         CLI   ECBX,X'7F'                COMPLETION NORMAL?
+         BNE   IOBAD                     IF NOT, GO PRINT ECB & CSW
+IOOK     LA    R2,1(R2)                  INCREMENT CYL NUMBER
+         MVI   SRCHREAD,X'31'            SWITCH SEARCH TO SINGLE TRK
+         SR    R4,R4                     ZERO TRACK NUMBER
+         L     R9,MEMADDR                RESET CCW PTR FOR NEXT CHN PGM
+         LR    R10,R9                    RESET SEEK
+         AR    R10,R5                      DATA PTR
+         B     CYLLOOP                   CONTINUE READING CYLS TIL DONE
+*  I/O EXCP ERROR--WRITE OUT ECB AND CSW AND EXIT
+IOBAD    MVC   CSW2(8),CSWINFO           COPY CSW TO BE NEXT TO ECB
+         LA    R1,XSTRING                POINT AT TRANSLATE STRING
+         LA    R2,ECBX                   POINT AT ECB
+         LA    R3,12                     SET COUNT OF ECB AND CSW
+         LA    R6,WTOCSW+8               POINT AT FFFF'S IN WTOCSW AREA
+CSWLOOP  SR    R4,R4                     ZERO HI NIBBLE XSTRING OFFSET
+         SR    R5,R5                     ZERO LO NIBBLE XSTRING OFFSET
+         IC    R4,0(R2)                  GET A HEX BYTE
+         IC    R5,0(R2)                  GET SAME HEX BYTE
+         SRL   R4,4                      SHIFT HI NIBBLE INTO LO NIBBLE
+         N     R5,=F'15'                 AND-OUT HI NIBBLE
+         AR    R4,R1                     ADD XSTRING START ADDR
+         AR    R5,R1                     ADD XSTRING START ADDR
+         MVC   0(1,R6),0(R4)             MOVE EBCDIC HI NIBBLE TO WTO
+         MVC   1(1,R6),0(R5)             MOVE EBCDIC LO NIBBLE TO WTO
+         LA    R2,1(R2)                  POINT TO NEXT HEX DIGIT
+         LA    R6,2(R6)                  POINT TO NEXT 2 CHARS IN WTO
+         C     R3,=F'9'                  ECB ALL TRANSLATED?
+         BNE   DECREMNT                  IF NOT, GO TRANSLATE NEXT HEX#
+         LA    R6,3(R6)                  IF SO, POINT PAST " / "
+DECREMNT BCT   R3,CSWLOOP                CONTINUE TRANSLATION
+         WTO   'EXCP I/O FAILURE--ECB AND CSW ARE:',ROUTCDE=11
+WTOCSW   WTO   'FFFFFFFF / FFFFFFFFFFFFFFFF',ROUTCDE=11
+         DEQ   (QNAME,RNAME,6,SYSTEMS)   DEQ VTOC
+         CLOSE (VOLUME)                  CLOSE VTOC
+         B     EXIT                      EXIT
+*  I/O FOR ALL CYLINDERS HAS COMPLETED--PRINT OR LEAVE IN MEMORY
+NONELEFT DEQ   (QNAME,RNAME,6,SYSTEMS)   DEQ VTOC
+         CLOSE (VOLUME)                  CLOSE VTOC
+MEMCHECK CLI   MEMYES,C'Y'               VTOC DUMP TO REMAIN IN MEMORY?
+         BNE   PRINTOUT                  IF NOT, GO PRINT
+         L     R3,RETURNSA               GET RETURN SAVE AREA ADDRESS
+         L     R4,MEMADDR                GET MEMORY AREA ADDRESS
+         AR    R5,R6                     ADD CCW AND SEEK AREA SIZES
+         LH    R6,TOTTRACK               GET TOTAL # OF TRACKS
+         MH    R6,RECINTRK               MULTIPLY BY # DSCBS PER TRACK
+         STM   R4,R7,0(R3)               SAVE RETURN PARAMETERS
+         B     EXIT1                     AND EXIT
+PRINTOUT OPEN  (PRINT,OUTPUT)            OPEN PRINT FILE
+         LTR   R15,R15                   OPEN SUCCESSFUL?
+         BZ    GETMEMAD                  IF SO, GET MEMORY ADDRESS
+         LR    R2,R15                    SAVE R15 TEMPORARILY
+         WTO   'PRINT FILE OPEN PROBLEM--CHECK RETURN CODE',ROUTCDE=11
+         FREEMAIN LU,LA=AMOUNT,A=MEMADDR   FREE STORAGE FIRST
+         LR    R15,R2                       ...THEN RESTORE R15
+         B     EXIT1                     GO RELEASE MEMORY
+GETMEMAD L     R9,MEMADDR                GET ADDR TO START OF CCWS
+         AR    R9,R5                     POINT PAST CCWS TO SEEK DATA
+         AR    R9,R6                     POINT PAST SEEK DATA TO RESULT
+         LH    R11,TOTTRACK              GET TOTAL # OF TRACKS IN VTOC
+TRKLOOP  LH    R10,RECINTRK              GET # OF BLOCKS IN EACH TRACK
+RECLOOP  PUT   PRINT,0(R9)               WRITE OUT 1 RECORD
+         LA    R9,148(R9)                POINT TO NEXT RECORD
+         BCT   R10,RECLOOP               CONTINUE WRITING RECORDS
+         BCT   R11,TRKLOOP               CONTINUE WRITING TRACKS
+         CLOSE (PRINT)                   CLOSE PRINT FILE
+*  FREE STORAGE AND EXIT PROGRAM
+EXIT     FREEMAIN LU,LA=AMOUNT,A=MEMADDR
+EXIT1    L     R13,4(R13)                EXIT PROGRAM
+         L     R14,12(R13)
+         LM    R0,R12,20(R13)
+         BR    R14
+VOLUME   DCB   DSORG=PS,MACRF=E,DDNAME=VOLUME,EODAD=EXIT,              X
+               RECFM=F,IOBAD=IOBX,DEVD=DA,EXLST=EXITLIST
+EXITLIST DS    0F
+         DC    X'07',AL3(JFCBAREA)
+JFCBAREA DS    CL176
+PRINT    DCB   DSORG=PS,MACRF=PM,DDNAME=PRINT,                         X
+               RECFM=FB,LRECL=148,BLKSIZE=14800
+STRTCC   DS    H                         VTOC STARTING CYLINDERS ADDR
+STRTHH   DS    H                         VTOC STARTING HEAD ADDRESS
+ENDCC    DS    H                         VTOC ENDING CYLINDERS ADDRESS
+ENDHH    DS    H                         VTOC ENDING HEAD ADDRESS
+TOTTRACK DS    H                         TOTAL NUMBER OF TRACKS IN VTOC
+AMOUNT   DS    F                         AMOUNT OF STORAGE FOR GETMAIN
+MEMYES   DC    C'N'                      MEMORY-RESIDENT FLAG FOR RET
+XSTRING  DC    CL16'0123456789ABCDEF'    HEX DIGIT STRING FOR CSW ERROR
+*                                                MESSAGE GENERATION
+RECINTRK DS    H                         RECORDS IN A TRACK
+TRKINCYL DS    H                         TRACKS IN A CYLINDER
+ECBX     DS    F                         ECB AREA
+CSW2     DS    2F                        DUPLICATE AREA FOR CSW INFO
+IOBX     DS    0D
+         DC    XL4'42000000'             COMMAND CHAINING ON
+         DC    A(ECBX)                   ECB ADDR
+CSWINFO  DC    2F'0'                     CHAN STATUS
+CCWADDR  DS    A                         CHAN PROGRAM ADDRESS
+         DC    A(VOLUME)                 DCB ADDRESS
+         DC    F'0'                      USED BY SYSTEM
+         DC    H'0'                      FOR MAG TAPE
+         DC    H'0'                      USED BY SYSTEM
+SEEKADDR DS    D                         SEEK ADDRESS
+SEEKCCHH DC    XL8'0B00000040000006'     SEEK CYL CCW
+         DC    XL8'1B00000040000006'     SEEK HEAD CCW
+SRCHREAD DC    XL8'3100000040000005'     SEARCH MULTI-TRACK ID = CCW
+         DC    XL8'0800000040000001'     TIC CCW
+         DC    XL8'5E00000040000000'     READ MULTIPLE C-K-D
+DDNAME   DC    CL8'VOLUME  '             DDNAME NAME FOR DEVTYPE MACRO
+DEVRESLT DS    5F                        RESULT AREA FOR DEVTYPE MACRO
+QNAME    DC    CL8'SYSVTOC'              ENQ QNAME
+RNAME    DS    CL6                       ENQ RNAME
+SAVE     DS    18F                       PROGRAM SAVE AREA
+RETURNSA DS    F                         ADDRESS OF CALLER'S 3 REG SA
+MEMADDR  DS    F                         ADDRESS OF GETMAINED MEMORY
+UCBADDR  DS    F                         UCB ADDRESS FROM DEB
+         LTORG
+         DCBD
+         IEZDEB
+         DSECT
+         IEFUCBOB
+         END
+
+
+David R Saunders
+Senior Systems Engineer
+University of Virginia (USA) © University of Virginia 1989
+
+

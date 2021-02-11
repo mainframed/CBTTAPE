@@ -1,0 +1,447 @@
+HOTRDR   TITLE '* HOTRDR Version 2.1.0 '
+*--------+---------+---------+---------+---------+---------+----------*
+*                                                                     *
+* HOTRDR - An internal reader routine to handle multiple PDS files    *
+*          concatenated to the same DD name, PDS.  JCL member to be   *
+*          submitted to the Internal Reader is passed through the     *
+*          PARM field.  JCL member is located with the FIND macro     *
+*          after OPEN processing is completed.  The BPAM access       *
+*          method will position the subsequent READ macro request     *
+*          to the TTR of the JCL member.  The BLKSIZE of the first    *
+*          PDS is used as the size of the buffer used for the READ    *
+*          operation.  The records are de-blocked in the buffer and   *
+*          submitted to the Internal Reader via a QSAM PUT macro.     *
+*          All non-blank records are submitted to the Internal Reader *
+*          and written to SYSPRINT for inspection.                    *
+*                                                                     *
+* Modified for ADP Tax and Financial Services, May 10, 2003.          *
+* Original Developer - Peter McFarland, June 6, 1994.                 *
+*                                                                     *
+*--------+---------+---------+---------+---------+---------+----------*
+* Disclammer                                                          *
+*                                                                     *
+*     This program is developed on a non-restrictive basis and        *
+*     is of general interest submitted for unrestricted distribution. *
+*     The end user is expected to make the final evaluation as to the *
+*     usefullness in their own environment.                           *
+*                                                                     *
+*     I make no warranty, expressed or implied, including but not     *
+*     limited to, the warranties or merchantability and fitness for a *
+*     particular purpose as to the function or performance of this    *
+*     program.                                                        *
+*                                                                     *
+*     Acceptance and use of this program constitutes a release from   *
+*     any liability of ADP for any problems of the use of this        *
+*     program that may be caused at the user's installation.          *
+*                                                                     *
+*     Users are invited to sumbit suggestions or error documentation  *
+*     to me, however, no promise can be made that such suggestions    *
+*     will be implemented or errors corrected.  Sumbit comments to:   *
+*              Peter McFarland                                        *
+*              P. O. Box 94                                           *
+*              Woodacre, CA. 94973                                    *
+*              (415) 488-4576                                         *
+*       email: zzsprm0@sbcglobal.net                                  *
+*                                                                     *
+*     This program is made available WITHOUT CHARGE OR consideration  *
+*     Recipients are free to make this program available to others in *
+*     a like manner.  It may not be sold.                             *
+*                                                                     *
+*--------+---------+---------+---------+---------+---------+----------*
+* Sample JCL -                                                        *
+*                                                                     *
+*    //HOTRDR    EXEC  PGM=HOTRDR,PARM='IEFBR14'                      *
+*    //STEPLIB   DD  DSN=YOUR.APFAUTH.LINKLIB,DISP=SHR                *
+*    //SYSPRINT  DD  SYSOUT=*                                         *
+*    //INTRDR    DD  SYSOUT=(A,INTRDR)                                *
+*    //SYSUDUMP  DD  SYSOUT=*                                         *
+*    //PDS       DD  DISP=SHR,DSN=PROD.JOBLIB                         *
+*    //          DD  DISP=SHR,DSN=PROD.SYSTEMS.JOBLIB                 *
+*    //          DD  DISP=SHR,DSN=SYSPM4.ASM.SAMPLIB                  *
+*                                                                     *
+* Note:  A large BLKSIZE works best and reduces READ operations.      *
+*        R9 is the addr. of the PDS DCB for the life of the task.     *
+*        Must run AMODE/RMODE 24 because of the BPAM access method.   *
+*                                                                     *
+*--------+---------+---------+---------+---------+---------+----------*
+*
+HOTRDR   AMODE 24
+HOTRDR   RMODE 24
+HOTRDR   ESAENTRY PAR0=R10,PAR1=R11,BASEREGS=1,WORKLEN=HOTRWAL,SP=3
+*
+         USING HOTRWA,R13         Map local work area
+         $CLEAR HOTRWTOL          to blanks
+         $CLEAR PRINT_BUF         to blanks
+         $CLEAR PARMDATA          to blanks
+         PARMS PARMDATA           Get the PARM data passed
+         LTR   R1,R1              any parm data ?
+         BZ    NO_PARM_DATA       zeros, RC = 8
+         CL    R1,=F'8'           parm data <> 8 char ?
+         BH    BAD_PARM_LEN       RC = 8
+         ST    R1,PARMLEN         save the length for later
+         LA    R1,DCB_TABLE       Where the PDS DCBs are kept
+         BAL   R14,TIOT_SEARCH    Do the TIOT search.
+         TM    SW,GOT_PDS_DCB+GOT_INTRDR+GOT_SYSPRINT all present ?
+         BZ    MISSING_DCBS       no, exit with WTO and RC=12
+         OPEN  (INTRDR,OUTPUT,SYSPRINT,OUTPUT)  open our files
+         OI    SW,OUT_OPEN        say we opened our output DCBs
+*
+         LA    R9,PDS             R9 = ptr to PDS DCB for processing
+         BAL   R14,OPEN_SEARCH    Do OPEN DCB processing for PDS
+         TM    SW,MEM_FOUND       did we find a member ?
+         BO    READ_MEMBER        yes, read it and send it off.
+*                                 else, no member was found
+         B     NO_MEMBER          clean-up and exit for now.
+*
+NO_MORE_DCBS DS 0H
+         TM    SW,OPEN_DONE       did we open any DCBs ?
+         BZ    DO_FREE            no, skip close processing
+         CLOSE ((9))              close out the DCB
+DO_FREE  DS    0H
+         ICM   R1,B'1111',BLOCKAD  any buffer ptr to free storage
+         BZ    MAIN_EXIT          no, just exit
+         L     R0,BLOCKSIZ        get the buffer size
+         FREEMAIN R,LV=(0),A=(1)  free the buffer
+*
+MAIN_EXIT DS   0H
+         TM    SW,OUT_OPEN        did we open our output DCBs ?
+         BZ    SET_RC             no, just exit.
+         CLOSE (INTRDR,,SYSPRINT)  close our output files
+SET_RC   DS    0H
+         LH    R15,RETCODE        set a return code
+         ESAEXIT RC=(R15)
+*
+READ_MEMBER DS 0H
+*--------------------------------------------------------------------*
+*  Read a block and deblock it into locical records to be written    *
+*  to the internal reader for submission to JES2.  Write each record *
+*  to SYSPRINT also for inspection.                                  *
+*--------------------------------------------------------------------*
+         USING IHADCB,R9          DCBD mapping
+         L     R4,BLOCKAD         get ptr to our buffer
+         READ  DECBPDS,SF,(9),(4),'S' read a block
+         CHECK DECBPDS            check the DECB
+         SLR   R1,R1
+         LH    R1,DCBBLKSI        get blksize from open DCB
+         L     R2,DECBPDS+16      get record iob address
+         SH    R1,14(R2)          Subtract residual count
+         LA    R1,0(R1,R4)        point to end of buffer
+         ST    R1,STOPAD          save end ptr
+         ST    R4,LRECAD          save the current record ptr
+         LR    R6,R4
+         SLR   R5,R5
+         LH    R5,DCBLRECL        get lrecl from open DCB
+         CH    R5,=H'80'          are we lrecl=80 ?
+         BNE   BAD_PDS_FORMAT
+         B     REC_MOVER
+*                                 Deblock input
+NXTLRECL DS    0H
+         L     R6,LRECAD
+         AH    R6,DCBLRECL        add lrecl from open DCB
+         C     R6,STOPAD
+         BNL   READ_MEMBER
+         ST    R6,LRECAD
+         LH    R5,DCBLRECL        get lrecl from open DCB
+*
+REC_MOVER DS   0H
+         PUT   INTRDR,(6)         send a record to INTRDR
+         $CLEAR PRINT_BUF         clear the print buffer
+         TM    SW,PASS_ONE        been through here once ?
+         BO    SKIP_HDR           yes, skip printing a header
+         LA    R1,PRINT_BUF
+         USING PRINTHDR,R1
+         MVC   JOB,WTOJOBN        Build a header line w/job name
+         MVC   DSN,DSNAME          data set name
+         MVC   MEM,MEMNAME          member name
+         MVC   VOL,VOLNO             and volume serial
+         DROP  R1
+         PUT   SYSPRINT,PRINT_BUF
+         OI    SW,PASS_ONE        say we've been through here
+         $CLEAR PRINT_BUF         clear the print buffer
+SKIP_HDR DS    0H
+         MVC   PRINT_BUF+1(80),0(R6)  write it to sysprint
+         PUT   SYSPRINT,PRINT_BUF
+SKIP_LOOP DS   0H
+         LA    R6,80(,R6)
+         CL    R6,STOPAD          at the end ?
+         BNL   READ_MEMBER
+         CLC   =CL80' ',0(R6)
+         BE    SKIP_LOOP
+         B     REC_MOVER
+*
+ENDPDS   DS    0H
+         L     R0,BLOCKSIZ        use the blksize for buffer size
+         L     R1,BLOCKAD         buffer ptr to free storage
+         FREEMAIN R,LV=(0),A=(1)  free the buffer
+         CLOSE ((9))              close out the PDS
+         PUT   SYSPRINT,=CL133' **** END OF MEMBER SUBMITTED ****'
+         SLR   R15,R15
+         STH   R15,RETCODE
+         B     MAIN_EXIT          we're done
+*
+OPEN_SEARCH DS 0H                 Check the DCB for member passed
+*--------------------------------------------------------------------*
+*  Open the PDS DCB and check it for correct processing. Then see if
+*  we can find the member to be submitted to the internal reader.
+*--------+-----+------------------+----------------------------------*
+         ST    R14,SAVER14        save our return ptr
+         LA    R15,ENDPDS         setup EODAD
+         ST    R15,DCBEODAD         processing
+         OPEN  ((9),INPUT)        open the DCB
+         TM    DCBOFLGS,DCBOFOPN  did DCB open ?
+         BZ    DCB_NOT_OK         No, bad DCB - skip it
+         TM    DCBDSORG,DCBDSGPO  Is it Partitioned
+         BZ    DCB_NOT_OK         No, not a PDS - skip it
+         TM    DCBRECFM,DCBRECF   Is it fixed block ?
+         BO    ACQVS              yes, continue
+DCB_NOT_OK DS  0H
+         OI    SW,BAD_DCBD        indicate we cannot process DCB
+         CLOSE ((9))              close DCB
+         B     BAD_PDS_FORMAT
+*
+ACQVS    DS    0H
+         SLR   R0,R0
+         LH    R0,DCBBLKSI        use the blksize for buffer size
+         ST    R0,BLOCKSIZ        size of GETMAIN area
+         GETMAIN R,LV=(0)
+         ST    R1,BLOCKAD         save it for later
+         OI    SW,OPEN_DONE       flip the switch
+         L     R2,44(,R9)         DEB pointer
+         L     R2,32(,R2)         UCB pointer
+         MVC   VOLNO,28(R2)       save the volume serial of PDS
+         LA    R1,WORKAREA        build RDJFCB parms
+         ST    R1,BUFPTR
+         MVI   BUFPTR,X'87'
+         LA    R1,BUFPTR
+         ST    R1,DCBEXLST
+         RDJFCB ((9))             get the JFCB for PDS DCB
+         MVC   DSNAME,WORKAREA    save the DSN of this PDS
+         FIND  ((9)),PARMDATA,D   see if our member is there
+         STH   R15,RETCODE        save the return code
+         STH   R0,RESCODE         save the reason code
+         LTR   R15,R15            found it ?
+         BZ    FOUND_MEMBER       yes, setup for read
+*                                 RC = 4, name not found - R0 = 0
+*                                 RC = 8, perm I/O error - R0 = 0
+         CLOSE ((9))              close out the PDS DCB
+         NI    SW,NOT-OPEN_DONE   flip the switch off
+         SLR   R15,R15
+         LH    R15,RETCODE        reset return code
+         B     OPEN_EXIT          and continue
+FOUND_MEMBER DS 0H
+         OI    SW,MEM_FOUND       flip the switch
+         MVC   MEMNAME,PARMDATA   indicate we found the member
+         SLR   R15,R15            with a RC = 0
+         STH   R15,RETCODE
+OPEN_EXIT DS   0H
+         L     R14,SAVER14        were done
+         BR    R14
+         DROP  R9
+*
+TIOT_SEARCH DS 0H
+*--------------------------------------------------------------------*
+*  Go down through the TIOTs and match up the DD names with our
+*  DCBs coded internally.  If no match is found for any of our DCBs
+*  issue a message and quit.
+*--------+-----+------------------+----------------------------------*
+         ST    R14,SAVER14        save return address
+         LA    R2,TIOTADDR        where to put the TIOT ptr
+         EXTRACT (2),'S',FIELDS=TIOT   get our TIOT ptr.
+         L     R1,TIOTADDR
+         USING TIOT1,R1           TIOT mapping
+         LA    R2,TIOENTRY        R2 = First DD entry in the list
+         MVC   WTOJOBN,TIOCNJOB   save off the jobname for WTOs
+         LA    R3,DCB_TABLE       work from the top
+         L     R9,DCB_TABLE       Start with the 1st DCB
+         USING IHADCB,R9          DCBD mapping
+*
+TIOTLOOP DS    0H
+         CLC   0(4,R2),=XL4'00'   end of TIOT?
+         BE    TIOT_DONE          yes, we're done
+         CLC   4(8,R2),DCBDDNAM   match on DD name ?
+         BE    DDNAME_HIT         yes, check the next one
+         SLR   R5,R5
+         IC    R5,0(,R2)          R5 = length of TIOT DD entry
+         LA    R2,0(R5,R2)        R2 = Next DD entry
+         B     TIOTLOOP           Go check it out.
+*
+DDNAME_HIT DS  0H
+         CLC   DCBDDNAM,=CL8'PDS '
+         BNE   CHK_INTRDR
+         OI    SW,GOT_PDS_DCB
+         B     TIOT_DONE
+CHK_INTRDR DS  0H
+         CLC   DCBDDNAM,=CL8'INTRDR '
+         BNE   CHK_SYSPRINT
+         OI    SW,GOT_INTRDR
+         B     TIOT_DONE
+CHK_SYSPRINT DS 0H
+         CLC   DCBDDNAM,=CL8'SYSPRINT'
+         BNE   TIOT_DONE
+         OI    SW,GOT_SYSPRINT
+*
+TIOT_DONE DS  0H
+         LA    R3,4(0,R3)         Select next DCB to process
+         ICM   R9,B'1111',0(R3)   any DCB ptr left ?
+         BZ    TIOTS_EXIT         None - no more DCBs to check
+         LA    R2,TIOENTRY        R2 = First DD entry in the list
+         B     TIOTLOOP           and continue
+*
+TIOTS_EXIT DS  0H
+         L     R14,SAVER14        get return address
+         BR    R14                exit sub-routine
+*
+*        SYNAD ROUTINE
+*
+PDSIOER  DS    0H
+         SYNADAF ACSMETH=BSAM
+         MVC   SYNADMS2+1(132),8(R1)     save the error msg.
+         MVC   SYNADMS1+65(44),DSNAME    get the dsname
+         PUT   SYSPRINT,SYNADMS1
+         PUT   SYSPRINT,SYNADMS2
+         SYNADRLS
+         B     NO_MORE_DCBS       go clean-up and exit
+         DROP  R1                 done with TIOT base
+         DROP  R9                 give up any DCB addressability
+*
+*--------ERROR MESSAGES AND NON-ZERO RETURN CODES---------------------*
+*
+NO_PARM_DATA DS 0H
+         LA    R15,4
+         STH   R15,RETCODE
+         WTO   '*-*-*HOTRDR - Parm field not specified. Return code=4'
+         B     MAIN_EXIT          exit sub-routine
+*
+BAD_PARM_LEN DS 0H
+         LA    R15,4
+         STH   R15,RETCODE
+      WTO  '*-*-*HOTRDR - Parm field greater than 8 characters. Return +
+               code=4'
+         B     MAIN_EXIT          exit sub-routine
+*
+BAD_PDS_FORMAT DS 0H
+         LA    R15,8
+         STH   R15,RETCODE
+        WTO  '*-*-*HOTRDR - PDS not RECFM=FB,LRECL=80. Return code=8'
+         B     NO_MORE_DCBS       exit sub-routine
+*
+NO_MEMBER DS   0H
+         LA    R15,8
+         STH   R15,RETCODE
+         MVC   NOMWTO+8+17(8),PARMDATA   plug in the member name
+NOMWTO   WTO   '*HOTRDR - Member XXXXXXXX not found. Retrun code=8'
+         B     NO_MORE_DCBS       exit sub-routine
+*
+MISSING_DCBS DS 0H
+         LA    R15,16
+         STH   R15,RETCODE
+         WTO   '*HOTRDR - Missing DCBs to process. Return code=12. Chec+
+               k DD names supplied.'
+         B     NO_MORE_DCBS       exit sub-routine
+*
+UNKOWN_ERR DS  0H
+         LA    R15,16
+         STH   R15,RETCODE
+         WTO   '*HOTRDR - Unknown error occured, Return code=16. Contac+
+               t System Support.'
+         B     NO_MORE_DCBS       exit sub-routine
+*
+FIND_ERR DS    0H
+         BAL   R14,THE_CONVERTER
+FINDERR  WTOL  '*HOTRDR - BLDL-FIND Failure, Retrun code=',            +
+               (CVTWORK,4),' Reason code=',(CVTWORK2,4),MF=(G,HOTRWTOL)
+         B     NO_MORE_DCBS       exit sub-routine
+*
+THE_CONVERTER DS 0H
+         ST    R14,SAVER14
+         LA    R2,RETCODE         return code set.
+         LA    R3,CVTWORK         where to convert it
+         LA    R4,2               the number of bytes
+         CONVERT (R3,R2,R4)       make it print-able
+*
+         LA    R2,RESCODE         reason code set
+         LA    R3,CVTWORK2        where to convert it
+         LA    R4,2               the number of bytes
+         CONVERT (R3,R2,R4)       make it print-able
+         L     R14,SAVER14
+         BR    R14
+*
+*--------CONSTANTS, EXECUTED INST. AND WORK AREAS---------------------*
+*
+         DS    0D
+FOXES    DC    F'-1'              mask table marker
+*
+DCB_TABLE DS   0H                 Table of all the DCBs
+         DC    A(PDS)
+         DC    A(INTRDR)
+         DC    A(SYSPRINT)
+         DC    F'0'               zeros mark the end
+*
+         PUSH  PRINT
+         PRINT NOGEN
+PDS      DCB   DSORG=PO,MACRF=R,LRECL=80,RECFM=FB,DDNAME=PDS,          X
+               SYNAD=PDSIOER
+INTRDR   DCB   DSORG=PS,MACRF=(PM),LRECL=80,RECFM=FB,DDNAME=INTRDR
+SYSPRINT DCB   DSORG=PS,MACRF=(PM),LRECL=133,RECFM=FB,DDNAME=SYSPRINT
+         POP  PRINT
+SYNADMS1 DC    CL133' * * * I/O ERROR OCCURRED READING DIRECTORY OF PDS1
+               .* * * DSNAME='
+SYNADMS2 DC    CL133' '
+         LTORG
+*
+HOTRWA   DSECT 0
+SAVE     DS    18F            Standard save area for DCB data mgnt.
+RETCODE  DS    H              any return code
+RESCODE  DS    H              any reason code(s)
+SAVER1   DS    F              a place to save R1
+SAVER14  DS    F              a place to save R14
+TIOTADDR DS    F              ptr to TIOT
+FINDAREA DS    D
+LRECAD   DS    F              current record ptr
+STOPAD   DS    F              end of the buffer
+BLOCKSIZ DS    F              length of buffer for reads
+BLOCKAD  DS    F              ptr to blksize buffer for reads
+PARMLEN  DS    F              PARM data length
+CVTWORK  DS    CL4            CONVERT macro work area
+CVTWORK2 DS    CL4            CONVERT macro work area
+PARMDATA DS    CL8            PARM data passed
+WTOJOBN  DS    CL8            Our JOB name
+BUFPTR   DS    X,AL3          X'87',AL3(WORKAREA)
+SW       DS    X              internal switches
+PASS_ONE  EQU  X'80'            first pass through
+OPEN_DONE EQU  X'40'            we have open DCB for PDS
+MEM_FOUND EQU  X'20'            we found the member
+OUT_OPEN  EQU  X'10'            we opened out output DCBs
+BAD_DCBD  EQU  X'08'            DCB not FB, PDS, or failed OPEN
+GOT_PDS_DCB EQU X'04'           PDS DDNAME present
+GOT_INTRDR  EQU X'02'           INTRDR DDNAME present
+GOT_SYSPRINT EQU X'01'          SYSPRINT DDNAME present
+         DS    0D             align on dlbl-wd boundry
+WORKAREA DS    CL256          RDJFCB work area
+         DS    CL80           some fudge filler
+DSNAME   DS    CL44           DSN of current PDS
+MEMNAME  DS    CL8            member name found
+VOLNO    DS    CL6            VOLUME where DSN lives
+         DS    0F             align WTO buffer on FL-WD
+HOTRWTOL DS    CL128          message buffer
+PRINT_BUF DS   CL133          print buffer
+HOTRWAL  EQU   *-HOTRWA
+*
+PRINTHDR DSECT 0
+         DS    CL2
+JOB      DS    CL8
+         DS    CL2
+DSN      DS    CL44
+         DS    CL2
+MEM      DS    CL8
+         DS    CL2
+VOL      DS    CL6
+*
+         IEFTIOT1
+*
+JFCBMAP  DSECT 0
+         IEFJFCBN LIST=YES
+*
+         DCBD  DSORG=BS,DEVD=DA
+*
+         END   HOTRDR

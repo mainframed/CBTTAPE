@@ -1,0 +1,196 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "SET-VARIABLES"
+;
+; This handles assignments to SETQ variables.
+;
+; Note: We used to search special-freevars and fluid-freevars to find
+;       the atom pair associated with the argument if it's atomic.
+;       Now we search special-unbounds and fluid-unbounds instead.
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/30/88 - Fixed bug that caused T or NIL register to be loaded     *
+;*            after a call to ZILVSET.                                 *
+;* 04/28/88 - If a variable to be set has never been referenced and    *
+;*            is local (not SPECIAL or closed over), then suppress     *
+;*            the storing of the value.  Unfortunately, we can't       *
+;*            eliminate the stack slot allocation that easily.         *
+;*            ZCGSTPRM has been incorporated into this function and    *
+;*            is now obsolete.                                         *
+;* 05/01/88 - Above not done when the value is being returned in       *
+;*            register 15, since multiple values could end up          *
+;*            being invalidly returned if the SETQ were eliminated.    *
+;*            To handle this, we now pass 4 arguments to ZCGSTVRS.     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(defun zcgstvrs (rr v s mvp)
+ (and rr (dolist (x v) (set-variable rr x s mvp))))
+
+(defun set-variable (r v s mvp)
+ (prog (sp fp o m a sub lb1 lb2 p)
+  (if (atom v)
+   then
+   (setq sp (assq v (cdr special-unbounds))
+         fp (assq v (cdr fluid-unbounds)))
+   (if (and sp fp)
+       (zerror
+       "Compiler error - free variable to be set both special and fluid"
+              v))
+    (setq a (or sp fp
+       (zerror "Compiler error - free variable to be set not found" v)))
+    (setq o (get (cdr a) 'pointer))
+    (setq m (if (> (string-length v) 16) (cdr a) v))
+    (princ "Note - assigning to non-local ")
+    (princ (cond (sp 'special)
+                 (fp 'lexical)
+                 (t "(and undeclared)")))
+    (princ " variable ")
+    (prin1 v)
+    (terpri)
+
+    (if sp                       ; If variable declared SPECIAL...
+
+     then
+
+  ; If subr ZILVSET doesn't already exist, create it.
+
+   (or (setq sub (assq 'zilvset subrs))
+       (modq subrs (setq sub (zilcosym 'zilvset 'subrs))))
+
+
+   (zcgemit 4 () "L" `("14," ,o "(,11)")       `("Get binding of " ,m))
+   (zcgemit 4 () "L" "3,##CDR(,14)"             "Check if it is bound.")
+   (zcgemit 4 () "C" "3,ZLCUNBND"               "If variable bound")
+   (zcgemit 4 () "BE" (setq lb1 (gensym))       "then...")
+   (zcgemit 4 () "ST" `(,r ",##CDR(,14)")  `("store into variable " ,m))
+   (zcgemit 4 () "B " (setq lb2 (gensym))       "else...")
+   (zcgemit 0 lb1 "DS" "0H"                      nil)
+   (zcgemit 2 () "LR" `("3," ,r)                " get address of value")
+   (zcgemit 4 () "L" `("2," ,(or (get (cdr a) 'location)
+                                 (putprop (cdr a) (gensym) 'location)
+                             ))                " get address of symbol")
+   (zcgemit 4 () "L" `("15," ,(or (get (cdr sub) 'location)
+                                  (putprop (cdr sub) (gensym) 'location)
+                              ))             " get address of ZILVSET")
+   (zcgemit 4 () "LA" `("1," ,(car pdmax) "(,11)") " get stack pointer")
+   (zcgemit 2 () "BALR" "14,15"  " call ZILVSET")
+
+   (zcgbase name nil) ; Reload additional base registers if necessary.
+
+   (zcgemit 4 () "ST"  `("15," ,o "(,11)")
+                                         " store binding cell on stack")
+   ; Don't reload #8 or #10!!!
+   (when (memq r regs)
+    (zcgemit 4 () "L" `(,r ",##CDR(,15)")      `("Reload value of " ,m))
+   )
+   (zcgemit 0 lb2 "DS" "0H"                 nil)
+
+     else   ; SETQ of unbound variable which is "pseudolexical"
+
+   (zcgemit 4 () "L" `("14," ,o "(,11)")  `("Get binding of " ,m))
+   (zcgemit 4 () "ST" `(,r ",##CDR(,14)")  `("Store into variable " ,m))
+
+     endif
+
+    )
+
+  else
+;
+; At this point we have a dotted pair, meaning a local assignment.
+;
+  (setq o (get (cdr v) 'offset))
+  (setq p (get (cdr v) 'position))
+  (setq m (if (> (string-length (car v)) 16)
+              (or p (cdr v))
+              (car v)))
+  (cond
+   (p                       ; A function argument.
+    (set-function-argument r v o m s mvp))
+   ((alistboundp v)
+    (zcgemit 4 () "L" `("14," ,o "(,11)")  "Get pointer to alist cell.")
+    (zcgemit 4 () "ST" `(,r ",##CDR(,14)") `("Store into variable " ,m))
+   )
+   ((zcgstvrs-setq-needed r v s mvp)
+    (zcgemit 4 () "ST" `(,r "," ,o "(,11)")`("Store into variable " ,m))
+   )
+   (t
+    (zcgstvrs-warn-unreferenced v)))
+  endif)))
+
+;;;
+;;; This routine generates code for a SETQ to a function argument.
+;;; Formerly ZCGSTPRM.
+;;;
+
+(defun set-function-argument (r v o m s mvp) ;
+ (cond
+  ((get (cdr v) 'lexprarg)
+   ;
+   ; Store LEXPR argument
+   ;
+   (zcgemit     4 () "L" "14,0(,11)"       "Get pointer to LEXPR arg.")
+   (cond
+    ((alistboundp v)
+     (zcgemit 4 () "L" "14,0(,14)"        "Get pointer to alist cell.")
+     (zcgemit 4 () "ST" `(,r ",##CDR(,14)")  `("Store LEXPR arg. " ,m))
+    )
+    (t
+     (zcgemit 4 () "ST" `(,r ",0(,14)")      `("Store LEXPR arg. " ,m))
+    )))
+
+  ((alistboundp v)
+   ;
+   ; Store local variable captured by lexical closure
+   ;
+   (zcgemit 4 () "L" `("14," ,o "(,11)")   "Get pointer to alist cell.")
+   (zcgemit 4 () "ST" `(,r ",##CDR(,14)")  `("Store function arg. " ,m))
+  )
+  ((zcgstvrs-setq-needed r v s mvp)
+   ;
+   ; Store local variable
+   ;
+   (zcgemit 4 () "ST" `(,r "," ,o "(,11)")  `("Store function arg " ,m))
+  )
+  (t
+   (zcgstvrs-warn-unreferenced v))))
+
+(defun zcgstvrs-setq-needed (r v s mvp)
+ (or (get (cdr v) 'used)
+     (get (cdr v) 'mustinit)
+     (and mvp
+          (eq r '\15)
+          (zilcomvp nil s))))
+
+(defun zcgstvrs-warn-unreferenced (v)
+ ;
+ ; Local variable never referenced - skip store
+ ;
+ ; We don't put out a warning because various optimizations
+ ; may have resulted in this situation, so the programmer may
+ ; not even be aware that a variable has become unreferenced.
+ ;
+ (when debug
+       (cterpri)
+       (princ "Skipping store of unreferenced local variable ")
+       (princ v)
+       (terpri))
+)

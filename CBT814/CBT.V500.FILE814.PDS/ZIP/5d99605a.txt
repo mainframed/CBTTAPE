@@ -1,0 +1,330 @@
+Dynamic allocation dataset diversion
+Many MVS installations employ some form of DASD pooling to isolate data
+associated with different types of workloads.  It is not uncommon for this
+approach to be used with TSO: a subset of devices is designated for the
+exclusive or primary use of that particular workload.  A problem arises,
+however, in controlling the sizes of new TSO datasets allocated.  Ideally, such
+allocations should be limited to some installation-specified maximum size with
+any larger allocations being diverted to a different DASD pool with different
+characteristics, eg having more capacity and servicing work that is more batch
+oriented.
+These objectives can be met to a large degree by the IEFDB401 dynamic allocation
+user exit, which is documented for MVS/XA in the MVS/Extended Architecture
+System Programming Library: User Exits Manual (GU28-1147).  In the
+implementation shown below, the exit checks for new allocations to unit name
+SYSTSO and changes them to unit name SYSBAT if the space requested exceeds
+limits specified in the CYLLIM or TRKLIM constants.  For block-type allocations,
+the TRKCALC function is invoked to determine if the request will fit within the
+TRKLIM limit.  Note that in this case the limits are set based on the
+expectation of the allocation occurring on a 3380: this will need to be changed
+where it is not appropriate.
+Allocation diversion will only occur if the default log-on unit name is SYSTSO
+and this default is being used for the allocation being requested.  Changing the
+log-on default to SYSTSO# or specifying SYSTSO# explicity as the unit name for
+the allocation will nullify diversion.  Nullification can also be achieved by
+including the user-id that is to be exempted in the DYNALUSR table.
+Note that various programs or facilities (eg ISPF) may have an internal default
+allocation unit name unique to them, which may alter the expected results from
+this exit.
+         TITLE 'I E F D B 4 0 1 - DYNAMIC ALLOCATION EXIT'
+IEFDB401 AMODE 31
+IEFDB401 RMODE ANY
+*** DSECTS ***
+WORKAREA DSECT
+UNITUPTR DS    A                  UNITNAME TU PTR IF UNITNAME MISSING
+UNITU    DS    XL14               UNITNAME TU
+* N O T E:  TOTAL WORKAREA DSECT LENGTH CANNOT EXCEED 500 BYTES
+         DS    50F                UNUSED AREA - CAN BE USED FOR TEXT
+*                                 UNIT EXTENSION
+BEGDATA1 EQU   *
+SAVEAREA DS    18F                REGISTER SAVE AREA
+PATRND   DC    0D'0'              PATTERN DSECT DATA - MOVED FROM CSECT
+TRKCALCD TRKCALC MF=L             TRKCALC LIST FORM IN THE DSECT
+BEGTUPTD DS    0A(0)              BEGIN TU & ROUTINE PTRS IN THE DSECT
+STATAD   DC    A(0),A(CHKSTAT)    DATASET STATUS TU & ROUTINE PTR
+UNITAD   DC    A(0),A(CHKUNIT)    UNITNAME TU & ROUTINE PTR
+CYLAD    DC    A(0),A(CHKCYL)     CYL ALLOC TU & ROUTINE PTR
+TRKAD    DC    A(0),A(CHKTRK)     TRK ALLOC TU & ROUTINE PTR
+BLKAD    DC    A(0),A(CHKBLK)     BLK ALLOC TU & ROUTINE PTR
+VLSERAD  DC    A(0),A(CHKVLSER)   VOLSER TU & ROUTINE PTR
+ENDTUPTD EQU   *                  END TU & ROUTINE PTRS IN THE DSECT
+PATRNED  EQU   *                  PATTERN DATA END FOR THE DSECT
+PRIMAD   DS    A                  PRIMARY REQUEST TEXT UNIT POINTER
+SECAD    DS    A                  SECONDARY REQUEST TEXT UNIT POINTER
+ENDTUPTR EQU   *                  END OF TEXT UNIT POINTER LIST
+ENDDATA1 EQU   *                  END OF ACTIVE DATA PORTION
+         IEFZB4D0                 SVC 99 DATA AREA MAPPER
+         IEFZB4D2                 SVC 99 MNEMONICS SUPPLIER
+         CVT    DSECT=YES         COMMUNICATION VECTOR TABLE
+         IKJTCB DSECT=YES         TASK CONTROL BLOCK
+         IEZJSCB                  JOB STEP CONTROL BLOCK
+         IKJPSCB                  PROTECTED STEP CONTROL BLOCK
+*** MAIN CSECT ***
+IEFDB401 CSECT
+         B     50(R15)            BRANCH AROUND ID
+         DC    CL46'I E F D B 4 0 1 - DYNAMIC ALLOCATION EXIT'
+         STM   R14,R12,12(R13)    STORE REGISTERS
+         L     R12,4(R1)          GET ADDR OF WORK AREA ADDR
+         L     R12,0(R12)         GET ADDR OF WORK AREA
+         USING WORKAREA,R12       SET ITS BASE
+         XC    BEGDATA1(ENDDATA1-BEGDATA1),BEGDATA1 ZERO DATA AREA
+         ST    R13,SAVEAREA+4     CHAIN SAVE AREAS
+         LA    R15,SAVEAREA
+         ST    R15,8(R13)
+         LR    R13,R15
+         BALR  R11,0              SET BASE REGISTER
+         USING *,R11
+         LR    R3,R1              SAVE P.A.L. ADDR
+         L     R1,12(R1)          GET JOBNAME/USERID POINTER
+         L     R2,=V(DYNALUSR)    GET ADDR OF USERID EXCLUSION TABLE
+CHKUSR   CLC   0(8,R1),0(R2)      MATCH?
+         BE    RETURN             YES, USER IS EXEMPT FROM THIS EXIT
+         CLI   0(R2),X'FF'        END OF TABLE?
+         BE    CONT1              YES, NO MATCH FOUND
+         LA    R2,8(R2)           NO, NEXT ENTRY
+         B     CHKUSR             LOOP
+CONT1    L     R4,0(R3)           GET SVC99 REQUEST BLOCK ADDR
+         USING S99RB,R4
+         CLI   S99VERB,S99VRBAL   DSNAME ALLOCATION?
+         BE    ALLOCREQ           YES
+         CLI   S99VERB,S99VRBDN   DDNAME ALLOCATION?
+         BNE   RETURN             NO,EXIT
+ALLOCREQ MVC   PATRND(PATRNED-PATRND),PATRNC PRIME THE DSECT
+         L     R5,S99TXTPP        GET TEXT UNIT PARM LIST POINTER
+         USING S99TUPL,R5
+***********************************************************************
+* THE FOLLOWING CODE EMPLOYS A LOOP TO PICK OFF THE PERTINENT TEXT    *
+* UNITS AND SAVE THEIR ADDRESSES IN A TABLE STARTING AT 'BEGTUPTD'.   *
+* THESE ADDRESSES ARE PAIRED WITH THE ADDRESSES OF ROUTINES TO CHECK  *
+* THE TEXT UNIT PARAMETERS IN DETAIL IN HIERARCHICAL ORDER.  FOR EX-  *
+* AMPLE, THE FIRST CHECK MADE IS ON DATASET STATUS; IF IT IS NOT      *
+* 'NEW', THEN NO FURTHER CHECKING NEED BE DONE.                       *
+***********************************************************************
+GETTUPTR L     R6,S99TUPTR        GET TEXT UNIT POINTER
+         USING S99TUNIT,R6
+         CLC   S99TUKEY,=AL2(DALSTATS) DATASET STATUS?
+         BE    STSTATAD                YES
+         CLC   S99TUKEY,=AL2(DALTRK)   TRACK ALLOCATION?
+         BE    STTRKAD                 YES
+         CLC   S99TUKEY,=AL2(DALCYL)   CYLINDER ALLOCATION?
+         BE    STCYLAD                 YES
+         CLC   S99TUKEY,=AL2(DALBLKLN) BLOCK ALLOCATION?
+         BE    STBLKAD                 YES
+         CLC   S99TUKEY,=AL2(DALPRIME) PRIMARY SPACE SPECIFICATION?
+         BE    STPRIMAD                YES
+         CLC   S99TUKEY,=AL2(DALSECND) SECONDARY SPACE SPECIFICATION?
+         BE    STSECAD                 YES
+         CLC   S99TUKEY,=AL2(DALUNIT)  UNITNAME SPECIFICATION?
+         BE    STUNITAD                YES
+         CLC   S99TUKEY,=AL2(DALVLSER) VOLSER SPECIFICATION?
+         BE    STVLSEAD                YES
+         B     NEXTTU             NEXT TEXT UNIT
+STSTATAD ST    R6,STATAD          STORE DATASET STATUS TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STTRKAD  ST    R6,TRKAD           STORE TRACK ALLOCATION TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STCYLAD  ST    R6,CYLAD           STORE CYLINDER ALLOCATION TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STBLKAD  ST    R6,BLKAD           STORE BLOCK ALLOCATION TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STPRIMAD ST    R6,PRIMAD          STORE PRIMARY SPACE SPEC. TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STSECAD  ST    R6,SECAD           STORE SECONDARY SPACE SPEC. TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STUNITAD ST    R6,UNITAD          STORE UNITNAME TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+STVLSEAD ST    R6,VLSERAD         STORE VOLSER TU ADDR
+         B     NEXTTU             NEXT TEXT UNIT
+NEXTTU   TM    S99TUPTR,S99TUPLN  IS THIS THE LAST TEXT UNIT PTR?
+         BO    PROCTUS            YES, PROCESS ACCUMULATED TU'S
+         LA    R5,L'S99TUPTR(R5)  INCREMENT TO NEXT TU PTR
+         B     GETTUPTR           LOOP
+***********************************************************************
+* PROCESS TEXT UNITS IN HIERARCHICAL ORDER AS DESCRIBED PREVIOUSLY.   *
+***********************************************************************
+PROCTUS  LA    R8,BEGTUPTD-8      INTIAL VALUE
+DISPATCH LA    R8,8(R8)           NEXT TEXT UNIT/ROUTINE PTR SLOT
+         LA    R9,ENDTUPTD        END OF SLOTS
+         CR    R8,R9              ARE WE THERE?
+         BNL   RETURN             YES
+         LM    R6,R7,0(R8)        NO, GET TU PTR AND ROUTINE PTR
+         BR    R7                 GO TO IT
+CHKSTAT  LTR   R6,R6              IS THE TU PTR PRESENT?
+         BZ    DISPATCH           NO, BUT DEFAULT IS 'NEW'
+         CLI   S99TUPAR,X'04'     NEW DATASET?
+         BE    DISPATCH           YES, NEXT ROUTINE
+         B     RETURN             NO, EXIT
+CHKVLSER LTR   R6,R6              IS THE TU PTR PRESENT?
+         BZ    DISPATCH           NO, KEEP CHECKING
+         B     RETURN             YES, FORGET ABOUT THE REST
+CHKUNIT  LTR   R6,R6              IS TU PTR PRESENT?
+         BNZ   CTULNG             YES, GO CHECK LENGTH
+         L     R2,CVTPTR               GET ADDR OF CVT
+         L     R2,CVTTCBP-CVT(R2)       "    "   " TCB WORDS
+         L     R2,4(R2)                 "    "   " CURRENT TCB (US)
+         ICM   R2,7,TCBJSCB+1-TCB(R2)   "    "   " JSCB
+         L     R2,JSCBPSCB-IEZJSCB(R2)  "    "   " PSCB
+         LTR   R2,R2                   IS THERE A PSCB?
+         BZ    RETURN                  NO, CAN DO NO MORE
+         CLC   PSCBGPNM-PSCB(8,R2),=CL8'SYSTSO' IS SYSTSO THE DEFAULT?
+         BE    SYSTSODE                YES
+         CLC   PSCBGPNM-PSCB(8,R2),=CL8'SYSTSO#' WHAT ABOUT SYSTSO#?
+         BNE   RETURN                  NO
+SYSTSODE LA    R1,UNITU                GET SUPPLEMENTARY TU ADDR
+         ST    R1,UNITUPTR             SAVE IT
+         NI    S99TUPTR,255-S99TUPLN   TURN OFF CURRENT END-OF-LIST BIT
+         LA    R5,UNITUPTR             POINT TO SUPPLEMENTARY TU PTR
+         OI    S99TUPTR,S99TUPLN       SET ITS END-OF-LIST BIT
+         LA    R6,UNITU           POINT TO SUPPLEMENTARY TU
+         XC    S99TUKEY,S99TUKEY  LEAVE THE KEY AT ZERO INITIALLY
+         MVC   S99TUNUM,=AL(L'S99TUNUM)(1)  SET NUMBER OF PARMS
+         MVC   S99TULNG,=AL(L'S99TUNUM)(6)  SET LENGTH OF PARM
+         ST    R6,UNITAD          STORE TU PTR IN CASE 'CHGUNIT' NEEDED
+         CLC   PSCBGPNM-PSCB(8,R2),=CL8'SYSTSO'  IS IT SYSTSO?
+         BE    DISPATCH           YES
+         MVC   S99TUKEY,=AL2(DALUNIT)       IT'S SYSTSO#, SET KEY
+         MVC   S99TUPAR(8),=CL8'SYSTSO'     SET VALID UNITNAME
+         B     RETURN                       AND FORGET ABOUT IT
+CTULNG   CLC   S99TULNG(L'S99TULNG),=AL(L'S99TULNG)(L'SYSTSO) CHK LNGTH
+         BE    CSYSTSO            INVESTIGATE FURTHER
+         CLC   S99TULNG(L'S99TULNG),=AL(L'S99TULNG)(L'SYSTSO#) DITTO
+         BE    CSYSTSO#           DITTO
+         B     RETURN             WE'VE LOST INTEREST
+CSYSTSO  CLC   SYSTSO,S99TUPAR    IS IT 'SYSTSO'?
+         BE    DISPATCH           YES, STILL INTERESTED
+         B     RETURN             NO, NOT ANY MORE
+CSYSTSO# CLC   SYSTSO#,S99TUPAR   IS IT 'SYSTSO#'?
+         BNE   RETURN             NO, FORGET IT
+         MVI   S99TUPAR+L'SYSTSO#-1,C' ' YES, BLANK OUT THE '#'
+         MVC   S99TULNG(L'S99TULNG),=AL(L'S99TULNG)(6) SET LENGTH TO 6
+         B     RETURN             AND GET OUT
+CHKCYL   LTR   R6,R6              OS TU PTR PRESENT?
+         BZ    DISPATCH           NO, GET NEXT
+         ICM   R6,15,PRIMAD       GET PRIMARY SPACE TU ADDR
+         BZ    CHKSCYL            IF ZERO CHECK SECONDARY CYL REQUEST
+         CLC   S99TUPAR(L'CYLLIM),CYLLIM OVER THE LIMIT?
+         BH    CHGUNIT            YES
+CHKSCYL  ICM   R6,15,SECAD        GET SECONDARY SPACE TU ADDR
+         BZ    RETURN             IF ZERO, OUT
+         CLC   S99TUPAR(L'CYLLIM),CYLLIM OVER THE LIMIT?
+         BH    CHGUNIT            YES
+         B     RETURN             NO
+CHKTRK   LTR   R6,R6              IS TU PTR PRESENT?
+         BZ    DISPATCH           NO, GET NEXT
+         ICM   R6,15,PRIMAD       GET PRIMARY SPACE TU ADDR
+         BZ    CHKSTRK            IF ZERO CHECK SECONDARY TRACK REQUEST
+         CLC   S99TUPAR(L'TRKLIM),TRKLIM OVER THE LIMIT?
+         BH    CHGUNIT            YES
+CHKSTRK  ICM   R6,15,SECAD        GET SECONDARY SPACE TU ADDR
+         BZ    RETURN             IF ZERO, OUT
+         CLC   S99TUPAR(L'TRKLIM),TRKLIM OVER THE LIMIT?
+         BH    CHGUNIT            YES
+         B     RETURN             NO
+CHKBLK   LTR   R6,R6              IS TU PTR PRESENT?
+         BZ    DISPATCH           NO, GET NEXT
+         SR    R0,R0              CLEAR R0
+         IC    R0,=X'0E'          USE 3380 UCBTYPE
+         SR    R2,R2              CLEAR R2
+         ICM   R2,3,S99TUPAR+1    GET LAST 2 BYTES OF BLOCK LENGTH
+         TRKCALC FUNCTN=TRKCAP,TYPE=(R0),R=1,K=0,DD=(R2),REGSAVE=YES,  C
+               MF=(E,TRKCALCD)    GET NO. OF BLOCKS PER TRACK
+         LTR   R15,R15            CHECK R15
+         BNZ   RETURN             ABNORMAL - SYSTEM WILL GET HIM
+         MH    R0,TRKLIM+1        MULTIPLY BY TRKLIM TO GET MAX BLOCKS
+*                                 ALLOWABLE
+         ICM   R6,15,PRIMAD       GET PRIMARY SPACE TU ADDR
+         BZ    CHKSBLK            IF ZERO CHECK SECONDARY BLOCK REQUEST
+         CLM   R0,7,S99TUPAR      CHECK AGAINST REQUESTED BLOCKS
+         BL    CHGUNIT            REQUESTED > ALLOWABLE - DIVERT HIM
+CHKSBLK  ICM   R6,15,SECAD        GET SECONDARY SPACE TU ADDR
+         BZ    RETURN             EXIT IF ZERO
+         CLM   R0,7,S99TUPAR      CHECK AGAINST REQUESTED BLOCKS
+         BL    CHGUNIT            REQUESTED > ALLOWABLE - DIVERT HIM
+         B     RETURN             HE'S OK
+CHGUNIT  ICM   R6,15,UNITAD       GET UNITNAME TU ADDR
+         MVC   S99TUKEY,=AL2(DALUNIT) SET UNITNAME KEY IN CASE IT'S 0
+         MVC   S99TUPAR(L'SYSBAT),SYSBAT CHANGE UNITNAME TO 'SYSBAT'
+         B     RETURN             END
+RETURN   SR    R15,R15            SET RETURN CODE
+         L     R13,4(R13)         RE-POINT TO OLD SAVE AREA
+         L     R14,12(R13)        RELOAD R14...
+         LM    R0,R12,20(R13)     ...AND THE REST
+         BR    R14                EXIT
+*** DATA AREA ***
+SYSTSO   DS    0CL6
+SYSTSO#  DS    0CL7
+         DC    C'SYSTSO#'
+SYSBAT   DC    CL6'SYSBAT'
+         DC    0F'0'
+CYLLIM   DC    AL3(5)             CYLINDER LIMIT
+TRKLIM   DC    AL3(75)            TRACK LIMIT
+PATRNC   DC    0D'0'              PATTERN CSECT DATA - WILL BE MOVED...
+*                                 ...TO DSECT
+TRKCALCC TRKCALC MF=L             TRKCALC LIST FORM IN THE CSECT
+BEGTUPTC DS    0A(0)              BEGIN TU & ROUTINE PTRS IN THE CSECT
+STATAC   DC    A(0),A(CHKSTAT)    DATASET STATUS TU & ROUTINE PTR
+UNITAC   DC    A(0),A(CHKUNIT)    UNITNAME TU & ROUTINE PTR
+CYLAC    DC    A(0),A(CHKCYL)     CYL ALLOC TU & ROUTINE PTR
+TRKAC    DC    A(0),A(CHKTRK)     TRK ALLOC TU & ROUTINE PTR
+BLKAC    DC    A(0),A(CHKBLK)     BLK ALLOC TU & ROUTINE PTR
+VLSERAC  DC    A(0),A(CHKVLSER)   VOLSER TU & ROUTINE PTR
+ENDTUPTC EQU   *                  END TU & ROUTINE PTRS IN THE CSECT
+PATRNEC  EQU   *                  PATTERN DATA END FOR THE CSECT
+*** EXEMPT USER TABLE CSECT ***
+DYNALUSR AMODE 31
+DYNALUSR RMODE ANY
+DYNALUSR CSECT
+         DC    05CL8' '           EXEMPT USER SLOTS
+         DC    X'FF'              END OF TABLE
+         END
+
+
+     © Xephon 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

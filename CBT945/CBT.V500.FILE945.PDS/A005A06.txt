@@ -1,0 +1,164 @@
+Checking volume security
+
+When using RACF or a RACF-compatible product (including
+the SAF interface), there is a potential security exposure when
+allocating new VSAM datasets or extending VSAM datasets on
+new volumes. When the security call is performed, the volume
+serial number passed is not for the volume on which the
+allocation or extension is to take place. For VSAM datasets,
+the volume serial number used is that of the disk containing the
+catalog in which the VSAM dataset being allocated or extended
+is catalogued. This presents a problem to security systems such
+as CA-Top Secret when ICF VSAM user catalogs are
+protected.
+
+Consider this scenario: datasets using the high-level qualifier
+TEST are catalogued in catalog ICFUCAT.VTEST01 on
+volume TEST01. A TSO user wants to create a VSAM dataset
+called TEST.TESTFILE on volume TEST02, which the user
+has full access to. When the security request is generated, the
+volume for which CREATE ACCESS will be requested will be TEST01;
+this is because MVS builds the RACHECK/RACROUTE parameter list to
+reflect TEST01 as the volume on which the dataset is to be
+allocated rather than TEST02 as the user requested. In order to
+allow this allocation, the security system must have a definition
+allowing the TSO CREATE ACCESS to volume TEST01, even though he
+wants to allocate his dataset on TEST02. This opens up the
+possiblity that the user could also allocate his VSAM datasets on
+TEST01, since he would have CREATE ACCESS to that volume. This
+presents a potential security breach if the user should not
+really be allowed to create datasets on TEST01.
+
+In order to remedy this security exposure, I have written a
+DADSM pre-processing exit. The standard name of the exit is
+required to be IGGPRE00 and its use is documented in the
+appropriate level of the MVS Data Facility Product (DFP)
+Customization guide. The exit is passed a parameter list
+containing the function requested, as well as the addresses of
+the UCB, JFCB, and DCB for the dataset in question. The
+basic mechanics of the exit is to check that the request is for a
+new allocation or extension to a dataset on a new volume. The
+dataset is checked for a DSORG of VSAM, and a RACROUTE
+macro is issued to check the users authority to CREATE on the
+volume requested. The DADSM exit is passed the actual
+volume on which the user wishes to allocate his dataset rather
+than the volume on which the user catalog resides. If the
+RACROUTE gives a return code of zero, the
+allocation/extension is allowed by the exit. If not, a return code
+of 8 is set by the exit to unconditionally reject the request and
+this return code is also stored in the parameter list passed to
+IGGPRE00. This value will be used as the reason code in
+message IEF274I which indicates that the space request was
+rejected by the DADSM exit. One further note concerns the
+class name parameter list (labelled CLASS) which is used by
+the RACROUTE; the class name used is DASDVOLX, which
+is not a standard class and is in fact undocumented in CA-Top
+Secret manuals. Its name was given to me by the vendor after
+calling about problems relating to using this exit. The
+parameter list consists of a one-byte field containing the length
+of the class name (X'08'), the class name itself (DASDVOLX),
+and finally a byte indicating the access level to be checked.
+Access level X'10' has no meaning in standard RACF systems,
+it is used by CA-Top Secret to indicate CREATE ACCESS.
+Although this value can be placed in a register and used in the
+ATTR= keyword of the RACROUTE/RACHECK macros, it
+was recommended by the vendor to use the format coded in
+this exit.
+
+This version of the IGGPRE00 exit also performs some
+additional security checking that is not done in any security
+product. If the volume on which the allocation will take place
+is mounted as a public volume, a check is done to ensure that
+the dataset being allocated is temporary. A temporary dataset is
+defined as one which has a system-generated temporary dataset
+name or one which is
+deleted, either explicitly or implicitly, at job termination. This
+check is performed to disallow any users from using a specific
+volume serial number to point to a public volume when they
+are trying to create datasets. This, in effect, will ensure that
+only temporary datasets reside on public volumes.
+
+IGGPRE00 TITLE  'PRE ALLOCATION DADSM EXIT FOR SECURITY CHECKING OF VOLX
+               UMES FOR VSAM DATASETS'
+IGGPRE00 AMODE 31                 31-BIT ADDRESSING MODE
+IGGPRE00 RMODE ANY                31-BIT RESIDENCY MODE ALLOWED
+         REGS  ,                  MACRO TO PERFORM REGISTER EQUATES
+IGGPRE00 CSECT
+         SAVE  (14,12),,IGGPRE00-&SYSDATE
+         LR    R12,R15            LOAD R12 W/BASE ADDRESS
+         USING IGGPRE00,R12
+         LR    R2,R1              SAVE PARMS IN R2
+         GETMAIN RU,LV=WORKLEN    OBTAIN DYNAMIC STORAGE
+         ST    R13,4(,R1)         SET BACKWARD POINTER
+         ST    R1,8(,R13)         SET FORWARD POINTER
+         LR    R13,R1             SET R13 TO POINT TO OUR SAVE AREA
+         USING WORKAREA,R13
+         L     R3,CVTPTR          LOAD A(CVT)
+         USING CVT,R3
+         ICM   R3,15,CVTRAC       LOAD A(RACF CVT), IF ANY
+         BZ    ALLOCOK            IF NONE, ALLOW THE REQUEST
+         USING RCVT,R3
+         TM    RCVTSTAT,RCVTRNA   ELSE, IS RACF-NOT-ACTIVE BIT ON
+         BO    ALLOCOK            YES, GO ALLOW THE REQUEST
+         USING PREPL,R2
+         CLI   IEXFUNC,IEXALL     ELSE, IS IT ALLOCATION FUNCTION CODE
+         BE    CHKPUB             YES, GO CHECK FOR TYPE OF VOLUME
+         CLI   IEXFUNC,IEXEXT     ELSE, IS IT EXTEND FUNCTION CODE
+         BNE   ALLOCOK            NO, GO ALLOW THE REQUEST
+         CLI   IEXEXTCD,X'04'     ELSE, IS IT EXTEND DATASET ON NEW VOL
+         BNE   ALLOCOK            NO, GO ALLOW THE REQUEST
+CHKPUB   L     R4,IEXUCB          ELSE, LOAD A(UCB)
+         USING UCBOB,R4
+         L     R3,IEXPTR1         LOAD A(JFCB)--NOTE THE A(JFCB) IS
+*                                 ONLY VALID FOR ALLOCATE, EXTEND,
+*                                 AND PARTIAL RELEASE FUNCTION CODES.
+         USING INFMJFCB,R3
+         TM    UCBSTAB,UCBBPUB    IS THE VOLUME MOUNTED PUBLIC
+         BZ    CHKVSAM            NO, GO CHECK FOR VSAM
+CHKTEMP  TM    JFCBIND2,JFCTEMP   ELSE, IS IT A TEMPORARY DATASET
+         BZ    ALLOCNG            NO, GO DISALLOW THE REQUEST
+         B     ALLOCOK            ELSE, GO ALLOW THE REQUEST
+CHKVSAM  TM    JFCDSRG2,JFCORGAM  IS IT A VSAM DATASET
+         BNO   ALLOCOK            NO, GO ALLOW THE REQUEST
+         MVC   VOLUME,UCBVOLI     MOVE IN THE VOLSER
+         LA    R8,VOLUME          LOAD A(VOLUME) FOR RACROUTE
+         LA    R7,RACWK           LOAD A(WORKAREA) FOR RACROUTE
+         MVC   RACHKD(RACHKL),RACHK MOVE PLIST TO GETMAINED AREA
+         RACROUTE REQUEST=AUTH,ENTITY=((R8)),WORKA=(R7),MF=(E,RACHKD)
+         LTR   R15,R15            IS CREATE AUTHORITY ALLOWED FOR VOL
+         BZ    ALLOCOK            YES, GO ALLOW THE REQUEST
+ALLOCNG  LA    R9,8               ELSE, SET RC = 8 TO CAUSE DADSM TO
+*                                 UNCONDITIONALLY REJECT THE REQUEST
+         STH   R9,IEXREASN        STORE AS REASON CODE FOR DADSM TO BE
+*                                 DISPLAYED IN MESSAGE IEF274I
+         B     RETURN             GO RETURN TO CALLER
+ALLOCOK  LA    R9,0               SET ZERO RETURN CODE
+RETURN   LR    R1,R13             GET SAVEAREA ADDRESS
+         L     R13,4(,R13)        LOAD R13 W/A(CALLER SAVEAREA)
+         FREEMAIN RU,A=(1),LV=WORKLEN FREE STORAGE
+         LR    R15,R9             LOAD R15 WITH RETURN CODE
+         RETURN (14,12),RC=(15)   RETURN TO CALLER
+* CLASS CONTAINS CLASS NAME LENGTH/CLASS NAME/ACCESS LEVEL (CREATE)
+CLASS    DC    X'08',CL8'DASDVOLX',X'10'
+CLASSL   EQU   *-CLASS
+RACHK    RACROUTE CLASS=CLASS,REQUEST=AUTH,MF=L
+RACHKL   EQU   *-RACHK
+         LTORG
+WORKAREA DSECT
+SAVEAREA DS    18F           SAVE AREA FOR STD LINKAGE CONVENTIONS
+RACHKD   DS    XL(RACHKL)    AREA FOR RACROUTE CODE TO BE RE-ENTRANT
+VOLUME   DS    CL6           VOLUME SERIAL SAVE AREA
+RACWK    DS    CL512         WORK AREA FOR RACROUTE
+WORKLEN  EQU   *-WORKAREA    LENGTH OF GETMAIN'D WORK AREA
+PREPL    IECIEXPL DSECT=YES  DADSM EXIT PLIST
+         PRINT NOGEN
+UCB      DSECT               GENERATE DSECT FOR UCB
+         IEFUCBOB LIST=YES   UCB DSECT
+JFCB     DSECT               GENERATE DSECT FOR JFCB
+         IEFJFCBN LIST=YES   JFCB DSECT
+         CVT   DSECT=YES,LIST=NO CVT
+         ICHPRCVT            RACF CVT DSECT
+         END
+
+
+

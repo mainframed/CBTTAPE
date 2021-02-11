@@ -1,0 +1,179 @@
+Condition code checking
+
+There are some utilities, both from IBM and other vendors,
+which try to be very forgiving when it comes to terminating
+their execution when errors are encountered.  One of the most
+common is IDCAMS, the Access Methods Services utility.
+Upon encountering an error it tends almost always to return a
+non-zero condition code rather than abending a step.  It does
+not even have the option of abending rather than  returning
+non-zero condition codes.
+
+This philosophy can present a large problem in batch
+production jobs and to some job scheduling systems.  Unless
+condition code checking is performed on each step following a
+step returning a non-zero condition code, the subsequent steps
+will be executed, even if not desired.  We ran into such a
+problem, again most noticeable with IDCAMS, in our batch
+production environment.  We also have no standard which
+requires the use of condition code checking in production JCL
+and our job scheduling system does not react to non-zero
+condition codes until the end of a job.
+
+Rather than go into all production JCL to add condition code
+checking, we tried to find another quick method to fix the
+problem.  While condition code checking could be done at the
+job level, that would have also required massive manual
+updating to add the required parameter to each batch
+production job card.
+
+What we opted for was a front-end program which issues an
+OS LINK to the desired program (IDCAMS for example) and
+examines the return code passed by the called program.  If the
+called program returns a non-zero condition code, the driver
+program issues an OS ABEND.  We decided to leave the task
+of determining the proper condition codes to our applications
+programmers.  This is because utilities like IDCAMS can
+return the same condition codes for an acceptable event (like
+deleting a dataset which does not exist or is currently in use).
+
+We wrote a driver program, called CONDCODE, to replace
+the program specified on the EXEC statement.  The actual
+program to be called is passed as a parameter to the
+CONDCODE program along with any parameters to be passed
+to the actual program.  The syntax of the EXEC statement is
+similar to that of the OS LOADER program; the program name
+to be executed is coded first and, if any PARM field is to be
+passed to that program, a slash (/) is coded following the
+program name, after which the parameter data to be passed to
+the program is coded.
+
+Below is an example using the SORT program.  The PARM
+data specifies that the program to be invoked is SORT.  The
+data to the right of the slash (/) specifies that the parameters
+CORE=MAX,MSG=PC are to be passed to the SORT
+program.  If SORT were to return a non-zero condition to the
+CONDCODE program, it would issue a user abend to prevent
+the execution of any further steps in a job.
+
+//STEP001  EXEC PGM=CONDCODE,
+//         PARM='SORT/CORE=MAX,MSG=PC'    PGM NAME/PGM PARAMETERS
+//SYSOUT   DD SYSOUT=*
+//SORTMSG  DD SYSOUT=*
+//SORTWK01 DD UNIT=SYSDA,DSN=&&SW01,SPACE=(CYL,2,,CONTIG)
+//SORTWK02 DD UNIT=SYSDA,DSN=&&SW02,SPACE=(CYL,2,,CONTIG)
+//SORTWK03 DD UNIT=SYSDA,DSN=&&SW03,SPACE=(CYL,2,,CONTIG)
+//SORTIN   DD DSN=SYS1.PARMLIB(VATLST01),DISP=SHR
+//SORTOUT  DD DSN=SYS1.PARMLIB(VATLST02),DISP=SHR
+//SYSIN    DD *,DCB=BLKSIZE=80
+ SORT FIELDS=(1,6,A),FORMAT=CH
+/*
+
+In its simplest implementation, we use a global update facility
+to replace all occurrences of:
+      EXEC PGM=IDCAMS
+with:
+      EXEC PGM=CONDCODE,PARM=IDCAMS
+
+This allows us to terminate any job in which IDCAMS returns
+a non-zero condition code with a minimum of interruption to
+our JCL decks.  We have identified other utilities which return
+non-zero condition codes rather than abend (such as
+EASYTRIEVE from Pansophic Systems) for which we will
+implement the above method of condition code checking.  This
+is the quickest route for us to ensure that subsequent steps of a
+job do not execute and is must faster to implement than going
+into these job streams to add condition code checking.
+
+CONDCODE CSECT                     ESTABLISH CSECT
+         SAVE  (14,12),,CONDCODE-&SYSDATE
+         LR    R12,R15            LOAD A(EPA)
+         USING CONDCODE,R12       ESTABLISH ADDRESSABLITY TO CSECT
+         LA    R8,SAVEAREA        LOAD ADDR OF MY S/A
+         ST    R8,8(,R13)         ST MY S/A ADDR IN CALLERS S/A
+         ST    R13,4(,R8)         ST CALLERS S/A ADDR IN MY S/A
+         LR    R13,R8             LOAD ADDR OF MY S/A IN R13
+         L     R1,0(,R1)          LOAD A(PARM LIST)
+         LH    R2,0(,R1)          LOAD PARM LIST LENGTH
+         LTR   R2,R2              IS THERE A PARM FIELD GIVEN
+         BNZ   PROCESS            YES, GO PROCESS IT
+         WTO   'CCD001I NO PROGRAM NAME SPECIFIED IN PARM FIELD-ABENDINX
+               G',ROUTCDE=11
+         ABEND 0001,DUMP,,USER    ABEND FOR MISSING PROGRAM NAME
+PROCESS  CH    R2,=H'100'         IS PARM LENGTH GREATER THAN MAX
+         BNH   STORELEN           NO, GO SAVE PARM LENGTH
+         WTO   'CCD002I PARMATER LENGTH EXCEEDS MAXIMUM OF 100 CHARACTEX
+               RS-ABENDING',ROUTCDE=11
+         ABEND 0002,DUMP,,USER    ABEND FOR BAD PROGRAM NAME
+STORELEN STH   R2,PARMLEN         STORE PARM FIELD LENGTH
+         LA    R3,2(,R1)          LOAD A(ACTUAL PARM DATA)
+         LA    R6,9               LOAD NUMBER OF TIMES TO LOOP
+         LR    R8,R3              SAVE A(PARM DATA)
+         SR    R4,R4              CLEAR FOR COUNTER
+PGMLOOP  CLI   0(R3),C'/'         DID WE REACH END OF PGM NAME
+         BE    RESETPRM           YES, GO FIX PARM FIELD
+         CLI   0(R3),C'@'         NO, IS IT A VALID CHARACTER
+         BE    BUMP               YES, GO BUMP TO NEXT BYTE
+         CLI   0(R3),C'$'         IS IT A VALID CHARACTER
+         BE    BUMP               YES, GO BUMP TO NEXT BYTE
+         CLI   0(R3),C'#'         IS IT A VALID CHARACTER
+         BE    BUMP               YES, GO BUMP TO NEXT BYTE
+         CLI   0(R3),C'A'         IS IT A VALID CHARACTER
+         BNL   BUMP               YES, GO BUMP TO NEXT CHARACTER
+ABEND4   WTO   'CCD003I PROGRAM NAME IN PARM FIELD CONTAINS INVALID CHAX
+               RACTERS-ABENDING',ROUTCDE=11
+         ABEND 0003,DUMP,,USER    ABEND FOR BAD PROGRAM NAME
+BUMP     LA    R3,1(,R3)          BUMP TO NEXT BYTE
+         LA    R4,1(,R4)          INCREMENT COUNTER
+         CH    R4,PARMLEN         IS COUNT = PARMLEN(W/O '/')
+         BE    RESETPRM           YES, GO FIX PARM FIELD
+         BCT   R6,PGMLOOP         LOOP TO CHECK AGAIN
+         WTO   'CCD004I PROGRAM NAME SPECIFIED IN PARM FIELD IS LONGER X
+               THAN 8 CHARACTERS-ABENDING',ROUTCDE=11
+         ABEND 0004,DUMP,,USER    ABEND FOR BAD PROGRAM NAME
+RESETPRM LR    R5,R4              SAVE LENGTH FOR LATER
+         BCTR  R4,R0              DECREMENT FOR MVC EXECUTE
+         EX    R4,MVCPGM          EXECUTE MOVE OF PROGRAM NAME
+         LR    R4,R5              RESTORE LENGTH
+         SR    R5,R5              CLEAR REGISTER
+         LH    R5,PARMLEN         LOAD PARM LENGTH
+         CR    R4,R5              IS COUNT= PARMLEN(WITHOUT ANY '/')
+         BE    MOVEPARM           YES, SKIP INCREMENT
+         LA    R4,1(,R4)          ADD 1 FOR ABOVE DECREMENT
+MOVEPARM SR    R5,R5              CLEAR REGISTER
+         LH    R5,PARMLEN         LOAD LENGTH OF ORIG PARMLIST
+         SR    R5,R4              SUBTRACT LENGTH OF PGMNAME & '/'
+         STH   R5,PARMLEN         STORE NEW PARM LENGTH
+         LTR   R5,R5              WAS ANY OTHER PARM GIVEN
+         BZ    ARNDSETF           NO, GO LINK TO PROGRAM
+         CH    R5,=H'90'          IS REAL PARM GREATER THAN I CAN TAKE
+         BNH   SETPARM            NO, I CAN HANDLE IT
+         WTO   'CCD005I PARM FIELD FOR PROGRAM BEING INVOKED EXCEEDS ALX
+               LOWABLE MAXIMUM OF 90 CHARACTERS-ABENDING',ROUTCDE=11
+         ABEND 0005,DUMP,,USER    ABEND FOR BAD PROGRAM NAME
+SETPARM  LA    R8,0(R4,R8)        LOAD A(WHATS AFTER 'PGMNAME/')
+         LH    R4,PARMLEN         LOAD W/LENGTH FOR EXECUTE
+         BCTR  R4,R0              DECREMENT FOR MVC EXECUTE
+         EX    R4,NEWPARM         EXECUTE MOVE OF NEW PARM FIELD
+ARNDSETF LA    R1,PARMPTR         LOAD A(NEW PARM)
+         LINK  EPLOC=PGMNAME      LINK TO REQUESTED PROGRAM
+         LTR   R15,R15            DID LINKED-TO PGM COND CODE=0
+         BZ    RETURN             YES, GO RETURN NORMALLY
+         ABEND 0009,DUMP,,USER    ELSE, ABEND FOR NON-ZERO COND CODE
+RETURN   L     R13,SAVEAREA+4     RELOAD A(CALLERS S/A)
+         RETURN (14,12),RC=(15)   RETURN TO OS
+MVCPGM   MVC   PGMNAME(0),0(R8)   EXECUTED MVC OF PGM NAME FOR LINK
+NEWPARM  MVC   PARMSTRT(0),0(R8)  EXECUTED MVC OF REST OF PARM FIELD
+SAVEAREA DC    18F'0'             OS SAVEAREA
+PARMPTR  DC    X'80',AL3(PARM)    POINTER TO PARM FIELD
+PGMNAME  DC    CL8' '             AREA FOR PROGRAM NAME TO LINK
+PARM     DS    0F                 BEGINNING OF RMF PARM FIELD
+PARMLEN  DC    AL2(PARMEND-PARMSTRT) HALFWORD OF PARM LENGTH
+PARMSTRT DC    CL90' '            ACTUAL PARM FIELD
+PARMEND  EQU   *                  EQUATE FOR END OF PARM FIELD
+         END
+
+
+                                                                      c Xephon 1990
+
+

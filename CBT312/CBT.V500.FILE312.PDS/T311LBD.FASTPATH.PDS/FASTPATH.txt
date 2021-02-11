@@ -1,0 +1,996 @@
+/* ---------------------  rexx procedure  ---------------------- *
+ * Name:      Fastpath                                           *
+ *                                                               *
+ * Function:  Display a selection list of all Selectable         *
+ *            commands in the ISPCMDS ISPF Command Table         *
+ *            and in the System and User command tables          *
+ *            along with the commands in the current application *
+ *            command table.  This command will:                 *
+ *                                                               *
+ *            1.  Provide the user with information on           *
+ *                fast path commands available.                  *
+ *            2.  Simplify access to fast path commands.         *
+ *            3.  Provide a pseudo-menu to ISPF command          *
+ *                functions.                                     *
+ *            4.  If a tutorial panel exists for the command     *
+ *                of the format $ followed by the first 7        *
+ *                characters of the command name, it will be     *
+ *                displayed if the user selects the command      *
+ *                with 'H' or via PF1(Help) on the pop-up        *
+ *                menu if the command has options.               *
+ *                                                               *
+ * Syntax:    %Fastpath                                          *
+ *                                                               *
+ * Author:    Lionel B. Dyck                                     *
+ *Updated:    Al Ferguson (AJF)                                  *
+ *                                                               *
+ * History:                                                      *
+ * LBD:       08/29/17 Incorporate updates from Hartmut          *
+ *                     - use ISPBLANK to invoke ISPF commands    *
+ *                       which now enables alias entries         *
+ *                     - Return to the command table after       *
+ *                       execution                               *
+ *                     - Additional cleanup                      *
+ * LBD:       08/28/17 Insert inline the ISPF Panels             *
+ *                     Turn off Keylist                          *
+ * AJF:       08/07/17 Update Build_Table to include Command     *
+ *                     table ApplID in display.                  *
+ * AJF:       08/07/17 Refactor "Do_Msg"                         *
+ * AJF:       08/07/17 Refactor "test_for_help" into             *
+ *                     "HELP_PANEL_EXISTS" Function.             *
+ * AJF:       08/07/17 Use hpan in all locations vs h_pan in     *
+ *                     some location (prevented finding correct  *
+ *                     Help Panel).                              *
+ * AJF:       08/07/17 Minor refactoring to aid in debugging     *
+ * AJF:       08/07/17 Change FASTPATH ISPF Panel HELP from      *
+ *                     FASTPATH (same name!) to $FASTPAT &       *
+ *                     create dummy $FASTPAT Help Panel          *
+ *            08/04/17 Support Site and User tables 2 & 3        *
+ *            06/29/17 Update to support multiple of the same    *
+ *                     commands in the list                      *
+ *            04/11/16 Update to not include the RFIND from      *
+ *                     the FASTCMDS table (added by this exec    *
+ *            03/14/16 Corrected repeat find                     *
+ *            05/20/03 correct command table search order        *
+ *                     add current application command table     *
+ *            09/02/97 minor cleanup for ispcmds                 *
+ *            08/22/97 Support current appl command table        *
+ *            02/26/97 Support System Command Table Search order *
+ *            02/24/97 Add support for System and User command   *
+ *                     tables (ISPF V4)                          *
+ *            03/16/95 Upper case zctact                         *
+ *            01/10/95 Clear our usrrfind variable on exit       *
+ *            01/17/94 Add Help for option                       *
+ *            02/23/93 Add 'Locate' option                       *
+ *            02/17/93 Created.                                  *
+ *                                                               *
+ * ------------------------------------------------------------- */
+
+  signal on novalue name sub_novalue
+/* ------------------------------------------------------------- *
+ * Verify entry under ISPF                                       *
+ * ------------------------------------------------------------- */
+IF "ACTIVE" <> SYSVAR('SYSISPF') THEN EXIT 4
+
+parse arg options
+parse value '' with _debug_ row null
+
+PARSE VALUE '1 0 0 0' WITH crp rowcrp last_find new_counter
+
+ADDRESS ISPEXEC
+"Control Errors Return"
+
+/* -------------------------------------------------- *
+ * Test for our ISPF Applid and if not then:          *
+ * - create an ISPF Commands Table so we can change   *
+ *   RFIND to PASSTHRU so we can process it           *
+ * - re-invoke ourselves with our APPLID              *
+ * - upon return end the ISPF Commands Table and exit *
+ * -------------------------------------------------- */
+ ADDRESS "ISPEXEC"
+ "VGET (Zapplid)"
+ IF zapplid <> "FAST" THEN DO
+     "TBCREATE fastcmds NAMES(zctverb zcttrunc zctact zctdesc)",
+              "REPLACE SHARE NOWRITE"
+     zctverb = "RFIND"
+     zcttrunc = 0
+     zctact = "&USRRFIND"
+     zctdesc = "RFIND for FastPath Dialog"
+     "TBADD fastcmds"
+     "SELECT CMD(%"SYSVAR('SYSICMD') options") NEWAPPL(FAST) PASSLIB"
+     "TBEND fastcmds"
+     EXIT 0
+  END
+
+/* ------------------ *
+ | Deactivate KeyList |
+ * ------------------ */
+ "SELECT PGM(ISPKLU) PARM(OFF) SCRNAME(SETTINGS)"
+
+/* ---------------------------------------------------- *
+ |  *Custom*                                            |
+ |                                                      |
+ |  dyn_panel values                                    |
+ |      0 - Disable inline panels (requires all panels  |
+ |          to be installed into ISPPLIB                |
+ |      1 - Enable inline panels                        |
+ * ---------------------------------------------------- */
+ dyn_panels = 1
+
+/* --------------------------------------- *
+ | Dynamically load the inline ISPF Panels |
+ * --------------------------------------- */
+ if dyn_panels = 1 then
+    load_info = loadispf()
+
+/* -------------------------- *
+ * Create ispf table          *
+ * -------------------------- */
+ fastcmds = "fast"RANDOM()
+ "TBCREATE" fastcmds ,
+           "NAMES(fpcmd fpdesc fpaction fpappl fptrunc fptable)" ,
+           "Replace Share"
+ IF RC = 8 THEN DO
+   if build_rc8 = 'on' then do
+      CALL Do_Mst "Error", "Fastpath dialog error - contact systems"
+      EXIT 8
+      END
+   "TBend" fastcmds
+   build_rc8 = 'on'
+   signal build_table
+   END
+
+"VGET (ZSCTPREF ZSCTSRCH ZUCTPREF ZAPPLID)"
+"VGET (zsctpre2 zsctpre3 zuctpre2 zuctpre3)"
+
+local_table = strip(zapplid)"CMDS"
+if local_table <> "ISPCMDS" then do
+   "Tbquery" local_table
+   fpappl = "**"
+   if rc = 0 then do
+      if local_table /= "FASTCMDS" then
+         call Build_Table zapplid
+      end
+   end
+
+fpappl = null
+if length(zsctsrch) = 0 then
+   call Build_Table "ISP"
+   else do
+        if zsctsrch = "A" then
+           call Build_Table "ISP"
+
+        if length(zsctpref) > 0 then
+           call Build_Table zsctpref
+
+        if length(zsctpre2) > 0 then
+           call Build_Table zsctpre2
+
+        if length(zsctpre3) > 0 then
+           call Build_Table zsctpre3
+
+        if zsctsrch = "B" then
+           call Build_Table "ISP"
+
+        if length(zuctpref) > 0 then
+           call Build_Table zuctpref
+
+        if length(zuctpre2) > 0 then
+           call Build_Table zuctpre2
+
+        if length(zuctpre3) > 0 then
+           call Build_Table zuctpre3
+        end
+"Vget (zapplid)"
+if zapplid <> "ISP" then
+   call Build_Table zapplid
+
+"TBSort "fastcmds" Fields(fpcmd)"
+"TBTop" fastcmds
+
+/* User_Display - not a label, more a comment */
+  src = ""  /* initialize variable src */
+  DO FOREVER
+     usrrfind = "PASSTHRU"
+
+     if src = 4 then "TBDispl" fastcmds
+        else do
+             "TBTOP" fastcmds
+             "TBSKIP "fastcmds" NUMBER("crp")"
+             if rowcrp = 0 then
+                "TBDISPL "fastcmds" PANEL(FASTPATH)"
+                else
+                "TBDISPL "fastcmds" PANEL(FASTPATH)",
+                        "CSRROW("rowcrp") AUTOSEL(NO)"
+             end
+     src = rc
+     if src > 4 then signal Out_A_Here /* leave */
+
+     crp = ztdtop
+     rowcrp = null
+
+     if row <> null & row > 0 then do
+          "TBTop" fastcmds
+          "TBSkip "fastcmds" NUMBER("row")"
+          end
+
+     PARSE VALUE null WITH zcmd_ok x_rc
+
+     SELECT
+       WHEN WORDS(ZCMD) > 1  THEN DO
+            parse value zcmd with o1 o2
+            if abbrev("L",o1,1) = 1 then call Loc_It
+            if abbrev("FIND",o1,1) = 1 then call Find_It
+            if zcmd_ok <> "ok" then
+               CALL Do_Msg "Error", "Invalid command:" zcmd
+            END
+       WHEN ZCMD = "RFIND"   THEN DO
+            if lcmd = "LOC" then do
+                zcmd = "RLOC" o2
+                call Loc_it
+                end
+            else do
+                 zcmd = "RFIND" o2
+                 call Find_It
+                 end
+            END
+       WHEN LENGTH(ZCMD) = 0 THEN DO
+            if zsel = "S" then do
+               if pos("&ZPARM",fpaction) > 0 then do
+                  pos = pos("&ZPARM",fpaction)
+                  left_act  = left(fpaction,pos-1)
+                  right_act = substr(fpaction,pos+6)
+                  opt = words(left_act)
+                  parse value word(left_act,opt) with fpopt "(" .
+                  fpinput = null
+                  if fpopt = "OPT" then do
+                                        fpaction
+                                        x_rc = 0
+                                        end
+                     else do
+                          hpan = strip("$"left(fpcmd,7))
+                          IF HELP_PANEL_EXISTS(hpan) ,
+                          THEN fpan = "Fastproh"
+                          ELSE fpan = "Fastprom"
+                          "Addpop"
+                          "Display Panel("fpan")"
+                          x_rc = rc
+                          "REMPOP"
+                          /*
+                          IF x_rc = 0 THEN left_act""fpinput""right_act
+                          */
+                          IF x_rc = 0 THEN ,
+                             _junk_ = ISPF_command(fpcmd" "fpaction)
+                          x_rc = 4 /* redisplay list */
+                     end
+                  end
+              else do
+                   x_rc = 0
+                   _junk_ = ISPF_command(fpcmd" "fpaction)
+                   x_rc = 4 /* redisplay list */
+                   end
+            end
+            if zsel = "H" then do
+               /* display the help panel if one exists */
+               hpan = strip("$"left(fpcmd,7))
+               IF HELP_PANEL_EXISTS(hpan) THEN
+                  ADDRESS ISPEXEC "SELECT PGM(ISPTUTOR) PARM("hpan")"
+               ELSE DO
+                  CALL Do_Msg "No Help",,
+                              "There is no help panel for command:",
+                              fpcmd
+                  end
+               END
+            if zsel = "V" then do
+               "Addpop"
+               "Display Panel(fastpdsp)"
+               "Rempop"
+               end
+            IF x_rc = 0 THEN leave
+        /*  IF x_rc = 0 THEN SIGNAL Out_A_Here   */
+            END
+     OTHERWISE; NOP; END
+  END
+  SIGNAL Out_A_Here
+ exit
+
+/* ------------------------------------------------------------- *
+ * Execute the selected ISPF command                             *
+ * Use panel ISPBLANK to execute the ISPF command to support     *
+ * all ISPF commands, ALIAS entries included.                    *
+ * ------------------------------------------------------------- */
+ISPF_command: procedure
+  parse arg ispf_command ispf_action
+
+  ispf_command = ispf_command
+  ispf_action  = ispf_action
+  "VGET (ZDEL)"
+  com = ""
+  com = ispf_command
+  "DISPLAY PANEL(ISPBLANK)" ,
+          "COMMAND(COM) RETBUFFR(RETBUFR)"
+  retbufr = retbufr
+ return 0
+
+/* ------------------------------------------------------------- *
+ * Find_it routine to search the table entries for the           *
+ * specified character string.  The search is done using         *
+ * REXX instead of using the ISPF TBSCAN which is very limited.  *
+ * ------------------------------------------------------------- */
+Find_It:
+  lcmd = "FIND"
+  zcmd_ok = "ok"
+  parse value zcmd with o1 argument
+  upper argument
+  argument = strip(argument)
+  zsel = null
+  crp = ztdtop
+  find_loop = null
+  search = null
+  rowid = crp
+  if o1 = "RFIND" then do
+     last_find = last_find + 1
+     "TBTOP " fastcmds
+     "TBSKIP "fastcmds" Position(ROWID) Number("Last_find")"
+     end
+     else do
+          "TBSKIP "fastcmds" Position(ROWID)"
+          end
+  if rc = 8 then do
+                 s_smsg = "Wrapped"
+                 "TBTOP " fastcmds
+                 "TBSKIP "fastcmds" Position(ROWID)"
+                 end
+            else s_smsg = "Found"
+
+  /* perform search */
+
+  do forever
+     search = translate(fpcmd fpdesc)
+     if pos(argument,search) > 0 then do
+        crp = rowid + 0
+        rowcrp = crp
+        last_find = crp
+        CALL Do_Msg s_smsg, argument "found during search in row:" crp
+        RETURN
+        END
+     "TBSKIP "fastcmds" POSITION(Rowid)"
+     if rc = 8 then do
+           "TBTOP" fastcmds
+            s_smsg = "Wrapped"
+        if find_loop = "on" then do
+            CALL Do_Msg "Not Found", argument "Not found during search"
+            rowid = crp
+            RETURN
+            END
+            else find_loop = "on"
+        end
+     zsel = null
+     end
+RETURN
+
+/* ------------------------------------------------------------- *
+ * Loc_it routine to search the table fpcmd entries for the      *
+ * specified character string.  The search is done using         *
+ * REXX instead of using the ISPF TBSCAN which is very limited.  *
+ * ------------------------------------------------------------- */
+Loc_It:
+  lcmd = "LOC"
+  zcmd_ok = "ok"
+  parse value zcmd with o1 argument
+  upper argument
+  argument = strip(argument)
+  arg_len = length(argument)
+  zsel = null
+  crp = ztdtop
+  find_loop = null
+  search = null
+  rowid = crp
+  if o1 = "RLOC" then do
+     last_find = last_find + 1
+     "TBTOP " fastcmds
+     "TBSKIP "fastcmds" Position(ROWID) Number("Last_find")"
+     end
+     else do
+          "TBSKIP "fastcmds" Position(ROWID)"
+          end
+  if rc = 8 then do
+                 s_smsg = "Wrapped"
+                 "TBTOP " fastcmds
+                 "TBSKIP "fastcmds" Position(ROWID)"
+                 end
+            else s_smsg = "Found"
+
+  /* perform search */
+
+  DO FOREVER
+     search = translate(fpcmd)
+     if left(search,arg_len) = argument then do
+        crp = rowid + 0
+        rowcrp = crp
+        last_find = crp
+            CALL Do_Msg s_smsg, argument "found during search in row:" crp
+        RETURN
+        END
+     "TBSKIP "fastcmds" POSITION(Rowid)"
+     IF RC = 8 THEN DO
+           "TBTOP" fastcmds
+            s_smsg = "Wrapped"
+        if find_loop = "on" then do
+            CALL Do_Msg "Not Found", argument "Not found during search"
+            rowid = crp
+            RETURN
+            END
+            else find_loop = "on"
+        end
+     zsel = null
+     end
+RETURN
+
+/* ------------------------------------------------------------- *
+ * Build table of fast path commands...................          *
+ * ------------------------------------------------------------- */
+Build_Table:
+ARG fpappl .
+  fptable = fpappl"CMDS"
+  "Tbquery" fptable "Rownum(rows)"
+  "Tbtop" fptable
+  DO i=1 TO ROWS
+     "TBSkip" fptable
+        IF RC > 0 THEN LEAVE i
+     fpcmd    = zctverb
+     fpdesc   = zctdesc
+     fpaction = zctact
+     fptrunc  = zcttrunc
+     "TBAdd" fastcmds
+  END
+RETURN
+
+/* ------------------------------------------------------------- *
+ * Do_msg routine is used to issue the ISPF Message....          *
+ * ------------------------------------------------------------- */
+Do_Msg:
+ARG zedsmsg, zedlmsg
+   "Setmsg Msg(ISRZ000)"
+RETURN
+
+Out_A_Here:
+  usrrfind = null
+  "TBEND" fastcmds
+  "LIBDEF Fasttabl"
+  if dyn_panels = 0 then exit
+  do until length(load_info) = 0
+     parse value load_info with dd libd load_info
+     if left(libd,6) = "ALTLIB" then do
+        if libd = "ALTLIBC" then lib = "CLIST"
+                            else lib = "EXEC"
+        Address TSO,
+          "Altlib Deact Application("lib")"
+        end
+     else "libdef" libd
+     address tso "free f("dd")"
+     end
+EXIT 0
+
+/* ----------------------------------------- *
+ * Test for a help panel for the application *
+ * ----------------------------------------- */
+HELP_PANEL_EXISTS: PROCEDURE
+ARG panel .
+  IF panel = "" THEN RETURN 0
+  Found=0; Cnt=0; Dsn.=""; Dsn.0=Cnt
+  DO i=1 UNTIL List \= 0
+     x = BPXWDYN("INFO INRELNO("i") INRTDDN(Ddn) INRTDSN(Dsn) INRTLST(List)")
+     SELECT
+       WHEN Ddn = "" & \(Found)            THEN ITERATE i
+       WHEN Ddn="" | ABBREV(Ddn,"ISPPLIB") THEN DO
+          Found=1; Cnt=1+Cnt; Dsn.Cnt = "ISPPLIB" Dsn; Dsn.0=Cnt
+         END
+       WHEN Ddn\="" & \(Found)             THEN ITERATE i
+     OTHERWISE; LEAVE i; END
+  END
+  /* --------------------------------- *
+   * Now test for the panel in ISPPLIB *
+   * --------------------------------- */
+  prc=0
+  DO i=1 TO Dsn.0
+     IF "OK" = SYSDSN("'"WORD(dsn.i,2)"("panel")'") THEN DO
+         prc=1; LEAVE i
+     END
+  END
+RETURN prc
+
+/* ----------------------------------------------------------------- */
+
+/*********************************************/
+/* Trap uninitialized variables              */
+/*********************************************/
+sub_novalue:
+  Say " "
+  Say "Variable" condition("Description") ,
+      "undefined in line" sigl":"
+  Say " "
+  Say sourceline(sigl)
+  Say " "
+  if sysvar("sysenv") <> "FORE" then exit 8
+  say "Report the error in this application",
+      "along with the syntax used."
+ exit 8
+
+/* --------------------  rexx procedure  -------------------- *
+ * Name:      LoadISPF                                        *
+ *                                                            *
+ * Function:  Load ISPF elements that are inline in the       *
+ *            REXX source code.                               *
+ *                                                            *
+ * Syntax:    rc = loadispf()                                 *
+ *                                                            *
+ *            The inline ISPF resources are limited to        *
+ *            ISPF Messages, Panels, and Skeletons,           *
+ *                 CLISTs and EXECs are also supported.       *
+ *                                                            *
+ *            The inline resources must start in column 1     *
+ *            and use the following syntax:                   *
+ *                                                            *
+ *            >START    used to indicate the start of the     *
+ *                      inline data                           *
+ *                                                            *
+ *            >END    - used to indicate the end of the       *
+ *                      inline data                           *
+ *                                                            *
+ *            Each resource begins with a type record:        *
+ *            >type name                                      *
+ *               where type is CLIST, EXEC, MSG, PANEL, SKEL  *
+ *                     name is the name of the element        *
+ *                                                            *
+ * Sample usage:                                              *
+ *          -* rexx *-                                        *
+ *          load_info = loadispf()                            *
+ *          ... magic code happens here (your code) ...       *
+ *          Address ISPEXEC                                   *
+ *          do until length(load_info) = 0                    *
+ *             parse value load_info with dd libd load_info   *
+ *             if left(libd,6) = "ALTLIB" then do             *
+ *                if libd = "ALTLIBC" then lib = "CLIST"      *
+ *                                    else lib = "EXEC"       *
+ *                Address TSO,                                *
+ *                  "Altlib Deact Application("lib")"         *
+ *                end                                         *
+ *             else "libdef" libd                             *
+ *             address tso "free f("dd")"                     *
+ *             end                                            *
+ *          exit                                              *
+ *          >Start inline elements                            *
+ *          >Panel panel1                                     *
+ *          ...                                               *
+ *          >Msg msg1                                         *
+ *          ...                                               *
+ *          >End of inline elements                           *
+ *                                                            *
+ * Returns:   the list of ddnames allocated for use along     *
+ *            with the libdef's performed or altlib           *
+ *                                                            *
+ *            format is ddname libdef ddname libdef ...       *
+ *                   libdef may be altlibc or altlibe         *
+ *                   for altlib clist or altlib exec          *
+ *                                                            *
+ * Notes:     Entire routine must be included with REXX       *
+ *            exec - inline with the code.                    *
+ *                                                            *
+ * Comments:  The entire rexx program is processed from the   *
+ *            last record to the first to find the >START     *
+ *            record at which point all records from that     *
+ *            point on are processed until the >END           *
+ *            statement or the end of the program is found.   *
+ *                                                            *
+ *            It is *strongly* suggested that the inline      *
+ *            elements be at the very end of your code so     *
+ *            that the search for them is faster.             *
+ *                                                            *
+ *            Inline ISPTLIB or ISPLLIB were not supported    *
+ *            because the values for these would have to be   *
+ *            in hex.                                         *
+ *                                                            *
+ * Author:    Lionel B. Dyck                                  *
+ *                                                            *
+ * History:                                                   *
+ *            05/31/17 - Change default directory count       *
+ *            12/09/16 - update for add_it routine            *
+ *            05/10/16 - correction for clist and exec        *
+ *            04/19/16 - bug correction                       *
+ *            06/04/04 - Enhancements for speed               *
+ *            08/05/02 - Creation                             *
+ *                                                            *
+ * ---------------------------------------------------------- *
+ * Disclaimer: There is no warranty, either explicit or       *
+ * implied with this code. Use it at your own risk as there   *
+ * is no recourse from either the author or his employeer.    *
+ * ---------------------------------------------------------- */
+ LoadISPF: Procedure
+
+ parse value "" with null kmsg kpanel kskel first returns ,
+                     kclist kexec
+/* ------------------------------------------------------- *
+ * Find the InLine ISPF Elements and load them into a stem *
+ * variable.                                               *
+ *                                                         *
+ * Elements keyword syntax:                                *
+ * >START - start of inline data                           *
+ * >CLIST name                                             *
+ * >EXEC name                                              *
+ * >MSG name                                               *
+ * >PANEL name                                             *
+ * >SKEL name                                              *
+ * >END   - end of all inline data (optional if last)      *
+ * ------------------------------------------------------- */
+ last_line = sourceline()
+ do i = last_line to 1 by -1
+    line = sourceline(i)
+    if translate(left(line,6)) = ">START " then leave
+    end
+ rec = 0
+/* --------------------------------------------------- *
+ * Flag types of ISPF resources by testing each record *
+ * then add each record to the data. stem variable.    *
+ * --------------------------------------------------- */
+ do j = i+1 to last_line
+    line = sourceline(j)
+    if translate(left(line,5)) = ">END "   then leave
+    if translate(left(line,7)) = ">CLIST " then kclist = 1
+    if translate(left(line,6)) = ">EXEC "  then kexec  = 1
+    if translate(left(line,5)) = ">MSG "   then kmsg   = 1
+    if translate(left(line,7)) = ">PANEL " then kpanel = 1
+    if translate(left(line,6)) = ">SKEL "  then kskel  = 1
+    rec  = rec + 1
+    data.rec = line
+    end
+
+/* ----------------------------------------------------- *
+ * Now create the Library and Load the Member(s)         *
+ * ----------------------------------------------------- */
+ Address ISPExec
+/* ----------------------------- *
+ * Assign dynamic random ddnames *
+ * ----------------------------- */
+ clistdd = "lc"random(999)
+ execdd  = "le"random(999)
+ msgdd   = "lm"random(999)
+ paneldd = "lp"random(999)
+ skeldd  = "ls"random(999)
+
+/* ---------------------------------------- *
+ *  LmInit and LmOpen each resource library *
+ * ---------------------------------------- */
+ if kclist <> null then do
+    call alloc_dd clistdd
+    "Lminit dataid(clist) ddname("clistdd")"
+    "LmOpen dataid("clist") Option(Output)"
+    returns = strip(returns clistdd "ALTLIBC")
+    end
+ if kexec <> null then do
+    call alloc_dd execdd
+    "Lminit dataid(exec) ddname("execdd")"
+    "LmOpen dataid("exec") Option(Output)"
+    returns = strip(returns execdd "ALTLIBE")
+    end
+ if kmsg <> null then do
+    call alloc_dd msgdd
+    "Lminit dataid(msg) ddname("msgdd")"
+    "LmOpen dataid("msg") Option(Output)"
+    returns = strip(returns msgdd "ISPMLIB")
+    end
+ if kpanel <> null then do
+    call alloc_dd paneldd
+    "Lminit dataid(panel) ddname("paneldd")"
+    "LmOpen dataid("panel") Option(Output)"
+    returns = strip(returns paneldd "ISPPLIB")
+    end
+ if kskel <> null then do
+    call alloc_dd skeldd
+    "Lminit dataid(skel) ddname("skeldd")"
+    "LmOpen dataid("skel") Option(Output)"
+    returns = strip(returns skeldd "ISPSLIB")
+    end
+
+/* ----------------------------------------------- *
+ * Process all records in the data. stem variable. *
+ * ----------------------------------------------- */
+ do i = 1 to rec
+    record = data.i
+    recordu = translate(record)
+    if left(recordu,5) = ">END " then leave
+    if left(recordu,7) = ">CLIST " then do
+       if first = 1 then call add_it
+       type = "Clist"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">EXEC " then do
+       if first = 1 then call add_it
+       type = "Exec"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,5) = ">MSG " then do
+       if first = 1 then call add_it
+       type = "Msg"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,7) = ">PANEL " then do
+       if first = 1 then call add_it
+       type = "Panel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">SKEL " then do
+       if first = 1 then call add_it
+       type = "Skel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+   /* --------------------------------------------*
+    * Put the record into the appropriate library *
+    * based on the record type.                   *
+    * ------------------------------------------- */
+    Select
+      When type = "Clist" then
+           "LmPut dataid("clist") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Exec" then
+           "LmPut dataid("exec") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Msg" then
+           "LmPut dataid("msg") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Panel" then
+           "LmPut dataid("panel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Skel" then
+           "LmPut dataid("skel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      Otherwise nop
+      end
+    end
+ if type <> null then call add_it
+/* ---------------------------------------------------- *
+ * Processing completed - now lmfree the allocation and *
+ * Libdef the library.                                  *
+ * ---------------------------------------------------- */
+ if kclist <> null then do
+    Address TSO,
+    "Altlib Act Application(Clist) File("clistdd")"
+    "LmFree dataid("clist")"
+    end
+ if kexec <> null then do
+    Address TSO,
+    "Altlib Act Application(Exec) File("execdd")"
+    "LmFree dataid("exec")"
+    end
+ if kmsg <> null then do
+    "LmFree dataid("msg")"
+    "Libdef ISPMlib Library ID("msgdd") Stack"
+    end
+ if kpanel <> null then do
+    "Libdef ISPPlib Library ID("paneldd") Stack"
+    "LmFree dataid("panel")"
+    end
+ if kskel <> null then do
+    "Libdef ISPSlib Library ID("skeldd") Stack"
+    "LmFree dataid("skel")"
+    end
+ return returns
+
+/* --------------------------- *
+ * Add the Member using LmmAdd *
+ * based upon type of resource *
+ * --------------------------- */
+ Add_It:
+ Select
+    When type = "Clist" then
+         "LmmAdd dataid("clist") Member("name")"
+    When type = "Exec" then
+         "LmmAdd dataid("exec") Member("name")"
+    When type = "Msg" then
+         "LmmAdd dataid("msg") Member("name")"
+    When type = "Panel" then
+         "LmmAdd dataid("panel") Member("name")"
+    When type = "Skel" then
+         "LmmAdd dataid("skel") Member("name")"
+    Otherwise nop
+    end
+ type = null
+ return
+
+/* ------------------------------ *
+ * ALlocate the temp ispf library *
+ * ------------------------------ */
+ Alloc_DD:
+ arg dd
+ Address TSO
+ if pos(left(dd,2),"lc le") > 0 then
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(5)",
+    "recfm(v b) lrecl(255) blksize(32760)"
+ else
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(5)",
+    "recfm(f b) lrecl(80) blksize(27920)"
+ return
+
+/*
+>Start
+>panel $FASTPAT
+)PANEL KEYLIST(ISPHELP,FAST)
+)ATTR DEFAULT(%+_)
+/* % TYPE(TEXT  ) INTENS(HIGH)              DEFAULTS DISPLAYED FOR */
+/* + TYPE(TEXT  ) INTENS(LOW )                   INFORMATION ONLY  */
+/* _ TYPE( INPUT) INTENS(HIGH) CAPS(ON ) JUST(LEFT )               */
+   ! TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(WHITE)
+   ~ TYPE(TEXT) INTENS(HIGH) COLOR(BLUE) HILITE(REVERSE)
+   ` TYPE(TEXT) INTENS(HIGH) COLOR(RED)
+   % TYPE(TEXT) INTENS(HIGH)
+   # AREA(SCRL) EXTEND(ON)
+)BODY  EXPAND(\\)
+%-\-\-~ISPF Fast Path Commands Help%-\-\-
+%Command ===>_zcmd \ \+
+%
++                                                                %Up F10 Dn F11
+#HELP -------------------------------------------------------------------------#
+)AREA HELP
++
++  Function: Display a selection list of all Selectable commands in the
++     ISPCMDS ISPF Command Table and in the System and User command
++     tables along with the commands in the current application command
++     table.  This command will:
++
++     1. Provide the user with information on ISPF Commands available.
++     2. Simplify access to fast path commands.
++     3. Provide a pseudo-menu to ISPF command functions.
++     4. If a tutorial panel exists for the command of the format:
++           $ plus 7 Left most Command Name Characters
++        it will be displayed if the user selects the command with 'H'
++        or via PF1(Help) on the pop-up menu if the command has options.
++
+)INIT
+  .CURSOR = ZCMD
+)PROC
+)END
+>panel FASTPATH
+)ATTR DEFAULT(%+_)
+/* % TYPE(TEXT  ) INTENS(HIGH)              DEFAULTS DISPLAYED FOR */
+/* + TYPE(TEXT  ) INTENS(LOW )                   INFORMATION ONLY  */
+/* _ TYPE( INPUT) INTENS(HIGH) CAPS(ON ) JUST(LEFT )               */
+   @ TYPE( INPUT) INTENS(HIGH) CAPS(ON ) JUST(LEFT ) PAD('_') COLOR(TURQ)
+   ! TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(WHITE)
+   ` TYPE(TEXT)   INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(YELLOW)
+   ~ TYPE(TEXT)   INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(TURQ)
+   % TYPE(TEXT)   INTENS(HIGH)
+   | TYPE(TEXT)   INTENS(HIGH) HILITE(USCORE)
+   + TYPE(TEXT  ) INTENS(LOW ) SKIP(ON)
+   # TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(YELLOW)
+   $ TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(TURQ)
+)BODY EXPAND(\\)
+%\-\`ISPF Fast Path Commands+\-\
+%Command ===>_zcmd \ \%Scroll ===>_mamt+
+%
+`Command Options: %Find~xxx   %Locate~xxx
+`Line Options:    %S~-Execute command %H~-Display help %V~-View entry
++
+%Sel|Command +|Description                                               +|AppId
+)MODEL
++ @z!z       +#z                                                         +$z   +
+)INIT
+  .ZVARS = '(ZSEL fpcmd fpdesc fpappl)'
+  .Help  = $fastpat
+  &zsel  = &z
+  &mamt  = CSR
+)PROC
+ IF (&ZCMD = &Z)
+     IF (&ztdsels = 0000)
+        &row = .csrrow
+        IF (&row ¬= &z)
+            IF (&zsel = &z)
+                &zsel = S
+     IF (&ztdsels ¬= 0000)
+          &row = &z
+     IF (&ZSEL ¬= &Z)
+        IF (&Zsel = '=')
+           &Zsel = &osel
+     &osel = &zsel
+     VER (&zsel,LIST,S,H,V)
+)END
+>panel FASTPDSP
+)ATTR DEFAULT(%+_)
+/* _ TYPE( INPUT) INTENS(HIGH) CAPS(ON ) JUST(LEFT )               */
+   % TYPE(TEXT)   INTENS(HIGH)
+   # TYPE(OUTPUT) INTENS(Low ) CAPS(OFF) JUST(ASIS )
+   @ TYPE(OUTPUT) INTENS(Low ) CAPS(OFF) JUST(ASIS ) Hilite(uscore)
+   ` TYPE(TEXT)   INTENS(HIGH) CAPS(OFF) JUST(ASIS ) COLOR(TURQ)
+)BODY WINDOW(66,12) EXPAND(\\)
+%\-\`Fast Path Command View%\-\
+%Command ===>_zcmd
+%
+%   Cmd:#fpcmd
+% Table:#fptable
+% Trunc:#fptrunc
+%  Desc:#fpdesc
+%
+\ \`Action+\ \
+%
+#z @fpaction
+%
+)INIT
+  .CURSOR = &ZCMD
+  .zvars = '(zind)'
+)PROC
+)Field
+ Field(fpaction) ind(zind,'<>') len(255) scale(lr1sc)
+)END
+>panel FASTPROH
+)Attr Default(%+_)
+/* _ type( input) intens(high) caps(on ) just(left )               */
+   @ type( input) intens(high) caps(on ) just(left ) pad('_') color(turq)
+   ! type(output) intens(high) caps(off) just(asis ) color(white)
+   ` type(text) intens(high) caps(off) just(asis ) color(yellow)
+   ~ type(text) intens(high) caps(off) just(asis ) color(turq)
+   % type(text) intens(high)
+   + type(text  ) intens(low )
+     skip(on)
+   # type(output) intens(high) caps(off) just(asis ) color(yellow)
+)Body Window(60,13)
+%---------------+ Fast Path Command Prompt +---------------
+%Command ===>_zcmd
+%
+%  #fpcmd
+%
+%  This command supports a parameter which may or may not
+%  be optional.  Fill in the parameter field and then
+%  press Enter to continue or press &END %to cancel this
+%  request.
+%
+% #fpopt   %value  : ===>_fpinput
+%
+% #fpdesc
+)Init
+  .cursor = &fpinput
+  .help   = &hpan
+  &end = pfk(END)
+)Proc
+)End
+>panel FASTPROM
+)Attr Default(%+_)
+/* _ type( input) intens(high) caps(on ) just(left )               */
+   @ type( input) intens(high) caps(on ) just(left ) pad('_') color(turq)
+   ! type(output) intens(high) caps(off) just(asis ) color(white)
+   ` type(text) intens(high) caps(off) just(asis ) color(yellow)
+   ~ type(text) intens(high) caps(off) just(asis ) color(turq)
+   % type(text) intens(high)
+   + type(text  ) intens(low )
+     skip(on)
+   # type(output) intens(high) caps(off) just(asis ) color(yellow)
+)Body Window(60,16)
+%---------------+ Fast Path Command Prompt +---------------
+%Command ===>_zcmd
+%
+%  #fpcmd
+%
+%  This command supports a parameter which may or may not
+%  be optional.  Fill in the parameter field and then
+%  press Enter to continue or press &END %to cancel this
+%  request.
+%
+% #fpopt   %value  : ===>_fpinput
+%
+% #fpdesc
+%
+% No help is available for this command
+)Init
+  .cursor = &fpinput
+  &end = pfk(END)
+)Proc
+)End
+>End */

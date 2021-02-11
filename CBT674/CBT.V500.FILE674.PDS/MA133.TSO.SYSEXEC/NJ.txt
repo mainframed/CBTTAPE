@@ -1,0 +1,1328 @@
+/* rexx */
+Arg Job .
+
+TraceIt = 'N'
+TraceHead = Copies('*',79)
+
+Signal On Failure
+Signal On Syntax
+Signal On Novalue
+
+Call Main_Routine
+
+Return
+/*-------------------------------------------------------------------*/
+/*- handle any problems encountered                                 -*/
+/*-------------------------------------------------------------------*/
+Failure: Say "Failure occured on line" Sigl; Call Cleanup; Exit(12);
+Syntax:  Say "Syntax error on line"    Sigl; Call Cleanup; Exit(12);
+Novalue: Say "Novalue used on line"    Sigl; Call Cleanup; Exit(12);
+Cleanup:
+Signal Off Novalue
+Say 'iRpt='iRpt
+Say 'Line='Rpt.iRpt
+Say 'RptStmt='RptStmt
+Say 'OldRptStmt='OldRptStmt
+If StackedCall = 'Y' Then Return
+Address ISPEXEC
+"CONTROL ERRORS RETURN"
+"TBEND" TabDsn
+"TBEND" TabPgm
+"TBEND" TabProc
+"TBEND" TabMsg
+"TBEND" TabPrt
+"LIBDEF ISPTLIB"
+"LIBDEF ISPTABL"
+"CONTROL ERRORS CANCEL"
+Return
+/*-------------------------------------------------------------------*/
+/*- this exec will take a job passed to it and create a bunch of    -*/
+/*- ispf tables showing where datasets are used, sysout stuff, procs-*/
+/*- called, jclcheck errors etc etc. it calls jclcheck and then     -*/
+/*- chops up the reports to generate the tables. from the tables    -*/
+/*- you can select different lines to pop you into the jcl source   -*/
+/*- line. if there is a dataset on the line, you can edit it. see   -*/
+/*- the help panels for more detailed information.                  -*/
+/*-------------------------------------------------------------------*/
+Main_Routine:
+
+Address ISPEXEC
+"VGET (ZSCREEN ZAPPLID ZUSER ZPREFIX)"
+If ZAPPLID \= 'NJ' Then Do        /*   If ZAPPLID\=NJ, re-invoke  */
+  "SELECT CMD(%NJ" Job") NEWAPPL(NJ)"
+  Exit RC                         /*   with NEWAPPL(NJ)  so that  */
+End                               /*   right/left cmds will work  */
+
+/* if we're stacked, just redisplay the tables */
+Call Is_Stacked
+If StackedCall = 'N' Then Do
+  Call Get_A_Job
+  Call Refresh_Tables
+End
+Call Display_Tables
+Call Cleanup_Tables
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Find out if this is a stacked call                              -*/
+/*-------------------------------------------------------------------*/
+Is_Stacked:
+
+TabDsn = 'NJDSN'ZSCREEN
+TabPgm = 'NJPGM'ZSCREEN
+TabProc = 'NJPROC'ZSCREEN
+TabMsg = 'NJMSG'ZSCREEN
+TabPrt = 'NJPRT'ZSCREEN
+
+"TBSTATS" TabDsn "STATUS2(STATUS2)"
+If Status2 = 2 | Status2 = 3 Then Do
+  StackedCall = 'Y'
+  "VGET DSNJOB"ZSCREEN "PROFILE"
+  DsnJob = Value('DSNJOB'ZSCREEN)
+  If Job <> '' Then "SETMSG MSG(NJ009)"
+End
+Else StackedCall = 'N'
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Get a job to work on.                                           -*/
+/*-------------------------------------------------------------------*/
+Get_A_Job:
+
+/* load up the source dataset from the FindJob command if all the */
+/* user passed was a job name. */
+If Length(Job) < 9 Then Do
+  Call FJ Job 'G'
+  "VGET FJJOB SHARED"
+  If FJJOB = '' Then Exit(0)
+
+  Parse Var FJJOB JobPds '(' Member ')'
+  JobPds = "'"JobPds"'"
+  DsnJob = "'"FJJOB"'"
+End
+/* or else the user passed the full job name */
+Else Do
+  DsnJob = Job
+  If Left(DsnJob,1) <> "'" Then Do
+    If ZPREFIX <> '' Then DsnJob = "'"ZPREFIX"."DsnJob"'"
+    Else DsnJob = "'"DsnJob"'"
+  End
+End
+/* save the dataset name we're processing in an ispf var */
+Interpret "DSNJOB"ZSCREEN "= DsnJob"
+"VPUT DSNJOB"ZSCREEN "PROFILE"
+
+/* create a temp dataset name for saving jclcheck reports */
+Parse Value Date() With Day Month .
+Upper Month
+Parse Value Time() With Hour ':' Minute ':' Second
+Qual = 'D'Day || Month'.T'Hour || Minute || Second
+DsnJck = "'"ZUSER".NJ.JCHK.SYSPRINT."Qual"'"
+
+/* save the ispf profile dataset name for later use */
+Msg = Msg('OFF')
+Ldsi = Listdsi('ISPPROF' 'FILE' 'NODIRECTORY')  /* find prof name */
+Msg = Msg(Msg)
+If Ldsi > 4 Then Signal Failure
+DsnTab = "'"SYSDSNAME"'"
+
+Return
+/*-------------------------------------------------------------------*/
+/*- call jclcheck. has been tested with the following level/parms:  -*/
+/*-------------------------------------------------------------------*/
+/*designed for jclcheck Genlevel: 7.0 03 SP04
+  CALLING  PARAMETERS: AUTOPROC HCD TLMS(54) SMS VSAM TSOE LIST(OUT)
+                       PROCXREF RPT
+  DEFAULT  PARAMETERS: CTL,FULL,JOB,LIST,XREF,PXREF(RPT),RUNTIME,SYNTAX
+  OPTIONS IN EFFECT: AUTOPROC() CTLSCAN() FULLLIST JOB LIST(OUT) HCD
+                       RUNTIME TLMS(54) TSOE VSAM() XREF RPT
+                       PROC(PROC00) PROCXREF PXREF(RPT) SYNTAX
+  DERIVED OPTIONS IN EFFECT: MVSLEVEL(5)
+*/
+Create_Jclcheck_Report:
+
+If TraceIt = 'Y' Then JckDisp = 'CATALOG'
+Else JckDisp = 'DELETE'
+
+Address TSO
+"ALLOC F(OUT) DA("DsnJck") NEW" JckDisp ,
+  "SPACE(3 3) TRACKS LRECL(133) RECFM(F B) DSORG(PS)"
+If RC > 0 Then Signal Failure
+"%NJCHECK" DsnJob "LIST(OUT) PROCXREF RPT"
+Address ISPEXEC "EDIT DATASET("DsnJck") MACRO(NJEDRPT)"
+"EXECIO * DISKR OUT (STEM Rpt. FINIS"
+"FREE F(OUT)"
+Address ISPEXEC
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report1.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report1_Listing:
+
+If Rpt.0 = 0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 1 Missing.'
+  Return
+End
+If Substr(Rpt.1,41,10) <> ' REPORT 1 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 1 Missing.'
+  Return
+End
+
+Address TSO
+"ALLOC F(JOB) DA("DsnJob") SHR REUSE"
+If RC > 0 Then Signal Failure
+"EXECIO * DISKR JOB (STEM Job. FINIS"
+"FREE F(JOB)"
+Address ISPEXEC
+
+OldJobStmt = ''
+iJob = 0
+Do iRpt = 2 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+
+  Parse Var Rpt.iRpt 2 JobStmt 7 8 JobCard 11 JobText
+  JobStmt = Strip(JobStmt)
+  JobCard = Strip(JobCard)
+  JobText = Strip(JobText)
+  If JobStmt = '' & JobCard = '' Then Iterate
+
+  If JobStmt <> '' Then OldJobStmt = JobStmt
+  If JobCard <> '' Then JobStmt = OldJobStmt'.'JobCard
+
+  Do iJob = iJob + 1 To Job.0
+    If JobText = Job.iJob Then Leave
+  End
+  JobPos.JobStmt = iJob
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report2.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report2_Merged:
+
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 2 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,10) <> ' REPORT 2 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 2 Missing.'
+  Return
+End
+
+RawSeq = 0
+ProcPos.0 = 0
+InclPos.0 = 0
+OldRptStmt = 0
+OldStep = ''
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+  RawSeq = RawSeq + 1
+
+  Parse Var Rpt.iRpt 2 RptStmt 7 8 RptCard 11 RptStep 20 RptProc 29 ,
+    38 RptText
+  RptStmt = Strip(RptStmt)
+  RptCard = Strip(RptCard)
+  RptStep = Strip(RptStep)
+  RptProc = Strip(RptProc)
+  /* don't strip rpttext until later, need to see leading blanks. */
+  If Word(RptText,1) = 'SUBSTITUTION' Then Iterate
+  If Pos('IN INPUT STREAM',RptText) > 0 Then Iterate
+
+  If RptStmt <> '' Then OldRptStmt = RptStmt
+  If RptCard <> '' Then RptStmt = OldRptStmt'.'RptCard
+
+  If TraceIt = 'Y' Then Call Process_Report2_Merged_Trace
+  Call Process_Report2_Merged_SetPos
+  If RptStmt = '' Then Iterate
+
+  /* ignore any comments, anything not a valid jcl statement */
+  If Left(RptText,2) <> '//' Then Iterate
+  If Substr(RptText,3,1) = '*' Then Iterate
+
+  /* see if this is a proc */
+  If Word(RptText,2) = 'EXEC' Then Do
+    Parse Value Word(RptText,3) With Proc ','
+    Proc = Strip(Proc)
+    If Left(Proc,4) = 'PGM=' Then Iterate
+
+    /* look ahead, skip extra exec lines, see what index we're at */
+    Do iRpt2 = iRpt + 1 To Rpt.0
+      If Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Iterate iRpt
+      Parse Var Rpt.iRpt2 2 RptStmt2 7 39 NextProcIndex 41 45 Which 46
+      RptStmt2 = Strip(RptStmt2)
+      If RptStmt2 = '' Then Iterate
+      If Left(RptStmt2,1) = '.' Then Iterate
+      Leave
+    End
+    If Which <> 'X' Then Iterate
+    NextProcIndex = Strip(NextProcIndex,'L','0')
+    If Datatype(NextProcIndex,'N') <> 1 Then Iterate
+    If NextProcIndex <> ProcIndex + 1 Then Iterate
+
+    /* we know the proc index now, clean up old procs */
+    Do While ProcPos.0 >= NextProcIndex
+      iProcPos = ProcPos.0
+      If TraceIt = 'Y' Then ,
+        Say '  Dropping proc index' iProcPos '('ProcPos.0')'
+      Drop ProcPos.iProcPos
+      iProcPos = iProcPos - 1
+      ProcPos.0 = iProcPos
+    End
+    /* add the new proc now */
+    iProcPos = ProcPos.0
+    iProcPos = iProcPos + 1
+    ProcPos.0 = iProcPos
+    ProcPos.iProcPos = Proc '0'
+    If TraceIt = 'Y' Then ,
+      Say '  Added a proc index, index=' iProcPos '('ProcPos.iProcPos')'
+  End
+
+  /* if it's not a proc, maybe it's an include */
+  Else If Word(RptText,2) = 'INCLUDE' Then Do
+    Parse Value Word(RptText,3) With 'MEMBER=' Incl .
+    /* assume that it will all be on one line */
+    iRpt2 = iRpt + 1
+    Parse Var Rpt.iRpt2 42 NextInclIndex 44 45 Which 46
+    If Which <> 'I' Then Iterate
+
+    NextInclIndex = Strip(NextInclIndex,'L','0')
+    If Datatype(NextInclIndex,'N') <> 1 Then Iterate
+    If NextInclIndex <> InclIndex + 1 Then Iterate
+
+    /* clean up old includes */
+    Do While InclPos.0 >= NextInclIndex
+      iInclPos = InclPos.0
+      If TraceIt = 'Y' Then ,
+        Say '  Dropping incl index' iInclPos '('InclPos.0')'
+      Drop InclPos.iInclPos
+      iInclPos = iInclPos - 1
+      InclPos.0 = iInclPos
+    End
+    /* add the new one */
+    iInclPos = InclPos.0
+    iInclPos = iInclPos + 1
+    InclPos.0 = iInclPos
+    InclPos.iInclPos = Incl '0'
+    If TraceIt = 'Y' Then ,
+      Say '  Added a incl index, index=' iInclPos '('InclPos.iInclPos')'
+  End
+End
+
+If TraceIt = 'Y' Then Say
+
+Return
+/*-------------------------------------------------------------------*/
+/*- save where each statement resides.                              -*/
+/*-------------------------------------------------------------------*/
+Process_Report2_Merged_SetPos:
+
+ProcIndex = 0; InclIndex = 0;
+
+/* source/pos will initially be set to the previous source/pos */
+Select
+  /* a ctlcard extracted either from an instream or sysin dd */
+  When RptCard <> '' Then Do
+    If Source = '(Inline)' & Symbol('JobPos.'RptStmt) = 'VAR' Then ,
+      Pos = JobPos.RptStmt
+  End
+  /* either a proc or include */
+  When Left(RptText,1) = 'L' Then Do
+    Parse Var RptText 2 ProcIndex 5 InclIndex 8 Which 9
+    ProcIndex = Strip(ProcIndex)
+    InclIndex = Strip(InclIndex)
+    ProcIndex = Strip(ProcIndex,'L','0')
+    InclIndex = Strip(InclIndex,'L','0')
+    If ProcIndex = '' Then ProcIndex = 0
+    If InclIndex = '' Then InclIndex = 0
+    If TraceIt = 'Y' Then ,
+      Say '  Processing Proc/Incl, ProcIndex =' ProcIndex || ,
+          ', InclIndex =' InclIndex
+    /* make the rpttext look like a regular jcl statement now */
+    RptText = '//' || Substr(RptText,10)
+
+    If Which = 'I' Then Do
+      Parse Var InclPos.InclIndex Source Pos
+      Pos = Pos + 1
+      InclPos.InclIndex = Source Pos
+    End
+    Else Do
+      Parse Var ProcPos.ProcIndex Source Pos
+      Pos = Pos + 1
+      ProcPos.ProcIndex = Source Pos
+    End
+  End
+  /* an inline statement, only care if it's labeled */
+  When RptStmt <> '' Then Do
+    Source = '(Inline)'
+    Pos = JobPos.RptStmt
+  End
+  /* a continuation of a card, who cars about it? */
+  Otherwise Return
+End
+
+Step = RptStep
+If RptProc <> '' Then Step = RptStep"."RptProc
+If Step <> '' Then OldStep = Step
+If RptCard <> '' Then Step = OldStep
+/* save the card image for later use */
+Imag.RptStmt = RptText
+/* save the number of statements in an index for later */
+Stmt.RptStmt = "<"Source"> <"Pos"> <"Step"> <"RawSeq">"
+If TraceIt = 'Y' Then Say '  Current stmt in:' Source 'Pos:' Pos 'Step:' Step
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Save where each statement resides.                              -*/
+/*-------------------------------------------------------------------*/
+Process_Report2_Merged_Trace:
+
+Say TraceHead
+Say 'TRACE Processing:'
+Say Left(Rpt.iRpt,79)
+Say '  RptStmt=' RptStmt
+Say '  RptStep=' RptStep
+Say '  RptProc=' RptProc
+Say '  RptText=' Left(RptText,68)
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report3.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report3_Datasets:
+
+Dsns.0 = 0
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 3 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,10) <> ' REPORT 3 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 3 Missing.'
+  Return
+End
+
+If TraceIt = 'Y' Then Do
+  Say TraceHead
+  Say 'Processing Dataset Report'
+End
+
+iDsns = 0
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+
+  Parse Var Rpt.iRpt 2 Dsn 46 55 DsnType 60 75 DsnDef 82 83 DsnDel 93 ,
+    102 DsnRef
+  Dsn = Strip(Dsn)
+  DsnType = Strip(DsnType)
+  DsnDef = Strip(DsnDef)
+  DsnDel = Strip(DsnDel)
+  DsnRef = Strip(DsnRef)
+  If Left(Dsn,10) = 'DATACLAS: ' Then Iterate
+  If Left(Dsn,10) = 'STORGRP:  ' Then Iterate
+  If DsnType = '' Then DsnType = '????'
+
+  If Dsn <> '' Then Do
+    If TraceIt = 'Y' Then Say '  Adding dataset' Dsn
+    iDsns = iDsns + 1
+    Dsns.iDsns = Dsn
+    Dsns.iDsns.dbType = DsnType
+    Dsns.iDsns.dbDef = DsnDef
+    Dsns.iDsns.dbDel = DsnDel
+    Dsns.iDsns.dbRef = ''
+  End
+  Dsns.iDsns.dbRef = Dsns.iDsns.dbRef DsnRef
+End
+Dsns.0 = iDsns
+
+If TraceIt = 'Y' Then Do
+  Say 'Added' Dsns.0 'datasets.'
+  Say TraceHead
+  Say
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report4.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report4_Program:
+
+Pgms.0 = 0
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 4 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,10) <> ' REPORT 4 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 4 Missing.'
+  Return
+End
+
+If TraceIt = 'Y' Then Do
+  Say TraceHead
+  Say 'Processing Program Report'
+End
+
+iPgms = 0
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+
+  Parse Var Rpt.iRpt 2 Pgm 10 20 PgmLib 79 PgmRef
+  Pgm = Strip(Pgm)
+  PgmLib = Strip(PgmLib)
+  PgmRef = Strip(PgmRef)
+  If PgmRef = '' Then Iterate
+
+  If Pgm <> '' Then Do
+    If TraceIt = 'Y' Then Say '  Adding program' Pgm
+    iPgms = iPgms + 1
+    Pgms.iPgms = Pgm
+    Pgms.iPgms.dbLib = PgmLib
+    Pgms.iPgms.dbRef = ''
+    Pgms.Pgm = iPgms
+  End
+
+  Do While Pos(')',PgmRef) > 0
+    Parse Var PgmRef PgmRef '(' ')' Remainder
+    PgmRef = PgmRef Remainder
+  End
+  Pgms.iPgms.dbRef = Pgms.iPgms.dbRef PgmRef
+End
+Pgms.0 = iPgms
+
+If TraceIt = 'Y' Then Do
+  Say 'Added' Pgms.0 'programs.'
+  Say TraceHead
+  Say
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report5.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report5_Reports:
+
+Prts.0 = 0
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 5 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,10) <> ' REPORT 5 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 5 Missing.'
+  Return
+End
+
+DDNot.1 = 'SYSUDUMP'
+DDNot.2 = 'SYSABEND'
+DDNot.3 = 'PLIDUMP'
+DDNot.4 = 'SORTMSG'
+DDNot.5 = 'ADRLOG'
+DDNot.0 = 5
+
+iPrts = 0
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+
+  Parse Var Rpt.iRpt 2 PrtRef 11 PrtStep 22 PrtProc 30 ,
+    32 PrtDD 40 42 PrtClass 43 52 PrtForm 56 69 PrtWtr 77 93 PrtDest
+  PrtRef = Strip(PrtRef)
+  PrtStep = Strip(PrtStep)
+  PrtProc = Strip(PrtProc)
+  PrtDD = Strip(PrtDD)
+  PrtForm = Strip(PrtForm)
+  PrtWtr = Strip(PrtWtr)
+  PrtDest = Strip(PrtDest)
+  Do iDDNot = 1 To DDNot.0
+    If PrtDD = DDNot.iDDNot Then Iterate iRpt
+  End
+  If PrtProc <> '' Then PrtStep = PrtStep'.'PrtProc
+
+  iPrts = iPrts + 1
+  Prts.iPrts = PrtRef
+  Prts.iPrts.dbStep = PrtStep
+  Prts.iPrts.dbDD = PrtDD
+  Prts.iPrts.dbClass = PrtClass
+  Prts.iPrts.dbForm = PrtForm
+  Prts.iPrts.dbWtr = PrtWtr
+  Prts.iPrts.dbDest = PrtDest
+End
+Prts.0 = iPrts
+Drop DDNot.
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report6.                                  -*/
+/*-------------------------------------------------------------------*/
+Process_Report6_Error:
+
+Msgs.0 = 0
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 6 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,10) <> ' REPORT 6 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 6 Missing.'
+  Return
+End
+
+OldRef = ''
+iMsgs = 0
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+
+  Parse Var Rpt.iRpt 2 MsgRef 11 Msg 21 Text
+  Msg = Strip(Msg)
+  Text = Strip(Text)
+  MsgRef = Strip(MsgRef)
+  MsgRef = Strip(MsgRef,'B','.')
+  If MsgRef <> '' Then OldRef = MsgRef
+  Else If MsgRef = '' Then MsgRef = OldRef
+
+  iMsgs = iMsgs + 1
+  Msgs.iMsgs = Msg
+  Msgs.iMsgs.dbText = Text
+  Msgs.iMsgs.dbRef = MsgRef
+End
+Msgs.0 = iMsgs
+
+Return
+/*-------------------------------------------------------------------*/
+/*- process the resulting report11.                                 -*/
+/*-------------------------------------------------------------------*/
+Process_Report11_Proc:
+
+Procs.0 = 0
+If iRpt > Rpt.0 Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 11 Missing.'
+  Return
+End
+If Substr(Rpt.iRpt,41,11) <> ' REPORT 11 ' Then Do
+  If TraceIt = 'Y' Then Say 'REPORT 11 Missing.'
+  Return
+End
+
+If TraceIt = 'Y' Then Do
+  Say TraceHead
+  Say 'Processing Proc Report'
+End
+
+iProcs = 0
+Done = 'N'
+Pending = 'N'
+Do iRpt = iRpt + 1 To Rpt.0
+  If Substr(Rpt.iRpt,2,1) = '*' & ,
+    Substr(Rpt.iRpt,41,8) = ' REPORT ' Then Leave
+  If Substr(Rpt.iRpt,2,17) = 'SYMBOLICS DEFINED' Then Done = 'Y'
+  If Done = 'Y' Then Iterate
+
+  Parse Var Rpt.iRpt 2 Proc 10 22 Proclib 68 ProcRef
+  If Left(Proc,1) = '*' Then Do
+    Pending = 'N'
+    Iterate
+  End
+  If Left(Proc,1) = ' ' & Proc <> '' Then Do
+    Pending = 'N'
+    Iterate
+  End
+  If ProcRef = '' Then Iterate
+
+  Proc = Strip(Proc)
+  Proclib = Strip(Proclib)
+  ProcRef = Strip(ProcRef)
+  If Proc = '' & Pending = 'N' Then Iterate
+
+  If Proc <> '' Then Do
+    If TraceIt = 'Y' Then Say '  Adding proc' Proc
+    Pending = 'Y'
+    iProcs = iProcs + 1
+    Procs.iProcs = Proc
+    Procs.iProcs.dbLib = Proclib
+    Procs.iProcs.dbRef = ''
+  End
+
+  Procs.iProcs.dbRef = Procs.iProcs.dbRef ProcRef
+End
+Procs.0 = iProcs
+
+If TraceIt = 'Y' Then Do
+  Say 'Added' Procs.0 'procs.'
+  Say TraceHead
+  Say
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Set the heading stuff to check.                                 -*/
+/*-------------------------------------------------------------------*/
+Write_Results:
+
+If TraceIt <> 'Y' Then Return
+
+Do iDsns = 1 To Dsns.0
+  Say Dsns.iDsns 'Type:' Dsns.iDsns.dbType 'Refs:' Dsns.iDsns.dbRef
+  Refs = Dsns.iDsns.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Parse Var Stmt.iStmt '<' Source '>' '<' Pos '>' '<' Step '>' ,
+      '<' RawSeq '>'
+    Say '  Located in stmt:' iStmt 'Source:' Source 'Pos:' Pos 'Step:' Step
+  End
+  Say
+End
+
+Do iPgms = 1 To Pgms.0
+  Say Pgms.iPgms Pgms.iPgms.dbLib
+  Refs = Pgms.iPgms.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Parse Var Stmt.iStmt '<' Source '>' '<' Pos '>' '<' Step '>' ,
+      '<' RawSeq '>'
+    Say '  Located in stmt:' iStmt 'Source:' Source 'Pos:' Pos 'Step:' Step
+  End
+  Say
+End
+
+Do iProcs = 1 To Procs.0
+  Say Procs.iProcs Procs.iProcs.dbLib
+  Refs = Procs.iProcs.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Parse Var Stmt.iStmt '<' Source '>' '<' Pos '>' '<' Step '>' ,
+      '<' RawSeq '>'
+    Say '  Located in stmt:' iStmt 'Source:' Source 'Pos:' Pos 'Step:' Step
+  End
+  Say
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Set the heading stuff to check.                                 -*/
+/*-------------------------------------------------------------------*/
+Refresh_Tables:
+
+"ADDPOP"
+
+STATJCK = 'In progress...'
+STATRPT = ''
+STATTBL = ''
+"CONTROL DISPLAY LOCK"
+"DISPLAY PANEL(NJSTAT)"
+Call Create_Jclcheck_Report
+
+STATJCK = 'Done.'
+STATRPT = 'In progress...'
+"CONTROL DISPLAY LOCK"
+"DISPLAY PANEL(NJSTAT)"
+Call Process_Report1_Listing
+Call Process_Report2_Merged
+Call Process_Report3_Datasets
+Call Process_Report4_Program
+Call Process_Report5_Reports
+Call Process_Report6_Error
+Call Process_Report11_Proc
+/*Call Write_Results*/
+
+STATRPT = 'Done.'
+STATTBL = 'In progress...'
+"CONTROL DISPLAY LOCK"
+"DISPLAY PANEL(NJSTAT)"
+Call Create_Tables
+
+"REMPOP"
+
+Return
+/*-------------------------------------------------------------------*/
+/*- create the tables.                                              -*/
+/*-------------------------------------------------------------------*/
+Create_Tables:
+
+If StackedCall = 'Y' Then Do
+  Call Empty_Table TabDsn
+  Call Empty_Table TabPgm
+  Call Empty_Table TabProc
+  Call Empty_Table TabMsg
+  Call Empty_Table TabPrt
+  Call Load_Tables
+  Return
+End
+
+"LIBDEF ISPTLIB DATASET ID("DsnTab") STACK"
+"LIBDEF ISPTABL DATASET ID("DsnTab") STACK"
+
+"TBCREATE" TabDsn "NAMES(DSN DD TYPE DISP STEP SOURCE POS RAWSEQ) NOWRITE"
+"TBCREATE" TabPgm "NAMES(PGM LIB STEP SOURCE POS RAWSEQ) NOWRITE"
+"TBCREATE" TabProc "NAMES(PROC LIB STEP SOURCE POS RAWSEQ) NOWRITE"
+"TBCREATE" TabMsg "NAMES(MSG TEXT1 TEXT2 STEP SOURCE POS RAWSEQ) NOWRITE"
+"TBCREATE" TabPrt "NAMES(DD CLASS FORM WTR DEST STEP SOURCE POS RAWSEQ) NOWRITE"
+
+Call Load_Tables
+
+Return
+/*-------------------------------------------------------------------*/
+/*- empty an existing table                                         -*/
+/*-------------------------------------------------------------------*/
+Empty_Table:
+Arg EmptyTable
+
+"TBBOTTOM" EmptyTable "NOREAD"
+Do Forever
+  "TBDELETE" EmptyTable
+  If RC > 0 Then Leave
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- load up the tables                                              -*/
+/*-------------------------------------------------------------------*/
+Load_Tables:
+
+Do iDsns = 1 To Dsns.0
+  DSN = Dsns.iDsns
+  TYPE = Dsns.iDsns.dbType
+  Refs = Dsns.iDsns.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Select
+      When iStmt = Dsns.iDsns.dbDef & iStmt = Dsns.iDsns.dbDel Then ,
+        DISP = 'DEF/DEL'
+      When iStmt = Dsns.iDsns.dbDef Then DISP = 'DEFINE'
+      When iStmt = Dsns.iDsns.dbDel Then DISP = 'DELETE'
+      Otherwise DISP = 'REFER'
+    End
+    iStmt = Strip(iStmt,'T','.')
+    Parse Var Stmt.iStmt '<' SOURCE '>' '<' POS '>' '<' STEP '>' ,
+      '<' RAWSEQ '>'
+    If Left(Imag.iStmt,2) = '//' Then Do
+      DD = Word(Imag.iStmt,1)
+      If Pos('.',DD) > 0 Then Parse Var DD '.' DD
+      Else DD = Strip(DD,'L','/')
+    End
+    Else DD = ''
+    "TBADD" TabDsn
+  End
+End
+"TBSORT" TabDsn "FIELDS(RAWSEQ,N,A,DSN,C,A)"
+TabSort.TabDsn = ''
+If TraceIt <> 'Y' Then Drop Dsns.
+
+Do iPgms = 1 To Pgms.0
+  PGM = Pgms.iPgms
+  LIB = Pgms.iPgms.dbLib
+  Refs = Pgms.iPgms.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Parse Var Stmt.iStmt '<' SOURCE '>' '<' POS '>' '<' STEP '>' ,
+      '<' RAWSEQ '>'
+    "TBADD" TabPgm
+  End
+End
+"TBSORT" TabPgm "FIELDS(RAWSEQ,N,A)"
+TabSort.TabPgm = ''
+If TraceIt <> 'Y' Then Drop Pgms.
+
+Do iProcs = 1 To Procs.0
+  PROC = Procs.iProcs
+  LIB = Procs.iProcs.dbLib
+  Refs = Procs.iProcs.dbRef
+  Do While Words(Refs) > 0
+    Parse Var Refs iStmt Refs
+    Parse Var Stmt.iStmt '<' SOURCE '>' '<' POS '>' '<' STEP '>' ,
+      '<' RAWSEQ '>'
+    "TBADD" TabProc
+  End
+End
+"TBSORT" TabProc "FIELDS(RAWSEQ,N,A)"
+TabSort.TabProc = ''
+If TraceIt <> 'Y' Then Drop Procs.
+
+Do iMsgs = 1 To Msgs.0
+  MSG = Msgs.iMsgs
+  TEXT1 = Left(Msgs.iMsgs.dbText,63)
+  TEXT2 = Substr(Msgs.iMsgs.dbText,64)
+  iStmt = Msgs.iMsgs.dbRef
+  Parse Var Stmt.iStmt '<' SOURCE '>' '<' POS '>' '<' STEP '>' ,
+    '<' RAWSEQ '>'
+  "TBADD" TabMsg
+End
+"TBSORT" TabMsg "FIELDS(RAWSEQ,N,A)"
+TabSort.TabMsg = ''
+If TraceIt <> 'Y' Then Drop Msgs.
+
+Do iPrts = 1 To Prts.0
+  STEP = Prts.iPrts.dbStep
+  DD = Prts.iPrts.dbDD
+  CLASS = Prts.iPrts.dbClass
+  FORM = Prts.iPrts.dbForm
+  WTR = Prts.iPrts.dbWtr
+  DEST = Prts.iPrts.dbDest
+  iStmt = Prts.iPrts
+  Parse Var Stmt.iStmt '<' SOURCE '>' '<' POS '>' '<' STEP '>' ,
+    '<' RAWSEQ '>'
+  "TBADD" TabPrt
+End
+"TBSORT" TabPrt "FIELDS(RAWSEQ,N,A)"
+TabSort.TabPrt = ''
+If TraceIt <> 'Y' Then Drop Prts.
+
+If TraceIt <> 'Y' Then Do
+  Drop Job.
+  Drop Rpt.
+  Drop Imag.
+  Drop Stmt.
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- clean tables up, remove libdefs                                 -*/
+/*-------------------------------------------------------------------*/
+Cleanup_Tables:
+
+If StackedCall = 'Y' Then Return
+
+"TBEND" TabDsn
+"TBEND" TabPgm
+"TBEND" TabProc
+"TBEND" TabMsg
+"TBEND" TabPrt
+
+"LIBDEF ISPTLIB"
+"LIBDEF ISPTABL"
+
+Return
+/*-------------------------------------------------------------------*/
+/*- display the table so user can play                              -*/
+/*-------------------------------------------------------------------*/
+Display_Tables:
+
+Call Setup_Panels
+
+MYCMDS = 'PASSTHRU'
+CURSOR = 'LC'; CSRROW = 0; CSRPOS = 1; ZTDTOP = 0
+Do Forever
+  Table = Panel.iPanel.dbTable
+  "TBTOP" Table
+  "TBSKIP" Table "NUMBER("ZTDTOP") NOREAD"
+  "TBDISPL" Table "PANEL("Panel.iPanel") POSITION(CRP) ROWID(ROW)" ,
+    "AUTOSEL(NO) CSRROW("CSRROW") CURSOR("CURSOR") CSRPOS("CSRPOS")"
+  If RC > 4 Then Leave
+
+  CURSOR = 'ZCMD'
+  CSRPOS = 1
+
+  If ZCMD <> '' Then Do        /* primary commands go here */
+    Upper ZCMD
+    ZCMD = Strip(ZCMD)
+    Select
+      When Left(ZCMD,3) = 'DSN' Then iPanel = 1
+      When Left(ZCMD,3) = 'PGM' Then iPanel = 3
+      When Left(ZCMD,4) = 'PROC' Then iPanel = 5
+      When Left(ZCMD,3) = 'MSG' Then iPanel = 7
+      When Word(ZCMD,1) = 'RIGHT' Then Call Shift_Display 1
+      When Word(ZCMD,1) = 'LEFT' Then Call Shift_Display -1
+      When Word(ZCMD,1) = 'SORT' Then Call Sort_Table
+      When Word(ZCMD,1) = 'REFRESH' Then Do
+        Call Cleanup_Tables
+        Call Refresh_Tables
+      End
+      When Word(ZCMD,1) = 'L' | Word(ZCMD,1) = 'LOCATE' Then ,
+        Call Locate_Line
+      When Word(ZCMD,1) = 'F' | Word(ZCMD,1) = 'FIND' Then Do
+        Parse Var ZCMD . PNLFVALU
+        PNLFBOTM = 'N'
+        Call Find_Line
+      End
+      When Word(ZCMD,1) = 'RFIND' Then Call Find_Line
+      Otherwise "SETMSG MSG(NJ008)"
+    End
+  End
+
+  Do While ZTDSELS > 0       /* line commands go here */
+    Upper LC
+    GotoWhich = 'LC_Goto_Source'
+    If Pos('>',LC) > 0 Then Do
+      LC = Strip(LC,'B','>')
+      GotoWhich = 'LC_Goto_Dataset'
+    End
+    If LC = 'S' Then LC = 'V'
+    If LC = '~' Then GotoWhich = 'LC_Debug_Entry'
+
+    If Length(LC) = 1 Then Interpret 'Call' GotoWhich
+    Else If LC <> '' Then "SETMSG MSG(NJ005)"
+
+    If ZTDSELS > 1 Then "TBDISPL" Table "POSITION(CRP) ROWID(ROW)"
+    Else ZTDSELS = 0
+    CURSOR = 'LC'
+  End
+  LC = ' '
+  "TBGET" Table "POSITION(CSRROW)"          /* place cursor properly */
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- allow user to shift left/right on the panels                    -*/
+/*-------------------------------------------------------------------*/
+Setup_Panels:
+
+Panel.1 = 'NJDSNS1'
+Panel.2 = 'NJDSNS2'
+Panel.3 = 'NJPGMS1'
+Panel.4 = 'NJPGMS2'
+Panel.5 = 'NJPROCS1'
+Panel.6 = 'NJPROCS2'
+Panel.7 = 'NJMSGS1'
+Panel.8 = 'NJMSGS2'
+Panel.9 = 'NJPRTS1'
+Panel.0 = 9
+
+Panel.1.dbTable = TabDsn
+Panel.1.dbLeft = 'Y'
+Panel.2.dbTable = TabDsn
+Panel.2.dbLeft = 'N'
+Panel.3.dbTable = TabPgm
+Panel.3.dbLeft = 'Y'
+Panel.4.dbTable = TabPgm
+Panel.4.dbLeft = 'N'
+Panel.5.dbTable = TabProc
+Panel.5.dbLeft = 'Y'
+Panel.6.dbTable = TabProc
+Panel.6.dbLeft = 'N'
+Panel.7.dbTable = TabMsg
+Panel.7.dbLeft = 'Y'
+Panel.8.dbTable = TabMsg
+Panel.8.dbLeft = 'N'
+Panel.9.dbTable = TabPrt
+Panel.9.dbLeft = 'Y'
+
+"VGET PNLINIT PROFILE"
+Do iPanel = 1 To Panel.0
+  If Panel.iPanel = PNLINIT Then Leave
+End
+If iPanel > Panel.0 Then iPanel = 1
+
+Return
+/*-------------------------------------------------------------------*/
+/*- shift the display left and right                                -*/
+/*-------------------------------------------------------------------*/
+Shift_Display:
+
+Arg How
+If How = -1 Then Do Until Panel.iPanel.dbLeft = 'Y'
+  iPanel = iPanel - 1
+  If iPanel < 1 Then iPanel = Panel.0
+End
+Else Do
+  iPanel = iPanel + 1
+  If iPanel > Panel.0 Then iPanel = 1
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- sort the table by the specified heading                         -*/
+/*-------------------------------------------------------------------*/
+Sort_Table:
+
+How = Word(ZCMD,2)
+Select
+  When Table = TabDsn Then Do
+    If How = 'DATASET' Then How = 'DSN'
+    Else If How = 'DDNAME' Then How = 'DD'
+    Select
+      When How = 'DSN' Then ,
+        "TBSORT" TabDsn "FIELDS(DSN,C,A,RAWSEQ,N,A)"
+      When How = 'DD' Then ,
+        "TBSORT" TabDsn "FIELDS(DD,C,A,RAWSEQ,N,A)"
+      When How = 'TYPE' Then ,
+        "TBSORT" TabDsn "FIELDS(TYPE,C,A,DSN,C,A,RAWSEQ,N,A)"
+      When How = 'DISP' Then ,
+        "TBSORT" TabDsn "FIELDS(DISP,C,A,DSN,C,A,RAWSEQ,N,A)"
+      When How = 'SOURCE' Then ,
+        "TBSORT" TabDsn "FIELDS(SOURCE,C,A,DSN,C,A,RAWSEQ,N,A)"
+      When How = 'STEP' Then ,
+        "TBSORT" TabDsn "FIELDS(STEP,C,A,DSN,C,A,RAWSEQ,N,A)"
+      When How = '' Then ,
+        "TBSORT" TabDsn "FIELDS(RAWSEQ,N,A,DSN,C,A)"
+      Otherwise "SETMSG MSG(NJ012)"
+    End
+  End
+  When Table = TabPgm Then Do
+    If How = 'LIBRARY' Then How = 'LIB'
+    Select
+      When How = 'PGM' Then ,
+        "TBSORT" TabPgm "FIELDS(PGM,C,A,RAWSEQ,N,A)"
+      When How = 'LIB' Then ,
+        "TBSORT" TabPgm "FIELDS(LIB,C,A,PGM,C,A,RAWSEQ,N,A)"
+      When How = 'SOURCE' Then ,
+        "TBSORT" TabPgm "FIELDS(SOURCE,C,A,PGM,C,A,RAWSEQ,N,A)"
+      When How = 'STEP' Then ,
+        "TBSORT" TabPgm "FIELDS(STEP,C,A,PGM,C,A,RAWSEQ,N,A)"
+      When How = '' Then ,
+        "TBSORT" TabPgm "FIELDS(RAWSEQ,N,A)"
+      Otherwise "SETMSG MSG(NJ012)"
+    End
+  End
+  When Table = TabProc Then Do
+    If How = 'LIBRARY' Then How = 'LIB'
+    Select
+      When How = 'PROC' Then ,
+        "TBSORT" TabProc "FIELDS(PROC,C,A,RAWSEQ,N,A)"
+      When How = 'LIB' Then ,
+        "TBSORT" TabProc "FIELDS(LIB,C,A,PROC,C,A,RAWSEQ,N,A)"
+      When How = 'SOURCE' Then ,
+        "TBSORT" TabProc "FIELDS(SOURCE,C,A,PROC,C,A,RAWSEQ,N,A)"
+      When How = 'STEP' Then ,
+        "TBSORT" TabProc "FIELDS(STEP,C,A,RAWSEQ,N,A)"
+      When How = '' Then ,
+        "TBSORT" TabProc "FIELDS(RAWSEQ,N,A)"
+      Otherwise "SETMSG MSG(NJ012)"
+    End
+  End
+  When Table = TabMsg Then Do
+    Select
+      When How = 'MSG' Then ,
+        "TBSORT" TabMsg "FIELDS(MSG,C,A,RAWSEQ,N,A)"
+      When How = 'TEXT' Then ,
+        "TBSORT" TabMsg "FIELDS(TEXT1,C,A,RAWSEQ,N,A)"
+      When How = 'SOURCE' Then ,
+        "TBSORT" TabMsg "FIELDS(SOURCE,C,A,RAWSEQ,N,A)"
+      When How = 'STEP' Then ,
+        "TBSORT" TabMsg "FIELDS(STEP,C,A,RAWSEQ,N,A)"
+      When How = '' Then ,
+        "TBSORT" TabMsg "FIELDS(RAWSEQ,N,A)"
+      Otherwise "SETMSG MSG(NJ012)"
+    End
+  End
+  When Table = TabPrt Then Do
+    If How = 'WRITER' Then How = 'WTR'
+    Else If How = 'DDNAME' Then How = 'DD'
+    Else If How = 'C' Then How = 'CLASS'
+    Select
+      When How = 'DD' Then ,
+        "TBSORT" TabPrt "FIELDS(DD,C,A,RAWSEQ,N,A)"
+      When How = 'CLASS' Then ,
+        "TBSORT" TabPrt "FIELDS(CLASS,C,A,RAWSEQ,N,A)"
+      When How = 'FORM' Then ,
+        "TBSORT" TabPrt "FIELDS(FORM,C,A,RAWSEQ,N,A)"
+      When How = 'WTR' Then ,
+        "TBSORT" TabPrt "FIELDS(WTR,C,A,RAWSEQ,N,A)"
+      When How = 'DEST' Then ,
+        "TBSORT" TabPrt "FIELDS(DEST,C,A,RAWSEQ,N,A)"
+      When How = 'SOURCE' Then ,
+        "TBSORT" TabPrt "FIELDS(SOURCE,C,A,RAWSEQ,N,A)"
+      When How = 'STEP' Then ,
+        "TBSORT" TabPrt "FIELDS(STEP,C,A,RAWSEQ,N,A)"
+      When How = '' Then ,
+        "TBSORT" TabPrt "FIELDS(RAWSEQ,N,A)"
+      Otherwise "SETMSG MSG(NJ012)"
+    End
+  End
+  Otherwise Nop
+End
+TabSort.Table = How
+
+Return
+/*-------------------------------------------------------------------*/
+/*- locate a line in the table                                      -*/
+/*-------------------------------------------------------------------*/
+Locate_Line:
+
+LocateIt = Word(ZCMD,2)
+If TabSort.Table = '' Then Return
+"TBTOP" Table
+Interpret TabSort.Table "='"LocateIt"*'"
+"TBSCAN" Table "ARGLIST("TabSort.Table") CONDLIST(GE) POSITION(CRP)"
+If RC > 0 Then Do
+  "TBBOTTOM" Table "POSITION(CRP)"
+  ZTDTOP = CRP
+  Return
+End
+
+ExactMatch = 'N'
+Interpret "If Pos(LocateIt,"TabSort.Table") > 0 Then ExactMatch = 'Y    '"
+If ExactMatch = 'Y' Then ZTDTOP = CRP
+Else ZTDTOP = CRP - 1
+If ZTDTOP < 0 Then ZTDTOP = 0
+
+Return
+/*-------------------------------------------------------------------*/
+/*- find a line in the table                                        -*/
+/*-------------------------------------------------------------------*/
+Find_Line:
+
+If PNLFVALU = '' Then Do
+  "SETMSG MSG(NJ001)"
+  Return
+End
+
+FindFrom = ZTDTOP - 1
+FindTo = 999999
+FindPos = 0
+FindVars = PNLFVARS
+If PNLFBOTM = 'Y' Then Do
+  PNLFBOTM = 'N'
+  FindTo = FindFrom + 1
+  FindFrom = 0
+End
+Else If ZCURINX > 0 Then Do
+  FindVarsPos = Pos(Strip(ZCURFLD),FindVars)
+  If FindVarsPos > 0 Then Do
+    FindVars = Substr(FindVars,FindVarsPos)
+    FindPos = ZCURPOS + 1
+  End
+  Else FindPos = 0
+  "TBSKIP" Table "ROW("ZCURINX") POSITION(CRP)"
+  If RC = 0 Then FindFrom = CRP - 1
+End
+"TBTOP" Table
+"TBSKIP" Table "NUMBER("FindFrom") POSITION(CRP)"
+
+Do Forever
+  "TBSKIP" Table "NUMBER(1) POSITION(CRP)"
+  If RC = 8 Then Do
+    PNLFBOTM = 'Y'
+    "SETMSG MSG(NJ002)"
+    Return
+  End
+  If CRP > FindTo Then Do
+    PNLFBOTM = 'N'
+    "SETMSG MSG(NJ003)"
+    Return
+  End
+  Else Do While Words(FindVars) > 0
+    Parse Var FindVars FindVar FindVars
+    VarVal = Value(FindVar)
+    FindPos = FindPos + 1
+    FindPos = Pos(PNLFVALU,VarVal,FindPos)
+    If FindPos = 0 Then Iterate
+    PNLFBOTM = 'N'
+    ZTDTOP = CRP
+    FindFrom = CRP
+    CURSOR = FindVar
+    CSRPOS = FindPos
+    "SETMSG MSG(NJ004)"
+    Return
+  End
+  FindVars = PNLFVARS
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- debug an entry in the table                                     -*/
+/*-------------------------------------------------------------------*/
+LC_Debug_Entry:
+
+Select
+  When Table = TabDsn Then Do
+    Say "DSN="DSN "TYPE="TYPE "STEP="STEP "SOURCE="SOURCE "POS="POS ,
+      "RAWSEQ=" RAWSEQ
+    If TraceIt = 'Y' Then Do
+      Say 'iDsns='iDsns
+      Say 'Dsns.iDsns.dbType='Dsns.iDsns.dbType
+      Say 'Dsns.iDsns.dbDef='Dsns.iDsns.dbDef
+      Say 'Dsns.iDsns.dbDel='Dsns.iDsns.dbDel
+      Say 'Dsns.iDsns.dbRef='Dsns.iDsns.dbRef
+    End
+  End
+  When Table = TabPgm Then Do
+    Say "PGM="PGM "LIB="LIB "STEP="STEP "SOURCE="SOURCE "POS="POS ,
+      "RAWSEQ=" RAWSEQ
+    If TraceIt = 'Y' Then Do
+      Say 'iPgms='iPgms
+      Say 'Pgms.iPgms.dbLib='Pgms.iPgms.dbLib
+    End
+  End
+  When Table = TabProc Then Do
+    Say "PROC="PROC "LIB="LIB "STEP="STEP "SOURCE="SOURCE "POS="POS ,
+      "RAWSEQ=" RAWSEQ
+    If TraceIt = 'Y' Then Do
+      Say 'iProcs='iProcs
+      Say 'Procs.iProcs.dbLib='Procs.iProcs.dbLib
+    End
+  End
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- find the jcl source line that produced this table line          -*/
+/*-------------------------------------------------------------------*/
+LC_Goto_Source:
+
+"VPUT POS SHARED"
+SOURCE = Strip(SOURCE)
+If SOURCE <> '(Inline)' Then Do
+  "TBTOP" TabProc
+  PROC = SOURCE
+  "TBSCAN" TabProc "ARGLIST(PROC)"
+  If RC > 0 Then Do
+    Say 'TBSCAN RC='RC
+    Say 'Proc' SOURCE 'not found, internal bug. Call tech support.'
+    Return
+  End
+  DsnGoto = LIB'('PROC')'
+End
+Else DsnGoto = DsnJob
+DsnGoto = Strip(DsnGoto,"B","'")
+
+/* need to implement our own version of edit/view/browse so we   */
+/* can control the command table left/right stuff under our appl */
+If LC = 'E' | LC = 'V' Then Call LC_Goto_EditView
+Else "SELECT CMD(%FDSN '"DsnGoto"'" LC") NEWAPPL(ISR)"
+
+Return
+/*-------------------------------------------------------------------*/
+/*- go to the dataset on the table line                             -*/
+/*-------------------------------------------------------------------*/
+LC_Goto_Dataset:
+
+DsnGoto = ''
+Select
+  When Table = TabDsn Then DsnGoto = DSN
+  When Table = TabPgm Then Do
+    LC = 'B'
+    DsnGoto = LIB'('Strip(PGM)')'
+  End
+  When Table = TabProc Then DsnGoto = LIB'('Strip(PROC)')'
+  Otherwise Nop
+End
+If DsnGoto = '' | Left(DsnGoto,1) = '&' Then Do
+  "SETMSG MSG(NJ011)"
+  Return
+End
+
+"SELECT CMD(%FDSN '"DsnGoto"'" LC") NEWAPPL(ISR)"
+
+Return
+/*-------------------------------------------------------------------*/
+/*- edit/view the dataset on the table line                         -*/
+/*-------------------------------------------------------------------*/
+LC_Goto_EditView:
+
+"CONTROL DISPLAY SAVE"
+"CONTROL ERRORS RETURN"
+MYCMDS = ''
+If LC = 'E' Then GotoType = 'EDIT'
+Else GotoType = 'VIEW'
+
+GoToType "DATASET('"DsnGoto"') MACRO(NJEDIT)"
+SaveRC = RC
+MYCMDS = 'PASSTHRU'
+"CONTROL ERRORS CANCEL"
+"CONTROL DISPLAY RESTORE"
+
+If SaveRC > 8 Then Do
+  TERRLM = ZERRLM
+  Upper TERRLM
+  Pos = Pos('PRESS HELP',TERRLM)
+  If Pos > 0 Then ZERRLM = Left(ZERRLM,Pos-1)
+  TERRLM = ZERRLM
+  Upper TERRLM
+  Pos = Pos('ENTER HELP',TERRLM)
+  If Pos > 0 Then ZERRLM = Left(ZERRLM,Pos-1)
+  "SETMSG MSG(NJ007)"
+End
+
+Return

@@ -1,0 +1,726 @@
+ Source control procedure
+ÝEditor's note: controlling source code is a perennial problem and we return to
+the subject again with a different approach to solving it.¨
+The following EXECs and procedures can be used to control access to files (both
+source and data) which are required by more than one user.  The files are
+resident on a disk controlled by a VM user who runs disconnected and uses the
+IPF procedure WAKEUP (RDR.  The communication between the users and the service
+machine are through the reader and punch queues.  This system has made the
+assumption that no one is out to beat it, and serves mainly as a 'traffic cop'.
+The main control is provided by a file on the service machine's A disk.  This
+file must be initialised with a dummy entry before the procedures are started.
+The following procedure controls the operation of the service machine:  it
+should be resident on a mini-disk other than the service machine's A disk since
+it obtains TDSK to use as file mode A, and reaccesses the 191 disk as another
+mode.  It should be executed from the profile EXEC.
+/*  A rudimentary EXEC to attempt to keep track of who has what      */
+/*  program and to control the sequence of program update            */
+/*                                                                   */
+trace o
+/*   Shuffle disk assignments.  191 as C temp disk as A and link to  */
+/*      the product disk                                             */
+ac 191 c
+/* Define and access t-disk as a */
+tdsk 15000 a no
+if rc ¬= 0 then do
+   warn operator 'Unable to obtain T-DISK'
+   queue 'CP LOGOFF'
+   exit
+end
+ac 319 p
+execio 0 cp '(STRING SET SMSG ON'
+bexec = 'ACQ'
+myself = userid()
+/*  Endless Processing Loop                                          */
+do n = 1
+  lstmsg = ''
+  svcode = 0
+  cpy_parm = ''
+  address command wakeup '(' rdr
+  if rc = 6 then leave n                 /* if console attention exit */
+  makebuf
+  bufnum2 = rc
+  address command xrdr stack
+  PULL . act1 act2 fn ft splid orig user
+  dropbuf bufnum2
+ if act1 = 'READER' & act2 = 'IS' & fn = 'EMPTY' then iterate n
+ splid = strip(splid,'L','(')
+ splid = strip(splid,'T',')')
+ if splid = prevspid then do
+   execio 0 cp '(STRING TRANSFER * RDR ' splid 'TO' user 'RDR'
+   execio 0 cp '(STRING SMSG' user fn ft 'returned to your reader'
+   iterate n
+ end
+ prevspid = splid
+ prm2 = ''
+ if act1 = 'DISK' then prm2 = '( OLDDATE'
+ act1 act2 prm2
+ if rc ¬= 0 then iterate n
+/*  Select Processing option                                         */
+ select
+   when fn = 'SRCIN'   then call check_in
+   when fn = 'SRCOUT'  then call check_out
+   when fn = 'SRCREL'  then call src_release
+   when fn = 'SRCTRAN' then call src_transfer
+   when fn = 'SRCPRG'  then call purge_it
+   when fn = 'SRCOFF'  then call src_off
+    when fn = 'SRCINIT' then call src_init
+   otherwise               call move_file
+ end
+ if svcode ¬= 0 then do
+   CP smsg user fn ft action FAILED RETURN svcode lstmsg
+   iterate n
+ end
+ CP SMSG user fn ft action complete lstmsg
+ end
+ exit
+  /*  routine to purge a file from the source disk                   */
+  /*    If file not checked out do the erase                         */
+  /*    if file checked out purge only if checked to user requesting */
+  /*     (also update the out data file)                             */
+ purge_it:
+ execio 1 diskr srcprg exec a '(' finis
+ pull . fn ft ck_user .
+ fn = left(fn,8)
+ ft = left(ft,8)
+ ck_user = left(ck_user,8)
+ execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+ if rc = 0 then do
+   pull rec_num oth_num
+   pull . . out_user out_date out_time .
+   out_user = left(out_user,8)
+   if out user ¬= ck_user then do
+     svcode = 255
+     lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+   end
+   else do
+     erase fn ft b
+     svcode = rc
+     if svcode = 0 then call clean
+   end
+end
+else do
+  erase fn ft b
+  svcode = rc
+end
+address command erase srcprg exec a
+action = 'PURGED'
+return
+ /*  Routine to check a file back in.                                 */
+ /*    the checkin user id must be the same as the check out user id  */
+ /*    if the file has not been checked out the check in will         */
+ /*    will be denied.                                                */
+check_in:
+action = 'IN'
+makebuf
+buf_out = rc
+execio 1 diskr srcin exec a '(' finis
+pull . fn ft ck_user .
+fn = left(fn,8)
+ft = left(ft,8)
+ck_user = left(ck_user,8)
+execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+if rc = 0 then do
+  pull rec_num oth_num
+  pull . . out_user out_date out_time .
+  out_user = left(out_user,8)
+  if out_user ¬= ck_user then do
+    svcode = 255
+    lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+  end
+  else do
+  call ck_comp
+   copy fn ft a '= = B ( OLDD REP' cpy_parm
+  svcode = rc
+  if svcode ¬= 0 then,
+    lstmsg = 'Copy Error' svcode 'File returned'
+  else call clean
+  end
+end
+else do
+  lstmsg = 'Not checked out -- Returned'
+  svcode = 255
+end
+if svcode ¬= 0 then do
+  CP SPOOL 00D TO ck_user CL s
+  DISK DUMP FN FT a
+  CP SPOOL 00D CLOSE
+  CP SPOOL 00D OFF
+end
+finis out data c
+erase fn ft a
+erase srcin exec a
+dropbuf buf_out
+return
+ /*   Routine to move in a new file.                                 */
+ /*      The file may not already exist.                             */
+move_file:
+action = 'MOVED'
+state fn ft b
+if rc = 0 then do
+  lstmsg = 'Duplicate file Returned'
+  svcode = 255
+  end
+else do
+  call ck_comp
+  copy fn ft a '= = B ( OLDDATE' cpy_parm
+  svcode = rc
+  if svcode ¬= 0 then,
+    lstmsg = 'Copy Error' svcode 'File returned'
+end
+if svcode ¬= 0 then do
+  CP SPOOL 00D TO user CL s
+  DISK DUMP FN FT A
+  CP SPOOL 00D CLOSE
+  CP SPOOL 00D OFF
+end
+erase fn ft A
+return
+ /*  This routine will check out a file to the specified user.       */
+ /*    The file may not already be checked out to any one else       */
+ /*    the transfer will be effected through the requestors reader   */
+check_out:
+action = 'OUT'
+makebuf
+buf_out = rc
+execio 1 diskr srcout exec a '(' finis
+pull . fn ft ck_user .
+fn = left(fn,8)
+ft = left(ft,8)
+ck_user = left(ck_user,8)
+state fn ft b
+svcode = rc
+if svcode ¬= 0 then do
+   lstmsg = 'State Error on' fn ft
+   return
+end
+execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+if rc = 0 then do
+   pull .
+  pull . . out_user out_date out_time.
+  svcode = 255
+  lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+end
+else do
+  CP SPOOL 00D TO ck_user CL s
+  DISK DUMP FN FT b
+  CP SPOOL 00D CLOSE
+  CP SPOOL 00D OFF
+  lstmsg = ' '
+  svcode = 0
+  execio 1 diskw out data c 0 f 80 '(' string fn ft ck_user,
+       date('U') time()
+  finis out data c
+end
+erase srcout exec a
+dropbuf buf_out
+return
+ /*  This routine will perform the check out function without        */
+ /*    actually transferring.  It has been provided to allow entry   */
+ /*    of fn ft into the out data file for those programs which were */
+ /*    worked on when this system was started.                       */
+src_init:
+action = 'INIT'
+makebuf
+buf_out = rc
+execio 1 diskr srcinit exec a '(' finis
+pull . fn ft ck_user .
+fn = left(fn,8)
+ft = left(ft,8)
+ck_user = left(ck_user,8)
+state fn ft b
+svcode = rc
+if svcode ¬= 0 then do
+   lstmsg = 'State Error on' fn ft
+   return
+end
+execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+if rc = 0 then do
+  pull .
+  pull . . out_user out_date out_time .
+  svcode = 255
+  lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+end
+else do
+  lstmsg = ' '
+  svcode = 0
+  execio 1 diskw out data c 0 f 80 '('string fn ft ck_user,
+       date('U') time()
+  finis out data c
+end
+erase srcinit exec a
+dropbuf buf_out
+return
+ /*  this routine will release a checked out file record             */
+src_release:
+action = 'release'
+makebuf
+buf_out = rc
+execio 1 diskr srcrel exec a '(' finis
+pull . fn ft ck_user .
+fn = left(fn,8)
+ft = left(ft,8)
+ck_user = left(ck_user,8)
+execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+ if rc = 0 then do
+  pull rec_num oth_num
+  pull . . out_user out_date out_time.
+  out_user = left(out_user,8)
+  if out_user ¬= ck_user then do
+    svcode = 255
+    lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+  end
+  else call clean
+ end
+ else do
+  lstmsg = 'File not checked out'
+  svcode = 255
+end
+erase srcrel exec a
+dropbuf buf_out
+return
+ /*  this routine will transfer userid of a checked out file          */
+src_transfer:
+action = 'Transfer'
+makebuf
+buf_out = rc
+execio 1 diskr srctran exec a '(' finis
+pull . fn ft ck_user new_user
+fn = left(fn,8)
+ft = left(ft,8)
+ck_user = left(ck_user,8)
+new_user = left(new_user,8)
+execio '*' diskr out data c '(' fi '/'||fn ft||'/' finis
+if rc = 0 then do
+  pull rec_num oth_num .
+  pull . . out_user out_date out_time .
+  out_user = left(out_user,8)
+  if out_user ¬= ck_user then do
+    svcode = 255
+    lstmsg = 'Checked out to ' out_user 'at' out_date out_time
+  end
+  else execio 1 diskw out data c rec_num f 80,
+    '('string fn ft new_user date('U') time()
+ end
+ else do
+  lstmsg = 'File not checked out'
+  svcode = 255
+end
+erase srctran exec a
+dropbuf buf_out
+return
+ /*  This routine will remove the specified record from the out data  */
+ /*  file.  the requested number is in variable rec_num               */
+clean:
+execio 1 diskw out data c rec_num f 80 '(' finis string xxxxxxxxxx
+makebuf
+kill_buf = rc
+execio '*' diskr out data c '(' finis
+num_rec = queued()
+do kill_num = 1 to queued()
+  pull record
+  check_null = strip(record)
+  if check_null ¬= xxxxxxxxxx then,
+  execio 1 diskw out temp c 0 f 80 '(' string record
+end
+dropbuf kill_buf
+finis out temp c
+erase out data c
+er_code = rc
+ren out temp c out data c
+ return
+ /*  Routine to check if file is compressed and if not compress it   */
+ /*  either by compress or copy with the pack option                 */
+ck_comp:
+makebuf
+buf_comp = rc
+execio 1 diskr fn ft a '(' finis
+pull comp_ck .
+ /*  Check if already compressed                                     */
+if comp_ck = ':COMPRESSED' then do
+  dropbuf buf_comp
+  return
+end
+ /*  Don't compress text module or LIB type files                    */
+if ft = 'TEXT' | ft = 'MODULE' | right(ft,3) = 'LIB' then do
+   dropbuf buf_comp
+   return
+end
+listfile fn ft a '(' stack date
+pull . . . recfm lrecl .
+dropbuf buf_comp
+ /*  Select type of compression (F 1024 already PACKED so ignore     */
+if recfm = 'F' & lrecl = 1024 then return
+if recfm = 'F' & lrecl = 80 then,
+   compress 'R' fn ft a '= = ='
+else cpy_parm = 'PACK'
+return
+ /*  This routine will stack a LOGOFF command and Exit               */
+src_off:
+queue 'LOGOFF'
+exit
+return
+The following EXECs are resident on a commonly accessed disk and are executed in
+the requestor's virtual machine.  We have activated them through a REXX EXEC
+using the XMENU product but they work just fine in a stand alone mode.
+
+CHECKIN
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+q v c '(' stack
+pull rstuff
+rstuff = delword(rstuff,8)
+rstuff = delword(rstuff,2,1)
+execio 0 cp '(' string ch rdr cl s hold
+spool rdr cl s
+cp spool 00d to srvid cl a cont
+set cmstype ht
+l fn ft a
+svcode = rc
+set cmstype rt
+if svcode ¬= 0 then do
+ queue '** ** State Error on ' fn ft 'A Return Code' rc
+ cp spool 00d purge
+ cp spool 00d off
+ spool rstuff
+ exit
+end
+set cmstype ht
+erase srcin exec a
+set cmstype rt
+execio 1 diskw srcin exec a 0 f 80 '(' string '*' fn ft userid()
+execio 1 diskw srcin exec a 0 f 80 '(' finis string '&EXIT &RETCODE'
+disk dump srcin exec a
+disk dump fn ft a
+ cp spool 00d close
+cp spool 00d off
+erase fn ft a
+erase srcin exec a
+cp set smsg on
+wakeup '(' smsg
+cp set smsg off
+pull message
+if word(message,6) = 'FAILED' then do
+  makebuf
+  bufnam2 = rc
+  address command xrdr stack
+  PULL . act1 act2 fn ft splid orig user
+  dropbuf bufnum2
+  if (act1 = 'READER' & act2 = 'IS' & fn = 'EMPTY'),
+    | (act1 = 'ACTIVE' & act2 = 'RDR' & fn = 'CLASS' & ft = 'EMPTY'),
+  then do
+    queue message
+    spool rstuff
+    exit
+  end
+  prm2 = ''
+  if act1 = 'DISK' then prm2 = '( OLDDATE'
+  act1 act2 prm2
+  1 fn ft a '(' stack date
+  pull . . . recfm lrecl .
+  if recfm = 'F' & lrecl = 1024 then,
+    copy fn ft a '= = = (OLDD REP UNPACK'
+  else do
+    execio 1 diskr fn ft a '(' finis
+    pull comp_ck .
+    if comp_ck = ':COMPRESSED' then decomp cdr fn ft a '= = ='
+  end
+end
+else exec acq
+spool rstuff
+queue message
+exit
+
+CHECKOUT
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+if ft = '' then do
+  say 'Missing parameter(s)'
+  exit 99
+end
+q v c '(' stack
+pull rstuff
+rstuff = delword(rstuff,8)
+rstuff = delword(rstuff,2,1)
+execio 0 cp '(' string ch rdr cl s hold
+spool rdr cl s
+cp spool 00d to srvid cl a
+set cmstype ht
+makebuf
+bufnum = rc
+queue in
+queue '*' fn ft userid()
+queue '&EXIT &RETCODE'
+queue
+queue file
+xedit srcout exec a
+set cmstype rt
+disk dump srcout exec a
+ if rc ¬= 0 then do
+ queue '** ** Error procedure aborted return code' rc
+ cp spool 00d purge
+ cp spool 00d off
+ exit
+end
+cp spool 00d close
+cp spool 00d off
+address command erase srcout exec a
+cp set smsg on
+wakeup '(' smsg
+svcode = rc
+cp set smsg off
+pull message
+makebuf
+bufnum2 = rc
+address command xrdr stack
+PULL . act1 act2 fn ft splid orig user
+dropbuf bufnum2
+if (act1 = 'READER' & act2 = 'IS' & fn = 'EMPTY'),
+  | (act1 = 'ACTIVE' & act2 = 'RDR' & fn = 'CLASS' & ft = 'EMPTY'),
+  then do
+  queue message
+  spool rstuff
+  exit
+end
+prm2 =  ''
+if act1 = 'DISK' then prm2 = '( OLDDATE'
+act1 act2 prm2
+l fn ft a '(' stack date
+pull . . . recfm lrecl .
+if recfm = 'F' & lrecl = 1024 then,
+  copy fn ft a '= = = (OLDD REP UNPACK'
+else do
+  execio 1 diskr fn ft a '(' finis
+  pull comp_ck .
+  if comp_ck = ':COMPRESSED' then decomp cdr fn ft a '= = ='
+end
+spool rstuff
+queue message
+exit
+
+MVTOSRC
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+q v c '(' stack
+pull rstuff
+rstuff = delword(rstuff,8)
+rstuff = delword(rstuff,2,1)
+execio 0 cp '(' string ch rdr cl s hold
+spool rdr cl s
+CP SPOOL 00D TO srvid CL A
+set cmstype ht
+l fn ft a
+svcode = rc
+set cmstype rt
+if svcode ¬= 0 then do
+ SAY '** ** State Error on ' fn ft 'A Return Code' rc
+ cp spool 00D purge
+ cp spool 00D off
+ spool rstuff
+ exit
+end
+DISK DUMP fn ft A
+ cp spool 00D close
+cp spool 00D off
+erase fn ft A
+cp set smsg on
+wakeup '(' SMSG
+cp set smsg off
+pull message
+if word(message,6) = 'FAILED' then do
+  makebuf
+  bufnum2 = rc
+  address command xrdr stack
+  PULL . act1 act2 fn ft splid orig user
+  dropbuf bufnum2
+  if (act1 = 'READER' & act2 = 'IS' & fn = 'EMPTY'),
+    | (act1 = 'ACTIVE' & act2 = 'RDR' & fn = 'CLASS' & ft = 'EMPTY'),
+  then do
+    queue message
+    spool rstuff
+    exit
+  end
+  prm2 = ''
+  if act1 = 'DISK' then prm2 = '( OLDDATE'
+  act1 act2 prm2
+  l fn ft a '(' stack date
+  pull . . . recfm lrecl .
+  if recfm = 'F' & lrecl = 1024 then,
+    copy fn ft a '= = = (OLDD REP UNPACK'
+  else do
+    execio 1 diskr fn ft a '(' finis
+    pull comp_ck
+    if comp_ck = ':COMPRESSED' then decomp cdr fn ft a '= = ='
+  end
+end
+else exec acq
+spool rstuff
+queue message
+exit
+
+RELSRC
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+if ft = '' then do
+  say 'Missing parameter(s)'
+  exit 99
+end
+cp spool 00d to srvid cl a cont
+set cmstype ht
+erase srcrel exec a
+set cmstype rt
+execio 1 diskw srcrel exec a 0 f 80 '(' string '*' fn ft userid()
+execio 1 diskw srcrel exec a 0 f 80 '(' finis string '&EXIT &RETCODE'
+disk dump srcrel exec a
+cp spool 00d close
+cp spool 00d off
+erase srcrel exec a
+cp set smsg on
+wakeup '(' smsg
+cp set smsg off
+exit
+
+TRANSRC
+trace o
+arg fn ft newid
+srvid = 'SRCMNT'
+ ownerid = userid()
+vmfclear
+if newid = '' then do
+  say 'Missing parameter(s)'
+  exit 99
+end
+cp spool 00d to srvid cl a cont
+set cmstype ht
+erase srctran exec a
+set cmstype rt
+execio 1 diskw srctran exec a 0 f 80 '(' string '*' fn ft ownerid ,
+  newid
+execio 1 diskw srctran exec a 0 f 80 '(' finis string '&EXIT &RETODE'
+disk dump srctran exec a
+cp spool 00d close
+cp spool 00d off
+erase srctran exec a
+cp set smsg on
+wakeup '(' smsg
+cp set smsg off
+exit
+
+PURGESRC
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+it ft = '' then do
+  say 'Missing Parameter (s)'
+  exit 99
+end
+cp spool 00d to srvid cl a cont
+set cmstype ht
+erase srcprg exec a
+set cmstype rt
+execio 1 diskw srcprg exec a 0 f 80 '(' string '*' fn ft userid()
+execio 1 diskw srcprg exec a 0 f 80 '(' finis string '&EXIT &RETCODE'
+DISK DUMP SRCPRG EXEC A
+if rc ¬= 0 then do
+ queue '** ** Error Procedure Aborted Return Code' rc
+ CP SPOOL 00D PURGE
+ CP SPOOL 00D OFF
+ EXIT
+end
+CP SPOOL 00D CLOSE
+CP SPOOL 00D OFF
+address command ERASE SRCPRG EXEC A
+CP SET SMSG ON
+WAKEUP '(' SMSG
+CP SET SMSG OFF
+EXEC ACQ
+exit
+
+LOOKSRC
+trace o
+srvid = 'SRCMNT'
+svcode = xlr(srvid,,,rsrcmnt)
+if words(svcode) = 2 then do
+   address command xedit out data word(svcode,2)
+   release word(svcode,2) '('det
+   queue '** **'
+ end
+else
+   queue '** ** Access of' srvid '191 failed, RC=' svcode
+exit
+
+ INITSRC
+trace o
+arg fn ft .
+srvid = 'SRCMNT'
+vmfclear
+cp spool 00d to srvid cl a cont
+l fn ft a
+if rc ¬= 0 then do
+ queue '** ** State Error on ' fn ft 'A Return Code' rc
+ cp spool 00d purge
+ cp spool 00d off
+ exit
+end
+set cmstype ht
+erase srcinit exec a
+set cmstype rt
+execio 1 diskw srcinit exec a 0 f 80 '(' string '*' fn ft userid()
+execio 1 diskw srcinit exec a 0 f 80 '(' finis string '&EXIT &RETCODE'
+disk dump srcinit exec a
+cp spool 00d close
+cp spool 00d off
+erase srcinit exec a
+cp set smsg on
+wakeup '(' smsg
+cp set smsg off
+exit
+
+STOPSRC
+trace o
+srvid = 'SRCMNT'
+set cmstype ht
+erase srcoff exec a
+set cmstype rt
+execio 1 diskw srcoff exec a 1 f 80 '(' finis string '/* */'
+cp spool 00d to srvid cl a cont
+disk dump srcoff exec a
+cp spool 00d close
+cp spool 00d off
+erase srcoff exec a
+exit
+Maurice Smyth
+Senior Systems Programmer
+Frank Russell Company (USA)   ) Frank Russell Co 1989
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

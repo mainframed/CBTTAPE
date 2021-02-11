@@ -1,0 +1,906 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;**********************************************************************
+;
+;   ZILCOINT is the compiler initialization routine, called to establish
+;   all global values and defaults used by the compiler, and to perform
+;   definition of all compile-time macros required by the compiler.
+;
+;**********************************************************************
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/22/88 - Added ASSQ and MEMQ as inline functions.                 *
+;* 04/07/88 - Added ASSOC and MEMBER to known functions list.          *
+;*            Added compiler transforms for ASSOC and MEMBER.          *
+;* 04/14/88 - Added LOGCOUNT as a built-in.                            *
+;* 04/27/88 - Added ZXSETQ compiler transform for SETQ.                *
+;* 04/28/88 - Added some more names to "reserved" list to fix bugs     *
+;*            in compiler when generating atoms and subrs for them.    *
+;* 04/28/88 - Added ZILTEST as a built-in.                             *
+;* 05/13/88 - Removed REALTIME; added ZILCOCON.                        *
+;* 06/01/88 - Added LIST, etc., which are no longer EXPR's in ZEVINIT, *
+;*            and added VALUES and VALUES-LIST.                        *
+;*            Added more compiler transforms.                          *
+;*            Removed THROW, which is now a special form.              *
+;* 11/01/88 - Added XLATE (a.k.a STRING-TRANSLATE) and ZFSEXEC.        *
+;* 11/88 - Added LDIFF, reader functions, STRING, UNTYI, ZILSPAD.      *
+;* 12/88 - Added more reader-related functions, CHARP.                 *
+;* 12/89 - Added SETASCII.                                             *
+;*                                                                     *
+;***********************************************************************
+
+   ;;
+   ;; Steps in adding a new built-in function:
+   ;;
+   ;; (1) Add it to ZILCOINT.
+   ;; (2) Add it to ZILMODS.
+   ;; (3) Create a new help member for it.
+   ;; (4) Add it to help member $HELP.
+   ;;
+   ;;
+   ;; Steps in adding a new special form:
+   ;;
+   ;; (1) Add it to the list in ZEVINIT.
+   ;; (2) Add it to ZILEVAL.
+   ;; (3) Add it to FEXPAND.
+   ;; (4) Add it to ZILCOTRN.
+   ;; (5) Add it to ZILCOINT.
+   ;; (6) Figure out how to compile it.
+   ;; (7) Create a new help member for it.
+   ;; (8) Add it to help member $HELP.
+   ;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+; First, some local macros.
+
+(defmacro def-1-arg-trans (function (arg) body
+                           &aux (y (gensym)) (z (gensym)))
+ `(deftrans ,function (,z)
+   (let ((,y (cdr ,z)))
+    (cond
+     ((null ,y) (zerror "Too few arguments" ,z))
+     ((cdr ,y)  (zerror "Too many arguments" ,z))
+     (t         (let ((,arg (car ,y)))
+                     ,body))))))
+
+; Then, some read-time functionality.
+
+(eval-when ()
+#.(progn
+   ;
+   ; Reserved symbol names that cannot be generated as assembler labels.
+   ;
+   (defvar reserved
+                    '(zlbptrs
+                      zilopts zilpdsiz zilcssiz zilvssiz zilacsiz
+                      zilatoms zilatome zillists zilliste
+                      zilvset zilvsym zilxdef zilxlfy
+                     ))
+   ;
+   ; Special forms.
+   ;
+   (defvar special-forms
+           (let ((formlist nil))
+                (mapatoms #'(lambda (x)
+                                    (when (get x '|SPECIAL FORM|)
+                                          (push x formlist))))
+                formlist))
+
+   (format t "~%The special forms that will be defined to the compiler ~
+                are:~%~S~2%" special-forms)
+   ;
+   ; Functions that generate inline code, not subroutine calls.
+   ;
+   (defvar inline-funcs
+       '(car cdr pname plist pbind             ; Accessor functions
+         funfun funenv                         ; Accessor functions
+         zcar zcdr                             ; ZIL-only accessors
+         rplaca rplacd setplist setpbind       ; Updater functions
+         oblist                                ; The "object list"
+         salist setsalst                       ; "ALIST" stuff
+         zilunbnd                              ; The "unbound marker"
+         rmnil                                 ; The reader "nothing"
+         cons                                  ; Fast call to common
+         assq memq                             ; List loopers
+
+         ; NOTE: Code below depends on the predicates
+         ;       all following EQ in this list.  DO NOT CHANGE THIS!!!
+
+         eq                                    ; Basic predicates
+         zerop minusp evenp oddp plusp         ; Numeric predicates
+         atom numberp symbolp fixnump floatp   ; Type predicates...
+         consp listp
+         codep subrp closurep stringp vectorp
+         bigp fixp integerp funargp
+         vecp structp sfloatp dfloatp charp
+        ))
+  )
+)
+
+
+; Now, the actual function definition.
+
+(defun zilcoint (&aux (infuns '#.inline-funcs))
+
+;
+; Set up the function lists used by the compiler.
+;
+ (putprop '*zilco* '#.reserved       'reserved)
+ (putprop '*zilco* infuns            'inline-funcs)
+ (putprop '*zilco* '#.special-forms  'special-forms)
+
+;
+; Declare the default binding technique to be SPECIAL.
+; Note: (declare (default-binding .......)) can override this.
+;
+
+ (defprop *zilco* special default-binding)
+
+;(defprop *zilco* nil   default-binding) disallows undeclared unbounds
+
+;
+; Define built-in inline functions.
+;
+ (loop for x in infuns
+       with pred = nil
+       (putprop x t 'builtin) ; True for all built-in in-line code.
+       (putprop x t 'inline)  ; True unless (DECLARE (NOTINLINE ...))
+       when (eq x 'eq)        ; Start of predicate functions
+            (setq pred t)
+       when pred
+            (putprop x t 'predicate)
+ )
+;
+; Define additional predicate functions for those that are sometimes
+; inline and sometimes not.
+;
+ (putprop 'eql t 'predicate)
+ ;
+ ; Eventually, LESSP/GREATERP/ZILEQUAL/etc. will also be defined
+ ; as predicates, but only when some inline code is possible for them.
+ ;
+; Invoke the "DEFARGS" facility to define minimum and maximum
+; arguments for standard LISP functions as shown below.
+;
+ (mapc #'(lambda (x)
+                 (let (((fun min max rst) x))
+                      (putprop fun min 'minargs)
+                      (putprop fun max 'maxargs)
+                      (putprop fun rst 'restarg)))
+       '(
+           (abs      1 1 nil)
+           (acsize   0 0 nil)
+           (add1     1 1 nil)
+           (alphacp  1 1 nil)
+           (append2  2 2 nil)
+           (apply    1 1 t  )
+           (apropos  1 1 nil)
+           (args     1 2 nil)
+           (ash      2 2 nil)
+           (assq     2 2 nil)
+           (assql    2 2 nil)
+           (assqual  2 2 nil)
+           (atom     1 1 nil)
+           (biglist  1 1 nil)
+           (bigp     1 1 nil)
+           (boundp   1 1 nil)
+           (butlast  1 2 nil)
+           (car      1 1 nil)
+           (cdr      1 1 nil)
+           (ceiling  1 2 nil)
+           (char     2 2 nil)
+           (chardown 1 1 nil)
+           (charp    1 1 nil)
+           (charup   1 1 nil)
+           (close    1 2 nil)
+           (closurep 1 1 nil)
+           (clrscrn  0 0 nil)
+           (codep    1 1 nil)
+           (concat   0 0 t  )
+           (cons     2 2 nil)
+           (consp    1 1 nil)
+           (copyenv  1 1 nil)
+           (copysym  2 2 nil)
+           (copytree 1 1 nil)
+           (cssize   0 0 nil)
+           (cterpri  0 1 nil)
+           (curdate  0 0 nil)
+           (curjdate 0 0 nil)
+           (curtime  0 0 nil)
+           (defrdmac 2 2 nil)
+           (delq     2 3 nil)
+           (delql    2 3 nil)
+           (delqual  2 3 nil)
+           (dfloatp  1 1 nil)
+           (digitcp  1 2 nil)
+           (downcase 1 1 nil)
+           (ebcdic   1 2 nil)
+           (echo     1 3 nil)
+           (ed       0 1 nil)
+           (endread  0 1 nil)
+           (eof      0 1 nil)
+           (eq       2 2 nil)
+           (eql      2 2 nil)
+           (equal    2 2 nil)
+           (equalp   2 2 nil)
+           (error    0 1 t  ) ; 05/22/89
+           (eval     1 2 nil)
+           (evenp    1 1 nil)
+           (every    1 1 t  )
+           (exit     0 1 nil)
+           (explode  1 1 nil)
+           (explodec 1 1 nil)
+           (exploden 1 1 nil)
+           (expt     2 2 nil)
+           (fboundp  1 1 nil)
+           (featurep 1 1 nil)
+           (fexpand  1 1 nil)
+           (firstn   2 2 nil)
+           (fix      1 1 nil)
+           (fixnump  1 1 nil)
+           (fixp     1 1 nil)
+           (float    1 2 nil)
+           (floatp   1 1 nil)
+           (floor    1 2 nil)
+           (fmakunbo 1 1 nil)
+           (format   2 2 t  )
+           (funargp  1 1 nil)
+           (funcall  1 1 t  )
+           (funenv   1 1 nil)
+           (funfun   1 1 nil)
+           (gc       0 0 nil)
+           (gcd2     2 2 nil)
+           (gcmsg    0 1 nil)
+           (gctime   0 0 nil)
+           (gensym   0 1 nil)
+           (gentemp  0 2 nil)
+           (get      2 3 nil)
+           (getchar  2 2 nil)
+           (getcharn 2 2 nil)
+           (getk     2 3 nil)
+           (getl     2 2 nil)
+           (getparm  0 2 nil)
+           (greaterp 2 2 nil)
+           (haipart  2 2 nil)
+           (haulong  1 1 nil)
+           (ifilep   1 1 nil)
+           (implode  1 1 nil)
+           (index    2 3 nil)
+           (integerp 1 1 nil)
+           (intersec 2 2 nil)
+           (intrpret 0 3 nil)
+           (intrq    2 2 nil)
+           (invoke   1 2 nil)
+           (ispfp    0 0 nil)
+           (keywordp 1 1 nil)
+           (kwdify   1 1 nil)
+           (land     2 2 nil)
+           (last     1 1 nil)
+           (ldiff    2 2 nil)
+           (length   1 1 nil)
+           (lessp    2 2 nil)
+           (listp    1 1 nil)
+           (llkeywdp 1 1 nil)
+           (llvars   1 1 nil)
+           (load     1 1 t  )
+           (log      1 2 nil)
+           (logbitp  2 2 nil)
+           (logcount 1 1 nil)
+           (lognot   1 1 nil)
+           (logtest  2 2 nil)
+           (lor      2 2 nil)
+           (lsh      2 2 nil)
+           (lxor     2 2 nil)
+           (maknam   1 1 nil)
+           (maknum   1 1 nil)
+           (makunbou 1 1 nil)
+           (maxargs  1 1 nil)
+           (max2     2 2 nil)
+           (memq     2 2 nil)
+           (memql    2 2 nil)
+           (memqual  2 2 nil)
+           (mexpand  1 1 nil)
+           (mexpand1 1 1 nil)
+           (minargs  1 1 nil)
+           (minus    1 1 nil)
+           (minusp   1 1 nil)
+           (min2     2 2 nil)
+           (mkatom   1 3 nil)
+           (mkbignum 1 1 nil)
+           (mkfixnum 1 1 nil)
+           (mkflonum 1 2 nil)
+           (mkfunarg 2 2 nil)
+           (mklist   1 2 nil)
+           (mknewenv 0 1 nil)
+           (mkstruct 2 2 nil)
+           (mkvector 1 2 nil)
+           (msglevel 0 1 nil)
+           (nconc2   2 2 nil)
+           (newlinep 0 1 nil)
+           (not      1 1 nil)
+           (notany   1 1 t  )
+           (notevery 1 1 t  )
+           (nreconc  2 2 nil)
+           (nreverse 1 1 nil)
+           (nth      2 2 nil)
+           (nthcdr   2 2 nil)
+           (null     1 1 nil)
+           (numberp  1 1 nil)
+           (oblist   0 0 nil)
+           (oddp     1 1 nil)
+           (ofilep   1 1 nil)
+           (open     1 2 nil)
+           (pairlis  2 3 nil)
+           (parsbody 1 3 nil)
+           (pbind    1 1 nil)
+           (pdsize   0 0 nil)
+           (peekch   0 3 nil)
+           (plist    1 1 nil)
+           (plusp    1 1 nil)
+           (pm       1 2 nil)
+           (pm1      1 2 nil)
+           (pname    1 1 nil)
+           (ppdate   0 1 nil)
+           (pprint   1 2 nil)
+           (pptime   0 1 nil)
+           (prefix   0 0 nil)
+           (princ    1 2 nil)
+           (print    1 2 nil)
+           (printc   1 2 nil)
+           (prints   1 2 nil)
+           (prin1    1 2 nil)
+           (probef   1 1 nil)
+           (putprop  3 3 nil)
+           (quit     0 1 nil)
+           (random   0 2 nil)
+           (rdrmacro 2 2 nil)
+           (read     0 2 nil)
+           (readch   0 3 nil)
+           (readline 0 1 nil)
+           (remdupq  1 1 nil)
+           (remdupql 1 1 nil)
+           (remdupqu 1 1 nil)
+           (remprop  2 2 nil)
+           (remq     2 3 nil)
+           (remql    2 3 nil)
+           (remqual  2 3 nil)
+           (restarg  1 1 nil)
+           (revappen 2 2 nil)
+           (reversal 1 1 nil)
+           (reverse  1 1 nil)
+           (rmchar   0 0 nil)
+           (rminit   0 0 nil)
+           (rmmac    0 0 nil)
+           (rmnil    0 0 nil)
+           (rot      2 2 nil)
+           (round    1 2 nil)
+           (rplaca   2 2 nil)
+           (rplacd   2 2 nil)
+           (runtime  0 0 nil)
+           (salist   0 0 nil)
+           (sappend  0 0 t  )
+           (sappendl 1 1 nil)
+           (scapital 1 1 nil)
+           (scrsize  0 0 nil)
+           (set      2 2 nil)
+           (setabend 1 1 nil)
+           (setascii 0 1 nil)
+           (setattn  1 1 nil)
+           (setbrack 2 3 nil)
+           (setdebug 1 1 nil)
+           (setfeat  1 1 nil)
+           (setnfeat 1 1 nil)
+           (setpbind 2 2 nil)
+           (setplist 2 2 nil)
+           (setprt   1 1 nil)
+           (setread  1 1 nil)
+           (setsalst 1 1 nil)
+           (setsynta 3 3 nil)
+           (sfloatp  1 1 nil)
+           (sleep    1 1 nil)
+           (slength  1 1 nil)
+           (sltrim   2 2 nil)
+           (some     1 1 t  )
+           (sort     1 2 nil)
+           (sortcar  1 2 nil)
+           (sremove  2 2 nil)
+           (sreverse 1 1 nil)
+           (srtrim   2 2 nil)
+           (sscan    1 7 nil)
+           (strim    2 2 nil)
+           (string   1 1 nil)
+           (stringp  1 1 nil)
+           (structp  1 1 nil)
+           (sublis   2 2 nil)
+           (sublisq  2 2 nil)
+           (subrp    1 1 nil)
+           (substq   3 3 nil)
+           (substql  3 3 nil)
+           (substqua 3 3 nil)
+           (substr   1 3 nil)
+           (sub1     1 1 nil)
+           (sxhash   1 1 nil)
+           (symbolp  1 1 nil)
+           (symeval  1 1 nil)
+           (tabs     1 2 nil)
+           (terpri   0 1 nil)
+           (tostring 1 2 nil)
+           (truncate 1 2 nil)
+           (tso      0 0 t  )
+           (tyi      0 3 nil)
+           (tyipeek  0 4 nil)
+           (tyo      1 2 nil)
+           (typep    1 2 nil)
+           (uconcat  0 0 t  )
+           (unebcdic 1 1 nil)
+           (union    2 2 nil)
+           (unionq   2 2 nil)
+           (unkwdify 1 1 nil)
+           (untyi    1 4 nil)
+           (upcase   1 1 nil)
+           (userid   0 0 nil)
+           (values   0 0 t  )
+           (valuesl  1 1 nil)
+           (vcopy    1 1 nil)
+           (vecp     1 1 nil)
+           (vectorp  1 1 nil)
+           (verify   2 3 nil)
+           (vfill    2 2 nil)
+           (vlength  1 1 nil)
+           (vlist    1 1 nil)
+           (vref     2 2 nil)
+           (vset     3 3 nil)
+           (vssize   0 0 nil)
+           (warn     1 2 t  )
+           (xcons    2 2 nil)
+           (xlate    3 3 nil)
+           (zcar     1 1 nil)
+           (zcdr     1 1 nil)
+           (zcprint  3 3 nil)
+           (zcread   6 6 nil)
+           (zcsrdl   1 3 nil) ; READ-DELIMITED-LIST
+           (zcsrfs   1 3 t  ) ; READ-FROM-STRING
+           (zdprint  3 3 nil)
+           (zdread   6 6 nil)
+           (zerop    1 1 nil)
+           (zerror   0 2 t  ) ; 05/15/89
+           (zevauto  1 2 nil)
+           (zevdefld 2 2 nil)
+           (zevdefun 2 2 nil)
+           (zevdsub  2 2 nil)
+           (zevdvar  2 2 nil)
+           (zevinit  0 0 nil)
+           (zevlist  1 2 nil)
+           (zevmapp  3 3 nil)
+           (zevset   2 2 nil)
+           (zevsym   1 1 nil)
+           (zevxvar  1 4 nil)
+           (zfmexec  3 3 nil)
+           (zfmpars  1 1 nil)
+           (zfsexec  0 0 t  )
+           (zgetfpi  0 1 nil)
+           (zgetfpo  0 1 nil)
+           (zifacos  1 1 nil)
+           (zifasin  1 1 nil)
+           (zifatan  2 2 nil)
+           (zifcos   1 1 nil)
+           (zifexp   1 1 nil)
+           (ziflog   1 1 nil)
+           (zifsin   1 1 nil)
+           (zifsqrt  1 1 nil)
+           (ziftan   1 1 nil)
+           (ziladd   2 2 nil)
+           (zilapply 2 4 nil)
+           (zilbool  3 3 nil)
+           (zilclose 2 2 nil)
+           (zilcocon 2 2 nil)
+           (zildiv   2 2 nil)
+           (zildsni  1 1 nil)
+           (zildsno  1 1 nil)
+           (zildump  1 1 nil)
+           (ziledit  1 1 nil)
+           (zilequal 2 2 nil)
+           (zileval  3 3 nil)
+           (zilexpl  1 3 nil)
+           (zilfix   2 2 nil)
+           (zilflat  2 2 nil)
+           (zilhelp  0 2 nil)
+           (zilimpl  1 3 nil)
+           (zilload  1 1 nil)
+           (zilmul   2 2 nil)
+           (zilopen  2 2 nil)
+           (zilpp    1 2 nil)
+           (zilprogv 3 3 nil)
+           (zilrem   2 2 nil)
+           (zilspad  5 5 nil)
+           (zilspkg  1 1 nil)
+           (zilsprt  1 1 nil)
+           (zilsrd   1 1 nil)
+           (zilsub   2 2 nil)
+           (ziltest  1 1 nil)
+           (ziltrace 2 2 nil)
+           (zilunbnd 0 0 nil)
+           (zilvtos  2 2 nil)
+           (zilxclo  2 2 nil)
+           (zilxsub  2 2 nil)
+           (zisexec  0 0 t  )
+           (zisget   1 1 nil)
+           (zisput   2 2 nil)
+           (zmstruct 1 1 nil)
+           (zmvector 1 1 nil)
+           (zputfpi  1 2 nil)
+           (zputfpo  1 2 nil)
+
+           (peek     1 1 nil)
+           (peekb    1 1 nil)
+           (peekc    1 2 nil)
+           (peekl    2 3 nil)
+           (unword   1 1 nil)
+           (word     1 2 nil)
+
+;;; The following should never be compiled directly, since they will
+;;; always be compiler-transformed into other functions.  However,
+;;; they need to be made known to the compiler in case functional
+;;; closures are generated using them.
+
+           (append   0 0 t  )
+           (assoc    2 2 t  )
+           (bignum   0 0 t  )
+           (boole    1 1 t  )
+           (concatl  1 1 nil)
+           (endp     1 1 nil)
+           (flatc    1 1 nil)
+           (flatsize 1 1 nil)
+           (intern   1 2 nil)
+           (list     0 0 t  )
+           (mapand   1 1 t  )
+           (mapatoms 1 1 nil)
+           (mapc     1 1 t  )
+           (mapcan   1 1 t  )
+           (mapcar   1 1 t  )
+           (mapcon   1 1 t  )
+           (mapl     1 1 t  )
+           (maplist  1 1 t  )
+           (mapor    1 1 t  )
+           (member   2 2 t  )
+           (mknumber 1 1 nil)
+           (nconc    0 0 t  )
+           (ncons    1 1 nil)
+           (structur 0 0 t  )
+           (uconcatl 1 1 nil)
+           (vector   0 0 t  )
+ ))
+
+;
+; Now, the compiler transforms.
+;
+
+ (def-1-arg-trans concatl     (x) `(zilimpl ,x t nil))
+ (def-1-arg-trans uconcatl    (x) `(zilimpl ,x nil nil))
+ (def-1-arg-trans flatc       (x) `(zilflat ,x nil))
+ (def-1-arg-trans flatsize    (x) `(zilflat ,x t))
+ (def-1-arg-trans make-number (x) `(mkatom ,x nil t))
+ (def-1-arg-trans mknumber    (x) `(mkatom ,x nil t))
+ (def-1-arg-trans ncons       (x) `(cons ,x nil))
+ (def-1-arg-trans endp        (x) `(null ,x))
+
+;
+; Standard map functions implemented as open code because they take
+; a function specification as an operand.
+;
+ (deftrans mapl     zxmap)
+ (deftrans maplist  zxmap)
+ (deftrans mapc     zxmap)
+ (deftrans mapcar   zxmap)
+ (deftrans mapand   zxmap)
+ (deftrans mapor    zxmap)
+ (deftrans mapcan   zxmap)
+ (deftrans mapcon   zxmap)
+ (deftrans every    zxmap)
+ (deftrans notany   zxmap)
+ (deftrans notevery zxmap)
+ (deftrans some     zxmap)
+;
+; The following functions are implemented under the compiler
+; as source transformations, often avoiding calls to functions
+; that take lists of arguments or keywords.
+;
+ (deftrans append  zxappend)
+ (deftrans assoc   zxassoc )
+ (deftrans boole   zxboole )
+ (deftrans intern  zxintern)
+ (deftrans list    zxlist  )
+ (deftrans member  zxmember)
+ (deftrans nconc   zxnconc )
+
+ (deftrans caar          (x) `(car (car . ,(cdr x))))
+ (deftrans cadr          (x) `(car (cdr . ,(cdr x))))
+ (deftrans cdar          (x) `(cdr (car . ,(cdr x))))
+ (deftrans cddr          (x) `(cdr (cdr . ,(cdr x))))
+ (deftrans caaar         (x) `(car (car (car . ,(cdr x)))))
+ (deftrans caadr         (x) `(car (car (cdr . ,(cdr x)))))
+ (deftrans cadar         (x) `(car (cdr (car . ,(cdr x)))))
+ (deftrans caddr         (x) `(car (cdr (cdr . ,(cdr x)))))
+ (deftrans cdaar         (x) `(cdr (car (car . ,(cdr x)))))
+ (deftrans cdadr         (x) `(cdr (car (cdr . ,(cdr x)))))
+ (deftrans cddar         (x) `(cdr (cdr (car . ,(cdr x)))))
+ (deftrans cdddr         (x) `(cdr (cdr (cdr . ,(cdr x)))))
+
+ (deftrans caaaar        (x) `(car (car (car (car . ,(cdr x))))))
+ (deftrans caaadr        (x) `(car (car (car (cdr . ,(cdr x))))))
+ (deftrans caadar        (x) `(car (car (cdr (car . ,(cdr x))))))
+ (deftrans caaddr        (x) `(car (car (cdr (cdr . ,(cdr x))))))
+ (deftrans cadaar        (x) `(car (cdr (car (car . ,(cdr x))))))
+ (deftrans cadadr        (x) `(car (cdr (car (cdr . ,(cdr x))))))
+ (deftrans caddar        (x) `(car (cdr (cdr (car . ,(cdr x))))))
+ (deftrans cadddr        (x) `(car (cdr (cdr (cdr . ,(cdr x))))))
+ (deftrans cdaaar        (x) `(cdr (car (car (car . ,(cdr x))))))
+ (deftrans cdaadr        (x) `(cdr (car (car (cdr . ,(cdr x))))))
+ (deftrans cdadar        (x) `(cdr (car (cdr (car . ,(cdr x))))))
+ (deftrans cdaddr        (x) `(cdr (car (cdr (cdr . ,(cdr x))))))
+ (deftrans cddaar        (x) `(cdr (cdr (car (car . ,(cdr x))))))
+ (deftrans cddadr        (x) `(cdr (cdr (car (cdr . ,(cdr x))))))
+ (deftrans cdddar        (x) `(cdr (cdr (cdr (car . ,(cdr x))))))
+ (deftrans cddddr        (x) `(cdr (cdr (cdr (cdr . ,(cdr x))))))
+
+ (deftrans zcadr         (x) `(zcar (zcdr . ,(cdr x))))
+ (deftrans zcddr         (x) `(zcdr (zcdr . ,(cdr x))))
+ (deftrans zcaddr        (x) `(zcar (zcdr (zcdr . ,(cdr x)))))
+ (deftrans zcdddr        (x) `(zcdr (zcdr (zcdr . ,(cdr x)))))
+ (deftrans zcadddr       (x) `(zcar (zcdr (zcdr (zcdr . ,(cdr x))))))
+
+ (deftrans vector        (x) `(zmvector (list . ,(cdr x))))
+ (deftrans bignum        (x) `(mkbignum (list . ,(cdr x))))
+ (deftrans structur      (x) `(zmstruct (list . ,(cdr x))))
+ (deftrans structure     (x) `(zmstruct (list . ,(cdr x))))
+
+ ;
+ ; Arithmetic functions implemented as macros.
+ ;
+
+ (deftrans plus          (x)   (zxarith (cdr x) 'ziladd   0))
+ (deftrans difference    (x)   (zxarith (cdr x) 'zilsub   0))
+ (deftrans times         (x)   (zxarith (cdr x) 'zilmul   1))
+ (deftrans quotient      (x)   (zxarith (cdr x) 'zildiv   1))
+ (deftrans remainder     (x)   (zxarith (cdr x) 'zilrem   1))
+
+ (deftrans gcd           (x)   (zxarith (cdr x) 'gcd2     0))
+
+ (deftrans +             (x)   (zxarith (cdr x) 'ziladd   0))
+ (deftrans *             (x)   (zxarith (cdr x) 'zilmul   1))
+ (deftrans //            (x)   (zxarith (cdr x) 'zilrem   1))
+ (deftrans \\            (x)   (zxarith (cdr x) 'zilrem   1))
+
+ (deftrans max           (x)   (zxarith (cdr x) 'max2 nil 'max))
+ (deftrans min           (x)   (zxarith (cdr x) 'min2 nil 'min))
+
+ (deftrans logand        (x)   (zxarith (cdr x) 'land    -1))
+ (deftrans logior        (x)   (zxarith (cdr x) 'lor      0))
+ (deftrans logxor        (x)   (zxarith (cdr x) 'lxor     0))
+
+ (deftrans =             (x)   (zxrelop x 'zilequal ))
+ (deftrans >             (x)   (zxrelop x 'greaterp ))
+ (deftrans <             (x)   (zxrelop x 'lessp    ))
+ (deftrans >=            (x)   (zxrelop x 'nlessp   ))
+ (deftrans <=            (x)   (zxrelop x 'ngreaterp))
+
+ (deftrans - (x)
+  (setq x (cdr x))
+  (cond
+   ((null x)       0)
+   ((null (cdr x)) `(minus ,(car x)))
+   (t              (zxarith x 'zilsub 0))))
+
+ (deftrans / (x)
+  (setq x (cdr x))
+  (cond
+   ((null x)       1)
+   ((null (cdr x)) `(zildiv 1 ,(car x)))
+   (t              (zxarith x 'zildiv 1))))
+
+
+;=========== Compiler Transformations For Special Forms =============
+
+ (deftrans and      zxand  )
+ (deftrans cond     zxcond )
+ (deftrans or       zxor   )
+ (deftrans progn    zxprogn)
+ (deftrans quote    zxquote)
+ (deftrans setq     zxsetq )
+
+;============= Compiler Transformations For Accessors ===============
+
+ (deftrans car          zxcarcdr)
+ (deftrans cdr          zxcarcdr)
+ (deftrans plist        zxcarcdr)
+ (deftrans symbol-plist zxcarcdr)
+ (deftrans zcar         zxcarcdr)
+ (deftrans zcdr         zxcarcdr)
+
+;============= Compiler Transformations For Predicates ==============
+
+ (deftrans equal    zxequal)
+ (deftrans greaterp zxzilgt)
+ (deftrans lessp    zxzillt)
+ (deftrans typep    zxtypep)
+ (deftrans zilequal zxzileq)
+
+;======== Compiler Transformations For Arithmetic Functions =========
+
+ (deftrans ceiling  zxfix)
+ (deftrans fix      zxfix)
+ (deftrans floor    zxfix)
+ (deftrans round    zxfix)
+ (deftrans truncate zxfix)
+
+ (deftrans ziladd   zxbinop)
+ (deftrans zilsub   zxbinop)
+ (deftrans zilmul   zxbinop)
+ (deftrans zildiv   zxbinop)
+ (deftrans zilrem   zxbinop)
+ (deftrans lsh      zxbinop)
+ (deftrans ash      zxbinop)
+ (deftrans rot      zxbinop)
+
+ (deftrans expt     zxexpt  )
+ (deftrans gcd2     zxgcd2  )
+ (deftrans log      zxlog   )
+ (deftrans add1     zxadd1  )
+ (deftrans sub1     zxsub1  )
+
+;========== Compiler Transformations For Other Functions ============
+
+ (deftrans mapatoms zxmapat )
+ (deftrans nth      zxnth   )
+ (deftrans nthcdr   zxnthcdr)
+ (deftrans values   zxvalues)
+
+;========== Compiler Transformations For Arithmetic Functions =======
+;========== and Similar Functions that Can Be Constant-Folded =======
+
+ (mapc #'(lambda (x) (putprop x 'zxarfun 'compiler-transform))
+       '(abs
+         alphacp
+         atom
+         bigp
+         char
+         closurep
+         codep
+         consp
+         dfloatp
+         digitcp
+         evenp
+         fixnump
+         fixp
+         float
+         floatp
+         funargp
+         getchar
+         getcharn
+         haipart   ; at least until it has its own transform
+         haulong
+         index
+         integerp
+         land      ; at least until it has its own transform
+         length
+         listp
+         llkeywdp  ; yes, checks print name only
+         llvars    ; yes, syntactic-surface-scanner
+         logbitp   ; at least until it has its own transform
+         logcount
+         lognot
+         logtest   ; at least until it has its own transform
+         lor       ; at least until it has its own transform
+         lxor      ; at least until it has its own transform
+         max2
+         minus
+         minusp
+         min2
+         mkbignum
+         mkfixnum
+         mkflonum
+         not
+         null
+         numberp
+         oddp
+         plusp
+         sfloatp
+         slength
+         stringp
+         structp
+         subrp
+         symbolp
+         unebcdic
+         vecp
+         vectorp
+         verify
+         vlength
+         zerop
+         zilbool
+         zilfix
+         zilflat
+         zilintln
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;        ebcdic            ; No, may return an uninterned symbol
+;        sxhash            ; No, what if hashing algorithm changes?
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; The following create strings.  They probably shouldn't be
+;;; constant-folded, since some day strings will be mutable.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; chardown char-downcase charup char-upcase downcase string-downcase
+; sappend string-append sappendl string-appendl scapital
+; string-capitalize sltrim string-left-trim sremove string-remove
+; sreverse string-reverse srtrim string-right-trim strim string-trim
+; substr string-substr tostring upcase string-upcase
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+        ))
+
+;========== Compiler Transformations For Other Functions ============
+
+
+
+;;; Do this after all compiler transforms have been defined.
+
+;
+; All the macros known to the evaluator are automatically known as
+; macros to the compiler.  This is NOT true for all DEFLOADed functions;
+; therefore, transfer the "AUTOLOAD" properties thereof.
+;
+; Although not all compiler macros are interpreter macros,
+; it is true that all interpreter macros are compiler macros.
+;
+; Similarly, all "officially" autoloaded functions are also
+; defined to the compiler with the analogous feature.
+;
+ (mapatoms #'(lambda (x &aux y z)
+                  ;;;(when (setq y (get x 'macro))
+                  ;;;      (putprop x y 'cmacro)
+                  ;;;)
+                     (when (and (setq y (get x 'autoload))
+                                (symbolp y))
+                           (putprop x y 'cautoload)
+                           (putprop x (get y 'builtin) 'inline)
+                           (putprop x (get y 'predicate) 'predicate)
+                           ;;; Following done to avoid GETL lossage
+                           ;;; (see code below) - not needed for others
+                           (when (setq z (get y 'compiler-transform))
+                                 (putprop x z 'compiler-transform))
+                 )))
+
+;
+; All functions given compiler properties in this function are flagged
+; as being "defined by the system".
+;
+
+ (mapatoms
+   #'(lambda (x)
+       (when (getl x '(minargs                ; True if system function
+                       macro                  ; True if system macro
+                       |SPECIAL FORM|         ; True if special form
+                       autoload               ; True if ARRAY/FLAVORS
+                       cautoload              ; True if "equivalenced"
+                       compiler-transform     ; True if transformable
+                      ))
+             (putprop x 'system 'defined-by))))
+
+ nil ; return value from ZILCOINT
+)
+

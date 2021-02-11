@@ -1,0 +1,560 @@
+STCPTSKM TITLE 'TCP/IP task manager'
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do:
+*  1) Support WUDFLG1.WUD1MOD (attach module, not CSECT)
+*  1) Support WUDFLG1.WUD1RSTS (restart task as needed)
+*  0) MON support
+*     Should we restart failed subtask???
+*     Currently, we exit at first subtask completion
+*     Appropriate ABENDs from MVS...
+*  0) Check ECBs in START to assure TCB didn't die
+*     Might not be necessary, since whoever in main WAITs on the WEE
+*     Looks like TSKM will be the one who WAITs in main
+*     ECB list will take the POST & find out anyway
+*  4) WUD@CODE - if = 0, WUDNAME is load module name to be LINK/LOADd
+*----------------------------------------------------------------------
+         U#SET FUNC=STCP
+*----------------------------------------------------------------------
+* Function:    Manages subtasks for TCP/IP
+*
+* Main    - Accepts WUD from caller, attaches TCB to handle
+*           unit of work described by WUD
+*
+*         - Handles subtask shutdown
+*
+*         - Called by main task to monitor subtasks after
+*           main task initialization complete
+*
+* Subtask - Initializes TCB, establishes ESTAE environment to
+*           recover crashed CSECT, waits for work
+*
+*         - dispatches CSECT indicated in WUD to handle work
+*
+*         - Upon return from dispatched CSECT, waits for work
+*
+* Entry:  R0(00:07) - function code
+*
+*         TSKM$ADD - Create task to service WUD
+*                    R1 @ caller-supplied WUD
+*                    (not actual WUD used by new TCB)
+*                    addr of real WUD returned to caller in R1
+*
+*         TSKM$NEW - Subtask initialization & dispatch
+*                    R1 @ WUD (from STCP370 entry)
+*
+*         TSKM$MON - main task - monitor subtasks
+*                    R1 = 0
+*
+*         R0(08:31) - ignored
+*
+* Exit:   R15 =  0 - OK
+*               16 - STCPTSKM ABENDed
+*
+*         R1  @ WUD associated with new TCB (ADD only)
+*
+* Diagnostics:
+*
+*              1 - INIT WIB prefix
+*              2 - START attach TCB
+*              3 - ADD accepted WUD
+*                  MON - WIB prior to WAIT
+*              4 - WIB at subtask subdown
+*              5 - entry/exit
+*              6 - WIB at exit
+*              7 - RUN - WUD
+*              8 - ADD WUD scan
+*
+* Notes:
+*
+* Data Areas:
+*
+*        WUD - Work Unit Descriptor; describes work TCB will perform
+*
+*        WIB - WUD Information Block; application-wide anchor for WUDs
+*
+*        WTE - WIB Task Element; pointers in WIB to WUD stuff
+*
+*        WEE - WIB ECB Element; pointers in WIB to ECBs for WUD
+*
+*----------------------------------------------------------------------
+ERR#1    EQU   1        CPD missing
+ERR#2    EQU   2        invalid function code
+ERR#3    EQU   3
+ERR#4    EQU   4        ADD; R1=0
+ERR#5    EQU   5        ADD; no free WUDs
+ERR#6    EQU   6        can't locate WIB
+ERR#7    EQU   7
+*
+         DSWUD ,                       WUD
+         DSWIB ,                       WIB, WTE, WEE
+*----------------------------------------------------------------------
+TPU      DSECT ,                       CSECT's CPD user additions
+TPUFLG1  DS    X                       status flag
+TPU1RRR  EQU   1                       ESTAE established
+         DS    0D
+L$TPU    EQU   *-TPU
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    Usage
+*----------------------------------------------------------------------
+* R2            scratch
+* R3   WIB      RWIB
+* R4   WUD      RWUD
+* R5            Reserved for function code
+* R6            Reserved for function code
+* R7            Reserved for function code
+* R8            Reserved for function code
+* R9   TPU      RTPU
+* R10           internal linkage, scratch
+* R11           STCPWA
+* R12           base reg
+* R13  SAVEAREA SA
+*----------------------------------------------------------------------
+RWIB     EQU   3
+RWUD     EQU   4
+RTPU     EQU   9
+*----------------------------------------------------------------------
+STCPTSKM UPROC ID=STKM,L=L$SA,CPD=(Y,L$TPU,ESTAE)
+*----------------------------------------------------------------------
+         USING PSA,0
+         STM   R0,R2,SAENTRY           save entry parms
+         UDIAG 5,SKIP=GO
+         BAL   R10,DIAG1               display entry parms
+GO       DS    0H
+         EJECT ,
+*----------------------------------------------------------------------
+*  Main task: Initialize WIB
+*  Sub  task: Set RWIB
+*
+*  The WIB (only one) will be GETMAIN'd by main task
+*----------------------------------------------------------------------
+         BAL   R10,FINDWIB             locate WIB
+         LTR   RWIB,RWIB               found WIB?
+         BNZ   INITFIN
+*
+*  Main task will initialize WIB
+*
+INITWIB  DS    0H
+         L     R0,=A(L$WIB)            WIB length
+         ST    R0,STPWIBLV             save for shutdown
+         GETMAIN R,LV=(R0)             allocate WIB storage
+         LR    RWIB,R1
+         USING WIB,RWIB
+         UZERO (RWIB),L$WIB            clear WIB storage
+         ST    RWIB,STP@WIB            set @ WIB in AGD
+         ST    RTGD,STP@AGD            maintask TGD = AGD
+         MVC   WIBID,=C'WIB'           set eyecatcher
+         L     R0,PSATOLD              @ main task TCB
+         ST    R0,WIB@TCB
+*
+*  Init WUD section of WIB
+*
+         LA    R0,WIBWUD1              @ 1st WUD slot
+         LA    R1,L$WUD                WUD length
+         LA    R2,WIBWUDX              last byte of WUD slots
+         STM   R0,R2,WIBWUDBX          save BXLE regs
+         MVC   WIBWUDID,=C'WUDL'       set eyecatcher
+*
+*  Init WEE section of WIB
+*
+         LA    R0,WIBWEE1              @ 1st WEE slot
+         LA    R1,L$WEE                WEE length
+         LA    R2,WIBWEEX              last byte of WEE slots
+         STM   R0,R2,WIBWEEBX          save BXLE regs
+         MVC   WIBWEEID,=C'WEEL'       set eyecatcher
+*
+         UDIAG 3,'TSKM WIB init',(RWIB),L$WIB
+*
+*  Establish TSKM ESTAE in main task
+*
+         BAL   R10,FINDTPU             locate TPU
+         USING TPU,RTPU
+         UESTAE RETRYMOM               establish ESTAE routine
+         OI    TPUFLG1,TPU1RRR         ESTAE established
+         DROP  RTPU
+INITFIN  DS    0H                      RWIB set
+         EJECT ,
+*----------------------------------------------------------------------
+*  Check function code for call type
+*----------------------------------------------------------------------
+CKCODE   DS    0H
+         CLI   SAR0B0,TSKM$NEW         function code = NEW?
+         BE    NEW
+         CLI   SAR0B0,TSKM$ADD         function code = ADD?
+         BE    ADD
+         CLI   SAR0B0,TSKM$MON         function code = MONITOR?
+         BE    MON
+         MVI   SAREASON,ERR#2          invalid function code
+         B     DIE
+         EJECT ,
+*----------------------------------------------------------------------
+*  Main task - Add WUD to WIB
+*----------------------------------------------------------------------
+*  R5, R6, R7  WUD BXLE regs
+ADD      DS    0H
+         MVI   SAREASON,ERR#4          ADD; caller's R1=0
+         ICM   RWUD,15,SAR1            @ caller's WUD
+         BZ    DIE
+         LM    R5,R7,WIBWUDBX          WUD BXLE regs
+         USING WUD,R5
+*
+ADDSCAN  DS    0H
+         UDIAG 8,'TSKM ADD scan WUD',(R5),L$WUD
+         ULOCK RWUD,WUD@TCB            entry locked?
+         BE    ADDWUD                  br, we own it
+         BXLE  R5,R6,ADDSCAN           @ next WTE
+         MVI   SAREASON,ERR#5          no free WUDs
+         B     DIE
+*
+ADDWUD   DS    0H                      WUD now locked, we own it
+         BAL   R10,START               start WUD, reset RWUD
+         UDIAG 2,'TSKM ADD accept WUD',(RWUD),L$WUD
+         B     EXIT                    WUD added OK
+         DROP  R5
+         EJECT ,
+*----------------------------------------------------------------------
+*  Main task - Attach new subtask giving it a WUD to initialize
+*  (Only) Caller: ADDWUD
+*
+*  There are two WUDs being referrenced here:
+*  RWUD - TSKM's caller provided
+*  R5   - The available WUD found by NEW when it scanned the WIB
+*
+*  NEW's WUD will be the real WUD, the caller's may be discarded
+*  upon return of TSKM.
+*
+*  The TCB will be associated with the WUD supplied by NEW for the
+*  life of the task
+*
+*  Upon return to ADD, RWUD contains the address of the "real" WUD
+*----------------------------------------------------------------------
+         USING WUD,RWUD                from ADD, @ caller's WUD
+START    DS    0H
+         LR    R0,RBASE                virtual address for VADR
+         LA    R1,SAVBUF               U370VADR's buffer
+         UCALL U370VADR                my module name for ATTACH
+*
+*  Copy selected fields from caller's WUD
+*  In particular, don't copy WUD@TBC; it's our lock word
+*
+         MVC   WUD@2ECB-WUD(L'WUD@2ECB,R5),WUD@2ECB
+         MVC   WUDNAME-WUD(L'WUDNAME,R5),WUDNAME
+         MVC   WUD@CODE-WUD(L'WUD@CODE,R5),WUD@CODE
+         MVC   WUDWORD-WUD(L'WUDWORD,R5),WUDWORD
+         MVC   WUDLOGD-WUD(L'WUDLOGD,R5),WUDLOGD
+*
+         LR    RWUD,R5                 RWUD @ real WUD
+         MVC   WUDID,=C'WUD'           flag WUD as accepted
+         MVI   WUDFLG1,WUD1STRT+WUD1ACT
+         ST    RTGD,WUD@AGD            tell subtask @ main's TGD
+         ST    RWIB,WUD@WIB            tell subtask @ WIB
+         SLR   R0,R0
+         ST    R0,WUDRUN               clear work-waiting ECB
+         ST    R0,WUDEOT               clear End Of Task ECB
+         ST    R0,WUDNEW               clear START/NEW ECB
+         UDIAG 3,'TSKM attach WUD',(RWUD),L$WUD
+*
+         MVC   SAATCH(L$ATCH),MDLATCH
+         LR    R1,RWUD                 STCP370 parm
+         ATTACH EPLOC=SAVMOD,ECB=WUDEOT,                               +
+               SF=(E,SAATCH)
+         ST    R1,WUD@TCB              @ TCB (replace placeholder)
+         UPSR  2,'TSKM START TCB',*WUD@TCB
+*
+         LA    R0,WUDNEW               1st ECB=init complete
+         ST    R0,SAWAITL1
+         LA    R0,WUDEOT               2nd ECB=task complete
+         ST    R0,SAWAITL2
+         OI    SAWAITL2,X'80'          end of WAIT list
+         WAIT  1,ECBLIST=SAWAITL1      WAIT for subtask to come up
+*
+         ST    RWUD,SA@WUD             @ WUD to return to caller
+         BR    R10                     return to ADD
+         EJECT ,
+*----------------------------------------------------------------------
+*  Subtask - set up WUD & wait for work
+*
+*  START (in main task) is waiting for us to indicate we're initialized
+*  The WUD in SAR1 is the one TSKM's caller provided; it's location
+*  is not where the WUD will reside once the new task is up
+*  The new WUD will reside in this CSECT's TPU, a unique copy of
+*  which exists for each TCB
+*----------------------------------------------------------------------
+*
+*  TSKM ADD note concerning WUD initialization:
+*  TSKM's caller must initialize the WUD before calling TSKM
+*  The following fields need consideration when creating a WUD:
+*
+*      WUD@CODE - required,  A-con pointing to service CSECT
+*      WUDLOGD  - required,  CL8 DDname for subtask LOG (U370LOG)
+*      WUDNAME  - suggested, CL8 service CSECT name
+*      WUD@2ECB - optional,  TSKM RUN external ECB (STCPOPR only)
+*      WUDID    - optional,  CL3 WUD-creator name
+*
+*  TSKM RUN note concerning WUD@CODE usage of WUD fields:
+*
+*  WUD@CODE may change the ECBLIST address (WUD@ECBL) if it wishes
+*  to WAIT on a different set of ECBs, subject to leaving WUDRUN
+*  the ECB which is WAITed on for work (task shutdown also POSTs
+*  WUDRUN, so don't be so clever you hurt yourself)
+*  If WUD@CODE does change the WUD@ECBL value, it may also reclaim
+*  the WUD@1ECB field for it's own use
+*  WUD@CODE may also make whatever use it wishes for the following
+*  fields:  WUDSCR, WUDWORD.
+*
+NEW      DS    0H
+         L     RWUD,SAR1               @ caller's WUD
+         USING WUD,RWUD
+         LA    R0,WUDRUN               work ECB
+         ST    R0,WUD@1ECB             into ECBLIST
+         LA    R0,WUD@1ECB             default ECBLIST addr
+         ST    R0,WUD@ECBL             WUD@CODE may change
+         SLR   R0,R0
+         C     R0,WUD@2ECB             external ECB present?
+         BNE   *+8                     yes, make that end of ECBLIST
+         OI    WUD@1ECB,X'80'          end of ECBLIST - WUDRUN
+         OI    WUD@2ECB,X'80'          end of ECBLIST - external ECB
+         L     R0,PSATOLD              @ my TCB
+         ST    R0,WUD@TCB
+*
+         BAL   R10,FINDTPU             locate TPU
+         USING TPU,RTPU
+*<temp>  UESTAE RETRYKID               establish ESTAE routine
+         OI    TPUFLG1,TPU1RRR         ESTAE established
+         DROP  RTPU
+*
+         L     R2,=A(POST$NEW)         NEW post code
+         POST  WUDNEW,(R2)             wake up START in main task
+         EJECT ,
+*----------------------------------------------------------------------
+*  Subtask - RUN - WAIT for work, dispatch @CODE when arrives
+*----------------------------------------------------------------------
+RUN      DS    0H
+         UDIAG 7,'TSKM run WUD',(RWUD),L$WUD
+         SLR   R0,R0                   see if can bypass WAIT
+         C     R0,WUDRUN               ECB already POSTed?
+         BNE   RUNWAITX                ECB POSTEd, br
+*
+RUNWAIT  DS    0H
+         UDIAG 7,'TSKM run wait'
+         L     R2,WUD@ECBL             @ ECBLIST
+         WAIT  1,ECBLIST=(R2)          wait for work to appear
+*
+RUNWAITX CLC   SHUTCODE,WUDRUN+1       shutdown?
+         BE    SHUTSUB                 yes, br
+         SLR   R0,R0                   clear ECB for next POST
+         ST    R0,WUDRUN
+*
+RUNDISP  DS    0H
+         UDIAG 7,'TSKM run disp'
+         LR    R0,RWUD                 @ WUD
+         L     R1,WUDWORD              parmlist or whatever
+         L     R15,WUD@CODE            @ CSECT supporting WUD
+         BALR  R14,R15                 call support code
+         B     RUN
+*
+POSTSHUT DC    A(POST$SHU)             subtask shutdown POST code
+SHUTCODE EQU   POSTSHUT+1,3
+*----------------------------------------------------------------------
+*  Shutdown subtask
+*----------------------------------------------------------------------
+SHUTSUB  DS    0H
+         UPSR  1,'TSKM shutsub WUD',(RWUD)
+         B     EXIT
+         EJECT ,
+*----------------------------------------------------------------------
+*  Main task: monitor subtasks
+*  Build ECBLIST, WAIT on it for subtask completion
+*  At task completion, DETACH TCB
+*----------------------------------------------------------------------
+MON      DS    0H
+         DROP  RWUD
+         LA    R8,WIBWEE1              @ 1st WEE
+         USING WEE,R8
+         LM    R5,R7,WIBWUDBX          WUD BXLE regs
+         USING WUD,R5
+*
+MONSCAN  TM    WUDFLG1,WUD1ACT         WUD running?
+         BNO   MONNEXT
+         LA    R0,WUDEOT               @ WUD's End Of Task ECB
+         ST    R0,WEE@EOT
+         LA    R8,L$WEE(,R8)           @ next WEE
+MONNEXT  BXLE  R5,R6,MONSCAN
+*
+         LA    R0,L$WEE
+         SR    R8,R0                   back up to last WEE
+         OI    WEE@EOT,WEE$LAST        last ECB flag
+         DROP  R5,R8
+*
+         UDIAG 3,'TSKM mon wait WIB',(RWIB),L$WIB
+         WAIT  1,ECBLIST=WIBWEE1       wait for news
+*
+         BAL   R10,DETACH              DETACH completed TCBs
+*
+*  For now, we exit after 1st subtask completes
+*
+         ICM   RWIB,15,STP@WIB
+         BZ    MONFIN
+         UDIAG 4,'TSKM mon post-detach WIB',(RWIB),L$WIB
+         ICM   R0,15,STPWIBLV          WIB allocated?
+         BZ    MONFIN
+         FREEMAIN R,LV=(R0),A=(RWIB)   release WIB storage
+         SLR   RWIB,RWIB               tell EXIT no WIB
+         ST    RWIB,SA@WUD             WUDs were in WIB just freed
+MONFIN   DS    0H
+         EJECT ,
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+EXIT     DS    0H
+         ICM   RWUD,15,SA@WUD
+         BZ    EX01
+         UDIAG 5,'TSKM exit WUD',(RWUD),L$WUD
+EX01     LTR   RWIB,RWIB
+         BZ    EX02
+         UDIAG 6,'TSKM exit WIB',(RWIB),L$WIB
+EX02     UPSR  1,'TSKM exit rc',*SARC
+         LR    R1,RWUD                 return WUD or 0
+         UPEND RC=*SARC,R1=PASS
+         EJECT ,
+*----------------------------------------------------------------------
+*  DETACH - main task - locate completed TCB(s), DETACH, release WUD
+*  The task that DETACHes a TCB must be the task that created it
+*----------------------------------------------------------------------
+DETACH   DS    0H
+         LM    R5,R7,WIBWUDBX          WUD BXLE regs
+         USING WUD,R5
+*
+DETSCAN  DS    0H
+         ICM   R8,15,WUD@TCB
+         BZ    DETNEXT
+         USING TCB,R8
+         UDIAG 3,'TSKM detach WUD',(R5),L$WUD
+         TM    WUDFLG1,WUD1ACT         TCB created?
+         BNO   DETNEXT
+         UDIAG 7,'TSKM detach TCB',(R8),TCBMNLEN+TCBX2LEN
+         TM    TCBFLGS5,TCBFC          task terminated?
+         BNO   DETNEXT
+*
+         LA    R1,WUD@TCB
+         DETACH (1)                    remove subtask TCB
+         XC    WUD(L$WUD),WUD          clear WUD
+*
+DETNEXT  BXLE  R5,R6,DETSCAN
+         UDIAG 4,'TSKM post-detach TCB summary'
+         UCALL U370QTCB
+         SLR   R15,R15                 <temp> no restart???
+         BR    R10
+         DROP  R5,R8
+*----------------------------------------------------------------------
+*  FINDTPU - Locate TPU or ABEND
+*----------------------------------------------------------------------
+FINDTPU  U@CPD TPU,RTPU,ERR=NOTPU      find our TPU
+         BR    R10                     return w/ TPU
+NOTPU    MVI   SAREASON,ERR#1          couldn't find TPU
+DIE      UABEND SAREASON
+*----------------------------------------------------------------------
+*  FINDWIB - Locate WIB
+*  Will return RWIB @ WIB, RWIB = 0, or no return if bad environment
+*  Subtask side effects: sets STP@AGD, STP@WIB
+*----------------------------------------------------------------------
+FINDWIB  DS    0H
+         ICM   RWIB,15,STP@WIB         main/subtask already know?
+         BNZR  R10                     that was easy
+*
+*  We now know it's first TSKM call in this TCB
+*
+         MVI   SAREASON,ERR#7          assume broken environment
+         ICM   RWUD,15,SAR1            caller provided WUD?
+         BZ    DIE                     MON request, but no WIB
+         USING WUD,RWUD
+*
+*  WUD@AGD and WUD@WIB only set for subtasks
+*
+         ICM   R14,15,WUD@AGD          caller provided @ AGD in WUD?
+         BZR   R10                     no, return to init WIB
+         ST    R14,STP@AGD             subtask now knows @ AGD
+         ICM   RWIB,15,WUD@WIB         (subtask) WUD knows @ WIB?
+         BNZ   FW@WIB                  yes, store @WIB in subtask TGD
+         ICM   RWIB,15,STP@WIB-STCPWA(R14)   main task knows @ WIB?
+         BZR   R10                     return w/ RWIB=0
+FW@WIB   ST    RWIB,STP@WIB            subtask now knows @ WIB
+         BR    R10                     return w/ RWIB @ WIB
+*----------------------------------------------------------------------
+*  DIAG1 - TSKM entry parms diagnostic
+*----------------------------------------------------------------------
+DIAG1    DS    0H
+         MVI   SAMSG,C' '
+         MVC   SAMSG+1(L'SAMSG-1),SAMSG
+         MVC   SAM1LIT1,=C'<5> TSKM enter'
+         L     R0,SAR0
+         LA    R1,SAM1TXT1
+         CALL  U370HEX
+         L     R0,SAR1
+         LA    R1,SAM1TXT2
+         CALL  U370HEX
+         ULOG  SAMSG
+         BR    R10
+*----------------------------------------------------------------------
+RETRYMOM DS    0H                      main task RRR
+         MVI   SARC+3,16               TSKM ABENDed
+         UWTO  0,'TSKM main RETRY'
+         L     RWIB,STP@WIB            @ WIB if initialized
+         B     EXIT
+*----------------------------------------------------------------------
+RETRYKID DS    0H                      sub  task RRR
+         MVI   SARC+3,16               TSKM ABENDed
+         UWTO  0,'TSKM sub RETRY'
+         B     EXIT
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+MDLATCH  ATTACH EPLOC=0,ECB=0,SF=L
+L$ATCH   EQU   *-MDLATCH
+         LTORG ,
+*
+*----------------------------------------------------------------------
+*  Savearea & workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F
+SAENTRY  DS    3F                      R0:R2 at entry
+SAR0B0   EQU   SAENTRY+00,1
+SAR0     EQU   SAENTRY+00,4
+SAR1     EQU   SAENTRY+04,4
+*
+SARC     DS    F                       OPR return code
+SA@WUD   DS    A                       WUD added to WIB or 0
+SAECB1   DS    F                       START waits for init to finish
+SAWAITL1 DS    2F                      START ECBLIST
+SAWAITL2 EQU   SAWAITL1+4,4            2nd ECB in START ECBLIST
+SAATCH   ATTACH EPLOC=SAVMOD,SF=L
+SAATPL   DS    F                       parm for ATTACHed pgm
+SAREASON DS    X                       UABEND reason code
+SAVBUF   DS    0C                      U370VADR return area
+         DVADRBUF PFX=SAV              output buffer for U370VADR
+         ORG   SAVBUF
+SAM1LIT1 DS    C'<5> TSKM enter',C
+SAM1TXT1 DS    CL8,C                   entry R0
+SAM1TXT2 DS    CL8                     entry R1
+L$SAMSG1 EQU   *-SAM1LIT1
+SAMSG    EQU   SAM1LIT1,L$SAMSG1
+         ORG   ,
+*
+         DS    0D                      align
+L$SA     EQU   *-SAVEAREA              length of savearea
+*
+         WASTCP ,
+*
+         PRINT NOGEN
+         IHAPSA ,                      Prefixed Storage Area
+         IKJTCB DSECT=YES,LIST=NO      Task Control Block
+L$TCB    EQU   TCBMNLEN                length of main section
+         IHAECB ,                      Event Control Block
+*
+         PRINT GEN
+STCPTSKM UFINI DXDSTKM,L$SA
+         END   ,

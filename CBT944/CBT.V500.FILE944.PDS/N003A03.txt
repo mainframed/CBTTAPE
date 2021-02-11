@@ -1,0 +1,766 @@
+Data flow in LU6.2
+
+This is the second article in a series which examines in depth
+the LU6.2 support implemented in ACF/VTAM 3.3 via the
+APPCCMD macro.  Getting started with LU6.2 in Issue 2 of
+SNA Update outlined two Assembler-level programs that use
+the new LU6.2 support macros to demonstrate the comparative
+simplicity with which APPCCMD can be used.  The second
+article in this series will explain the complexities and subtleties
+of the data flow between the two programs.  Subsequent
+articles will consider the question of error recovery, multiple
+session control, and various specialized features such as
+synchronization and security.  Sample code will be given to
+illustrate key features and help simplify the design and assist
+the development process.
+
+To talk of data flow control in the context of what is supposed
+to be an application-level protocol may seem strange but the
+APPCCMD implementation of LU6.2 by IBM has somewhat
+clouded the issue.  SNA defines layer 5 as Data Flow Control
+(DFC).  To those familiar with pre-LU6.2 session protocol then
+DFC protocol supports bracketing, chaining, signalling, and
+response synchronization.  DFC is also responsible for
+maintaining the mode between two LUs as agreed at session
+set-up time.  The three possible modes are:
+
+1      Half duplex flip-flop, in which the LUs take turns at
+      sending data (or in SNA terms being the requestor).
+
+2      Half duplex contention, in which either LU can begin
+      sending by bidding for permission.
+
+3      Duplex, in which data can flow in either direction
+      simultaneously.
+
+DFC is supported by LU6.2 services and so removes the
+necessity for application programs to be concerned with
+chaining and bracketing protocols as was necessary with pre-
+LU6.2 LU-LU sessions.  LU6.2 DFC also handles request and
+response mode and protocol, which again was the
+responsibility of pre-LU6.2 applications.  Although the
+intricacies of data flow control may have been absorbed into
+LU6.2, the rigid requirements and constraints imposed by the
+Application Program Interface (API) must be observed by
+application programs.
+
+LU6.2 applications communicate via a session which is
+established and maintained by the VTAM LU6.2 support
+routines.  This contrasts with pre-LU6.2 sessions which have to
+be maintained by the application programs themselves.  LU6.2
+refers to the dialogue between two transactions running under
+two applications as a conversation.  This is analogous in many
+respects to pre-LU6.2 LU-LU sessions except the
+communications-id or CID now becomes the conversation-id or
+CONVID.  As with pre-LU6.2 sessions which required the
+ARG parameter on VTAM macros to point to the
+communications-id, the APPCCMD macro requires the
+CONVID parameter to point to the conversation-id.  Session
+establishment is very similar except that instead of a LOGON
+exit the ATTN exit is used.  Aging VTAM programmers will
+recognize this exit as the now redundant attention exit.  The
+CONVID is extracted from a read-only RPL, the address of
+which is passed in word 5 of a 6-word parameter list whose
+address is contained in General Purpose Register 1 on entry to
+the ATTN exit.  It is unfortunate that what is claimed to be an
+application-level protocol still requires such nitty gritty VTAM
+exit coding but fortunately this is the only mandatory one.  All
+other required exits are simulated by VTAM once the
+application program has issued the SETLOGON macro.
+Optional additional exits include the two exits which are
+applicable to all SNA LU-LU sessions: LERAD for notification
+of RPL-based logic errors and RELREQ, which in the case of
+LU6.2 is for the notification that another application wants to
+establish a conversation (session) with it but cannot because of
+session limits - in other words the maximum number of
+conversations the application can support has been reached.
+
+Once a conversation has been established between two LU6.2
+applications, they will obviously need to exchange data.  Data
+exchange uses a half duplex flip-flop protocol which means
+that only one application can send data while the other must
+receive.  At all times during the exchange, one LU will be the
+sender and the other the receiver.  These designated states must
+be rigidly adhered to otherwise the conversation will fail with a
+state error.  If the receiver application wishes to send, it can
+coat-tail a REQUEST_TO_SEND onto the data it is sending,
+but it must wait for the sending application to change state to
+receiving before attempting to send data.  This protocol is
+vaguely similar to the BID and response of pre-LU6.2 session
+protocols but is far more rigid and unforgiving.  The response
+to the REQUEST_TO_SEND (BID) may arrive after many
+other events.  Essentially, data exchange is governed by the
+concept of Finite State Machines.  At any instant in time the
+conversation between the two applications will be one of a
+number of defined states.  Each finite state dictates what the
+application can and cannot do with respect to the conversation
+and also defines which other states it can be moved to, ie what
+state transitions are possible and under what conditions.
+Sounds complex but the two finite state conditions of concern
+to us are as follows:
+
+1      An application must be in send state to send data
+
+2      An application must be in receive state to receive data.
+
+Many transitions are possible from both of these states but the
+transitions of interest concern the reversal of roles and in
+particular how the application becomes the sender from the
+receiver state.  From the outset, the design of an LU6.2
+application program must cater for state transitions arising
+either because they are necessary in the transaction logic or
+because they are forced by the partner application or an error
+situation.
+
+
+SEND STATE
+
+An application is initially in the send state if it is the initiator of
+a conversation.  The send state is the most powerful of all
+states since it is possible to issue most types of APPCCMD
+requests.  Data in the form of logical records is sent by coding
+the CONTROL=SEND parameter of the APPCCMD macro.
+For each active (allocated) conversation, VTAM allocates a
+send buffer into which the data is placed following a
+CONTROL=SEND,QUALIFY=DATA request.  The size of
+the send buffer is determined by the maximum RU size
+specified in the session parameters.  Though the macro
+completes successfully, VTAM does not actually send the data
+until the send buffer is full.  However there are various ways
+VTAM can be forced to send the data, the most common being
+the use of the QUALIFY=FLUSH parameter of
+CONTROL=SEND.  This is illustrated by the following code:
+
+*
+*         SEND_DATA      RESOURCE(LU62CID)
+*                        DATA(DATABUFF)
+*                        LENGTH(DATALEN)
+*
+          LH      R2,DATALEN           Record length = Logical
+          APPCCMD CONTROL=SEND,        Length
+                  QUALIFY=DATA,
+                  CONVID=LU62CID,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  AREA=DATABUFF,
+                  RECLEN=(2),
+                  OPTCD=SYN
+          LTR     R15,R15
+          BNZ     BADSEND              Send accepted by VTAM ?
+                                       Skip Flush if not
+*
+*         FLUSH          RESOURCE(LU62CID)
+*
+          APPCCMD CONTROL=SEND,
+                 QUALIFY=FLUSH,
+                 CONVID=LU62CID,
+                 RPL=LU62RPL,
+                 ACB=LU62ACB,
+                 OPTCD=SYN
+*
+DATABUFF  DS     0F
+DATALEN   DC     H'102'
+DATA      DC     CL100' '
+
+Alternatively, the VTAM send buffer is flushed automatically
+when either a DEALLOCATE or PREPARE_TO_RECEIVE is
+issued while in the send state.  This is because before VTAM
+can allow the state transition locally and post the indication of
+the change of state request to the partner application it must
+first send any outstanding data.  State changes can not occur
+until all outstanding data exchange has been completed.
+
+
+RECEIVE STATE
+
+An application is initially in the receive state if it is the target
+of an ALLOCATE request to initiate a conversation.  Data (in
+the form of logical records) is received by coding the
+CONTROL=RECEIVE parameter of the APPCCMD macro.
+However it is not quite that simple.  It is not only data that can
+satisfy the macro request.  Protocol, synchronization, and state
+change requests can satisfy the macro call at the same time.
+The RPL extension block contains a flag which indicates what
+has actually been received.  This is the implementation of the
+SNA LU6.2 WHAT_RECEIVED indicator.  This indicator
+must be examined following a successful
+RECEIVE_AND_WAIT to determine what action is possible
+and in some cases necessary.  Successful completion of a
+CONTROL=RECEIVE macro could actually take the
+transaction out of the receive state.  This is illustrated by the
+following code:
+
+*
+*         RECEIVE_AND_WAIT RESOURCE(LU62CID)
+*                          FILL(LL)
+*
+          APPCCMD CONTROL=RECEIVE,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  CONVID=LU62CID,
+                  AREA=DATABUFF,
+                  AAREA=LU62RPLX,
+                  AREALEN=DATALEN,
+                  FILL=LL,                note 1
+                  OPTCD=SYN,
+                  QUALIFY=SPEC
+          LTR     R15,R15                 Good request completion ?
+          BNZ     BADRCV
+*
+          LA      R6,LU62RPLX
+          USING   ISTRPL6X,R6             Address RPL ...
+          MVC     SAVERCV1,RPL6RCV1       ...  extension block
+          TM      SAVERCV1,RPL6WDAC       Save what-received field
+          BAL     R14,PROCESS
+          TM      SAVERCV1,RPL6WSND       Data complete ?
+          BAL     R14,RCVSEND             Process
+          TM      SAVERCV1,RPL6WCFM       Permission to Send ?
+          BAL     R14,RCVCNFRM            Process
+          TM      SAVERCV1,RPL6WDAL       Confirm request ?
+          BAL     R14,RCVDEALL            Process
+                                          Deallocate request ?
+                                          note 2
+*
+SAVERCV1  DS      X                       note 3
+*
+*         CONFIRM         RESOURCE(LU62CID)
+*
+RCVCNFRM  DS      0H
+          ST      R14,SAVER14             Save main-line return addr
+          APPCCMD CONTROL=SEND,
+                  QUALIFY=CONFRMD,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  CONVID=LU62CID,
+                  OPTCD=SYN
+          LTR     R15,R15
+          BNZ     ERROR
+          L       R14,SAVER14
+          BR      R14
+SAVER14   DS      A
+
+Notes
+
+1      The QUALIFY=SPEC parameter has been coded on the
+      RECEIVE_AND_WAIT macro.  This means that the
+      receive will only be satisfied for the conversation specified
+      by the CONVID parameter.  Control of multiple sessions
+      and the use of QUALIFY=ANY will be the subject of a
+      future article.
+
+2      The technique of branching to sub-routines (as
+      recommended by IBM) enables all indicators to be checked
+      by dropping through the logic.
+
+3      The original WHAT_RETURNED field must be saved
+      since the RPL and RPL extension block may be re-used by
+      subsequent APPCCMD macros before all the indicators
+      have been checked.
+
+WHAT_RECEIVED indicator
+
+Key indicators relating to data flow to be monitored in the
+WHAT_RECEIVED field (RPL6RCV1) include :
+
+RPL6RCV1=RPL6WDAC
+
+DATA_COMPLETE means that either a complete logical
+record has been received or the remainder of the logical record
+partially received.
+
+RPL6RCV1=RPL6WDAI
+
+DATA_INCOMPLETE means that less than a complete logical
+record has been received.  Further receives must be issued until
+the DATA_COMPLETE indicator is set.  This condition can be
+avoided by ensuring that the receiving buffer (specified by the
+AREA and AREALEN parameters) is large enough to contain a
+complete logical record.
+
+RPL6RCV1=RPL6WSND
+
+SEND means that the partner application has entered the
+receive state and that this application is now in the SEND or
+PENDING_SEND state.
+
+RPL6RCV1=RPL6WCFM
+
+CONFIRM means that the partner application requires
+confirmation that all is well (or not as the case may be!).
+
+RPL6RCV1=RPL6WDAL
+
+DEALLOCATE means that the partner application has
+deallocated the confirmation.
+
+These indicators are not mutually exclusive.  For example, the
+DEALLOCATE and CONFIRM indicators may both be set,
+implying that the partner application wishes to deallocate the
+conversation but is open to negotiation.  The terms and
+conditions of the negotiation are at the application designer's
+discretion.  When trying to decide which of the
+WHAT_RECEIVED indicators to cater for, remember that they
+are not set randomly by VTAM, they are set as the result of
+partner application requests.  Design is therefore greatly
+simplified if it is known exactly what conditions and requests
+partner application(s) could generate.
+
+
+CHANGING STATE
+
+Applications can alternate between send and receive states (that
+is flip-flop) but certain rules must be observed.  If an
+application in the send state wants to become the receiver it can
+request transition to the receive state at any time by issuing an
+APPCCMD macro with CONTROL=PREPRCV.  This will
+send notification in the WHAT_RECEIVED indicator in the
+RPL extension block (RPL6RCV1=RPL6WSND) to the
+application currently in the receive state which is then placed in
+the send state.
+
+*
+*         PREPARE_TO_RECEIVE RESOURCE(LU62CID)
+*                            TYPE(FLUSH
+*
+          APPCCMD CONTROL=PREPRCV,
+                  QUALIFY=FLUSH,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  OPTCD=SYN,
+                  CONVID=LU62CID
+
+Exactly when the partner application changes to the send state
+depends upon the current activity.  If it is dormant (ie it has a
+receive outstanding and all data flow has finished) then the
+application can choose either to enter the send state
+immediately or to enter the PENDING_SEND state.  This
+option is exercised by the CD=IMMED and CD=DEFER
+parameters of the APPCCMD CONTROL=RECEIVE macro.
+The default is immediate.  Yes, CD means Change Direction
+and reflects the fact that the LU6.2 application can directly
+influence the underlying DFC.  The PENDING_SEND state
+enables the partner transaction to continue to behave as a
+receiver.
+
+If an application in the receive state wants to become the
+sender, it can request transition to the send state at any time by
+issuing an APPCCMD
+CONTROL=SEND,QUALIFY=RQSEND macro.  This
+generates a signal request unit to the application in the send
+state and the RPL6RTUN=RPL6RSIG indicator is set in the
+RPL extension block upon completion of the next APPCCMD
+request macro.
+
+*
+*         REQUEST_TO_SEND RESOURCE(LU62CID)
+*
+          APPCCMD CONTROL=SEND,
+                  QUALIFY=RQSEND,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  CONVID=LU62CID
+                  OPTCD=SYN
+
+The application in the send state should check the RPL6RTUN
+indicator after every APPCCMD macro to determine whether
+the receiving application wishes to send.  This is illustrated by
+the following code:
+
+          APPCCMD CONTROL=SEND,
+                  AAREA=LU62RPLX,......
+*
+          LTR     R15,R15                  Good request completion ?
+          BNZ     BADRCV
+          LA      R6,LU62RPLX
+          USING   ISTRPL6X,R6              Address RPL ...
+          TM      RPL6RTUN,RPL6RSIG        ...  extension block
+          BNO     CONTINUE                 Signal received ?
+                                           Proceed with process
+          APPCCMD CONTROL=PREPRCV,
+                  QUALIFY=CONFIRM,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  AAREA=LU62RPLX,
+                  OPTCD=SYN,
+                  CONVID=LU62CID
+
+Checking the RPL extension block WHAT_RECEIVED
+indicators is vital to maintaining the integrity of the finite states
+of the applications.  If the appropriate WHAT_RECEIVED
+indicator (RPL6RCV1) is set, the receiving application must be
+prepared to issue an APPCCMD
+CONTROL=SEND,QUALIFY=CONFRMD (or possibly
+QUALIFY=ERROR) if a CONFIRM request is received and
+must cease issuing RECEIVE_AND_WAIT requests if SEND
+is received.  If the returned indicator is set (RPL6RTUN) the
+sending application must be prepared to issue an APPCCMD
+CONTROL=PREPRCV macro and cease sending.  If these
+rules are not observed then a state error will be raised and the
+conversation will be in trouble.
+
+
+DATA BUFFERING
+
+LU6.2 architecture requires that data exchange between
+applications uses logical records, which simply means that data
+must be prefixed by a half word length count which includes
+two bytes for the length field itself.  The receiving application
+can nominate to receive individual logical records by coding
+FILL=LL on the APPCCMD CONTROL=RECEIVE macro, or
+sufficient data to fill a buffer supplied by the application by
+coding FILL=BUFF.  In the latter case the data placed in the
+buffer may be a complete logical record, part of a logical
+record, or many logical records, and the application must
+decode the buffer.  For ease of coding, it is recommended that
+FILL=LL is used - this is the default.  To simplify the coding
+logic further, the sending application should issue an
+APPCCMD CONTROL=SEND macro for each logical record
+and the receiving application should allocate a buffer large
+enough to contain a complete logical record.  It is possible
+either for logical records to span the VTAM send buffer or for
+many logical records to fit into the buffer.  Both of these
+situations require complex code to handle them.  The RECLEN
+parameter on the APPCCMD CONTROL=SEND macro has no
+fixed relationship to a logical record, it simply tells VTAM the
+length of data to be placed in the VTAM send buffer with a
+particular macro call.  A further design complication is the fact
+that, if a record spans the VTAM send buffer, no other
+APPCCMD macros can be issued until the entire logical record
+has been passed to VTAM using
+CONTROL=SEND,QUALIFY=DATA APPCCMD macros.
+
+By keeping the data exchange as simple as possible, the
+number of APPCCMD macros can be reduced with a
+considerable saving in overheads (early experience shows the
+VTAM API path length to be very long).  For example:
+
+          APPCCMD CONTROL=SEND,QUALIFY=DATA
+          APPCCMD CONTROL=SEND,QUALIFY=FLUSH
+
+can be combined into a single macro, thus:
+
+          APPCCMD CONTROL=SEND,QUALIFY=DATAFLU
+
+Also:
+
+          APPCCMD CONTROL=SEND,QUALIFY=DATA
+          APPCCMD CONTROL=SEND,QUALIFY=CONFIRM
+
+can be combined into a single macro like this:
+
+          APPCCMD CONTROL=SEND,QUALIFY=DATACON
+
+However, this does mean that the receiving application must be
+intelligent enough to detect the arrival of both the DATA and
+CONFIRM in response to the same APPCCMD
+CONTROL=RECEIVE macro.
+
+Combination of function is possible to a considerable degree,
+which enables simple transactions to be developed.  For
+example, a transaction that is required simply to allocate a
+conversation, send a single item of data, and deallocate the
+conversation could achieve this with two macros like this:
+
+          APPCCMD CONTROL=ALLOC,QUALIFY=ALLOCD
+          APPCCMD CONTROL=DEALLOC,QUALIFY=DATAFLU
+
+
+GDS STRUCTURES
+
+So far, LU6.2 application conversations have been referred to
+as data exchanges with no thought as to what the shape and
+form of the data might be.  LU6.2 applications on different
+processors need to be able to understand the command and data
+that is being exchanged and so must all agree on a structure for
+the messages.  APPC implements a message and data structure
+termed General Data Stream (GDS).   Each structured field in a
+GDS has a 4-byte header followed by the data:
+
+o      Length (LL)
+o      Identifier (ID)
+o      Data of length LL-4 bytes.
+
+The 2-byte LL field specifies the total length of the structure
+including the 4-byte LLID header.  The high-order bit (bit 0) is
+used as a continuation indicator.  Therefore, up to 32763 bytes
+of data can be contained in a GDS structure but, by using the
+continuation indicator (bit 0 set to 1), the total volume of data
+in the stream can be endless.  The end of the stream is
+signalled by an LL field for which bit 0 is zero.
+
+ID is a two-byte field that follows the LL field and identifies
+the content of the data or information field.  The GDS ID is
+application dependent and so the convention and meaning is
+left to the application designer.  By way of illustration consider
+the following:
+DS ID      Meaning
+0001      Start transaction
+000      Terminate transaction (normal)
+0100      Transaction name
+0200      Number of transaction parameters
+0201      Transaction parameter 1
+02nn      Transaction parameter nn
+0300      Number of returned data items
+0301      Returned data item 1
+03nn      Returned data item nn
+0900      Cancel transaction (backout)
+0999      Cancel transaction (abort).
+
+With this convention, an exchange between two applications
+that initiated an inquiry of the stock level of item number
+01017896 would look something like:
+
+First message from conversation initiator:
+
+         X'0004',X'0001'              Start transaction
+         X'0009',X'0100',C'STOCK'     Transaction name
+         X'0005',X'0200',X'02'        Number of parameters
+         X'0009',X'0201',C'LEVEL'     Parameter 1, transaction activity
+         X'000C',X'0202',C'01017896'  Parameter 2, stock number
+         X'0004',X'0002'              Terminate transaction
+
+Message returned from conversation partner:
+
+         X'0005',X'0300',X'01'        Number of returned data items
+         X'000A',X'0301',C'   102'    Data item 1 (stock level)
+
+As can be seen, this is a non-ambiguous and reasonably
+compact structure.  Programming is fairly straightforward since
+the GDS IDs can be set in a matrix.  Upon receipt, the matrix
+can be used as an index for verification and function
+determination.  Once defined, the matrix can be made available
+to all participating applications and could even be updated
+dynamically by defining a matrix update GDS ID.
+
+Use of GDS has been widely implemented by IBM in such
+applications as SNA/Distribution Services, Document
+Interchange Architecture, Graphical Data Display Manager,
+Intelligent Print Data Stream (see Using printers in SNA, SNA
+Update Issue 1), Facsimile Architecture, etc.  It is
+recommended that GDS structures are used in all LU6.2
+applications.  They remove ambiguity from data streams by
+clearly defining the rules for data exchange, and simplify
+troubleshooting and debugging by making trace data easy to
+interpret.
+
+Avoid the use of GDS IDs of the format X'12..' as these are
+used by APPC and APPN and so the potential for problems and
+confusion is obvious.
+
+By way of further illustration of how GDS is implemented, the
+use of Program Initialisation Parameters (PIPs) during a
+conversation ALLOCATE will be discussed.  PIP data is an
+example of a GDS structure which defines a data format known
+and understood by both the initiator of the conversation and the
+attached partner.
+
+
+PIP DATA
+
+The application starting a conversation must format a Function
+Management Header Type 5 (FMH5) and supply the address on
+the APPCCMD CONTROL=ALLOC macro.  As a minimum,
+the FMH5 must specify the name of the transaction to be
+executed at the partner application.  Optionally, transaction
+initialization parameters can be supplied in the form of the PIP
+data field of the FMH5.  At the partner application, the FMH5
+is made available in response to an APPCCMD
+CONTROL=RCVFMH5 macro.  Thus the transaction name
+and initialization parameters are available together.  PIP data
+can be complex as the FMH5 supports a GDS structure with
+subfields.  The general layout is as follows :
+
+Byte       Content
+0-1      Length of PIP data including these 2 bytes
+2-3      X'12F5' the GDS ID for PIP data
+4-nn      PIP subfields.
+
+PIP subfields have the same GDS structure for each subfield -
+the GDS ID is X'12E2'.  Use of PIP data is illustrated by the
+following code:
+
+          LA      R5,LU62FMH5           Address Skeleton ...
+          USING   ISTFM5,R5             ...  FMH5
+          MVC     FM5TPNAM,LU62TPNM     Transaction name and...
+          MVI     FM5LNTPN,X'05'        ...  length in FMH5 see note
+          MVI     FM5LENTH,X'0F'
+          OI      FM5FLAG2,FM5PIPPR     Length of FMH5 header
+*                                       Set PIP=YES indicator
+          LA      R6,18(,R5)
+          USING   FM5PIPFM,R6           Address PIP data ...
+          MVC     FM5PIPGD,=X'12F5'     ...  field in FMH5
+          MVC     FM5PIPLN,=X'0019'     Set PIP data GDS ID
+*                                       Set PIP data GDS length
+          LA      R6,4(,R6)
+          USING   FM5PIPSM,R6           Address PIP subfields ...
+          MVC     FM5PIPSG,=X'12E2'     ...  in FMH5
+          MVC     FM5PIPSL,=X'0009'     Set PIP subfield GDS ID
+          MVC     FM5PIPSD,=C'LEVEL'    Set PIP subfield GDS length
+*
+          LA      R6,9(,R6)             Move data into PIP subfield
+          MVC     FM5PIPSG,=X'12E2'
+          MVC     FM5PIPSL,=X'000C'
+          MVC     FM5PIPSD,=C'01017896' Address next PIP subfield
+                                        Set PIP subfield GDS ID
+                                        Move data into PIP subfield
+*
+*         ALLOCATE       LU_NAME(PARTNER)
+*                        TPN(LU62TPNM)
+*                        TYPE(BASIC_CONVERSATION)
+*                        PIP(YES)
+          APPCCMD CONTROL=ALLOC,
+                  QUALIFY=ALLOCD,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  LUNAME=LU62PLU,
+                  LOGMODE=LU62MODE,
+                  AREA=LU62FMH5,
+                  RECLEN=63,
+                  OPTCD=SYN,
+                  AAREA=LU62RPLX
+
+LU62RPL   RPL     AM=VTAM
+LU62RPLX  ISTRPL6
+LU62ACB   ACB     AM=VTAM,MACRF=LOGON,APPLID=LU62NAME
+LU62NAME  DC      XL1'08',C'LU62APPL'
+LU62PLU   DC      XL1'07',C'PARTNER'
+LU62CID   DS      XL4
+LU62FMH5  DS      XL255
+LU62TPNM  DC      C'STOCK'
+          ISTFM5
+
+Note
+
+This move (MVC) has an implied 3 bytes of hexadecimal zeros
+appended to the transaction name which set the access security,
+logical unit of work, and conversation correlation subfields in
+the FMH5 to zero.  Use of these fields will be the subject of a
+future article.
+
+The partner transaction must use an identical mapping to
+extract the PIP data from the FMH5: the use of supplied
+mapping DSECTs is therefore essential.  Note that it is
+essential to ensure that the DSECTs are at the same SNA
+version and release level.  An obvious point but remember that
+APPC is supposed to link a number of diverse host systems
+including MVS, VM, and VSE.  Extraction of PIP data by the
+receiving transaction is illustrated by the following code:
+
+          APPCCMD CONTROL=RCVFMH5,     Receive the ...
+                  RPL=LU62RPL,         ... FMH5 sent ...
+                  ACB=LU62ACB,         ...  by the ...
+                  AREA=LU62FMH5,       ...  conversation ...
+                  AAREA=LU62RPLX,      ...  initiator
+                  OPTCD=SYN
+*
+          LA      R5,LU62FMH5          Address ...
+          USING   ISTFMH5,R5           ...  FMH5
+          TM      FM5FLAG2,FM5PIPPR    Any PIP data ?
+          BNO     NOPIP                Skip receive
+*
+          APPCCMD CONTROL=RECEIVE,
+                  RPL=LU62RPL,
+                  ACB=LU62ACB,
+                  CONVID=LU62CID,
+                  AREA=PIPDATA,
+                  AREALEN=PIPDLEN,
+                  FILL=LL,
+                  QUALIFY=SPEC,
+                  OPTCD=SYN
+*
+          LA      R6,PIPDATA           Address PIP data ...
+          USING   FM5PIPFM,R6          ...  in logical record
+          CLC     FM5PIPGD,=X'12F5'    Verify valid PIP GDS id
+          BNE     BADPIP               Error if not
+          LH      R2,FM5PIPLN          PIP data length in R2
+          LA      R6,4(,R6)            Address PIP subfields ...
+          USING   FM5PIPSM,R6          ...  in logical record
+          SH      R2,=H'4'             Decrement PIP data length
+          LA      R4,PIPPARM1          Address first PIP parm
+PIPLOOP   DS      0H
+          CLC     FM5PIPSG,=X'12E2'    Valid PIP subfield GDS id ?
+          BNE     BADPIP
+          SR      R3,R3                Error if not
+          ICM     R3,3,FM5PIPSL
+          SH      R3,=H'3'             Length of PIP subfield
+          EX      R3,MOVEDATA          Prepare for execute move
+          LA      R4,20(,R4)           Move data to parm list
+          CLI     0(R4),X'FF'          Prepare to extract next parm
+          BE      TOOMANY              Too many PIP parms ?
+          SR      R2,R3
+          LTR     R2,R2                Exit loop
+          BNZ     PIPLOOP              Decrement PIP data length
+                                       End of PIP data subfields ?
+                                       Continue if not
+*
+MOVEDATA  MVC     0(0,R4),4(R6)
+*
+PIPDLEN   DC      H'48'
+PIPDATA   DC      CL44' '
+PIPPARM1  DC      CL20' '
+PIPPARM2  DC      CL20' '
+   .
+   .
+PIPPARMn  DC      CL20' '
+          DC      X'FF'
+
+Note that although the application initiating the conversation
+passes the FMH5 and PIP data together to the APPCCMD
+CONTROL=ALLOC macro, at the partner application they are
+received separately.  The FMH5 is made available following a
+CONTROL=FMH5RCV macro while a separate
+CONTROL=RECEIVE must be issued for the PIP data.  In
+effect the PIP data becomes the first logical record.  Take heed
+of this when designing a partner application; if in doubt always
+check for PIP data.
+
+This article has concentrated on the control of data exchange
+between two applications.  However, as the above sample PIP
+data code shows, such an exchange could be simplified by the
+use of PIP data since it effectively removes the necessity for
+the initiating application to send any data at all.  The FMH5
+shown requests execution of the transaction 'STOCK', function
+'LEVEL', for stock number '01017896'.  Such a simple
+transaction is typical of the vast majority of commercial on-line
+applications.  The inquiry could as easily have been for a bank
+account balance or the status of work in progress on a
+production line.
+
+
+DESIGN FOOTNOTE
+
+Data exchange is the most likely area for problems with LU6.2
+applications.  There are many possibilities for errors and it is
+important to be able to debug problems easily.  The main point
+always to bear in mind is that the application uses LU6.2
+protocol.  To reinforce this point it may be helpful to refer to
+the Transaction Programmer's Reference Manual For LU Type
+6.2 and add to the code the conversation verbs in the form of
+comments.  By way of illustration this has been done in the
+preceding code examples.
+
+
+SUMMARY
+
+Design of data flow for LU6.2 applications must take into
+account the interaction with DFC implemented in the VTAM
+LU6.2 support logic.  This means being aware of the finite
+states that are supported and the rules governing Finite State
+Machines and in particular state transitions.  Always check the
+WHAT_RECEIVED and RETURNED indicators in the RPL
+extension block to monitor state changes.  Use of GDS
+structures to exchange data is strongly recommended to
+standardize data formats across applications and assist in the
+debugging of data traces.  The exchange of data by individual
+logical records rather than buffers is recommended.  In this
+way, the logical sequence sends and receives can be matched.
+Be careful in the selection of the key parameters RECLEN and
+AREALEN to minimize the possibility of logical records
+spanning buffers.  These precautions should simplify coding
+and error recovery as will be explained in the next article, Error
+Recovery in LU6.2.
+
+Brian Alford
+Systems Consultant
+Aranda (UK)
+

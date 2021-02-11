@@ -1,0 +1,389 @@
+/* Rexx */
+/**********************************************************************/
+/* Function: General routine to handle ISPF tables                    */
+/*                                                                    */
+/* This routine provides general-purpose display functions for ISPF   */
+/* tables that have one or two keys. Non-keyed tables are not catered */
+/* for. The routine allows display, scrolling, sorting, panels to     */
+/* display full row details, command exits for row display and for    */
+/* row update, protection against concurrent update of any row.       */
+/* This allows multiple user access, with update, to the table.       */
+/* Extension variables, if present, are always preserved.             */
+/*                                                                    */
+/* R Gardiner, November 1997                                          */
+/**********************************************************************/
+/* ChangeControl-Start                                                */
+/* ChangeControl-End                                                  */
+                             /* Debug on?                             */
+  arg argstr
+  if pos("DEBUG",argstr) \= 0
+  then trace all
+  else
+  do
+     debug = ""
+     a = msg("OFF")
+     a = prompt("OFF")
+  end
+                             /* establish default environment         */
+  address "ISPEXEC"
+                             /* error handling                        */
+  "CONTROL ERRORS RETURN"
+  Zerrlm = ""
+  rc = 0
+  AcceptCC = 8
+  call on error name Error
+  call on failure name Error
+                             /* general variables                     */
+  true    = a=a
+  false   = ¬true
+  sysuid  = sysvar("SYSUID")
+  dandt   = sysuid date() time()
+  update    = "OK"
+                             /* table update logging variables        */
+  log     = ""
+  storLog = ""
+  linecmd = ""
+  svar    = ""
+  NoSkip  = false
+                             /* names of display and update exits     */
+  exitact   = ""
+  exitupd   = ""
+  extnames  = ""
+                             /* decode arguments                      */
+  parse arg                                                  ,/*..cont*/
+             1 "TABLE("         table       ")"              ,/*..cont*/
+             1 "LIBRARY("       library     ")"              ,/*..cont*/
+             1 "DATASET("       dataset     ")"              ,/*..cont*/
+             1 "TBPAN("         tbpan       ")"              ,/*..cont*/
+             1 "FULLPAN("       fullpan     ")"              ,/*..cont*/
+             1 "SCAN("          scan        ")"              ,/*..cont*/
+
+  if dataset \= ""
+  then exitlibs = "THISDA("dataset")"
+  else exitlibs = "THISDD("library")"
+                             /* is it to be rebuilt each time?        */
+  if pos("REFRESH",argstr) \= 0
+  then refresh = true
+  else refresh = false
+                             /* decide order of table display         */
+  if pos("DESCENDING",argstr) \= 0
+  then order = "D"
+  else order = "A"
+                             /* DATASET takes precedence over LIBRARY */
+  if dataset \= "" then
+  do
+     "LIBDEF YYDATA DATASET ID('&DATASET')"
+     library = yydata
+  end
+  call TBopen "NOWRITE"
+                             /* open was successful.                  */
+                             /* deduce names of variables             */
+  "TBQUERY &TABLE KEYS(KEY) NAMES(NAMES)"
+                             /* check if the variable exists to       */
+                             /* enable row-level update checking      */
+  if pos("LOG",names) \= 0
+  then UpdateCheck = true
+  else UpdateCheck = false
+                             /* remove brackets                       */
+  parse var key "(" key1 key2 ")" 1 "(" key ")"
+                             /* check if one or two keys              */
+  scankey  = key1
+  scancond = "GE"
+  sortneeded = false
+
+  if key2 \= ""
+  then kcount = 2
+  else kcount = 1
+                             /* browse type colours                   */
+  parse var names "(" names ")"
+  color = "BLUE"
+  attr  = "OUTPUT"
+                             /* display the table                     */
+  "TBDISPL &TABLE PANEL(&TBPAN)"
+  do while rc <= 4
+     parse var opts opt1 opt2 opt3 opt4 opt5 opt6
+                             /* process command-line commands         */
+     if maincmd = "LOCATE"     then
+     do
+                             /* set key values...                     */
+        call value Scankey,opt1
+                             /* ...scan for them                      */
+        "TBTOP &TABLE"
+        "TBSCAN &TABLE ARGLIST(&SCANKEY)" ,
+               "CONDLIST("scancond") POSITION(ZTDTOP)"
+                             /* row not found...                      */
+        if rc = 8 then
+        do
+                             /* ...show the last 10                   */
+           "TBBOTTOM &TABLE POSITION(ZTDTOP)"
+           "TBSKIP   &TABLE NUMBER(-10)"
+           NoSkip = true
+        end
+        csrrow = ztdtop
+     end
+     else
+     if maincmd = "ADD" then
+     do
+                             /* clear for add                         */
+        "TBVCLEAR &TABLE"
+        if kcount = 2             then
+        do
+                             /* check key options specified           */
+           if opt1 = "=" then opt1 = opt3
+           if opt2 = "=" then opt2 = opt4
+           if opt3 = "=" then opt3 = opt1
+           if opt4 = "=" then opt4 = opt2
+
+           call value key1,opt3
+           call value key2,opt4
+        end
+        else call value key1,opt2
+                             /* get extension variables from          */
+                             /* row being copied (if any)             */
+        addnames = ""
+        "TBGET &TABLE SAVENAME(ADDNAMES)"
+        parse var addnames "(" addnames ")"
+                             /* set new key values                    */
+        if kcount = 2             then
+        do
+           call value key1,opt1
+           call value key2,opt2
+        end
+        else call value key1,opt1
+                             /* don't add if already there            */
+        "TBEXIST &TABLE"
+        if rc = 0
+        then call stdMsg "Row" opt1 "already exists"
+        else linecmd = "U"
+     end
+     else
+     if maincmd = "DELETE" then
+     do
+                             /* set key values for delete             */
+        call value key1,opt1
+        if kcount = 2
+        then call value key2,opt2
+                             /* call update routine                   */
+        call tbupdate maincmd,""
+        csrrow = 0
+     end
+     else
+     if maincmd = "SORT" then
+     do
+        if sortvar = ""
+        then call StdMsg "No valid sort column was selected",  ,
+                         "Column invalid"
+        else Call TableSort
+     end
+                             /* process prefix area commands          */
+     if linecmd \= ""  then
+     do
+        "TBQUERY &TABLE POSITION(CSRROW)"
+        "TBGET   &TABLE SAVENAME(EXTNAMES) NOREAD"
+        parse var extnames "(" extnames ")"
+                             /* colours for table update              */
+        if linecmd = "U"          then
+        do
+           color  = "GREEN"
+           attr   = "INPUT"
+        end
+                             /* show full details of a row            */
+        if fullpan \= ""  & (linecmd = "S"  | linecmd = "U")
+        then
+        do
+           "DISPLAY PANEL(&FULLPAN)"
+           do while rc = 0
+              "DISPLAY PANEL(&FULLPAN)"
+           end
+        end
+                             /* update table                          */
+        if linecmd = "U" | exitupd \= "" then
+        do
+                             /* xrc keeps the user update return code */
+           xrc = 0
+           if exitupd \= "" then
+           do
+                             /* call user update, if specified        */
+
+              "TBEXIST &TABLE"
+                             /* tell user if the row exists or not    */
+              if rc = 0
+              then exists = "YES"
+              else
+              do
+                 exists = "NO"
+                 extnames = addnames
+              end
+                             /* pass in all related variables         */
+              "VPUT (KCOUNT KEY1 KEY2 &KEY1 &KEY2 ",
+                    "NAMES &NAMES EXTNAMES &EXTNAMES) SHARED"
+                             /* make sure we can restore environment  */
+              "CONTROL DISPLAY SAVE"
+              acceptCC = 12
+              address "TSO" exitupd exitlibs
+              xrc = rc
+              acceptCC = 8
+                             /* restore environment after the update  */
+              "CONTROL DISPLAY RESTORE"
+              exitupd = ""
+              "VGET (NAMES &NAMES EXTNAMES &EXTNAMES) SHARED"
+           end
+                             /* update the table                      */
+           if xrc = 0 then
+           do
+              call tbupdate "MOD","SAVE(&EXTNAMES) ORDER"
+           end
+        end
+     end
+                             /* take exit action                      */
+     if exitact \= "" then
+     do
+        "VPUT (KCOUNT KEY1 KEY2 &KEY1 &KEY2 ",
+              "NAMES &NAMES EXTNAMES &EXTNAMES) SHARED"
+
+        "CONTROL DISPLAY SAVE"
+        acceptCC = 12
+        if exitstyl = "CALL"
+        then interpret "CALL" xroutine "xparms"
+        else address "TSO" exitact exitlibs
+        acceptCC = 8
+        "CONTROL DISPLAY RESTORE"
+        exitact = ""
+     end
+                             /* re-open the table if requested        */
+     if refresh
+     then call TBopen "NOWRITE"
+                             /* redisplay the table                   */
+     linecmd = ""
+     color   = "BLUE"
+     attr    = "OUTPUT"
+     if NoSkip
+     then NoSkip = false
+     else
+     do
+        "TBTOP &TABLE"
+        "TBSKIP &TABLE NUMBER(&ZTDTOP)"
+     end
+     "TBDISPL &TABLE PANEL(&TBPAN) CSRROW(&CSRROW) AUTOSEL(NO)"
+  end
+  if library = "YYDATA" then "LIBDEF YYDATA"
+qquit:
+                             /* abandon ...                           */
+  AcceptCC = 12
+  "TBEND &TABLE"
+  exit
+ /********************************************************************/
+TBopen:
+  arg mode
+                             /* table may not be open, so allow rc 12 */
+  acceptCC = 12
+  "TBEND &TABLE"
+  "TBOPEN &TABLE &MODE LIBRARY(&LIBRARY)"
+  do while rc \= 0
+                             /* table won't open, retry               */
+     "TBEND &TABLE"
+     "TBOPEN &TABLE &MODE LIBRARY(&LIBRARY)"
+                             /* table won't open, so prompt user      */
+     if rc \= 0 then
+     do
+        "DISPLAY PANEL(UTPTSHAR)"
+        if rc = 8 then
+        do
+           call stdMsg "cannot open" table
+           signal qquit
+        end
+                             /* try again                             */
+        "TBOPEN &TABLE &MODE LIBRARY(&LIBRARY)"
+     end
+  end
+  acceptCC = 8
+  return
+ /********************************************************************/
+tbupdate:
+  parse arg tbcmd,parms
+                             /* re-open in WRITE, then update, then   */
+                             /* re-open back to NOWRITE mode          */
+  call tbopen "WRITE"
+                             /* For an update that is not a delete,   */
+                             /* is row-level checking enabled?        */
+  CheckOK = true
+  if UpdateCheck & (maincmd \= "DELETE") then
+  do
+                             /* Yes, save current values              */
+        "VPUT (KCOUNT KEY1 KEY2 &KEY1 &KEY2 ",
+              "NAMES &NAMES EXTNAMES &EXTNAMES) SHARED"
+                             /* Get latest row valuve                 */
+     StorLog = Log
+     "TBGET &TABLE"
+                             /* Check the log field                   */
+     if StorLog \= Log then
+     do
+                             /* If it's different, send a message     */
+        CheckOK = false
+        call stdMsg "Row has changed" ,
+                 "before" StorLog "after" log ,
+                 "you must re-enter your changes"
+     end
+                             /* Yes, get current values back          */
+     else "VGET (NAMES &NAMES EXTNAMES &EXTNAMES) SHARED"
+  end
+                             /* Either checking is not enabled or it  */
+                             /* showed that the row can be updated    */
+  if CheckOK then
+  do
+     parse var log last '01'x lastButOne '01'x lastButTwo
+     dandt   = sysuid date() time()
+     log = dandt || '01'x || last || '01'x lastButOne
+     zerrsm = "hello mum"
+     zerrlm = "hello mum"
+     "TB"tbcmd table parms
+     if tbcmd = "DELETE" & rc = 8
+     then call StdMsg value(key1) "was not found","not found"
+                             /* sort only if a new row is added       */
+     if sortneeded & (maincmd = "ADD" | (tbcmd = "MOD" & rc \= 0))
+     then call TableSort
+                             /* close the table with updates          */
+     "TBCLOSE &TABLE LIBRARY(&LIBRARY)"
+  end
+                             /* abandon the update                    */
+  else "TBEND   &TABLE"
+                             /* reopen in browse mode                 */
+  call TBopen
+                             /* sort to current order (if necessary)  */
+  return
+ /********************************************************************/
+ TableSort:
+
+   if sortdir = "D"
+   then scancond = "LE"
+   else scancond = "GE"
+   scankey = sortvar
+
+   "TBSORT &TABLE FIELDS("sortvar","sorttype","sortdir")"
+
+   sortneeded = true
+  return
+ /********************************************************************/
+Error:
+                             /* Generalised error handling            */
+                             /* Return acceptable code to the program */
+  if (rc >= 0 & rc <= AcceptCC)
+  then return
+                             /* Or report the error and terminate     */
+  eline = sourceline(sigl)
+  errCond = condition("C")
+  errDesc = condition("D")
+                             /* get error text if applicable          */
+  if lrc > 0 & lrc < 100
+  then etext = errortext(lrc)
+  else etext = ""
+                             /* Check error code                      */
+  if lrc = -3
+  then etext = "A Host command was not found"
+  "DISPLAY PANEL(UTPERR01)"
+  signal qquit
+/**********************************************************************/
+StdMsg:
+  parse arg zerrlm,zerrsm
+  "ISPEXEC SETMSG MSG(ISRZ002)"
+  return

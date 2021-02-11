@@ -1,0 +1,297 @@
+Extending the RACF ACEE with user data fields
+
+A previous article (Unlimited user data in RACF profiles, May
+1990) showed how to extend RACF profiles with your own
+fields called user data. But, unlike installation-data, these fields
+are not brought into storage automatically by RACF and need
+the macro ICHEINTY to be issued to retrieve them. This can
+only be done from an APF-authorized program.
+
+It is easy to locate a RACF user-id's ACEE in storage and
+access the standard IBM fields from there. This article will
+demonstrate how to extend the ACEE by retrieving (previously
+defined) user data during RACINIT and chaining it to the in-
+storage ACEE. It can then be accessed easily by any
+application program such as a CICS transaction. This technique
+can also be used regardless of where the data comes from.
+
+The RACINIT post-processing exit extracts the user data fields
+from the user's RACF profile and copies them to a virtual
+storage area. The address of this is placed in the ACEE field
+ACEEIEP, which is intended for installation extensions to the
+ACEE. RACF takes care of freeing this buffer providing that
+you set the subpool and length information. RACF 1.9.2 will
+also cache this information along with the ACEE itself.
+
+Two types of RACINITs can take place: the main user of the
+address space and any users that log on to that address space.
+The exit places their user data in appropriate subpools to match
+the ACEE. It would be possible to add code to determine if the
+user data extension should be built or not so that extra I/O is
+not incurred unnecessarily.
+
+One way to do this would be to add a RACHECK in this exit
+(make sure that the chosen class is RACLISTed) or to add
+some indicator in the RACF installation data that user data is to
+be loaded for RACINITs performed by this address space. You
+may want to apply different criteria to the main address space
+RACINIT and subsequent user log-ons.
+
+All that remains is for applications to access this data. Sample
+code to scan through the extension area to locate a particular
+user data member entry is also shown below both in Assembler
+and in REXX. Note that CICS applications can use the EXEC
+CICS ADDRESS ACEE command in order to be passed the
+currently signed-on user's ACEE address by CICS.
+
+This technique makes it possible for ordinary applications to
+take advantage of RACF to store extra information such as
+employee reference numbers and so on. It is important not to
+let such information become used in place of the RACHECK
+mechanism for actually authorizing access to resources or you
+will downgrade RACF to a mere database manager.
+
+
+Exit ICHRIX02
+
+************************************************************
+* MODULE : ICHRIX02
+* RACF RACINIT POST PROCESSING EXIT
+* RACF USERDATA EXTRACT, BUILD USERDATA AREA, CHAINS TO ACEE.
+* THIS AREA IS DELETED BY RACF AUTOMATICALLY BECAUSE IT HAS
+* THE SUBPOOL AND LENGTH IN THE FIRST FULLWORD. THIS FORMAT
+* CONFORMS TO THE IBM STANDARDS FOR RACF 1.9.2 ACEE CACHING.
+* REENTRANT, AUTHORIZED
+************************************************************
+ICHRIX02 CSECT
+ICHRIX02 AMODE 31
+ICHRIX02 RMODE ANY
+         STM   R14,R12,12(R13)   SAVE REGISTERS
+         LR    R12,R15           ADDRESSABILITY
+         LR    R11,R1            SAVE PARM ADDR
+         USING ICHRIX02,R12
+         GETMAIN R,LV=WORKLEN    GETMAIN DYNAMIC AREA
+         LR    R10,R1            R10 -> DYNAMIC AREA
+         USING WORKAREA,R10      ADDRESS DYNAMIC AREA
+         ST    R13,SAVEAREA+4    SAVE CALLER'S SAVEAREA ADDRESS
+         ST    R10,8(R13)        SAVE SAVEAREA ADDRESS
+         LR    R13,R10           SAVE AREA PTR
+* ADDRESS PARAMETER LIST, CHECK CALL IS CREATE AND OK
+         USING RIXPL,R11         ADDR PARM LIST
+         L     R1,RIXFLAG        LOAD FLAG ADDR
+         TM    0(R1),RIXENVCH+RIXENVDE CHANGE OR DELETE ?
+         BNZ   EXIT              YES, EXIT
+         L     R1,RIXRCODE       ADDR RCODE FROM RACINIT
+         CLC   0(4,R1),=F'0'     IS IT ZERO?
+         BNE   EXIT              NO, CHECK FOR REVOKE
+         L     R1,RIXCOMP        ADDR RCOMP FROM RACINIT
+         CLC   0(4,R1),=F'0'     IS IT ZERO?
+         BNE   EXIT              NO, EXIT
+* GET USERS RACFID FROM RACINIT EXIT PARM LIST
+         MVC   RUSER,BLANKS      CLEAR USERID
+         L     R6,RIXUID         USERID PTR
+         LTR   R6,R6             CHECK
+         BZ    EXIT              NO USERID PTR
+         XR    R7,R7             CLEAR LEN
+         IC    R7,0(R6)          LOAD LEN OF USERID
+         LTR   R7,R7             TEST LEN
+         BZ    EXIT              NO LENGTH
+         BCTR  R7,0              DOWN FOR EX
+         EX    R7,MOVEUSR        MOVE USERID
+* DON'T EXTRACT FOR DUMMY USERS OR FOR STAT=NO RACINITS
+         CLC   RUSER,BLANKS      BLANKS?
+         BE    EXIT              DON'T PROCESS
+         CLC   RUSER,DUMMYU      DUMMY USER?
+         BE    EXIT              DON'T PROCESS
+         L     R1,RIXFLAG        LOAD FLAG ADDRESS
+         TM    0(R1),RIXSTANO    STAT=NO CODED ON RACINIT
+         BNZ   EXIT              DON'T PROCESS
+* EXTRACT ENTIRE USERDATA AREA FROM THE USERS PROFILE (ALL MEMBERS)
+         MVC   RX2(RX2L),RX1     COPY TEMPLATE
+         LA    R9,RACWORK        ADDRESS RACWORK
+         RACROUTE REQUEST=EXTRACT,WORKA=(R9),TYPE=EXTRACT,             X
+               FIELDS=RFLD1,ENTITY=RUSER,RELEASE=1.8.1,MF=(E,RX2)
+         LTR   R15,R15           TEST RC
+         BNZ   EXIT              FAILED
+* ACCESS THE RETRIEVED DATA, LENC(4), COUNT(4), LEND(4), DATA(NN)
+         LR    R7,R1             RETURN AREA ADDR
+         XR    R4,R4             CLEAR
+         IC    R4,0(R7)          SUBPOOL OF GETMAINED AREA
+         XR    R5,R5             CLEAR
+         ICM   R5,B'0111',1(R7)  LENGTH OF GETMAINED AREA
+         LH    R6,4(R7)          OFFSET TO SEGMENT AREA
+         AR    R6,R7             ADD BASE ADDR FOR SEGMENT AREA
+* TEST THE RETRIEVED DATA HAS SOME MEMBERS AND CAN BE CHAINED
+         L     R2,4(R6)          NUMBER OF MEMBERS RETRIEVED
+         LTR   R2,R2             TEST IF ANY
+         BZ    FREEX             NONE
+         L     R9,RIXACEE        ADDRESS RACINITED USER'S ACEE
+         LTR   R9,R9             PRESENT
+         BZ    FREEX             NO, CAN'T DO IT
+         USING ACEE,R9           USING IT
+         L     R2,ACEEIEP        LOAD INSTALLATION WORD
+         LTR   R2,R2             USED ALREADY?
+         BNZ   FREEX             STRANGE PROBLEM
+* GETMAIN STORAGE FOR THE USER DATA CONTROL BLOCK
+         L     R3,8(R6)          LOAD LENGTH OF USERDATA FIELD
+         LA    R3,RUDATA-RUSRBLK(R3) ADD LEN OF FIXED HEADER
+         LA    R8,255            USE SUBPOOL 255 LSQA
+         L     R2,RIXACEEA       LOAD ACEE ADDRESS ON RACINIT
+         LTR   R2,R2             TEST
+         BZ    GETUXA            NONE SO THIS IS MAIN RACINIT
+         LA    R8,252            USE SUBPOOL 252 FOR THIRD PARTIES
+* CICS/IMS ETC IN EXTENDED PRIVATE (252) OR LSQA (255) IF MAIN ID
+GETUXA   EQU   *
+         GETMAIN RC,LV=(R3),LOC=(ANY),SP=(R8)  GET IT
+         LTR   R15,R15           TEST
+         BNZ   FREEX             CAN'T GET IT
+         LR    R2,R1             SAVE ADDRESS
+         USING RUSRBLK,R2        USING IT
+* INITIALIZE USER AREA CONTROL BLOCK
+         STCM  R3,B'0111',RUSLEN SAVE LENGTH OF CONTROL BLOCK
+         STC   R8,RUSSP          SAVE SUBPOOL USED
+         MVC   RUHDR,=CL4'RUXA'  EYE-CATCHER
+         MVC   RUCNT,4(R6)       SAVE NUMBER OF MEMBERS
+         MVC   RULEN,8(R6)       SAVE LENGTH OF USERDATA FIELD
+         MVC   RURSV1,ZEROS      CLEAR RESERVED
+         LA    R14,RUDATA        ADDRESS DEST IN BLOCK
+         L     R15,RULEN         LENGTH OF DATA
+         LA    R0,12(R6)         ORIGIN OF DATA
+         L     R1,RULEN          LENGTH OF DATA
+         MVCL  R14,R0            MOVE TO NEW CONTROL BLOCK
+* CHAIN NEW CONTROL BLOCK TO THE ACEE
+         ST    R2,ACEEIEP        SAVE ADDRESS IN ACEE
+* FREE RACXTRT AREA
+FREEX    EQU   *
+         FREEMAIN R,LV=(5),A=(7),SP=(4) FREE RACXTRT AREA
+* QUIT EXIT
+EXIT     EQU   *
+         L     R13,SAVEAREA+4    RESTORE R13
+         FREEMAIN R,LV=WORKLEN,A=(10) FREE DYNAMIC AREA
+         LA    R15,0             RETURN CODE TO R15 (ZERO)
+         L     R14,12(R13)       RESTORE R14
+         LM    R0,R12,20(R13)    RESTORE R0 TO R12
+         BR    R14               RETURN
+MOVEUSR  MVC   RUSER(0),1(R6)    EXECUTED MOVE USERID
+         LTORG
+* CONSTANTS, NON-MODIFIABLE
+ZEROS    DC    256XL1'00'        ZEROS
+BLANKS   DC    CL255' '          BLANKS
+DUMMYU   DC    CL8'*'            DUMMY USER
+*
+RFLD1    DC    A(2)              NUMBER OF FIELDS TO EXTRACT )
+RFLD2    DC    CL8'USRCNT'       USER COUNT OF MEMBERS       )
+RFLD3    DC    CL8'USERDATA'     USER DATA MEMBERS           )
+RX1      RACROUTE REQUEST=EXTRACT,WORKA=ZEROS,TYPE=EXTRACT,MF=L,       X
+               FIELDS=ZEROS,ENTITY=ZEROS,CLASS='USER',RELEASE=1.8.1
+* PROGRAM DATA AREA
+WORKAREA DSECT
+SAVEAREA DS    18F               SAVE AREA
+RUSER    DS    CL8               USER FOR EXTRACT
+RX2      RACROUTE REQUEST=EXTRACT,WORKA=ZEROS,TYPE=EXTRACT,MF=L,       X
+               FIELDS=ZEROS,ENTITY=ZEROS,CLASS='USER',RELEASE=1.8.1
+RX2L     EQU   *-RX2
+RACWORK  DS    CL512             RACROUTE WORK AREA
+WORKLEN  EQU   *-WORKAREA
+* RUSRBLK AREA (RUXA)
+RUSRBLK  DSECT                   CONTROL BLOCK
+RUSSP    DS    X                 SUBPOOL OF STORAGE ) IBM
+RUSLEN   DS    AL3               LENGTH OF STORAGE  ) STANDARD
+RUHDR    DS    F                 EYE-CATCHER 'RUXA'
+RUCNT    DS    F                 COUNT OF USER DATA MEMBERS
+RURSV1   DS    F                 RESERVED FIELD 1
+RULEN    DS    F                 LENGTH OF USERDATA FOLLOWING
+RUDATA   DS    0X                USERDATA FIELDS START
+* USERDATA FORMAT:  LEN MEMBER-NAME(4), MEMBER-NAME(8),
+*                   LEN MEMBER-DATA(4), MEMBER-DATA(NN),
+*                   LEN FLAG-DATA  (4), FLAG-DATA(1)
+* THIS IS REPEATED FOR EACH USERDATA MEMBER IN USERS PROFILE
+* OTHER DSECTS
+         ICHRIXP                 RACINIT EXIT PARM MAPPING
+         IEZBITS                 BIT MAP
+         IHAACEE                 ACEE
+         YREGS                   REGS
+         END
+
+
+Sample Assembler scan of RUXA for a user data member
+
+         USING ACEE,R6            MAP THE ACEE
+         L     R7,ACEEIEP         LOAD EXTENSION ADDR
+         LTR   R7,R7              PRESENT?
+         BZ    NORUXA             NO
+         USING RUSRBLK,R7         ADDR RUXA (AMODE 31)
+* SCAN FOR REQUESTED USERDATA MEMBER
+         L     R5,RUCNT           NUMBER OF MEMBERS
+         LA    R4,RUDATA          START OF USERDATA
+LOOPUD   EQU   *
+         L     R2,0(R4)           LOAD LEN OF MEMBER NAME
+         LA    R4,4(R4)           ADDR START OF MEMBER NAME
+         BCTR  R2,0               DECREASE FOR EX
+         EX    R2,COMPMEM         COMPARE MEMBER NAME
+         BE    GOTMEM             FOUND THE MEMBER
+* SKIP MEMBER
+         LA    R2,1(R2)           REVERSE BCTR
+         AR    R4,R2              ADD MEMNAME LEN TO OFFSET
+* SKIP DATA
+         L     R2,0(R4)           LOAD LEN OF DATA
+         LA    R4,4(R4)           ADDR START OF DATA
+         AR    R4,R2              ADD LEN TO OFFSET
+* SKIP FLAG
+         L     R2,0(R4)           LOAD LEN OF FLAG
+         LA    R4,4(R4)           ADDR START OF FLAG
+         AR    R4,R2              ADD LEN TO OFFSET
+* NEXT ENTRY
+         BCT   R5,LOOPUD          REPEAT FOR EACH MEMBER
+* NO MATCH
+         B     NOMEM              NOT FOUND MEMBER
+COMPMEM  CLC   0(0,R4),MEMNAME    EXECUTED COMPARE MEMBER NAME
+MEMNAME  DC    CL8'EMPLOYEE'      EXAMPLE OF ONE MEMBER NAME
+* FOUND MEMBER, POINT R4 TO LENGTH DATA, DATA VALUE INSIDE RUXA
+GOTMEM   EQU   *
+         LA    R2,1(R2)           REVERSE BCTR
+         AR    R4,R2              ADD MEMNAME LEN TO OFFSET
+* NOW USE THE INFORMATION (EG PASS IT BACK TO A CALLING PROGRAM)
+
+
+Sample REXX scan of RUXA for all user data members
+
+/* REXX : SHOW INSTORAGE USERDATA (VERIFY ICHRIX02 IS WORKING)      */
+NUMERIC DIGITS 10                       /* ALLOW FOR FULLWORD ADDR  */
+SL = C2D(STORAGE('0224',4))             /* FIND ASCB        */
+SL = ADDC(SL,'6C')                      /* FIND ASXB        */
+SL = ADDC(SL,'C8')                      /* FIND ACEE        */
+SL = ADDC(SL,'C')                       /* FIND IEP PTR     */
+IF SL = 0 THEN
+   DO
+      SAY 'NO INSTORAGE USERDATA FOR CURRENT USERID */
+      EXIT
+   END
+LL = C2D(STORAGE(D2X(SL+1),3))          /* STORAGE LENGTH   */
+RUXA = STORAGE(D2X(SL),LL)              /* COPY ENTIRE RUXA */
+RUSSP  = SUBSTR(RUXA,1,1)               /* SUBPOOL */
+RUSLEN = SUBSTR(RUXA,2,3)               /* LENGTH  */
+RUHDR  = SUBSTR(RUXA,5,4)               /* EYECATCH */
+RUCNT  = C2D(SUBSTR(RUXA,9,4))          /* NUMBER OF MEMBERS */
+RULEN  = C2D(SUBSTR(RUXA,17,4))         /* LENGTH OF USER DATA */
+RUDATA = SUBSTR(RUXA,21,RULEN)          /* USER DATA EXTRACTED */
+J = 1
+DO I = 1 TO RUCNT                       /* FOR EACH MEMBER */
+   RMEML = C2D(SUBSTR(RUDATA,J,4))      /* MEM NAME LEN */
+   RMEMN = SUBSTR(RUDATA,J+4,RMEML)     /* MEMBER NAME */
+   J = J + 4 + RMEML
+   RDATL = C2D(SUBSTR(RUDATA,J,4))      /* DATA LEN */
+   RDATN = SUBSTR(RUDATA,J+4,RDATL)     /* DATA CONTENT */
+   J = J + 4 + RDATL
+   RFLGL = C2D(SUBSTR(RUDATA,J,4))      /* FLAG LEN */
+   RFLGN = SUBSTR(RUDATA,J+4,RFLGL)     /* FLAG BYTE */
+   J = J + 4 + RFLGL
+   SAY 'MEMBER=' RMEMN 'DATA=' RDATN 'FLAG=' C2X(RFLGN)
+END
+EXIT
+ADDC:ARG AD1,AD2                        /* CALC ADDRESS FUNCTION */
+RETURN C2D(STORAGE(D2X(AD1+X2D(AD2)),4))
+
+
+                                                            c Xephon 1993
+

@@ -1,0 +1,1623 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; ZIL 1.3 flavor system - November 1987
+;
+; This file defines all the FLAVORS user-accessible functions.
+;
+; Other files used:
+;
+;  ZLFLVSTR defines the flavor structure.
+;  ZLFLVAUX defines other flavor functions.
+;  ZLVANLLA creates VANILLA-FLAVOR flavor.
+;
+; Implementation is as follows:
+;
+; A flavor is a structure consisting of the flavor methods,
+; instance variables, etc., etc.
+;
+; An INSTANCE of a flavor is a structure that has a property that
+; enables it to be FUNCALLed, as well as a lexical closure that embodies
+; the flavor stuff.  Instance variables are not closed over, but are
+; inserted into the special variable binding environment using some very
+; hairy kludgery,
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 06/20/88 - Support for multiple values.                             *
+;*                                                                     *
+;* 11/27/89 - Support for "(varname)" spec in DEFFLAVOR var list.      *
+;*                                                                     *
+;***********************************************************************
+;
+;
+; Unique macro-defining hack for compile-time and run-time macros.
+;
+
+(defmacro defmacro-for-all (name arglist . body)
+ `(progn
+   (defmacro ,name ,arglist . ,body)
+   (eval-when (load)
+    (xdefmacro ,name ,arglist . ,body)
+   )
+   ',name
+  )
+)
+
+(defmacro bindenv (env) `(car ,env))
+
+(include #.(zil-source-member zlflvstr))   ; Flavor defstruct.
+
+#|---------------------------------------------------------------------
+
+(defvar *print-escape* t) ; In case Common Lisp printer not available
+(defvar *print-level*  t) ; In case Common Lisp printer not available
+
+---------------------------------------------------------------------|#
+
+(defvar *all-flavor-names* nil "List of all flavor names.")
+
+(defvar *flavor-msglevel* 1 "Message level for flavor messages.")
+;
+; 0 - display all flavor informational messages
+; 1 - suppress informational messages, display warnings and errors
+; 2 - display errors only
+;
+
+; Enable SEND/FUNCALL of a flavor instance object.
+
+(putprop 'zil-flavor-instance
+         #'(lambda (instance &rest args)
+            (zilapply (zil-flavor-instance-closure-object instance)
+                      args))
+         'defstruct-funcall-method)
+
+#|---------------------------------------------------------------------
+
+; Enable printing of a flavor instance object.
+
+(putprop 'zil-flavor-instance
+         #'(lambda (object &optional stream
+                                     (depth 0)
+                                     (escape *print-escape*))
+            (send object :print-self stream depth escape))
+         'defstruct-print-method)
+
+---------------------------------------------------------------------|#
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Some utility functions.                                             *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defun zil-get-flavor (flavor-name)
+ (or (get flavor-name 'flavor)
+     (zerror "Not defined as a flavor" flavor-name)))
+
+;
+; This collects primary methods (actually message-method pairs).
+;
+; Used by ZIL-INITIALIZE-FLAVOR to regenerate methods for a flavor.
+;
+
+(defun zil-collect-primary-methods (flavor &aux (mlist nil))
+ (loop for flavorname in (flavor-all-flavor-list flavor)
+       (loop for methodpair in
+                 (flavor-primary-methods (zil-get-flavor flavorname))
+             unless (assq (car methodpair) mlist)
+                 do (push methodpair mlist)))
+ mlist
+)
+
+;
+; This collects instance variables.
+;
+; Used by MAKE-INSTANCE (this will change) to determine all the
+; instance variables that need to be generated into the closure,
+; and by the VANILLA-FLAVOR :DESCRIBE method to find all the
+; instance variables for the instance.
+;
+; This function returns three lists:
+;   the list of instance VARIABLES
+;   the list of instance KEYWORDS
+;   the list of instance INITIALIZERS
+;
+; As the instance variables are collected, the lists of required
+; instance variables for the component flavors are checked.
+;
+
+(defun zil-collect-instance-variables (flavor &aux vlist klist ilist)
+ (loop for flavorname in (flavor-all-flavor-list flavor)
+   (let ((f (zil-get-flavor flavorname)))
+        (loop for variable    in (flavor-instance-variables    f)
+              for keyword     in (flavor-instance-keywords     f)
+              for initializer in (flavor-instance-initializers f)
+              unless (memq variable vlist)
+                  do (push variable    vlist)
+                     (push keyword     klist)
+                     (push initializer ilist))))
+ (values (nreverse vlist) (nreverse klist) (nreverse ilist))
+)
+
+;
+; This builds a composite init plist.
+;
+; Used by MAKE-INSTANCE to determine initial values for instance
+; variables based on the flavor definition, after any
+; init-plist specified by the caller of MAKE-INSTANCE, and after any
+; initialization forms found in the DEFFLAVOR instance variable
+; declarations.
+;
+; This function returns a disembodied property list in which the
+; value are actually "thunks" which must be funcalled to get the
+; initialization values.
+;
+
+(defun zil-collect-init-plist (flavor &aux (plist (list nil)))
+ (loop for flavorname in (flavor-all-flavor-list flavor)
+       (loop for subplist on
+                 (cdr (flavor-init-plist
+                       (zil-get-flavor flavorname)))
+             by #'cddr
+             (let (((indicator thunk) subplist))
+                  (unless (get plist indicator)
+                          (putprop plist thunk indicator)))))
+ plist
+)
+
+;
+; This initializes a flavor.  Done by MAKE-INSTANCE if the flavor
+; has not yet been initialized.
+;
+
+(defun zil-initialize-flavor (flavor
+                       &aux component-flavor-list included-flavor-list)
+ (unless (flavor-initialized flavor)
+  ;
+  ; Build the list of component flavors.  This is a list, not a tree.
+  ;
+  ; We assume that each component flavor has an already-built linear
+  ; list of component flavors just like the one we are building.  It
+  ; turns out that it is not necessary to descend further than 2
+  ; levels to build this tree.
+  ;
+
+  (when (lessp *flavor-msglevel* 2)
+        (cterpri)
+        (princ "Initializing flavor ")
+        (prin1 (flavor-name flavor))
+        (terpri)
+  )
+
+  ;
+  ; First, make a linear tree-walking list of all the component flavors.
+  ;
+
+  (loop for c in (flavor-component-flavors flavor)
+        unless (memq c component-flavor-list)
+            do (push c component-flavor-list)
+               (loop for x in (flavor-component-flavor-list
+                               (zil-initialize-flavor
+                                (zil-get-flavor c)))
+                     unless (memq x component-flavor-list)
+                         do (push x component-flavor-list)
+               )
+  )
+  (loop for c in (flavor-included-flavors flavor)
+               (loop for x in (flavor-component-flavor-list
+                               (zil-initialize-flavor
+                                (zil-get-flavor c)))
+                     unless (memq x component-flavor-list)
+                         do (push x component-flavor-list)
+               )
+  )
+
+  ;
+  ; Now, make this list the component flavor list of the flavor.
+  ;
+
+  (setf (flavor-component-flavor-list flavor)
+        (nreverse component-flavor-list))
+
+  ;
+  ; Next, make a linear tree-walking list of all the included flavors.
+  ;
+
+  (loop for c in (flavor-component-flavor-list flavor)
+               (loop for x in (flavor-included-flavor-list
+                                (zil-get-flavor c))
+                     unless (memq x included-flavor-list)
+                         do (push x included-flavor-list)
+               )
+  )
+  (loop for c in (flavor-included-flavors flavor)
+        unless (memq c included-flavor-list)
+            do (push c included-flavor-list)
+               (loop for x in (flavor-component-flavor-list
+                               (zil-initialize-flavor
+                                (zil-get-flavor c)))
+                     unless (memq x included-flavor-list)
+                         do (push x included-flavor-list)
+               )
+               (loop for x in (flavor-included-flavor-list
+                                (zil-get-flavor c))
+                     unless (memq x included-flavor-list)
+                         do (push x included-flavor-list)
+               )
+  )
+
+  ;
+  ; Now, make this list the included flavor list of the flavor.
+  ;
+
+  (setf (flavor-included-flavor-list flavor)
+        (nreverse included-flavor-list))
+
+
+  ;
+  ; Now, combine these two lists for ease of method-searching, etc.
+  ;
+
+  (setf (flavor-all-flavor-list flavor)
+        (append (list (flavor-name flavor))
+                (flavor-component-flavor-list flavor)
+                (flavor-included-flavor-list flavor)))
+
+  ;
+  ; For each component or included flavor, indicate that this flavor
+  ; is dependent on it by adding it to their list of dependent flavors.
+  ;
+
+  (loop for fname in (cdr (flavor-all-flavor-list flavor))
+   (let ((f (zil-get-flavor fname)))
+    (unless (memq (flavor-name flavor) (flavor-dependent-flavor-list f))
+            (push (flavor-name flavor) (flavor-dependent-flavor-list f))
+    )))
+
+  ;
+  ; Find all the primary methods for this flavor and all its
+  ; component flavors, and build the combined methods for them.
+  ;
+  (loop for (message) in (zil-collect-primary-methods flavor)
+         do
+            (zil-regenerate-method flavor message)
+  )
+
+  ;
+  ; Find all the instance variables for this flavor, as well as
+  ; the corresponding keywords and initializers.
+  ;
+  (multiple-value-bind
+     (instance-variables instance-keywords instance-initializers)
+     (zil-collect-instance-variables flavor)
+   (setf (flavor-all-instance-variables flavor)   instance-variables)
+   (setf (flavor-all-instance-keywords  flavor)   instance-keywords)
+   (setf (flavor-all-instance-initializers flavor)instance-initializers)
+  )
+
+  ;
+  ; Clear the which-operations list.
+  ;
+  (setf (flavor-which-operations flavor) nil)
+
+  ;
+  ; Mark flavor initialized.
+  ;
+  (setf (flavor-initialized flavor) t)
+ )
+ flavor
+)
+
+;
+;***********************************************************************
+;*                                                                     *
+;* DECLARE-FLAVOR-INSTANCE-VARIABLES:                                  *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defmacro-for-all declare-flavor-instance-variables (flavor-name . def)
+ (let ((f (or (zil-get-flavor flavor-name)
+              (zerror
+ "Flavor not defined, can't expand DECLARE-FLAVOR-INSTANCE-VARIABLES"
+                     flavor-name))))
+  `(progn
+    (declare (special . ,(flavor-all-instance-variables f)))
+    ,def))
+)
+
+;
+;***********************************************************************
+;*                                                                     *
+;* SEND:                                                               *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defmacro-for-all send (instance method &rest methodargs)
+ `(funcall ,instance ,method . ,methodargs))
+
+
+;
+;***********************************************************************
+;*                                                                     *
+;* DEFFLAVOR:                                                          *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defmacro-for-all defflavor
+ (flavor-name instance-variables component-flavors &rest flavor-options)
+ (mxdefflavor flavor-name instance-variables component-flavors
+              flavor-options))
+
+(defun mxdefflavor (flavor-name instance-variables component-flavors
+                    flavor-options
+                    &aux
+                         instance-variable-list
+                         instance-keyword-list
+                         instance-initializer-list
+                         default-defmethods
+                         init-plist
+                         default-init-plist
+                         new-default-init-plist
+                         gettable-instance-variables
+                         settable-instance-variables
+                         initable-instance-variables
+                         init-keywords
+                         initialized-keywords
+                         included-flavor-list
+                         no-vanilla-flavor
+                         required-instance-variables
+                         required-methods
+                         default-handler
+                         outside-macros
+                         method-combination-list
+                         (g (gensym)))
+
+ (unless (listp instance-variables)
+         (zerror "Invalid instance variable list"
+                 flavor-name instance-variables))
+
+ (unless (listp component-flavors)
+         (zerror "Invalid component flavor list"
+                 flavor-name component-flavors))
+
+ ;
+ ; Build the instance variable list and the instance keyword list.
+ ;
+
+ (loop for x in instance-variables
+  when (atom x)
+    do (let ((k (keywordify x)))
+        (zil-check-instance-variable flavor-name x
+                                     instance-variable-list)
+        (push k instance-keyword-list)
+        (push x instance-variable-list)
+        (push nil instance-initializer-list))
+  else
+  when (symbolp (car x))
+    do (let ((k (keywordify (car x))))
+        (zil-check-instance-variable flavor-name (car x)
+                                     instance-variable-list)
+        (push k instance-keyword-list)
+        (push (car x) instance-variable-list)
+        (cond
+         ((null (cdr x))
+          (push nil instance-initializer-list))
+         ((or (atom (cdr x)) (cddr x))
+          (zerror "Invalid instance variable specification"
+                  flavor-name x))
+         (t
+          (push `(subr (lambda () ,(cadr x)))
+                 instance-initializer-list))))
+  else
+    do (zerror "Invalid instance variable name" flavor-name (car x))
+  finally
+       (setq instance-keyword-list (nreverse instance-keyword-list))
+       (setq instance-variable-list (nreverse instance-variable-list))
+       (setq instance-initializer-list
+             (nreverse instance-initializer-list))
+ )
+  ;
+  ; Analyze the options.
+  ;
+ (loop for opt in flavor-options do
+  (let (oname ovalue ovalue?)
+       (cond
+        ((atom opt)
+         (setq oname opt ovalue? nil))
+        ((and (cdr opt) (atom (cdr opt)))
+         (zerror "Invalid flavor option specification" flavor-name opt))
+        (t
+         (setq oname (car opt) ovalue (cdr opt) ovalue? t)))
+       (case oname
+        (:gettable-instance-variables
+         (let ((the-list (zil-check-instance-specs ovalue? ovalue
+                             instance-variable-list)))
+              (mark-gettable the-list))
+        )
+        (:settable-instance-variables
+         (let ((the-list (zil-check-instance-specs ovalue? ovalue
+                             instance-variable-list)))
+              (mark-settable the-list)
+              (mark-gettable the-list)
+              (mark-initable the-list)
+              (mark-init-key the-list))
+        )
+        (:initable-instance-variables
+         (let ((the-list (zil-check-instance-specs ovalue? ovalue
+                             instance-variable-list)))
+              (mark-initable the-list)
+              (mark-init-key the-list))
+        )
+        (:init-keywords
+         (mark-init-key (if ovalue? ovalue nil))
+        )
+        (:no-vanilla-flavor
+         (if ovalue? (zerror "No value permitted for this flavor option"
+                             flavor-name oname))
+         (setq no-vanilla-flavor t))
+        (:included-flavors
+         (setq included-flavor-list ovalue))
+        (:default-init-plist
+         (unless ovalue?
+                 (zerror "A value is required for this flavor option"
+                         flavor-name oname))
+         (setq default-init-plist ovalue)
+        )
+        (:required-instance-variables
+         (unless ovalue?
+                 (zerror "A value is required for this flavor option"
+                         flavor-name oname))
+         (setq required-instance-variables ovalue)
+        )
+        (:required-methods
+         (unless ovalue?
+                 (zerror "A value is required for this flavor option"
+                         flavor-name oname))
+         (setq required-methods ovalue)
+        )
+        (:default-handler
+         (unless ovalue?
+                 (zerror "A value is required for this flavor option"
+                         flavor-name oname))
+         (unless (and ovalue
+                      (symbolp (car ovalue))
+                      (null (cdr ovalue))
+                 )
+                 (zerror "A single function name must be specified"
+                         flavor-name oname ovalue))
+         (setq default-handler (car ovalue))
+        )
+        (:outside-accessible-instance-variables
+         (let ((the-list (zil-check-instance-specs ovalue? ovalue
+                             instance-variable-list)))
+              (loop for var in the-list
+                    (push `(defmacro ,(concat flavor-name "-" var) (,g)
+                            `(symeval-in-instance ,,g ',',var))
+                          outside-macros)))
+        )
+        (:method-combination
+         (unless ovalue?
+                 (zerror "A value is required for this flavor option"
+                         flavor-name oname))
+         (loop for x in ovalue do
+               (unless (consp x)
+                       (zerror "Invalid argument to :METHOD-COMBINATION"
+                               flavor-name x))
+               (let (((type order . messages) x))
+                    (loop for message in messages
+                          when (assq message method-combination-list)
+                            do (zerror
+              "Duplicate message name specified for :METHOD-COMBINATION"
+                                      flavor-name message)
+                          else
+                               (push (cons message (cons type order))
+                                     method-combination-list))))
+        )
+        ((
+          :ordered-instance-variables
+          :select-method-order
+          :documentation
+         )
+         (warn  "Sorry, this flavor option not supported in ZIL"
+                flavor-name oname))
+        (t
+         (zerror "Unknown flavor option" flavor-name oname)))
+  )
+ )
+
+  ;
+  ; For each instance variable specified, we create two methods:
+  ;
+  ; (e.g. given an instance variable FOO)
+  ;
+  ; (1) A method FOO, which returns the value of FOO;
+  ; (2) A method SET-FOO, which sets FOO to a new value.
+  ;
+
+  (loop for var in instance-variable-list
+        for key in instance-keyword-list
+    when (memq var settable-instance-variables)
+         (push `(defmethod (,flavor-name ,(concat ":SET-" var)) (,g)
+                           (setq ,var ,g))
+               default-defmethods)
+    when (memq var gettable-instance-variables)
+         (push `(defmethod (,flavor-name ,key) () ,var)
+               default-defmethods)
+  )
+
+  ;
+  ; If :default-handler is specified, create the method.
+  ;
+  (when default-handler
+   (push `(defmethod (,flavor-name :default-handler) ,default-handler)
+         default-defmethods))
+
+  ;
+  ; If :initable-instance-variables is specified,
+  ; build the init-plist out of all the specified instance
+  ; variables and their specified values.  The init-plist,
+  ; a disembodied property list, is used when an instance of
+  ; a flavor is created via MAKE-INSTANCE.
+  ;
+  ; Entries are added to the init-plist only for variables that
+  ; have initial values specified on the DEFFLAVOR declarations
+  ; thereof.
+  ;
+
+  ;
+  ; The init-plist is actually a run-time list consisting of
+  ; constant indicators and "thunks" (argless lambda subrs).
+  ;
+  ; e.g.:
+  ;
+  ; (foo bar baz frob) ==>
+  ; (list nil 'foo (subr (lambda () bar)) 'baz (subr (lambda () frob)))
+  ;
+
+  (setq init-plist (list nil))
+
+  (loop for var   in instance-variable-list
+        for key   in instance-keyword-list
+        for thunk in instance-initializer-list
+    when (and thunk (memq var initable-instance-variables))
+         (push key initialized-keywords)
+         (push `',key init-plist)
+         (push thunk  init-plist)
+  )
+
+  ;
+  ; The value of default-init-plist is a list of alternating
+  ; keyword-value pairs.  For each pair, add it to the existing
+  ; init-plist, converting indicators and values as above.
+  ;
+
+  (setq new-default-init-plist (list nil))
+
+  (loop for subplist on default-init-plist by #'cddr
+        (unless (cdr subplist)
+                (zerror "Odd number of elements in default-init-plist"
+                        flavor-name))
+        (let (((indicator value) subplist))
+             (unless (keywordp indicator)
+                     (zerror
+":DEFAULT-INIT-PLIST indicator must be a keyword"
+                       flavor-name indicator))
+             (if (memq indicator initialized-keywords)
+                 (warn
+":DEFAULT-INIT-PLIST spec overridden by instance variable init spec"
+                       flavor-name indicator)
+                 (let ((newind `',indicator)
+                       (newval `(subr (lambda () ,value))))
+                      (push newind init-plist)
+                      (push newval init-plist)
+                      (push newind new-default-init-plist)
+                      (push newval new-default-init-plist)))))
+
+  (setq init-plist (nreverse init-plist))
+  (setq default-init-plist (nreverse new-default-init-plist))
+
+  ;
+  ; Make sure that VANILLA-FLAVOR is included in the component flavors,
+  ; unless otherwise indicated.
+  ;
+
+  (unless (or no-vanilla-flavor
+              (memq 'vanilla-flavor included-flavor-list))
+          (setq included-flavor-list
+                `(,@included-flavor-list vanilla-flavor)))
+
+  ;
+  ; OK, here's the macro expansion.
+  ;
+
+ `(progn
+   (zil-create-flavor ',flavor-name
+                      ',instance-variable-list
+                      ',instance-keyword-list
+                      ',component-flavors
+                      ',included-flavor-list
+                      ',init-keywords
+                      ',required-instance-variables
+                      ',required-methods
+                      ',method-combination-list
+                      (list . ,instance-initializer-list)
+                      (list . ,init-plist)
+                      (list . ,default-init-plist)
+   )
+   ,.default-defmethods
+
+   ,(when outside-macros
+          `(progn
+            (eval-when (compile load eval) . ,outside-macros)
+            (eval-when (load)
+            . ,(mapcar #'(lambda (x) `(xdefmacro . ,(cdr x)))
+                       outside-macros))))
+
+   ',flavor-name
+  )
+)
+
+(defun zil-create-flavor (flavor-name
+                          instance-variables
+                          instance-keywords
+                          component-flavors
+                          included-flavors
+                          init-keywords
+                          required-instance-variables
+                          required-methods
+                          method-combination-list
+                          instance-initializers
+                          init-plist
+                          default-init-plist
+                         )
+ (let ((z (make-flavor
+             name                         flavor-name
+             instance-variables           instance-variables
+             instance-keywords            instance-keywords
+             component-flavors            component-flavors
+             included-flavors             included-flavors
+             init-keywords                init-keywords
+             required-instance-variables  required-instance-variables
+             required-methods             required-methods
+             method-combination-list      method-combination-list
+             instance-initializers        instance-initializers
+             init-plist                   init-plist
+             default-init-plist           default-init-plist
+
+             ; All other fields NIL including flavor-initialized.
+
+          ))
+       oldflavor
+      )
+      (cond
+       ((memq flavor-name *all-flavor-names*)
+        (warn "Flavor being redefined.  Old methods retained."
+              flavor-name)
+        (setq oldflavor (zil-get-flavor flavor-name))
+        (setf (flavor-combined-methods z)
+              (flavor-combined-methods oldflavor)) ; This must change!
+        (setf (flavor-primary-methods z)
+              (flavor-primary-methods oldflavor))
+        (setf (flavor-before-methods z)
+              (flavor-before-methods oldflavor))
+        (setf (flavor-after-methods z)
+              (flavor-after-methods oldflavor))
+        (setf (flavor-default-methods z)
+              (flavor-default-methods oldflavor))
+        (setf (flavor-wrapper-methods z)
+              (flavor-wrapper-methods oldflavor))
+        (setf (flavor-dependent-flavor-list z)
+              (flavor-dependent-flavor-list oldflavor))
+        ; All other fields NIL including flavor-initialized.
+
+        ; If the flavor being redefined has other flavors depending
+        ; on it, then mark them uninitialized to force them to be
+        ; regenerated next time an instantiation is done on them.
+
+        (when (flavor-initialized oldflavor)
+              (loop for f in (flavor-dependent-flavor-list oldflavor)
+                when (lessp *flavor-msglevel* 2)
+                  do (cterpri)
+                     (princ "Resetting flavor ")
+                     (prin1 (flavor-name (zil-get-flavor f)))
+                     (terpri)
+                do (setf (flavor-initialized (zil-get-flavor f)) nil)))
+       )
+       (t
+        (push flavor-name *all-flavor-names*)
+       )
+      )
+      (putprop flavor-name z 'flavor)
+      flavor-name
+ )
+)
+
+(defmacro mark-gettable (x)
+ `(mapc #'(lambda (x)
+                  (or (memq x gettable-instance-variables)
+                      (push x gettable-instance-variables)))
+        ,x))
+
+(defmacro mark-settable (x)
+ `(mapc #'(lambda (x)
+                  (or (memq x settable-instance-variables)
+                      (push x settable-instance-variables)))
+        ,x))
+
+(defmacro mark-initable (x)
+ `(mapc #'(lambda (x)
+                  (or (memq x initable-instance-variables)
+                      (push x initable-instance-variables))
+          )
+        ,x))
+
+(defmacro mark-init-key (x)
+ `(mapc #'(lambda (x)
+                  (setq x (keywordify x))
+                  (or (memq x init-keywords)
+                      (push x init-keywords))
+          )
+        ,x))
+
+
+
+(defun zil-check-instance-variable (nam var lis)
+ (when (keywordp var)
+       (zerror "Instance variable should not be a keyword" nam var))
+ (when (memq var lis)
+       (zerror "Duplicate instance variable" nam var)))
+
+(defun zil-check-instance-specs (ovalue? ovalue instance-variable-list)
+ (cond
+  (ovalue?
+   (loop for var in ovalue
+         unless (memq var instance-variable-list)
+             do (zerror
+ "Instance variable requested in flavor option but not present in list"
+                       var)
+   )
+   ovalue
+  )
+  (t instance-variable-list)))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* DEFMETHOD:                                                          *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defmacro-for-all defmethod
+ ((flavor-name message-name &optional (message-type nil message-type?))
+  arglist . body)
+ (mxdefmethod flavor-name message-name message-type message-type?
+              arglist body))
+
+(defun mxdefmethod
+ (flavor-name message-name message-type message-type? arglist body)
+ (if message-type?
+     (psetq message-name message-type
+            message-type message-name)
+     (setq  message-name message-name
+            message-type :primary)
+ )
+ (if (and arglist (symbolp arglist))
+  ; (DEFMETHOD (FOO BAR) ANOTHER-FUNCTION-NAME)
+  (if body
+   (zerror
+"Invalid DEFMETHOD syntax (cannot specify function symbol with body)"
+                  arglist body)
+   `(zil-create-method ',flavor-name ',message-name ',message-type
+                       (subr ,arglist))
+  )
+  (let
+   ((f (concat flavor-name
+               "-"
+               (if message-type? (unkeywordify message-type) "")
+               (if message-type? "-" "")
+               (unkeywordify message-name)
+               "-METHOD"
+       )))
+  `(progn
+    (defun ,f (,(gensym) . ,arglist) . ,body)
+    (zil-create-method ',flavor-name ',message-name ',message-type
+                        (subr ,f))))))
+
+(defun zil-create-method
+      (flavor-name message-name message-type f &aux z)
+ (let ((flavor (zil-get-flavor flavor-name)))
+      (case message-type
+            (:primary
+             (if (setq z (assq message-name
+                         (flavor-primary-methods flavor)))
+                 (rplacd z f)
+                 (push (cons message-name f)
+                       (flavor-primary-methods flavor)))
+            )
+            (:before
+             (if (setq z (assq message-name
+                         (flavor-before-methods flavor)))
+                 (rplacd z f)
+                 (push (cons message-name f)
+                       (flavor-before-methods flavor)))
+            )
+            (:after
+             (if (setq z (assq message-name
+                         (flavor-after-methods flavor)))
+                 (rplacd z f)
+                 (push (cons message-name f)
+                       (flavor-after-methods flavor)))
+            )
+            (:default
+             (if (setq z (assq message-name
+                         (flavor-default-methods flavor)))
+                 (rplacd z f)
+                 (push (cons message-name f)
+                       (flavor-default-methods flavor)))
+            )
+            (:wrapper
+             (if (setq z (assq message-name
+                         (flavor-wrapper-methods flavor)))
+                 (rplacd z f)
+                 (push (cons message-name f)
+                       (flavor-wrapper-methods flavor)))
+            )
+            ((:combined)
+             (zerror "Message type not supported by DEFMETHOD"
+                     flavor-name message-type message-name)
+            )
+            (otherwise
+             (zerror "Message type unknown to DEFMETHOD"
+                     flavor-name message-type message-name)))
+  ;
+  ; If the flavor has already been initialized,
+  ; regenerate the method to be invoked for this message.
+  ; Note that this will encompass all the different types of methods
+  ; existing for this message.
+  ; Also, if there are flavors that depend on this flavor
+  ; (which can be true only if this flavor has been initialized),
+  ; then regenerate the methods for this message for all those flavors.
+  ;
+
+  (when (flavor-initialized flavor)
+        (zil-regenerate-method flavor message-name)
+        (loop for fname in (flavor-dependent-flavor-list flavor)
+              (let ((f (zil-get-flavor fname)))
+                   (when (flavor-initialized f)
+                         (zil-regenerate-method f message-name)))))
+
+  ; Return the name of the function as the value of DEFMETHOD.
+
+  f
+
+ )
+)
+
+;
+; This function determines the combination type for a message of a
+; given flavor.  It returns a cons of type and order.
+;
+
+(defun zil-method-combination-type (flavor message-name
+                                    &aux type order tflavor)
+ (loop for flavorname in (flavor-all-flavor-list flavor)
+       (let* ((f
+               (zil-get-flavor flavorname))
+              ((nil typ . ord)
+               (assq message-name (flavor-method-combination-list f)))
+             )
+             (cond
+              ((null typ)
+               nil)
+              ((null type)
+               (setq type typ order ord tflavor flavorname))
+              ((eq typ type)
+               (unless (eq ord order)
+                       (when (lessp *flavor-msglevel* 3)
+                        (cterpri)
+                        (princ "Order keyword mismatch for message ")
+                        (prin1 message-name)
+                        (princ " using ")
+                        (prin1 type)
+                        (princ " combination")
+                        (terpri)
+                        (princ "Flavor ")
+                        (prin1 tflavor)
+                        (princ " specifies ")
+                        (prin1 order)
+                        (princ ", but flavor ")
+                        (prin1 flavorname)
+                        (princ " specifies ")
+                        (prin1 ord)
+                        (terpri)
+                       )
+                       (zerror "Method generation failed for flavor "
+                               (flavor-name flavor)))
+              )
+              (t
+                       (when (lessp *flavor-msglevel* 3)
+                        (cterpri)
+                       (princ "Combination type mismatch for message ")
+                        (prin1 message-name)
+                        (terpri)
+                        (princ "Flavor ")
+                        (prin1 tflavor)
+                        (princ " specifies ")
+                        (prin1 type)
+                        (princ ", but flavor ")
+                        (prin1 flavorname)
+                        (princ " specifies ")
+                        (prin1 typ)
+                        (terpri)
+                       )
+                       (zerror "Method generation failed for flavor "
+                               (flavor-name flavor))))))
+ (if type (cons type order) '(:daemon . nil))
+)
+
+;
+; This function builds the combined method for the message name and
+; adds it to the flavor (or replaces the existing one).
+;
+
+(defun zil-regenerate-method (flavor message-name)
+
+ (when (lessp *flavor-msglevel* 1)
+       (cterpri)
+       (princ "(Re)generating methods for message ")
+       (prin1 message-name)
+       (princ " for flavor ")
+       (prin1 (flavor-name flavor))
+       (terpri)
+ )
+
+ (setf (flavor-which-operations flavor) nil)
+
+ (let*
+  (((type . order)
+    (zil-method-combination-type flavor message-name)
+   )
+   (methoddef
+    ;
+    ; (function-name argsymbol body)
+    ;
+    ; or just function-name (if daemon combination and no before/after)
+    ;
+    (case type
+     (:daemon (zil-regenerate-daemon-method flavor message-name order))
+     (:progn  (zil-regenerate-progn-method  flavor message-name order))
+     (:or     (zil-regenerate-or-method     flavor message-name order))
+     (:and    (zil-regenerate-and-method    flavor message-name order))
+     (:list   (zil-regenerate-list-method   flavor message-name order))
+     (:inverse-list
+       (zil-regenerate-inverse-list-method  flavor message-name order))
+     (otherwise
+      (zerror "Unknown method combination type"
+              (flavor-name flavor) message-name type))
+    )
+   )
+   (methodfun
+    (cond
+     ((atom methoddef)
+      methoddef)
+     (t
+      (let (((mname margs mbody) methoddef))
+            (eval `(defun ,mname (&rest ,margs)
+                          ,(zil-flavor-wrap flavor message-name
+                                            mname margs mbody)))
+            mname
+      )
+     )
+    )
+   )
+   (z
+    (assq message-name (flavor-combined-methods flavor))
+   )
+  )
+  (if z
+      (rplacd z methodfun)
+      (push (cons message-name methodfun)
+            (flavor-combined-methods flavor)))
+ )
+ ; The return value is not important.
+)
+
+;
+; This function applies all wrappers to the generated code for the
+; combined method.
+;
+
+(defun zil-flavor-wrap (flavor message-name mname margs mbody)
+ (do ((w (zil-collect-wrappers flavor message-name)
+         (cdr w))
+      (b mbody
+         (funcall (cdar w) message-name margs (list b)))
+     )
+     ((null w) b)))
+
+(defun zil-collect-wrappers (flavor message &aux mlist m)
+ (loop for f in (flavor-all-flavor-list flavor)
+       when (setq m (assq message
+                          (flavor-wrapper-methods (zil-get-flavor f))))
+         do (push m mlist)
+ )
+ mlist  ;  base-flavor-first order, so that the base flavor's wrapper
+        ;  (e.g. for vanilla-flavor) goes on first, etc., and the
+        ;  wrapper for self's flavor goes on last.
+)
+
+;
+; These are the functions that generate the combined method code
+; - in the form (functionname argsym body) - for each method
+; combination type.
+;
+
+(defun zil-regenerate-daemon-method (flavor message-name ignored)
+
+ ;
+ ; Build the method that will execute all these different kinds
+ ; of individual methods.
+
+ (let (
+       (primary-method
+        (zil-combine-daemon-methods flavor message-name))
+       (before-method-list
+        (zil-combine-before-methods flavor message-name))
+       (after-method-list
+        (zil-combine-after-methods flavor message-name))
+       (wrapper-list
+        (zil-collect-wrappers flavor message-name))
+      )
+      (if (and (null before-method-list)
+               (null after-method-list)
+               (null wrapper-list))
+          ;
+          ; If no BEFORE/AFTER and no wrappers,
+          ; just the primary method...
+          ;
+          (cdr primary-method)
+          ;
+          ; else...
+          ;
+          (let (
+                (combined-function-name
+                 (concat (flavor-name flavor)
+                         "-COMBINED-"
+                         (unkeywordify message-name)
+                         "-DAEMON-METHOD"))
+                (args (gensym))
+               )
+           `(,combined-function-name
+             ,args
+             (progn
+              ,.(mapcar #'(lambda (x) (zil-make-method-call x args))
+                        before-method-list)
+              (multiple-value-prog1
+               ,(zil-make-method-call primary-method args)
+               ,.(mapcar #'(lambda (x) (zil-make-method-call x args))
+                         after-method-list)
+              )))))))
+
+(defun zil-regenerate-progn-method (flavor message-name order)
+ (let (
+       (method-list
+        (zil-combine-untyped-methods flavor message-name order))
+       (combined-function-name
+         (concat (flavor-name flavor)
+                 "-COMBINED-"
+                 (unkeywordify message-name)
+                 "-PROGN-METHOD"))
+       (args (gensym))
+      )
+      `(,combined-function-name
+        ,args
+        (progn . ,(mapcar #'(lambda (x) (zil-make-method-call x args))
+                          method-list)))))
+
+(defun zil-regenerate-or-method (flavor message-name order)
+ (let (
+       (method-list
+        (zil-combine-untyped-methods flavor message-name order))
+       (combined-function-name
+         (concat (flavor-name flavor)
+                 "-COMBINED-"
+                 (unkeywordify message-name)
+                 "-OR-METHOD"))
+       (args (gensym))
+      )
+      `(,combined-function-name
+        ,args
+        (or . ,(mapcar #'(lambda (x) (zil-make-method-call x args))
+                       method-list)))))
+
+(defun zil-regenerate-and-method (flavor message-name order)
+ (let (
+       (method-list
+        (zil-combine-untyped-methods flavor message-name order))
+       (combined-function-name
+         (concat (flavor-name flavor)
+                 "-COMBINED-"
+                 (unkeywordify message-name)
+                 "-AND-METHOD"))
+       (args (gensym))
+      )
+      `(,combined-function-name
+        ,args
+        (and . ,(mapcar #'(lambda (x) (zil-make-method-call x args))
+                        method-list)))))
+
+(defun zil-regenerate-list-method (flavor message-name order)
+ (let (
+       (method-list
+        (zil-combine-untyped-methods flavor message-name order))
+       (combined-function-name
+         (concat (flavor-name flavor)
+                 "-COMBINED-"
+                 (unkeywordify message-name)
+                 "-LIST-METHOD"))
+       (args (gensym))
+      )
+      `(,combined-function-name
+        ,args
+        (list . ,(mapcar #'(lambda (x) (zil-make-method-call x args))
+                         method-list)))))
+
+(defun zil-regenerate-inverse-list-method (flavor message-name order)
+ (let (
+       (method-list
+        (zil-combine-untyped-methods flavor message-name order))
+       (combined-function-name
+         (concat (flavor-name flavor)
+                 "-COMBINED-"
+                 (unkeywordify message-name)
+                 "-INVERSE-LIST-METHOD"))
+       (args (gensym))
+       (arg1 (gensym))
+       (arg2 (gensym))
+      )
+      `(,combined-function-name
+        ,args
+       ;
+       ; (funcall m1 arg1 (car arg2))
+       ; (funcall m2 arg1 (cadr arg2))
+       ; (funcall m3 arg1 (caddr arg2))
+       ; ... etc. ...
+       ;
+       ; or...
+       ;
+       ; (apply m1 (list arg1 (car arg2)))
+       ; (apply m2 (list arg1 (cadr arg2)))
+       ; (apply m3 (list arg1 (caddr arg2)))
+       ; ... etc. ...
+       ;
+        (let (((,arg1 ,arg2) ,args))
+             ;
+             ; We'd like to have number-of-arg-checking here...
+             ; maybe in a future enhancement to ZIL we can have
+             ; (declare (destructuring-arg-check ,args))
+             ; or something like that...?
+             ;
+           . ,(do ((z nil (cons `(funcall ',(cdar m) ,arg1 (car ,a)) z))
+                   (m method-list (cdr m))
+                   (a arg2 `(cdr ,a))
+                  )
+                  ((null m) (nreverse z)))))))
+
+
+(defun zil-make-method-call (methodpair args)
+ (let ((m (cdr methodpair)))
+      `(,(if (codep m) 'zilxsub 'zilapply) ',m ,args)))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* DEFWRAPPER:                                                         *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defmacro-for-all defwrapper ((wf wm) (wa . wb) wz)
+ (unless (atom wb)
+  (zerror "Incorrect DEFWRAPPER syntax, arg2 must be (arglist . body)"
+          `(,wa . ,wb)))
+ (let ((wargs (gensym)))
+      `(defmethod (,wf :wrapper ,wm) (,wargs ,wb)
+                  `(let (((nil . ,',wa) ,,wargs)) ,,wz))))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* MAKE-INSTANCE:                                                      *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defun make-instance (flavor-name &rest keyworded-arguments)
+ (instantiate-flavor flavor-name keyworded-arguments t))
+
+(defun instantiate-flavor (flavor-name arg-plist
+                           &optional send-init-message-p area)
+ (when area
+  (when (lessp *flavor-msglevel* 2)
+        (cterpri)
+        (princ "Warning: area arg to INSTANTIATE-FLAVOR ignored: ")
+        (prin1 flavor-name)
+        (princ " ")
+        (prin1 area)
+        (terpri)))
+
+ (let* (
+        (flavor       (zil-get-flavor flavor-name))
+        (the-instance)
+        (value-alist)
+        (instance-variables)
+        (instance-values)
+        (instance-keywords)
+        (instance-initializers)
+        (collective-init-plist)
+        (init-plist)
+        (initializer)
+        (instance-alist)
+        (instance-joint)
+        (save-joint)
+       )
+
+  ;
+  ; If the flavor has not been initialized, initialize it.
+  ;
+
+  (zil-initialize-flavor flavor)
+
+  ;
+  ; Validity check the keyworded arguments.
+  ;
+
+  (loop for k on arg-plist by #'cddr
+   (unless (memq (car k) (flavor-init-keywords flavor))
+           (zerror "Not an initialization keyword of this flavor"
+                   flavor-name (car k)))
+   (unless (cdr k)
+           (zerror "Odd number of init-plist arguments to MAKE-INSTANCE"
+                   flavor-name arg-plist))
+  )
+
+  ;
+  ; Check that all required instance variables have been provided.
+  ;
+  ; Note: Don't check your own required instance variable list.
+  ;
+
+  (loop
+    with reqlist = nil
+    for flavorname in (cdr (flavor-all-flavor-list flavor))
+    do
+     (let ((f (zil-get-flavor flavorname)))
+          (loop for reqvar in (flavor-required-instance-variables f)
+            unless (memq reqvar (flavor-all-instance-variables flavor))
+                do (push (cons reqvar flavorname) reqlist)))
+    finally
+     (loop with lost = nil
+           for (reqvar . reqflavorname) in reqlist
+           when (lessp *flavor-msglevel* 3)
+             do (cterpri)
+                (princ "Instance variable ")
+                (prin1 reqvar)
+                (princ " (required by flavor ")
+                (prin1 reqflavorname)
+                (princ ")")
+                (princ " was not found.")
+                (terpri)
+           do (setq lost t)
+       finally
+              (when lost
+                    (zerror "Instantiation failed for flavor"
+                            (flavor-name flavor)))))
+
+
+  ;
+  ; Check that all required methods have been provided.
+  ;
+  ; Note: Don't check your own required method list.
+  ;
+
+  (loop
+    with reqlist = nil
+    for flavorname in (cdr (flavor-all-flavor-list flavor))
+    do
+     (let ((f (zil-get-flavor flavorname)))
+          (loop for reqmsg in (flavor-required-methods f)
+            unless (assq reqmsg (flavor-combined-methods flavor))
+                do (push (cons reqmsg flavorname) reqlist)))
+    finally
+     (loop with lost = nil
+           for (reqmsg . reqflavorname) in reqlist
+           when (lessp *flavor-msglevel* 3)
+             do (cterpri)
+                (princ "Method for message ")
+                (prin1 reqmsg)
+                (princ " (required by flavor ")
+                (prin1 reqflavorname)
+                (princ ")")
+                (princ " was not found.")
+                (terpri)
+           do (setq lost t)
+       finally
+              (when lost
+                    (zerror "Instantiation failed for flavor"
+                            (flavor-name flavor)))))
+
+
+  ;
+  ; This builds the binding environment of instance variables from
+  ; which the closure which implements the instance will be created.
+  ;
+
+  ;
+  ; Initialize all instance variables.
+  ; From:
+  ; (1) Keyword specified on call to MAKE-INSTANCE.
+  ; (2) Default-init-plist specification.
+  ; (3) Initializer specified on the instance variable in DEFFLAVOR.
+  ;
+  ; (Q: Does this also pick up from component flavors'
+  ;     default-init-plists?   Currently the answer is YES,
+  ;     based on the current implementation of ZIL-COLLECT-INIT-PLIST.)
+  ;
+
+  (setq collective-init-plist (zil-collect-init-plist flavor))
+
+  (loop for var in (flavor-all-instance-variables    flavor)
+        for key in (flavor-all-instance-keywords     flavor)
+        for ini in (flavor-all-instance-initializers flavor)
+        with kval
+     do
+        (push var instance-variables)
+        (push (cond
+               ((setq kval
+                (getk arg-plist key)) ; Specified on MAKE-INSTANCE call
+                (car kval))
+               ((setq initializer (get collective-init-plist key))
+                (funcall initializer)); Specified in :DEFAULT-INIT-PLIST
+               (ini
+                (funcall ini))        ; Specified on DEFFLAVOR var decl
+               (t (zilunbnd)))        ; Not specified
+              instance-values)
+  )
+
+
+  ;
+  ; Only if the flavor has an :INIT method:
+  ;
+  ; Construct the init-plist to be passed to the :INIT method.
+  ; This contains the keyworded arguments to MAKE-INSTANCE plus
+  ; the contents of the flavor's default-init-plist.
+  ;
+  ; (Q: Does it also contain component flavors' default-init-plists?)
+  ;
+
+  ;
+  ; Problem: Right now the init plist also contains the initialization
+  ;          specs from the instance variable specs in DEFFLAVOR.
+  ;          This is probably not right.  To correct this problem,
+  ;          we have to store the default-init-plist separately from
+  ;          the init-plist in the flavor structure.
+  ;
+
+  (when (and send-init-message-p
+             (assq ':init (flavor-combined-methods flavor)))
+
+   (setq init-plist (cons nil arg-plist))
+
+   (loop for subplist on (cdr (flavor-default-init-plist flavor))
+         by #'cddr
+         do
+             (let (((indicator thunk) subplist))
+                  (or (getk (cdr init-plist) indicator)
+                      (putprop init-plist (funcall thunk) indicator)))))
+
+  ;
+  ; Construct the partial alist from the instance variables and values
+  ; that will be glued onto the special alist when the instance is
+  ; funcalled.  Obtain the pointer to the "joint" where this alist
+  ; will be "glued".
+  ;
+
+
+  (setq instance-alist
+        (do ((vars instance-variables (cdr vars))
+             (vals instance-values    (cdr vals))
+             (pair)
+             (z)
+            )
+            ((null vals) z)
+            (setq pair (cons (car vars) (car vals)))
+            (if (null z)
+                (setq z (setq instance-joint (cons pair z)))
+                (push pair z))))
+
+
+  ;
+  ; Build the closure that is the instance.
+  ;
+  ; Note cheap NCONC substitute to glue instance variables onto
+  ; the special binding environment.
+  ;
+  ; We can't use PROGV because the bindings themselves need to be
+  ; retained in case of assignments.
+  ;
+  ; INSTANCE-JOINT and SAVE-JOINT exist so that the alist gets
+  ; reglued properly for SENDs to the same instance recursively.
+  ; It's kind of complicated, but the point is that
+  ; the system doesn't work unless you do this.
+  ;
+
+  (setq the-instance
+        (make-zil-flavor-instance
+          :flavor-name
+          (flavor-name flavor)
+          :closure-object
+          #'(lambda (&rest methodargs &aux recp savealist savepop)
+              (setq savealist (special-alist))
+              (when (setq recp (cdr instance-joint))
+                    (push nil save-joint))
+              (unwind-protect
+               (progn
+                  (when instance-alist
+                    (when recp
+                      (do ((subalist (special-alist) (cdr subalist)))
+                          ((null (cdr subalist)))
+                          (when (eq (cdr subalist) instance-alist)
+                            (setf (car save-joint) subalist)
+                            (setf (cdr subalist) (cdr instance-joint))
+                            (return))))
+                    (rplacd instance-joint (special-alist))
+                    (setf (special-alist) instance-alist))
+                  (let ((self the-instance)
+                        (*flavor* flavor))
+                    (declare (special self *flavor*))
+                    (zil-flavor-dispatch flavor methodargs))
+               )
+               (when recp (setq savepop (pop save-joint)))
+               (when instance-alist
+                     (when (and recp savepop
+                               (neq (cdr savepop) instance-alist))
+                          (setf (cdr instance-joint) (cdr savepop))
+                          (setf (cdr savepop) instance-alist))
+                    (setf (special-alist) savealist))
+              ))))
+
+  (when send-init-message-p
+        (send the-instance :send-if-handles :init init-plist))
+
+
+  the-instance
+
+))
+
+;
+; This is the function invoked from the closure built by MAKE-INSTANCE
+; which dispatches on methods requested by SEND.
+;
+
+(defun zil-flavor-dispatch (flavor methodargs)
+ (unless methodargs
+      (zerror "Missing message arg to instance" (flavor-name flavor)))
+ (zilapply (or (cdr (assq (car methodargs)
+                          (flavor-combined-methods flavor)))
+               (cdr (assq ':default-handler
+                          (flavor-combined-methods flavor)))
+               (zerror "No method defined to handle this message"
+                       (flavor-name flavor)
+                       (car methodargs)))
+           methodargs)
+)
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Method combination functions.                                       *
+;*                                                                     *
+;***********************************************************************
+;
+
+;
+; Default method combination for combining primary :DAEMON methods.
+;
+; This function returns the first primary method encountered
+; (it doesn't really "combine" anything).
+;
+
+(defun zil-combine-daemon-methods (flavor message &aux m)
+ (or
+     (loop for f in (flavor-all-flavor-list flavor)
+           when (setq m
+                      (assq message
+                        (flavor-primary-methods (zil-get-flavor f))))
+           return m
+     )
+     (zerror "No primary :DAEMON method found for this message"
+             (flavor-name flavor) message)))
+
+;
+; Default method combination for combining primary (untyped) methods.
+;
+
+(defun zil-combine-untyped-methods (flavor message order &aux mlist m)
+ ;
+ ; Collect all the primary (untyped) methods.
+ ;
+ (loop for f in (flavor-all-flavor-list flavor)
+       when (setq m (assq message
+                          (flavor-primary-methods (zil-get-flavor f))))
+         do (push m mlist)
+ )
+ ;
+ ; If there are no primary (untyped) methods,
+ ; then collect all the default methods.
+ ;
+ (when (null mlist)
+  (loop for f in (flavor-all-flavor-list flavor)
+        when (setq m (assq message
+                           (flavor-default-methods (zil-get-flavor f))))
+          do (push m mlist)
+  )
+ )
+ (unless mlist
+  (zerror "No untyped methods found to combine"
+          (flavor-name flavor) message))
+
+ (case order
+  (:base-flavor-first   mlist)
+  (:base-flavor-last    (nreverse mlist))
+  (t (zerror "Invalid order keyword"
+             (flavor-name flavor)
+             message
+             order)))
+)
+
+;
+; Default method combination for combining BEFORE methods.
+;
+; This returns all the BEFORE methods, in component flavor order.
+;
+
+(defun zil-combine-before-methods (flavor message &aux mlist m)
+ (loop for f in (flavor-all-flavor-list flavor)
+       when (setq m (assq message
+                          (flavor-before-methods (zil-get-flavor f))))
+         do (push m mlist)
+ )
+ (nreverse mlist)
+)
+
+;
+; Default method combination for combining AFTER methods.
+;
+; This returns all the AFTER methods, in reverse component flavor order.
+;
+
+(defun zil-combine-after-methods (flavor message &aux mlist m)
+ (loop for f in (flavor-all-flavor-list flavor)
+       when (setq m (assq message
+                          (flavor-after-methods (zil-get-flavor f))))
+         do (push m mlist)
+ )
+ mlist
+)
+

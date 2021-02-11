@@ -1,0 +1,264 @@
+ Batch verification that CICS files are closed
+Issue 12 of CICS Update contained a batch program which verified that CICS files
+were closed.  We have recently found the need for such a facility and I have
+written an MVS version of the program, which was originally written for VSE.
+The name of the CICS job or started task is provided via the PARM field and the
+files that are required to be closed are read from the SYSIN file.  If any of
+the required files are open the operator is prompted to close them and reply
+RETRY to repeat the check, or CANCEL, which causes the job to abend.
+The program uses cross memory services to access the required CICS control
+blocks, and is currently running under MVS/XA Release 2.1.7 and CICS Release
+1.6.1.
+SAMPLE JCL
+     //CHECK EXEC PGM=FCTCHECK,PARM='CICSPROD'
+     //SYSIN DD *
+     RK502
+     RK506
+     /*
+MESSAGES
+The following messages, all of which are self-explanatory, may be produced:
+     FCTCHECK: INVALID OR MISSING PARM FIELD
+     FCTCHECK: CSA NOT FOUND - PROBABLY NOT A CICS JOB
+     FCTCHECK: jobname NOT ACTIVE
+     FCTCHECK: FILE filename IS CLOSED
+     FCTCHECK: FILE filename IS OPEN
+     FCTCHECK: FILE filename NOT IN FCT
+     FCTCHECK: ONE OR MORE FILES TO BE CLOSED - REPLY RETRY OR CANCEL
+PROGRAM SOURCE CODE
+FCTCHECK CSECT
+***      Program name: FCTCHECK                                    ***
+*        Function: Read file names from SYSIN                        *
+*                  Check if each file is open to CICS                *
+*                  If any are open, prompt operator to close them    *
+***      Parameters: Jobname of CICS system is passed via PARM     ***
+         STM   R14,R12,12(R13)       | Save registers
+         LR    R12,R15
+         USING FCTCHECK,R12
+         LA    R11,SAVEAREA          | Set up save area
+         ST    R13,4(R11)            | chain to old
+         ST    R11,8(R13)
+         LR    R13,R11
+***      Extract parm field                                        ***
+         L     R1,0(R1)              | R1 > Parm field pointer
+         LH    R2,0(R1)              | R2 = Length of parm
+         LTR   R2,R2                 | If zero then error
+         BZ    NOPARM
+         CH    R2,=H'8'              | If more than 8 then error
+         BH    NOPARM
+         LA    R3,2(R1)              | R3 > Parameter
+         BCTR  R2,0
+         EX    R2,MOVEPARM           | Move jobname
+***      Find ASCB for requested job                               ***
+         EPAR  R1                    | Primary address space
+         STH   R1,PRIMASID           | Store for future use
+         L     R2,16                 | CVT
+         USING CVT,R2
+         L     R2,CVTASVT            | Address space table
+         DROP  R2
+         USING ASVT,R2
+         L     R4,ASVTMAXU           | Maximum address spaces
+         LA    R2,ASVTENTY           | First address space
+INIO10   USING ASCB,R1
+         ICM   R1,B'1111',0(R2)      | Insert Address space address
+         BM    INI020                | If not used branch
+         ICM   R3,B'1111',ASCBJBNI   | Get jobname
+         BNZ   JOBASCB               | If present then skip
+         ICM   R3,B'1111',ASCBJBNS   | Get started task name
+          BZ    INI020                | If none then skip
+JOBASCB  CLC   0(8,R3),#JOBNAME      | Is this CICS address space?
+         BNE   INI020                | No, try next one
+         LH    R0,ASCBASID           | Get CICS address space ID
+         STH   R0,CICSASID           | Save
+         L     R1,ASCBASXB           | Get address space extension
+         ST    R1,CICSASXB           | Save it
+         B     INI030                | Exit the loop
+INI020   LA    R2,4(R2)
+         BCT   R4,INI010
+         MVC   MSG0NAME(8),#JOBNAME
+         DFHWTO MSG0,UNCOND
+         B     RETURN
+INI030   WTO   'FCTCHECK: STATUS OF REQUESTED FILES IS AS FOLLOWS'
+***      Open input file and build table of file names             ***
+         OPEN  SYSIN
+         LA    R10,#NAMES
+CARDLOOP GET   SYSIN
+         MVC   0(8,R10),0(R1)        | Move FCT name from input card
+         LA    R10,8(R10)
+         B     CARDLOOP
+ENDIN    MVC   0(8,R10),=8X'FF'
+         CLOSE SYSIN
+***      Now check each file for close status                      ***
+PROCESS  LA    R11,#NAMES
+         MVI   #FLAG,X'00'
+PROCLOOP CLI   0(R11),X'FF'
+         BE    ENDPROC
+         MVC   #FCTNAME(8),0(R11)
+         BAL   R14,FCTFETCH
+         B     *+4(R15)
+         B     FCTCLOSE
+         B     FCTOPEN
+         B     FCTERROR
+         B     CSAERROR
+FCTCLOSE MVC   MSG1NAME(8),#FCTNAME
+         DFHWTO MSG1,UNCOND
+         B     NEXTNAME
+FCTOPEN  MVC   MSG2NAME(8),#FCTNAME
+         DFHWTO MSG2,UNCOND
+         MVI   #FLAG,X'FF'
+         B     NEXTNAME
+FCTERROR MVC   MSG3NAME(8),#FCTNAME
+         DFHWTO MSG3,UNCOND
+         B     NEXTNAME
+NEXTNAME LA    R11,8(R11)
+         B     PROCLOOP
+***      End of input                                              ***
+ENDPROC  CLI   #FLAG,X'FF'
+         BNE   RETURN
+WTORLOOP XC    WTORECB,WTORECB
+         WTOR 'FCTCHECK: ONE OR MORE FILES TO BE CLOSED - REPLY RETRY OX
+               R CANCEL',REPLY,6,WTORECB
+         WAIT  ECB=WTORECB
+         CLC   REPLY(6),=C'IGNORE'     | Allow override
+         BE    RETURN
+         CLC   REPLY(5),=C'RETRY'
+         BE    PROCESS
+         CLC   REPLY(6),=C'CANCEL'
+         BNE   WTORLOOP
+         WTO   'JOB CANCELLED AT OPERATOR REQUEST'
+         ABEND 1024
+***      Subroutine to check if file open                            *
+***      On return R15 will be 0 if closed,4 if open,8 if not in FCT *
+FCTFETCH ST    R14,R14SAVE
+         STM   R1,R10,RSAVE
+          MODESET KEY=ZERO
+         LA    R0,1                    | Set AX Value of 1
+         AXSET AX=(0)
+         ST    R0,PRIMAX               | Save Primary Auth index
+         XR    R1,R1
+         ICM   R1,B'0011',CICSASID     | Get cics ASID
+         SSAR  R1                      | Set CICS as secondary ASID
+         SR    R0,R0
+         CLC   CICS#FCT(4),=F'0'
+         BNE   LOADFCT
+         LA    R5,4
+         L     R2,CICSASXB             | Get CICS ASXB
+         MVCP  CICS#TCB(R5),ASXBLTCB-ASXB(R2),R0   | Move CICS TCB
+         L     R2,CICS#TCB
+         MVCP  CICS#CSA(R5),TCBGRS13-TCB(R2),R0 | Move CICS CSA
+         L     R2,CICS#CSA
+         LA    R4,8
+         MVCP  #WORK(R4),440(R2),R0    | Move 'WORKAREA'
+         CLC   #WORK(8),=C'WORKAREA'   | Move sure this is CSA
+         BNE   NOTCICS
+         MVCP  CICS#FCT(R5),CSAFCTBA-DFHCSADS(R2),R0 | Move CICS FCT
+LOADFCT  LA    R10,#FCTNTRY            | R10--> FCT entry table
+         LA    R5,16
+         L     R2,CICS#FCT
+         LA    R9,1000                 | Just in case it loops
+         SR    R0,R0
+FCTLOOP  MVCP  0(R5,R10),0(R2),R0      | Move this FCT entry
+         CLC   0(2,R10),=X'FFFF'       | Check if end of table
+         BE    NOMATCH
+         CLC   FCTDSID-DFHFCTDS(8,R10),#FCTNAME
+         BE    MATCHED
+         LH    R6,FCTDSTEL-DFHFCTDS(R10)  | R6 = Length of entry
+         LA    R2,0(R6,R2)             | Next FCT entry
+         BCT   R9,FCTLOOP
+NOMATCH  LA    R8,8                    | 8 = no match
+         B     SWAPASID
+MATCHED  XR    R8,R8                   | 0 = Closed
+         TM    FCTDSOPN-DFHFCTDS(R10),FCTOPNIM | Check open flag
+         BNO   SWAPASID
+         LA    R8,4                    | 4 = open
+         B     SWAPASID
+NOTCICS  LA    R8,12                   | 12 = Not CICS
+         B     SWAPASID
+SWAPASID XR    R1,R1
+         ICM   R1,B'0011',PRIMASID
+         SSAR  R1                      | Reset primary ASID
+         L     R0,PRIMAX
+         AXSET AX=(0)                  | Reset authorization index
+         MODESET KEY=NZERO
+         LR    R15,R8
+         LM    R1,R10,RSAVE
+         L     R14,R14SAVE
+         BR    R14                     | Return to caller
+***      Parameter error                                           ***
+NOPARM   WTO   'FTCHECK: INVALID OR MISSING PARM FIELD'
+         ABEND 1024
+CSAERROR WTO   'FCTCHECK: CSA NOT FOUND - PROBABLY NOT A CICS JOB'
+         ABEND 1024
+***      Exit to MVS                                               ***
+RETURN   L     R13,4(R13)
+         LM    R14,R12,12(R13)
+         XR    R15,R15
+         BR    R14
+***      Constants                                                 ***
+MSG0     DFHMSG ('FCTCHECK: ',MSG0NAME,CL8' ',' NOT ACTIVE'),UNCOND
+MSG1     DFHMSG ('FCTCHECK: FILE ',MSG1NAME,CL8' ',' IS CLOSED'),     X
+                UNCOND
+MSG2     DFHMSG ('FCTCHECK: FILE ',MSG2NAME,CL8' ',' IS OPEN'),UNCOND
+MSG3     DFHMSG ('FCTCHECK: FILE ',MSG3NAME,CL8' ',' NOT IN FCT'),    X
+               UNCOND
+MOVEPARM MVC   #JOBNAME(0),0(R3)       | Executed move
+#DOUBLE  DS    D
+SAVEAREA DS    18F
+SYSIN    DCB   DDNAME=SYSIN,DSORG=PS,MACRF=GL,EODAD=ENDIN,            X
+               RECFM=FB,LRECL=80
+WTORECB  DS    F
+PRIMAX   DS    F
+R14SAVE  DS    F
+RSAVE    DS    10F
+CICSASXB DS    A(0)
+CICS#TCB DS    A(0)
+CICS#CSA DS    A(0)
+CICS#FCT DC    A(0)
+PRIMASID DS    H
+CICSASID DS    H
+#FCTNTRY DS    CL16
+#JOBNAME DC    CL8' '
+#FCTNAME DS    CL8
+REPLY    DS    CL6
+#WORK    DS    CL8
+#FLAG    DC    X'00'
+#NAMES   DC    65CL8' '                | Max 64 entries
+***      MACROS                                                    ***
+         CVT   DSECT=YES
+         IHAASVT
+         IHAASCB
+         IHAASXB
+         IKJTCB
+         COPY DFHCSADS
+         COPY DFHFCTDS
+FCTDSBAR EQU  R10
+         END
+
+
+Paul Beesley
+Senior Systems Programmer (UK)     ) Xephon 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,171 @@
+Efficiently processing sequential datasets
+
+This program processes records of a sequential dataset using
+BSAM with multiple concurrent running channel programs,
+giving the advantage of overlapping I/O time and processing time.
+The coding is very useful when processing large SAM files, eg
+system logs.  In this example, RECORDFORMAT may be fixed-
+length or variable.
+
+LOGIC
+
+1   If present, pick up Number of concurrent Channel Programs
+(NCP) from the DCB parameter in the JCL.  If it is not
+specified, take NCP from the program DCB.  (It is defined as
+64 in this example; IBM's maximum is 99.)
+
+2   GETMAIN storage for the DECBs and buffers.  The total
+GETMAIN amount is equal to NCP * (BLKSIZE +
+DECBLENGTH).  The GETMAIN request is variable.  If not
+all the requested storage is obtained, the number of NCPs is
+decremented.  Therefore, the number of concurrent channel
+programs depends on the number of datasets, their blocksizes,
+and the region size of the task.
+
+3   Construct DECBs in the GETMAINed storage.  The rest of
+the storage is used for buffers like this:
+
+    DECB1, DECB2, ...DECBn, BUFFER1, BUFFER2,
+...BUFFERn
+
+4   Issue a read for each DECB.
+
+5   Check for the completion of I/O for the first DECB.
+
+6   Unblock the block that was checked and BALR to the routine
+to process the record.
+
+7   Issue the next read for this DECB.
+
+8   Check the next DECB.
+
+9   Go to step 6.
+
+When the NCP number chosen is high enough, the program
+should never wait for I/O completion, thus giving an amazing
+reduction in elapsed time and CPU time.  In some cases,
+compared with QSAM, the elapsed time was decreased by 90 per
+cent and the CPU time (for performing I/O) was reduced by a
+factor of three.
+
+SCANLOGD CSECT
+         SAVE  (14,12)
+         BALR  R12,R0
+         USING *,R12                 R12 BASE REGISTER
+         LR    R10,R13               SAVE-AREA-CHAINING ROUTINE
+         LA    R13,SAVEA
+         ST    R13,8(R10)
+         ST    R10,4(R13)
+         B     INIT                  START PROGRAM
+SAVEA    DS    18F                   SAVE AREA
+*****      END OF PROGRAM            *****
+RETURN   CLOSE (FILEIN)              CLOSE DATASET
+         L     R13,4(R13)
+         SR    R15,R15
+         RETURN (14,12),RC=(15)      RETURN
+*****      GET JFCB AND, IF SPECIFIED IN JCL, PICK UP NBR OF NCPS (NCP#)
+INIT     XR    R3,R3                 CLEAR R3
+         LA    R7,FILEIN
+         USING IHADCB,R7             MAP DCB OF DATASET
+         RDJFCB ((7),(INPUT))        READJFCB
+         CLI   JFCNCP,X'00'          NCP= SPECIFIED IN JCL?
+         BE    OPEN                  NO
+         MVC   DCBNCP,JFCNCP         NCP# FROM JCL
+OPEN     OPEN  ((7),INPUT)           OPEN FILE
+         TM    DCBOFLGS,DCBOFOPN     GOOD OPEN?
+         BO    BUILDIO               YES
+         WTO   'FILEIN NOT OPENED'   NO
+         B     RETURN
+*****      BUILD IO-BUFFERS AND CONSTRUCT DECBS
+*****      TOTAL GETMAIN AMOUNT = NCP# * (DECBLENGTH + BLKSIZE)
+BUILDIO  IC    R3,DCBNCP             NCP# FROM DCB
+         LA    R5,DECBLNGT           LENGTH OF DECB
+         AH    R5,DCBBLKSI           ADD BLOCKSIZE
+         ST    R5,MINSIZE            MINIMUM GETMAIN AMOUNT
+         MR    R4,R3                 MULTIPLY WITH NCP#
+         ST    R5,MAXSIZE            GIVING MAXIMUM GETMAIN AMT
+         GETMAIN VU,LA=MINSIZE,A=IOADDR GETMAIN TOTAL AMOUNT
+         CLC   MAXSIZE,GOTAMT        ALL GOTTEN?
+         BNH   CREADECB              YES
+*        SEE HOW MANY DECBS + BUFFERS FIT IN GOTTEN STORAGE
+         XR    R2,R2
+         L     R3,GOTAMT
+         D     R2,MINSIZE            => NCP# IN R3
+         STC   R3,DCBNCP             NCP# IN DCB
+CREADECB L     R1,IOADDR             POINT TO FIRST DECB
+         LA    R5,DECBLNGT           LOAD LENGTH OF IT
+         MR    R4,R3                 TOTAL SIZE OF DECBS
+         AR    R5,R1                 R5 POINTS TO 1ST BUFFER
+NEXTDECB MVC   0(DECBLNGT,R1),DECBMODL CREATE A DECB HERE
+         ST    R5,12(R1)             STORE BUFFERADDRESS IN DECB
+         LA    R1,DECBLNGT(R1)       POINT TO NEXT DECB
+         AH    R5,DECBBLKSI          POINT TO NEXT BUFFER
+         BCT   R3,NEXTDECB           CREATE NEXT
+*****      READ NCP# OF BLOCKS AHEAD WITHOUT INTERVENING CHECK
+READBLK  IC    R3,DCBNCP             NBR OF DECBS
+         L     R2,IOADDR             LOAD ADDRESS OF FIRST DECB
+READNEXT READ  (2),SF,MF=E           READ A BLOCK
+         LA    R2,DECBLNGT(R2)       POINT TO NEXT DECB
+         BCT   R3,READNEXT           READ NEXT BLOCK
+*****      CHECK IO , PROCESS BLOCK, AND ISSUE NEXT READ FOR THIS DECB
+FRSTDECB L     R2,IOADDR             LOAD ADDRESS OF FIRST DECB
+         IC    R3,DCBNCP             LOAD NBR OF NCPS
+CHECKIO  CHECK (2)                   WAIT FOR GOOD DECB
+         STM   R2,R3,SAVER23         SAVE R2,R3
+         TM    DCBRECFM,DCBRECV      VARIABLE RECFM?
+         BZ    FIXBLOCK              NO, ASSUME FIXED
+VARBLOCK L     R2,12(R2)             LOAD BLOCKADDRESS
+         LH    R1,0(R2)              LOAD BLOCKLENGTH
+         AR    R1,R2                 => EOF BLOCK ADDRESS
+         ST    R1,EOFBLOCK
+         LA    R2,4(R2)              SKIP BDW
+VARREC   BAL   R8,RECORD             PROCESS VARIABLE LNGTH RECORD
+         AH    R2,0(R2)              POINT TO NEXT RECORD
+         C     R2,EOFBLOCK           EOF BLOCK?
+         BE    NEXTBLK               YES, READ NEXT BLOCK
+         B     VARREC                NEXT RECORD
+FIXBLOCK LH    R3,DCBBLKSI           LOAD BLOCKSIZE
+         L     R1,16(R2)             COMPUTE REAL BLOCKLENGTH
+         SH    R3,14(R1)             SUBTRACT RESIDUAL COUNT
+         L     R2,12(R2)             LOAD BLOCKADDRESS
+         AR    R3,R2                 => EOF BLOCK ADDRESS
+         ST    R3,EOFBLOCK
+FIXREC   BAL   R8,RECORD
+         AH    R2,DCBLRECL           POINT TO NEXT RECORD
+         C     R2,EOFBLOCK           EOF BLOCK?
+         BL    FIXREC                      NO, ROUTINE
+NEXTBLK  LM    R2,R3,SAVER23         RESTORE R2,R3
+         READ  (2),SF,MF=E           ISSUE NEXT READ FOR THIS DECB
+         LA    R2,DECBLNGT(R2)       POINT TO NEXT DECB
+         BCT   R3,CHECKIO            CHECK IT
+         B     FRSTDECB              GO CHECK FIRST DECB AGAIN
+*****      ROUTINE FOR PROCESSING THE RECORD
+RECORD   BR    R8                    RETURN FOR NEXT RECORD
+*****      DEFINE A MODEL DECB
+DECBMODL READ  DECB0,SF,FILEIN,,'S',MF=L
+DECBLNGT EQU   *-DECBMODL
+*****      DATA FIELDS
+EXLST    DS    0F
+         DC    X'87'
+         DC    AL3(INFMJFCB)         JFCB ADDRESS
+GETMPRM  DS    0F                    PARM FOR GETMAIN
+MINSIZE  DS    F                     MINIMUM AMOUNT FOR GETMAIN
+MAXSIZE  DS    F                     MAXIMUM AMOUNT FOR GETMAIN
+IOADDR   DS    F                     ADDRESS
+GOTAMT   DS    F                     RETURNED AMOUNT
+ROUTINE  DS    F                     ADDRESS OF BLOCKHANDLE ROUTINE
+SAVER23  DS    D                     SAVE R2 R3
+EOFBLOCK DS    F                     END OF BLOCK ADDRESS
+*        DCB OF INPUT FILE
+FILEIN   DCB   DDNAME=FILEIN,EODAD=RETURN,DSORG=PS,MACRF=(R),          X
+               EXLST=EXLST,NCP=64
+         IEFJFCBN                    MAP OF JFCB
+         DCBD  DSORG=PS,DEVD=DA      MAP DCB OF DATASET
+         END   SCANLOGD
+
+
+C J Koopman
+Systems Programmer
+Hoogovens Groep BV (The Netherlands)  © Xephon 1989
+
+

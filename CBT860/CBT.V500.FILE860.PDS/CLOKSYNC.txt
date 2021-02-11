@@ -1,0 +1,531 @@
+CLOCKS   TITLE 'CLOKSYNC -- CLOKSYNC -- INTRODUCTION'
+*        FROM C.B. & T. TAPE FILE 65                             87246
+***********************************************************************
+*                       CLOKSYNC -- CLOKSYNC                          *
+*                       AUTHOR: JAMES COOK  12/26/79                  *
+*                                                                     *
+*    THIS PROGRAM SYNCHRONIZES THE CLOCKS ON TWO LOOSELY COUPLED      *
+*  CPUS. THE PROGRAM RUNS ON THE TWO MACHINES AND COMMUNICATES WITH   *
+*  EACH OTHER THROUGH A DASD DATASET.  THERE ARE TWO PARAMETERS WHICH *
+*  CAN BE PASSED TO THE PROGRAM. THE 1ST IS 'FORMAT' WHICH FORMATS    *
+*  COMMUNICATION DATASET WHICH IS REFERENCED BY DDNAME DISK. THIS     *
+*  PARAMETER SHOULD ONLY BE SPECIFIED WHEN THE DATASET IS FIRST       *
+*  CREATED. THE SECOND PARAMETER WHICH MAY BE PASSED IS THE 'SYNC'    *
+*  PARAMETER.  THE SYNC PARM HAS 1 OPERAND WHICH IS THE SMF ID OF THE *
+*  CPU WHICH WILL BE CONSIDERED THE MAIN OR PRODUCTION SYSTEM. THIS   *
+*  SYSTEM WILL BE REFERED TO AS THE PRIMARY SYSTEM AND THE OTHER      *
+*  SYSTEM WILL BE CONSIDERED AS THE SECONDARY SYSTEM. AN EXAMPLE OF   *
+*  AND EXECUTE STATEMENT WOULD BE: // EXEC CLOKSYNC,PARM='SYNC IPO1'  *
+*  THIS WOULD MAKE THE SYSTEM WITH THE SMF ID OF IPO1 AS THE PRIMARY  *
+*  SYSTEM AND THE OTHER SYSTEM AS THE SECONDARY SYSTEM.               *
+*      FOR DEBUGGING PURPOSES, YOU CAN PUT THE OPERAND DEBUG AFTER    *
+*  THE SMF ID OPERAND. THIS WILL CAUSE THE PROGRAM TO NOT ACTUALLY    *
+*  ISSUE THE SET CLOCK CMD, BUT ONLY DISPLAY IT ON THE CONSOLE.       *
+*  EX:  // EXEC PGM=CLOKSYNC,PARM='SYNC IPO2 DEBUG'                   *
+*    BELOW IS A DESCRIPTION OF THE OPCODES AND THEIR MEANING.         *
+*                                                                     *
+*  OPCODE    ISSUED BY     MEANING                                    *
+*  ------    ---------     -------                                    *
+*                                                                     *
+*  X'01'     BOTH          FILE IS DORMANT                            *
+*  X'02'     PRIMARY       PRIMARY IS WAITING FOR SECONDARY           *
+*  X'03'     SECONDARY     SECONDARY HAS ACKNOWLEDGED THAT HE IS      *
+*                          HERE AND HAS RESPONDED TO THE OPCODE 2     *
+*  X'04'     PRIMARY       TELLS SECONDARY TO GIVE TIME               *
+*  X'05'     SECONDARY     TELLS PRIMARY THAT TIME HAS BEEN GIVEN     *
+*  X'06'     PRIMARY       SECONDARY SHOULD CHANGE TIME               *
+*  X'07'     PRIMARY       PRIMARY WILL CHANGE HIS TIME               *
+*  X'80'     PRIMARY       DATES ARE NOT THE SAME                     *
+*  X'81'     PRIMARY       TIMES ARE NOT WITHIN 5 MINUTES             *
+*  X'82'     PRIMARY       TIMES ARE CLOSE ENOUGH, NEITHER TIME       *
+*                          WILL BE CHANGED                            *
+*  X'FF'     BOTH          COMMUNICATIONS OR SYNCHRONIZATION PROBLEM  *
+*                                                                     *
+***********************************************************************
+         TITLE 'CLOKSYNC -- INITIALIZATION'
+CLOKSYNC CSECT
+         STM   R14,R12,12(R13)         SAVE REGS
+         LR    R12,R15                 LOAD BASE                 87246
+         USING CLOKSYNC,R12            DECLARE BASE              87246
+         LR    R15,R13                 DO
+         LA    R13,SAVE                   FORWARD AND
+         ST    R13,8(R15)                 BACKWARD SAVEAREA
+         ST    R15,4(R13)                 CHAINING;
+         L     R1,0(R1)                POINT R1 TO 1ST AND ONLY PARM
+         LH    R2,0(R1)                LOAD LENGTH OF PARM
+         CH    R2,=H'6'                LENGTH MUST BE AT LEAST 6
+         BL    PARMPROB                PARM ERROR
+         CLC   2(6,R1),=C'FORMAT'      IS IT A FORMAT CMD
+         BE    FORMAT                  YES, FORMAT THE FILE
+         CLC   2(5,R1),=C'SYNC '       IS IT A SYNC CMD
+         BE    SYNC                    YES, SYNC UP THE CLOCKS
+         B     PARMPROB                NO,  PARM ERROR
+         TITLE 'CLOKSYNC -- FORMAT THE FILE'
+***********************************************************************
+*     THIS SECTION FORMATS THE DIRECT ACCESS FILE WITH ONE RECORD.    *
+*  THIS RECORD IS THE MEANS BY WHICH THE PRIMARY AND SECONDARY        *
+*  ADDRESS SPACES COMMUNICATE. THE ACCESS METHOD USED IS BDAM.        *
+***********************************************************************
+FORMAT   EQU   *
+         OPEN  (CLOKSEQ,OUTPUT)        OPEN SYNC DATASET
+         WRITE DECB,SF,CLOKSEQ,RECORD
+         CHECK DECB                    VERIFY WRITE
+         CLOSE CLOKSEQ                 CLOSE FILE
+         WTO   MF=(E,WTO00)            ISSUE DATASET FORMATTED MSG
+         B     EOJ                     RETURN
+         TITLE 'CLOKSYNC -- SYNCHRONIZE THE TIMES'
+***********************************************************************
+*     THIS SECTION DETERMINES WHETHER WE ARE RUNNING ON THE PRIMARY   *
+*  OR SECONDARY SYSTEM. THE PRIMARY SYSTEM IS ALSO CALLED THE MASTER  *
+*  WHEREAS THE SECONDARY SYSTEM IS ALSO CALLED THE SLAVE. WE ALSO     *
+*  MAKE US NON SWAPABLE SO WE WON'T GET SWAPPED DURING OUR WAITS.     *
+***********************************************************************
+SYNC     EQU   *
+         CH    R2,=H'9'                PARM LENGTH 9?
+         BE    SYNC1                   YES, KEEP GOING
+         CH    R2,=H'15'               POSSIBLE DEBUG PARM?
+         BNE   PARMPROB                NO, PARAMETER ERROR
+         CLC   12(5,R1),=C'DEBUG'      DEBUG OPERAND?
+         BNE   SYNC1                   NO, KEEP GOING
+         OI    FLAGS,DEBUG             SET DEBUG FLAG
+SYNC1    EQU   *
+         LR    R2,R1                   SAVE PARM ADDRESS
+         OPEN  (CLOKRAN,UPDAT)         OPEN SYNC DATASET
+         SYSEVENT DONTSWAP             DO NOT SWAP US OUT
+         L     R3,16                   R3 -> CVT
+         L     R3,196(R3)              R3 -> SMCA
+         CLC   7(4,R2),16(R3)          COMPARE SMF IDS
+         BNE   SLAVE                   NOT EQUAL, WE MUST BE THE SLAVE
+         TITLE 'CLOKSYNC -- PRIMARY ADDRESS SPACE PROCESSING'
+***********************************************************************
+*     THIS SECTION IS FOR THE PRIMARY ADDRESS SPACE. WE PUT IN AN     *
+* OPCODE OF 2 TELLING THE SECONDARY ADDRESS SPACE (SLAVE) THAT WE     *
+* ARE AROUND. WE WAIT UP TO TEN MINUTES FOR THE SLAVE TO ARRIVE.      *
+* WHEN (OR SHOULD I SAY IF) HE ARRIVES, HE WILL PUT IN AN OPCODE OF   *
+* 3 TELLING US THAT HIS IS HERE AND HE HAS STORED HIS DATE IN THE     *
+* RECORD SO WE CAN COMPARE TO MAKE SURE WE ARE TALKING ABOUT THE      *
+* SAME DATE.                                                          *
+***********************************************************************
+MASTER   EQU   *
+         ENQ   (QNAME,RNAMEM,E,6,SYSTEMS),RET=USE
+         LTR   R15,R15                 DID WE GET THE ENQ?
+         BZ    MASTER1                 YES, EVERYTHING IS OK
+         WTO   MF=(E,WTO12)            ISSUE WARNING WTO
+         B     EOF                     AND QUIT
+MASTER1  EQU   *
+         OI    FLAG1,F1ENQM            SHOW WE HAVE THE MASTER ENQ
+         BAL   R10,GETIT               READ THE RECORD
+         BAL   R10,CHECKR              CHECK THE I/O
+         CLI   OPCODE,X'01'            IS FILE OK?
+         BE    MAST1                   YES, CONTINUE
+         CLI   OPCODE,X'FF'            TROUBLE LAST TIME?
+         BE    MAST1                   YES, WE CAN TRY AGAIN
+         WTO   MF=(E,WTO01)            ISSUE WTO
+         B     EOF                     AND QUIT FOR TODAY
+MAST1    EQU   *
+         MVI   OPCODE,X'02'            LET SLAVE KNOW WE ARE HERE.
+         BAL   R10,PUTIT               WRITE THE RECORD
+         BAL   R10,CHECKP              CHECK WRITE
+         LA    R4,120                  WAIT FOR UP TO 10 MINUTES
+WTLOOP   EQU   *
+         LA    R1,FIVESEC              WAIT 5 SEC
+         BAL   R10,STIMEIT             GO AND WAIT
+         BAL   R10,GETIT               READ FILE
+         BAL   R10,CHECKR              CHECK READ OPERATION
+         CLI   OPCODE,X'03'            IS SLAVE HERE?
+         BE    SLAVEHER                YES, THE SLAVE HAS COME TO SERVE
+         CLI   OPCODE,X'02'            IS THE OPCODE STILL A 2
+         BNE   SYNCPROB                NO, WE HAVE A SYNC PROB
+         BCT   R4,WTLOOP               WAIT SOME MORE IF NOT 10 MINUTES
+         WTO   MF=(E,WTO02)            ISSUE ADDR SPACE NOT UP MSG
+         B     TERM01                  QUIT FOR TODAY.
+***********************************************************************
+*    COMPARE THE DATE TO MAKE SURE THAT WE ARE TALKING ABOUT THE      *
+*  SAME DAY.                                                          *
+***********************************************************************
+SLAVEHER EQU   *
+         BAL   R10,TIMEIT              GET TOD
+         ST    R1,DATEHERE             SAVE DATE
+         CLC   DATE(4),DATEHERE        ARE DATES OK?
+         BE    DATEOK                  YES, KEEP GOING
+         WTO   MF=(E,WTO03)            ISSUE DATE PROBLEM MSG
+         LA    R1,X'80'                SET OPCODE FOR DATE PROBLEM
+         B     TERM                    TERMINATE
+         SPACE 2
+***********************************************************************
+*     PUT IN OPCODE 4 TO TELL HIM WE WANT TO KNOW WHAT TIME HE HAS.   *
+*  LOOP VERY FAST LOOKING FOR OPCODE 5. IF WE WAIT MORE THAN 20 SEC.  *
+*  STOP WITH AN ERROR.                                                *
+***********************************************************************
+DATEOK   EQU   *
+         MVI   OPCODE,X'04'            COMMAND SLAVE TO GIVE TIME
+         BAL   R10,PUTIT               WRITE THE RECORD
+         BAL   R10,CHECKP              CHECK WRITE
+         LA    R4,100                  WAIT NO MORE THAN 20 SECONDS
+LOOP4    EQU   *
+         BAL   R10,GETIT               READ THE RECORD
+         BAL   R10,TIMEIT              GET THE TIME
+         LR    R5,R0                   SAVE TIME
+         BAL   R10,CHECKR              CHECK READ OPERATION
+         CLI   OPCODE,X'05'            DID SLAVE LISTEN?
+         BE    SLAVEOK                 YES, THIS SLAVE IS OK
+         CLI   OPCODE,X'04'            IS OPCODE STILL 4?
+         BNE   SYNCPROB                NO, WE HAVE A SYNC PROBLEM
+         LA    R1,MS20                 WAIT 20 MILLI SECONDS
+         BAL   R10,STIMEIT             GO AND WAIT
+         BCT   R4,LOOP4                KEEP LOOPING
+         B     COMMPROB                COMMUNICATIONS PROBLEM
+***********************************************************************
+*     COMPARE THE TIMES, IF WE HAVE THE LARGEST, HE WILL HAVE TO      *
+* CHANGE HIS TIME, OTHERWISE WE WILL HAVE TO CHANGE OURS. IF OUR TIME *
+* DIFFERENCE IS LARGER THAN 5 MINUTES, DO NOT CHANGE THE TIMES.       *
+***********************************************************************
+SLAVEOK  EQU   *
+         L     R3,TIME                 LOAD SLAVES TIME
+         LR    R4,R5                   LOAD MY TIME
+         SR    R4,R3                   GET DIFFERENCE
+         LPR   R4,R4                   LOAD ABS
+         C     R4,=F'30000'            BIGGER THAN 5 MINUTES
+         BL    OKTIME                  NO, TIMES CLOSE ENOUGH
+         WTO   MF=(E,WTO04)            ISSUE TIMES NOT CLOSE ENOUGH MSG
+         LA    R1,X'81'                SET OPCODE FOR CLOSE TIMES
+         B     TERM                    TERMINATE
+OKTIME   EQU   *
+         C     R4,=F'100'              ARE TIMES WITHIN 1 SECOND
+         BH    SETEM                   NO, NEED TO SET TIME
+         WTO   MF=(E,WTO05)            ISSUE TIMES TOO CLOSE MSG
+         LA    R1,X'82'                SET OPCODE TO TOO CLOSE
+         B     TERM                    QUIT
+SETEM    EQU   *
+         CR    R5,R3                   WHICH TIME IS BIGGER
+         BL    OKASIS                  HIS TIME IS OK AS IS
+         ST    R5,TIME                 STORE OUR TIME
+         MVI   OPCODE,X'06'            TELL HIM TO CHANGE HIS TIME
+         BAL   R10,PUTIT               STORE THE RECORD
+         BAL   R10,CHECKP              CHECK RETURN CODE
+         WTO   MF=(E,WTO06)            ISSUE OTHER TIME ALTERED MSG
+         BAL   R10,CMDMAKE             MAKE THE SET CLOCK CMD
+         BAL   R10,CMDECHO             ECHO IT ON THIS CONSOLE
+         B     EOF                     QUIT
+***********************************************************************
+*   HIS TIME IS LARGER, SO WE WILL HAVE TO CHANGE OUR TIME.           *
+***********************************************************************
+OKASIS   EQU   *
+         MVI   OPCODE,X'07'            HIS TIME IS OK AS IS
+         BAL   R10,PUTIT               STORE THE RECORD
+         BAL   R10,CHECKP              CONFIRM WRITE
+         BAL   R10,CMDMAKE             MAKE  THE SET CLOCK CMD
+         BAL   R10,CMDEXEC             EXECUTE THE SET CLOCK
+         BAL   R10,CMDECHO             ECHO IT ON THE CONSOLE
+         B     EOF                     QUIT FOR TODAY
+         TITLE 'CLOKSYNC -- SECONDARY ADDRESS SPACE PROCESSING'
+***********************************************************************
+*     THIS SECTION IS FOR THE SECONDARY ADDRESS SPACE PROCESSING.     *
+*  OTHERWISE KNOWN AS THE SLAVE. IN THIS SECTION WE WAIT FOR THE      *
+*  MASTER TO ISSUE AN OPCODE OF 2 TELLING US HE IS AROUND. WHEN HE    *
+*  DOES, WE INSERT THE DATE ON OUR MACHINE AND ISSUE AN OPCODE OF 3   *
+*  TELLING HIM WE ARE AROUND ALSO.                                    *
+***********************************************************************
+SLAVE    EQU   *
+         ENQ   (QNAME,RNAMES,E,5,SYSTEMS),RET=USE
+         LTR   R15,R15                 DID WE GET THE ENQ?
+         BZ    SLAVE1                  YES, KEEP PROCESSING
+         WTO   MF=(E,WTO13)            ISSUE WTO
+         B     EOF                     AND QUIT
+SLAVE1   EQU   *
+         OI    FLAG1,F1ENQS            SHOW WE HAVE SLAVE ENQ
+         LA    R4,120                  WAIT NO LONGER THAN 10 MINUTES
+SLOOP1   EQU   *
+         BAL   R10,GETIT               READ THE RECORD
+         BAL   R10,CHECKR              CHECK I/O
+         CLI   OPCODE,X'02'            IS MASTER UP
+         BE    MASTERUP                YES, HE IS
+         CLI   OPCODE,X'01'            IS OPCODE STILL 1
+         BE    SLOOP1A                 YES, KEEP WAITING
+         CLI   OPCODE,X'FF'            DID WE HAVE PROBLEMS LAST TIME?
+         BNE   SYNCPROB                NO, GOT WE WHAT THE OPCODE IS
+SLOOP1A  EQU   *
+         LA    R1,FIVESEC              WAIT 5 SECONDS FOR HIM
+         BAL   R10,STIMEIT             GO AND WAIT
+         BCT   R4,SLOOP1               BACK FOR MORE
+         WTO   MF=(E,WTO11)            ISSUE PRIMARY ADDR SPACE NOT UP
+         B     EOF                     TERMINATE
+MASTERUP EQU   *
+         MVI   OPCODE,X'03'            TELL HIS HIGHNESS WERE AROUND
+         BAL   R10,TIMEIT              GET DATE ALSO
+         ST    R1,DATE                 SAVE IT
+         BAL   R10,PUTIT               WRITE THE RECORD
+         BAL   R10,CHECKP              CHECK THE I/O
+         LA    R4,120                  WAIT NO LONGER THAN 2 MINUTES
+***********************************************************************
+*     WE NOW WAIT FOR HIS REPLY, IF HE RETURNS A 4, WE KNOW THAT HE   *
+*  WANTS US TO GIVE HIM OUR TIME. AN OPCODE OF 80 MEANS THAT THE      *
+*  DATES ARE OUTTA SYNC AND WE SHOULD TERMINATED.                     *
+***********************************************************************
+SLOOP2   EQU   *
+         LA    R1,ONESEC               WAIT ONE SECOND
+         BAL   R10,STIMEIT             WAIT
+         BAL   R10,GETIT               READ THE RECORD
+         BAL   R10,CHECKR              CHECK I/O
+         CLI   OPCODE,X'04'            ARE WE TO SEND HIM THE TIME?
+         BE    SENDTIME                YES
+         CLI   OPCODE,X'03'            DID HE READ THE RECORD YET
+         BE    SLOOP2A                 NO, KEEP LOOPING
+         CLI   OPCODE,X'80'            DATES OUTTA SYNC?
+         BE    DATEPROB                YES, TERMINATE
+         BNE   SYNCPROB                WE HAVE SYNC PROBLEMS
+SLOOP2A  EQU   *
+         BCT   R4,SLOOP2               LOOP BACK FOR MORE
+         B     COMMPROB                COMMUNICATIONS PROBLEM
+SENDTIME EQU   *
+         BAL   R10,TIMEIT              GET THE TIME
+         ST    R0,TIME                 STORE THE TIME
+         MVI   OPCODE,X'05'            ISSUE OPCODE FOR HIM
+         BAL   R10,PUTIT               STORE THE RECORD
+         BAL   R10,CHECKP              CHECK THE I/O
+         L     R4,=F'10000'            LOOP NO MORE THAN 10000 TIMES
+***********************************************************************
+*     WE NOW WAIT TO SEE IF WE SET OUR TIME, OR HE SETS HIS TIME.     *
+*  AN OPCODE OF 6 MEANS WE SET OURS AND AN OPCODE OF 7 MEANS HE WILL  *
+*  SET HIS.                                                           *
+***********************************************************************
+SLOOP3   EQU   *
+         BAL   R10,GETIT               READ THE RECORD
+         BAL   R10,CHECKR              CHECK I/O
+         CLI   OPCODE,X'06'            DO WE NEED TO SET TIME
+         BE    SETIT                   YES, SET THE TIME
+         CLI   OPCODE,X'07'            IS HE GOING TO SET HIS TIME
+         BE    HESET                   YES, TERMINATE
+         CLI   OPCODE,X'82'            TIMES CLOSE ENOUGH?
+         BE    NOSET                   YES, NEITHER TIMES ARE SET
+         CLI   OPCODE,X'81'            TIMES NOT CLOSE ENOUGH?
+         BE    TIMEPROB                YES, TIME PROBLEM
+         CLI   OPCODE,X'05'            STILL A 05?
+         BNE   SYNCPROB                WE HAVE SYNC PROBLEMS
+         LA    R1,MS20                 WAIT 20 MILLI SEC
+         BAL   R10,STIMEIT             WAIT
+         BCT   R4,SLOOP3               LOOP FOR MORE
+         B     COMMPROB                COMMUNICATIONS PROBLEM
+SETIT    EQU   *
+         BAL   R10,CMDMAKE             MAKE THE SET CLOCK CMD
+         BAL   R10,CMDEXEC             EXECUTE THE SET CLOCK
+         BAL   R10,CMDECHO             ECHO IT ON THE CONSOLE
+         B     TERM01                  QUIT
+NOSET    EQU   *
+         WTO   MF=(E,WTO05)            ISSUE TIME CLOSE ENOUGH
+         B     TERM01                  QUIT
+HESET    EQU   *
+         WTO   MF=(E,WTO06)            OTHER MACHINE ALTERED MSG
+         BAL   R10,CMDMAKE             CREATE THE SET CLOCK CMD
+         BAL   R10,CMDECHO             ECHO THE SET CMD ON THIS CONSOLE
+         TITLE 'CLOKSYNC -- CLOKSYNC -- SERVICE SUBROUTINES'
+TERM01   EQU   *
+         LA    R1,X'01'                RETURN OP CODE TO 01
+TERM     EQU   *
+         STC   R1,OPCODE               MOVE IN OPCODE FROM R1
+         BAL   R10,PUTIT               WRITE THE RECORD
+         BAL   R10,CHECKP              CHECK THE I/O
+EOF      EQU   *
+         CLOSE CLOKRAN                 CLOSE THE FILE
+         TM    FLAG1,F1ENQS            DO WE HAVE THE SLAVE ENQ?
+         BZ    EOF1                    NO, SKIP DEQ
+         DEQ   (QNAME,RNAMES,5,SYSTEMS)
+EOF1     EQU   *
+         TM    FLAG1,F1ENQM            DO WE HAVE THE MASTER ENQ?
+         BZ    EOJ                     NO, SKIP DEQ
+         DEQ   (QNAME,RNAMEM,6,SYSTEMS)
+***********************************************************************
+*     RETURN TO THE CALLER                                            *
+***********************************************************************
+EOJ      EQU   *
+         L     R13,4(R13)              RESTORE R13
+         LM    R14,R12,12(R13)         RESTORE REGS
+         SR    R15,R15                 ZERO RETURN CODE
+         BR    R14                     RETURN
+***********************************************************************
+*     WRITE A RECORD                                                  *
+***********************************************************************
+PUTIT    EQU   *
+         WRITE DECBP,DI,CLOKRAN,RECORD,'S',0,REC1
+         BR    R10
+***********************************************************************
+*     READ A RECORD                                                   *
+***********************************************************************
+GETIT    EQU   *
+         READ  DECBR,DI,CLOKRAN,RECORD,'S',0,REC1
+         BR    R10
+***********************************************************************
+*     CHECK THE WRITE OPERATION                                       *
+***********************************************************************
+CHECKP   EQU   *
+         CHECK DECBP                   CHECK I/O OPERATION
+         BR    R10
+***********************************************************************
+*     CHECK THE READ OPERATION                                        *
+***********************************************************************
+CHECKR   EQU   *
+         CHECK DECBR                   CHECK I/O OPERATION
+         BR    R10
+***********************************************************************
+*     GET THE LOCAL TIME                                              *
+***********************************************************************
+TIMEIT   EQU   *
+         TIME  BIN
+         BR    R10
+***********************************************************************
+*     WAIT FOR THE TIME AS SPECIFIED BY R1                            *
+***********************************************************************
+STIMEIT  EQU   *
+         STIMER WAIT,BINTVL=(R1)
+         BR    R10
+***********************************************************************
+*     CREATE THE    SET CLOCK=HH.MM.SS    COMMAND                     *
+***********************************************************************
+CMDMAKE  EQU   *
+         L     R5,TIME                 LOAD IN THE TIME
+         SR    R4,R4                   ZERO FOR DIVIDE
+         D     R4,=F'100'              GET TO SECONDS
+         SR    R4,R4                   ZERO FOR DIVIDE
+         D     R4,=F'3600'             GET HOURS
+         CVD   R5,DOUBLE               CONVERT
+         UNPK  DOUBLE(3),DOUBLE+6(2)   UNPAK IT
+         MVC   HRS(2),DOUBLE+1         MOVE INTO CMD
+         OI    HRS+1,X'F0'             MAKE IT READABLE
+         LR    R5,R4                   MOVE INTO ODD
+         SR    R4,R4                   ZERO EVEN
+         D     R4,=F'60'               GET MINUTES
+         CVD   R5,DOUBLE               CONVERT
+         UNPK  DOUBLE(3),DOUBLE+6(2)   UNPK IT
+         MVC   MIN(2),DOUBLE+1         MOVE INTO CMD
+         OI    MIN+1,X'F0'             MAKE IT READABLE
+         CVD   R4,DOUBLE               CONVERT
+         UNPK  DOUBLE(3),DOUBLE+6(2)   UNPAK IT
+         MVC   SEC(2),DOUBLE+1         MOVE INTO CMD
+         OI    SEC+1,X'F0'             BOY, THIS IS MONOTONOUS
+         BR    R10                     RETURN TO CALLER
+***********************************************************************
+*     ISSUE THE SET CLOCK=HH.MM.SS VIA SVC 34 UNLESS DEBUG SPECIFIED  *
+***********************************************************************
+CMDEXEC  EQU   *
+         TM    FLAGS,DEBUG             ARE WE JUST TESTING?
+         BOR   R10                     YES, RETURN
+         MODESET KEY=ZERO              NEED KEY ZERO FOR SVC 34
+         SR    R0,R0                   ZERO R0
+         LA    R1,TRESET               LOAD ADDR OF T RESET
+         SVC   34                      ISSUE THE CMD
+         SR    R0,R0                   ZERO R0
+         LA    R1,CMD                  LOAD ADDR OF COMMAND
+         SVC   34                      ISSUE THE CMD
+         MODESET KEY=NZERO             RETURN TO TCB KEY
+         WTO   MF=(E,WTO07)            ISSUE TIME ALTERED MSG
+         BR    R10                     RETURN TO CALLER
+***********************************************************************
+*     DISPLAY THE   SET CLOCK=HH.MM.SS   ON THE CONSOLE               *
+***********************************************************************
+CMDECHO  EQU   *
+         LA    R1,CMD                  LOAD ADDR OF COMMAND
+         SVC   35                      ECHO TIME SET ON CONSOLE
+         BR    R10
+***********************************************************************
+*     ERROR ROUTINES                                                  *
+***********************************************************************
+COMMPROB EQU   *
+         WTO   MF=(E,WTO08)            ISSUE COMM PROB MSG
+         LA    R1,X'FF'                LOAD THE TROUBLE FLAG
+         B     TERM
+SYNCPROB EQU   *
+         WTO   MF=(E,WTO09)            ISSUE SYNC PROB MSG
+         LA    R1,X'FF'                LOAD THE TROUBLE FLAG
+         B     TERM
+PARMPROB EQU   *
+         WTO   MF=(E,WTO10)            ISSUE PARM PROB MSG
+         B     EOJ
+DATEPROB EQU   *
+         WTO   MF=(E,WTO03)            ISSUE DATE PROBLEM MSG
+         B     TERM01                  TERMINATE
+TIMEPROB EQU   *
+         WTO   MF=(E,WTO04)            ISSUE TIMES NO CLOSE ENOUGH
+         B     TERM01                  TERMINATE WITH OPCODE 1
+         TITLE 'CLOKSYNC -- CLOKSYNC -- STORAGE AND CONSTANTS'
+SAVE     DS    18F                     REGISTER SAVE AREA
+         DS    0D
+DOUBLE   DS    D                       USED FOR CVD
+MS20     DC    F'2'                    20 MILLISECOND WAIT CONSTANT
+ONESEC   DC    F'100'                  ONE  SECOND WAIT CONSTANT
+FIVESEC  DC    F'500'                  FIVE SECOND WAIT CONSTANT
+FLAG1    DC    X'00'
+F1ENQM   EQU   1                       ENQ FOR THE MASTER
+F1ENQS   EQU   2                       ENQ FOR THE SLAVE
+QNAME    DC    CL8'CLOKSYNC'
+RNAMEM   DC    CL6'MASTER'
+RNAMES   DC    CL5'SLAVE'
+RECORD   EQU   *                       COMMUNICATION RECORD
+TIME     DC    F'0'                       DATE
+DATE     DC    F'0'                       TIME
+OPCODE   DC    X'01'                      OPCODE
+         DC    CL71' '                    FILLER
+DATEHERE DC    F'0'
+CMD      EQU   *                       SET CLOCK CMD
+         DC    AL2(CMDEND-CMD)
+         DC    AL2(0)
+         DC    C'SET CLOCK='
+HRS      DC    C'00.'
+MIN      DC    C'00.'
+SEC      DC    C'00    EXECUTED BY CLOKSYNC'
+CMDEND   EQU   *
+TRESET   DS    0F
+         DC    AL2(TRESETND-TRESET)
+         DC    AL2(0)
+         DC    C'SET RESET       EXECUTED BY CLOKSYNC'
+TRESETND EQU   *
+FLAGS    DC    F'0'                    OPTION FLAGS
+DEBUG    EQU   1                       FLAG - DON'T ISSUE CMD FOR REAL
+REC1     DC    X'000000'               THE 1ST RECORD
+R0       EQU   0    --------------------------------------------------
+R1       EQU   1     ****  *****  ***  *****  ****  ***** ***** ****
+R2       EQU   2     *   * *     *       *   *        *   *     *   *
+R3       EQU   3     ****  ***   * ***   *    ***     *   ***   ****
+R4       EQU   4     * *   *     *   *   *       *    *   *     * *
+R5       EQU   5     *  *  *****  ***  ***** ****     *   ***** *  *
+R6       EQU   6     -------------------------------------------------
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9     -------------------------------------------------
+R10      EQU   10    *****   ***   *   *    ***   *****  *****   ****
+R11      EQU   11    *      *   *  *   *   *   *    *    *      *
+R12      EQU   12    ***    *   *  *   *   *****    *    ***     ***
+R13      EQU   13    *      * * *  *   *   *   *    *    *          *
+R14      EQU   14    *****   ****   ***    *   *    *    *****  ****
+R15      EQU   15    -------------------------------------------------
+         LTORG
+         TITLE 'CLOKSYNC -- WTO MESSAGES'
+WTO00    WTO   'CLOKSYNC-00I - THE DATASET HAS BEEN FORMATED',MF=L
+WTO01    WTO   'CLOKSYNC-01E - INVALID FILE FORMAT, FORMAT FILE AND RESX
+               TART',MF=L,DESC=2
+WTO02    WTO   'CLOKSYNC-02E - SECONDARY ADDRESS SPACE NOT ACTIVE',    X
+               MF=L,DESC=2
+WTO03    WTO   'CLOKSYNC-03E - MACHINE DATES ARE NOT THE SAME',        X
+               MF=L,DESC=2
+WTO04    WTO   'CLOKSYNC-04E - TIMES ARE NOT WITHIN 5 MINUTES, CANNOT SX
+               YNC',DESC=2,MF=L
+WTO05    WTO   'CLOKSYNC-05I - TIMES CLOSE ENOUGH, TIME NOT ALTERED',  X
+               MF=L
+WTO06    WTO   'CLOKSYNC-06I - OTHER MACHINE''S TIME BEING ALTERED',   X
+               MF=L
+WTO07    WTO   'CLOKSYNC-07I - THIS MACHINE''S TIME BEING ALTERED',MF=L
+WTO08    WTO   'CLOKSYNC-08E - COMMUNICATIONS PROBLEM, FORMAT AND RESTAX
+               RT',MF=L,DESC=2
+WTO09    WTO   'CLOKSYNC-09E - SYNCHRONIZATION PROBLEM, FORMAT AND RESTX
+               ART',MF=L,DESC=2
+WTO10    WTO   'CLOKSYNC-10E - INVALID PARAMETER SUPPLIED',MF=L,DESC=2
+WTO11    WTO   'CLOKSYNC-11E - PRIMARY ADDRESS SPACE NOT ACTIVE',      X
+               MF=L,DESC=2
+WTO12    WTO   'CLOKSYNC-12I - ANOTHER PRIMARY ADDRESS SPACE ACTIVE',  X
+               MF=L
+WTO13    WTO   'CLOKSYNC-13I - ANOTHER SECONDARY ADDRESS SPACE ACTIVE',X
+               MF=L
+         TITLE 'CLOKSYNC -- DATA CONTROL BLOCKS'
+CLOKSEQ  DCB   DSORG=PS,MACRF=W,DDNAME=DISK,DEVD=DA,RECFM=F,BLKSIZE=80
+CLOKRAN  DCB   DSORG=DA,DDNAME=DISK,OPTCD=RF,MACRF=(RISC,WIC),BUFNO=1, X
+               BUFL=160,BLKSIZE=80,RECFM=F
+         END

@@ -1,0 +1,622 @@
+//SOMITCWT JOB (????????,????,1439,9999,9999),TAPESTAT-SOMITCW,
+//             CLASS=?,MSGCLASS=?,
+//             NOTIFY=SOMITCW,COND=(0,NE)
+//HLASMCL  EXEC HLASMCL,PARM.C=(NORENT,OBJECT,NODECK,TERM),
+//             PARM.L=NORENT
+//SYSLIB   DD  DISP=SHR,DSN=SYS1.MACLIB
+//         DD  DISP=SHR,DSN=SYS1.MODGEN
+PASS TITLE 'TAPESTAT - - - Extracts tape label info from tape labels'
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+* Start Change Log:
+*
+* 2006-10-13 Removed check for tape vol sers ending with 5 numbers.
+*  W.A.M.    Changed range processing to increment one digit at a
+*            time in case only the last digits are numeric.
+*
+* 2006-06-07 Moved all tapes back to their standard scratch areas.
+*  W.A.M.    B***** tapes go to /tapeB
+*            A***** tapes go to /tapeA
+*            All others go to /tapeC
+*
+* 2006-05-10 Moved "A" tapes except "A00" tapes from /tapeA to /tapeC
+*  W.A.M.
+*
+* 2006-02-25 Moved "B" tapes except "B00" tapes from /tapeB to /tapeC
+*  W.A.M.
+*
+* 2005-12-19 Changed program to unload tapes present after error.
+*  W.A.M.    Expanded output date format from YYDDD to YYYY.DDD
+*
+* 2005-10-21 Stop writing 'Empty' tape records.
+*  W.A.M.
+*
+* End Change Log:
+*
+*
+*  This program reads SYSIN to determine which tapes to read.
+*  It can read individual tapes, ranges of tapes, and both.
+*
+*  It will list information about the tape to a data set as:
+*  Error-*** - Leading tape mark, read error, etc.
+*  MisMatch - Internal vol ser not same as vol ser requested.
+*  No-Label - Two blocks of data before a label.
+*  Expired - Retention date past.  Data has not been cleared.
+*  Exp-Today - Retention date is today's date.
+*  Protected - Retention has not past.  Tape is date protected.
+*  Previously, it would also list:
+*  Empty - Freshly relabeled or data cleared. ( no longer written )
+*
+*  Output fields are:
+*  Vol ser requested
+*  Status
+*  Last 17 bytes of data set name
+*  Creation date
+*  Expiration date
+*  Internal vol ser if a mis-match, else blank
+*
+*
+* Some sample out records:
+*
+*   Tape C01111 called for but internal label is C02222
+* C01111 MisMatch  .SYSLOG.G1234V00 2003.001 2005.001 C02222
+*
+*   Tape C01122 is has expired but has not been erased
+* C01122 Expired   VSYSRES.G0123V00 2005.255 2005.285
+*
+*   Tape C01234 is date protected until 2007/301
+* C01234 Protected SMFDUMP.G0012V00 2005.301 2007.301
+*
+*  The output file can be used to find tape errors
+*  ( no label, vol ser mismatch, others? ).
+*
+*  The output can also be used to know what tapes have
+*  expired but have not been cleared to free space in
+*  the disk area tape pool.
+*
+*  This program will issue mount, rewind, read, read, and
+*  rewind-unload CCWs without opening any tape so SMF data
+*  will not be updated for any tape.
+*
+*  If there is an EXCP error, a separate SENSE CCW will
+*  be issued to clear any bad status on the tape drive.
+*  Sense is also checked to see if a separate
+*  Rewind-Unload is needed.  The separate Rewind-Unload
+*  is issued if sense indicates a tape is present on the
+*  drive.  An oddity in Flex-ES would cause it to unload
+*  the tape anyway when the next tape is called for.
+*
+* * * * See program TAPEZERO for additional use and JCL * * *
+*
+* * * * Possible future enhancement? * * *
+* Add parm of vol ser format mask, i.e. PARM=ANANNN
+* with "A" meaning alphabetic, "N" meaning numeric, $ for national?
+*
+*  Date-written: 2005-10-17
+*
+*  Blame: somitcw@yahoo.com
+*
+*     Sample JCL:
+*
+* //xxxxxxxT JOB (xxxxxxxx,xxxx,1439,9999,9999),TAPEZERJ-xxxxxxxx,
+* //         CLASS=x,MSGCLASS=x,
+* //         NOTIFY=xxxxxxx,COND=(0,NE)
+* //TAPESTAT EXEC PGM=TAPESTAT
+* //STEPLIB  DD  DISP=SHR,DSN=xxxx.APF.LOADxxxx
+* C00000-C00999
+* C01234
+* C02000-C02999
+* //TAPESTAT DD  UNIT=(TAPE,,DEFER)
+* //STATS    DD  DISP=(,CATLG,DELETE),DSN=????.TAPES.STATS(+1),
+* //             UNIT=SYSDA,SPACE=(TRK,(15,15),RLSE),
+* //             DCB=$,RECFM=FB,LRECL=59
+* //SYSUDUMP DD  SYSOUT=*
+*
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE 1
+TAPESTAT CSECT ,
+TAPESTAT AMODE 24                 Addressing mode of 24 for GET MACRO
+TAPESTAT RMODE 24                 Residency mode of 24 because of AMODE
+         USING *,R15              Set temporary base register
+         SAVE  (14,12),,'TAPESTAT.&SYSDATE..&SYSTIME' Save Registers
+         DROP  R15                Drop the temporary base register
+         LR    R12,R15            Load the program's base register
+         USING TAPESTAT,R12       Give the assembler the new base
+         LA    R0,WORKSIZE        Load work area size for GETMAIN
+         GETMAIN R,LV=(0)         Get storage for work space
+         XC    0(CLEARSIZ,R1),0(R1)  Clear SAVEAREA in DSECT
+         ST    R1,8(,R13)         Connect old and new save areas
+         ST    R13,4(,R1)         Connect old and new save areas
+         LR    R13,R1             Connect old and new save areas
+         USING SAVEAREA,R13
+         TIME  ,   0CYYDDDF       Get today's date in R1, time in R0
+         ST    R1,DWORK           Convert today's date to decimal
+         OI    DWORK+3,X'0F'      Correct the sign for numeric display
+         UNPK  TODAY,DWORK+1(3)   Unpack today's date in YYDDD format
+* If there was a real DCB, either RDJFCB or OPEN might be
+* better than searching the TIOT ?
+         EXTRACT TIOT,'S',FIELDS=TIOT  Get the tape I/O table address
+         L     R11,TIOT           Load address of the TIOT
+         LA    R11,24(,R11)       Bump past TIOT header
+         USING TIOENTRY,R11       Give assembler TIOT DD entry address
+         SLR   R10,R10            Clear a work register
+TIOTLOOP DS    0H
+         ICM   R10,B'0001',TIOELNGH  Load the length of the entry
+         BZ    NODD               TAPESTAT DD statement missing, abend
+         CLC   TIOEDDNM,TAPEDD    See if tape DDNAME found
+         BE    DDFOUND            DD found, go save UCB address
+         AR    R11,R10            Bump to the next TIOT DD entry
+         B     TIOTLOOP           Go back to check new DD entry
+DDFOUND  DS    0H
+         ICM   R11,B'0111',TIOEFSRT  Load tape DD UCB address
+         DROP  R11                Don't need TIOT entry address anymore
+         STCM  R11,B'0111',DEBUCB Store UCB address in DEB
+* R11 contains the UCB address
+         OPEN  SYSIN              OPEN the control statement data set
+         OPEN  (STATS,OUTPUT)     OPEN the output statistics file
+*
+* IOSINTRP to blow away OS/390 outstanding IOSB for the tape drive.
+* PURGE PURGE or PURGE QUIESCE might make more sense, but I use
+* IOSINTRP after an EXCP and before the WAIT for other tape access.
+*
+         MODESET MODE=SUP,KEY=ZERO  Switch to supervisor mode, key zero
+         L     R1,4(,R13)         Save old register 13 from IOSINTRP
+         IOSINTRP UCB=(R11)       Interrupt old tape I/O for new
+         MODESET MODE=PROB,KEY=NZERO Switch to problem state, key eight
+GET      DS    0H
+         GET   SYSIN              Read an input record
+         CLI   0(R1),X'5C'        See if a ( C'*' ) comment statement
+         BE    GET                Comment, do not process, return
+         CLI   0(R1),X'40'        See if vol ser starts blank
+         BE    GET                Consider comment, do not process
+         MVC   INPUT(13),0(R1)    Copy record to process
+* INPUT has 13 bytes like: C01234-C01345 or just one vol ser
+* dead   TRT   INPUT+1(5),TABLE   See if first vol ser is numeric
+* dead   BNZ   BADSYSIN           Invalid vol ser, go abend
+         CLI   INPUT+6,C'-'       See if a range of vol sers
+         BNE   GOTVOL             Not a range, skip validation for 2nd
+         CLC   INPUT(1),INPUT+7   See if valid range
+         BNE   BADSYSIN           Not valid range, go abend
+         CLC   INPUT+1(5),INPUT+8 See if low number vol ser first
+         BH    BADSYSIN           First number higher, go abend
+* dead   TRT   INPUT+8(5),TABLE   See if second vol ser is numeric
+* dead   BNZ   BADSYSIN           Invalid vol ser, skip
+GOTVOL   DS    0H
+         MVC   MOUNT1,INPUT       Complete file system to mount tape
+         MVC   MOUNT3,INPUT       Set directory to mount tape from
+         MVC   MOUNT6,INPUT       Set vol ser to mount
+         CLI   MOUNT1,C'B'        See if ????/???? main tape pool
+         BE    GOTVOL2            Pool name correct, skip other checks
+         CLI   MOUNT1,C'A'        See if ???????? main tape pool
+         BE    GOTVOL2            Pool name correct, skip other checks
+         MVI   MOUNT1,C'C'        Set ????/???? tape pool tape pool
+GOTVOL2  DS    0H
+         LA    R10,CCWREAD        Load address of normal tape read
+         ST    R10,IOBCCWA        Store CCW string address for EXCP
+         MVI   INVOL1,C'?'        Clear input VOL1 and HDR1 area
+         MVC   INVOL1+1(159),INVOL1  Clear input VOL1 and HDR1 area
+* read tape
+         XC    ECB,ECB            Clear any left over garbage in ECB
+         MODESET KEY=ZERO         PSW Key 0 for EXCP with own DEB
+         EXCP  IOB                Issue automountccw
+         TM    ECB,ECBPOST        Was ECB posted?
+         BO    NOWAIT             Already posted, skip WAIT SVC
+         WAIT  ECB=ECB            Wait for mount to complete
+NOWAIT   DS    0H
+         MODESET KEY=NZERO        Switch back to non-key zero ( 8 )
+         CLI   ECB,X'7F'          See if an error
+         BE    READOKAY           Bypass extra unload if no error
+         LA    R10,CCWSENSE       Load address of sense CCW string
+         ST    R10,IOBCCWA        Store CCW string address for EXCP
+         XC    ECB,ECB            Clear any left over garbage in ECB
+         MODESET KEY=ZERO         PSW Key 0 for EXCP with own DEB
+         EXCP  IOB                Issue sense CCW
+         TM    ECB,ECBPOST        Was ECB posted?
+         BO    NOWAIT2            Already posted, skip WAIT SVC
+         WAIT  ECB=ECB            Wait for sense to complete
+NOWAIT2  DS    0H
+         MODESET KEY=NZERO        Switch back to non-key zero ( 8 )
+         MVC   OUTSTAT,ERROR      Move 'Error-***' to output record
+         UNPK  SENSE00(9),SENSE+00(5)  Unpack first word of sense
+         UNPK  SENSE04(9),SENSE+04(5)  Unpack first word of sense
+         UNPK  SENSE08(9),SENSE+08(5)  Unpack first word of sense
+         UNPK  SENSE0C(9),SENSE+12(5)  Unpack first word of sense
+         UNPK  SENSE10(9),SENSE+16(5)  Unpack first word of sense
+         UNPK  SENSE14(9),SENSE+20(5)  Unpack first word of sense
+         UNPK  SENSE18(9),SENSE+24(5)  Unpack first word of sense
+         UNPK  SENSE1C(9),SENSE+28(5)  Unpack first word of sense
+         TR    SENSEOUT,TABLEEBC-240 Translate X'FA'-X'FF' to C'A'-C'F'
+         MVI   SENSE00+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE04+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE08+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE0C+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE10+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE14+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE18+8,X'40'    Space out garbage byte after UNPK/TR
+         MVI   SENSE1C+8,X'40'    Space out garbage byte after UNPK/TR
+         WTO   'TAPESTAT - Tape error encountered, detail follows:'
+         MVC   WTOVOL,INPUT       Move expected vol ser to display
+         WTO   MF=(E,WTOSENSE)    Display sense information
+*
+*  If SENSE+21 has the X'10' bit on, then a tape is mounted
+*  and this program will unload it.  Even if not unloaded,
+*  a Flex-ES flaw will cause it to unload when the next
+*  tape is requested.
+*
+*        TM    SENSE+21,X'10'     See if tape is present
+*        BZ    WRITE              No tape on drive, do not unload
+         TM    SENSE+00,X'40'     See if tape drive has Int.Req.
+         BO    WRITE              No tape on drive, do not unload
+         LA    R10,CCWRUN         Load address of sense CCW string
+         ST    R10,IOBCCWA        Store CCW string address for EXCP
+         XC    ECB,ECB            Clear any left over garbage in ECB
+         MODESET KEY=ZERO         PSW Key 0 for EXCP with own DEB
+         EXCP  IOB                Issue sense CCW
+         TM    ECB,ECBPOST        Was ECB posted?
+         BO    WRITE              Already posted, skip WAIT SVC
+         WAIT  ECB=ECB            Wait for sense to complete
+*
+NOWAIT3  DS    0H
+         MODESET KEY=NZERO        Switch back to non-key zero ( 8 )
+         WTO   'TAPESTAT - Tape unloaded',ROUTCDE=11
+         B     WRITE              Go complete and write output record
+*
+READOKAY DS    0H
+         CLC   VOL1,INVOL1        See if a standard label tape
+         BE    SL                 Is standard label, skip no-label
+         MVC   OUTSTAT,NOLABEL    Move 'No-Label ' to output record
+         B     WRITE              Go complete and write output record
+SL       DS    0H
+         CLC   INVOL,INPUT        See if vol ser requested was read
+         BE    MATCHED            Vol sers matched, skip MisMatch
+         MVC   OUTSTAT,MISMATCH   Move 'MisMatch ' to output record
+         MVC   OUTOTHER,INVOL     Move read vol ser to output record
+         B     WRITE              Go complete and write output record
+MATCHED  DS    0H
+         CLC   EMPTAPE,INDSN      See if an empty tape
+* Next line commented out 2005-10-21, to bypass writing "Empty"
+*        BE    NODATA             Is empty, go report to output file
+* Next line added 2005-10-21, to bypass writing "Empty" tape records
+         BE    WRITE3             Go skip writing output     2005-10-21
+         CLC   ZEROES,INDSN       See if initialized tape
+* Next line commented out 2005-10-21, to bypass writing "Empty"
+*        BE    NODATA             Is initialized, go report to output
+* Next line added 2005-10-21, to bypass writing "Empty" tape records
+         BE    WRITE3             Go skip writing output     2005-10-21
+* Warning, Century is ignored so tapes with an expiration
+* date of 1999.365 and 1999.366 will almost never expire.
+         CLC   TODAY,INEXPDT+1    See if tape data set has expired
+         BH    EXPTAPE            Tape expired before today, go report
+         BE    EXPNOW             Tape expires today, go report
+         MVC   OUTSTAT,PROTECTD   Move 'Protected ' to output record
+         B     WRITE              Go complete and write output record
+*                                 *
+* Next four lines commented out 2005-10-21, to bypass writing "Empty"
+* NODATA   DS    0H                 *
+*        MVC   OUTSTAT,EMPTY      Move 'Empty ' to output record
+*        MVC   OUTEXPDT,OUTEXPDT-1  Clear expiration date
+*        B     WRITE2             Go complete and write output record
+*                                 *
+EXPNOW   DS    0H                 *
+         MVC   OUTSTAT,EXPTODAY   Move 'Exp-Today ' to output record
+         B     WRITE              Go complete and write output record
+*                                 *
+EXPTAPE  DS    0H                 *
+         MVC   OUTSTAT,EXPIRED    Move 'Expired ' to output record
+*        B     WRITE              Go complete and write output record
+WRITE    DS    0H
+         MVI   OUTCREDT,C'2'      Assume a century 2000 date
+         MVC   OUTCREDT+1(3),INCREDT  Move creation year CYY
+         MVI   OUTCREDT+4,C'.'    Insert a period
+         MVC   OUTCREDT+5(3),INCREDT+3  Move creation day
+         CLI   INCREDT,X'40'      See if a space for century ( 1900 )
+         BNE   EXPDT              Not a 1900 year, go process EXPDT
+         MVC   OUTCREDT(2),C19    Move 1900 century to output CREDT
+EXPDT    DS    0H
+         MVI   OUTEXPDT,C'2'      Assume a century 2000 date
+         MVC   OUTEXPDT+1(3),INEXPDT  Move expiration year CYY
+         MVI   OUTEXPDT+4,C'.'    Insert a period
+         MVC   OUTEXPDT+5(3),INEXPDT+3  Move expiration day
+         CLI   INEXPDT,X'40'      See if a space for century ( 1900 )
+         BNE   WRITE2             Not a 1900 year, skip '19' move
+         MVC   OUTEXPDT(2),C19    Move 1900 century to output EXPDT
+WRITE2   DS    0H
+         MVC   OUTVOL,INPUT       Move volume being read
+         MVC   OUTDSN,INDSN       Move data set name read from tape
+         PUT   STATS,OUTREC       Write an output record
+* Next line added 2005-10-21, to bypass writing "Empty" tape records
+WRITE3   DS    0H                                            2005-10-21
+         MVC   OUTOTHER,OUTOTHER-1  Space out "other" data
+         CLI   INPUT+6,C'-'       See if a range of tapes
+         BNE   GET                Not a range, go get next SYSIN
+         CLC   INPUT(6),INPUT+7   See if range completed processing
+         BNL   GET                Range complete, go get next SYSIN
+* dead   PACK  DWORK(3),INPUT+1(5)  Convert the tape number to COMP-3
+* dead   AP    DWORK(3),P1        Add one to the tape number
+* dead   UNPK  INPUT+1(5),DWORK(3)  Store new tape number
+* dead   OI    INPUT+5,X'F0'      Correct sign
+         LA    R9,INPUT+5         Load addr.past last byte to increment
+NEXTAPE  DS    0H
+         TM    0(R9),X'09'        See if maximum number in a digit
+         BO    NEXTAPE2           Is last, go clear and back up
+         IC    R1,0(,R9)          Load the digit to increment
+         LA    R1,1(,R1)          Bump number/letter by one
+         STC   R1,0(,R9)          Store new digit
+         B     GOTVOL             Go process the next volume
+NEXTAPE2 DS    0H
+         NI    0(R9),X'F0'        Set digit to zero
+         BCTR  R9,0               Back up one byte
+         B     NEXTAPE            Go back to increment previous digit
+*
+* The end
+EODAD    DS    0H
+         CLOSE STATS              Close output date file
+         CLOSE SYSIN              Close control statement file
+         LA    R0,WORKSIZE        Load work area size for FREEMAIN
+         LR    R1,R13             Save work area location for FREEMAIN
+         L     R13,4(,R13)        Restore caller's save area address
+         FREEMAIN R,LV=(0),A=(1)  Free work area's storage
+         RETURN (14,12),RC=(15)   Return to caller with FREEMAIN retcde
+*
+NODD     DS    0H
+         WTO   'TAPESTAT - TAPESTAT DD statement missing.',ROUTCDE=11
+         WTO   'TAPESTAT - It should look something like:',ROUTCDE=11
+         WTO 'TAPESTAT - //TAPESTAT DD UNIT=(TAPE,32,DEFER)',ROUTCDE=11
+         WTO   'TAPESTAT - Program abending without a dump.',ROUTCDE=11
+         ABEND 1                  Abend without a dump
+*
+BADSYSIN DS    0H
+         WTO   'TAPESTAT - SYSIN control card is invalid.',ROUTCDE=11
+         MVC   BADSYSI2+19(13),INPUT    Move bad data to display
+BADSYSI2 WTO   'TAPESTAT - xxxxxx-yyyyyy in not valid.',ROUTCDE=11
+         WTO   'TAPESTAT - Valid control cards are needed.',ROUTCDE=11
+         WTO   'TAPESTAT - Volume Serial number in 1-6 or',ROUTCDE=11
+         WTO   'TAPESTAT - range in 1-6 and 8-13 with',ROUTCDE=11
+         WTO   'TAPESTAT - a dash between.',ROUTCDE=11
+         WTO   'TAPESTAT - 1st character of each matching.',ROUTCDE=11
+         WTO   'TAPESTAT - Program abending without a dump.',ROUTCDE=11
+         ABEND 2                  Abend without a dump
+*
+*
+C19      DC    CL2'19'            Constant for 1900-1999 century
+*
+EMPTAPE  DC    CL11'EMPTY.TAPE '  Empty tape data set name
+*
+ZEROES   DC    17C'0'             New initialized tape data set name
+*
+TODAY    DS    CL5                Date in YYDDD format
+*
+         DS    0D                 Align constants and work areas
+*
+SENSE    DS    XL32               Area to read sense information
+*
+WTOSENSE WTO   'Tape xxxxxx Sense: xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx-C
+               xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx-',ROUTCDE=11,MF=L
+         ORG   WTOSENSE+4         Back up the location counter
+         DC    CL5'Tape '         Part of WTO
+WTOVOL   DS    CL6                Vol ser of tape with error
+         DC    CL8' Sense: '      Part of WTO
+SENSEOUT DS    0CL72              Output display sense area
+SENSE00  DC    CL8'x',CL1' '      First word of sense in display format
+SENSE04  DC    CL8'x',CL1' '      Second word of sense in display
+SENSE08  DC    CL8'x',CL1' '      Third word of sense in display
+SENSE0C  DC    CL8'x',CL1' '      Fourth word of sense in display
+SENSE10  DC    CL8'x',CL1' '      Fifth word of sense in display format
+SENSE14  DC    CL8'x',CL1' '      Sixth word of sense in display
+SENSE18  DC    CL8'x',CL1' '      Seventh word of sense in display
+SENSE1C  DC    CL8'x',CL1' '      Eight word of sense in display
+         ORG   ,                  Resume with old location counter
+*
+         DS    0D                 Align constants and work areas
+*
+* dead TABLE    DC    256X'1'            Table to verify numeric
+* dead   ORG   TABLE+C'0'         Back up to display zero in table
+* dead   DC    10X'0'             Mark all numeric positions as valid
+* dead   ORG   ,                  Reset the location counter
+*
+TABLEEBC DC    CL16'0123456789ABCDEF'  Convert unpacked to display
+*
+TIOT     DS    F                  Task I/O Table address holder
+*
+VOL1     DC    CL4'VOL1'          Volume serial label begin
+*
+INVOL1   DS    CL80               Volume serial read in
+INVOL    EQU   INVOL1+4,6,C'C'    Input volume serial number
+INHDR1   DS    CL80               Header 1 label read in
+INDSN    EQU   INHDR1+4,17,C'C'   Data set name on tape
+* Note: C in INCREDT CYYDDD is blank for 1900, 0 for 2000, 1 for 2100
+INCREDT  EQU   INHDR1+41,6,C'C'   CYYDDD creation date read in
+INEXPDT  EQU   INHDR1+47,6,C'C'   CYYDDD expiration date read in
+*
+ERROR    DC    CL9'Error-***'     Message type for output file
+NOLABEL  DC    CL9'No-Label'      Message type for output file
+MISMATCH DC    CL9'MisMatch'      Message type for output file
+* Next line commented out 2005-10-21, to bypass writing "Empty"
+* EMPTY    DC    CL9'Empty'         Message type for output file
+EXPIRED  DC    CL9'Expired'       Message type for output file
+EXPTODAY DC    CL9'Exp-Today'     Message type for output file
+PROTECTD DC    CL9'Protected'     Message type for output file
+*
+P1       DC    PL1'1'             Constant for addition
+*
+INPUT    DS    CL13               Input volume or volume range
+*
+OUTREC   DS    0CL59
+OUTVOL   DS    CL6                Tape volume serial requested
+         DC    CL1' '             Space
+OUTSTAT  DS    CL9                Output Status of the tape volume
+* Error, MisMatch, No-Label, Empty, Expired, or Protected
+         DC    CL1' '             Space
+OUTDSN   DS    CL17               Data set name from the tape label
+         DC    CL1' '             Space
+OUTCREDT DS    CL8                Creation date in YYYY.DDD format
+         DC    CL1' '             Space
+OUTEXPDT DS    CL8                Expiration date in YYYY.DDD format
+         DC    CL1' '             Space
+OUTOTHER DC    CL6' '             Errors like internal vol ser, etc.
+*
+ECB      DC    F'0'               Event Control Block for EXCP
+ECBPOST  EQU   X'40'              Indicator that ECB was posted
+*
+*
+* TAPESTAT DEB
+         DS    0D                 Insure alignment
+DEBVT    DS    0XL20              Data Extent Appendage Vector Table
+         DC    A(PSARET-PSA)  0   I/O appendage end-of-extent
+         DC    A(PSARET-PSA)  4   I/O appendage Start I/O
+         DC    A(PSARET-PSA)  8   I/O appendage Pgm.Contl.Intr.
+         DC    A(PSARET-PSA) 12   I/O appendage Channel end
+         DC    A(PSARET-PSA) 16   I/O appendage Abnormal end
+* DEB Prefix table
+         DC    3A(0)       20     Reserved?
+         DC    XL1'06'     32     Number of double-words in DEB ( 06 )
+         DC    XL1'00'     33     Unknown Access method type
+         DC    H'0'        34     Offset in DEB table for this DEB
+DEB      DS    0XL36
+         DC    A(0)        36     Address of TCB for this DCB
+         DC    AL1(4)      40     4 bytes in Acc.Meth.Dependent section
+         DC    AL3(0)      41     Address of next DEB in chain
+         DC    X'C0000000' 44     DEBDISP new data set
+         DC    XL1'30'     48     DEBOPATB Data set positioning leave
+         DC    AL3(0)      49     Addr.of first IOB in purge chain
+         DC    A(0)        52     Pointer to related request
+         DC    A(0)        56     Address of locate parameter list
+         DC    XL1'0F'     60     Indicate a DEB
+         DC    AL3(DCB)    61     Address of DCB or ACB
+         DC    AL1(2)      64     Half-words in DEB dev.dependent sect.
+         DC    AL3(DEBVT)  65     Addr. I/O app. vector table DEBVT
+* DEB Device dependent secion
+         DC    XL1'00'     68     Tape Modeset   ? X'D3' ?
+DEBUCB   DC    AL3(*-*)    69     Address of UCB
+         DC    F'0'        72     ?
+         DC    F'0'        76     ?
+         DC    F'0'        80     ?
+*
+* TAPESTAT DCB
+DCB      DS    0D
+         DC    10F'0'             40 byte unused for EXCP foundation
+         DC    H'0'               TIOT offset
+         DC    B'11010000'        MACRF byte 1
+* DCBMRECP EQU   DCBBIT0        EXECUTE CHANNEL PROGRAM (EXCP) ---
+* DCBMRFE  EQU   DCBBIT1        FOUNDATION EXTENSION IS PRESENT (EXCP)
+* DCBMRCI  EQU   DCBBIT3        COMMON INTERFACE (EXCP)
+         DC    B'00001000'        MACRF byte 2
+* DCBMR5WD EQU   DCBBIT4        FIVE-WORD DEVICE INTERFACE (EXCP)
+         DC    A(DEB)             Address of the DEB
+         DC    X'10000000'        OFLGS last I/O operation was a write
+*        DC    X'00000000'        OFLGS last I/O operation was read
+         DC    5F'0'              5 word EXCP device interface
+*
+*
+* IOB - Input/Output Block
+IOB      DS    0D                 IOB to mount a tape
+         DC    XL4'42000000'  0   Command Chaining and nonsequential
+* IOBCMDCH EQU   X'40' -   COMMAND CHAINING USED IN CHANNEL PROGRAM
+* IOBUNREL EQU   X'02' -   IOB UNRELATED FLAG (I.E., NONSEQUENTIAL)
+         DC    XL1'7F'        4   Addr. of expected I/O completion code
+         DC    AL3(ECB)       5   Address of the ECB
+         DC    D'0'           8   Channel Status Word
+IOBCCWA  DC    A(*-*)        16   Address of the Channel Command Words
+         DC    A(DCB)        20   Address of the Data Control Block
+         DC    A(0)          24   IOB Restart
+         DC    XL4'00010000' 28   Flags and counters
+*   Don't know what the bit means.  DEBE had it, so why not use it?
+         DC    D'0'          32   Seek address MBBCCHHR ? ? ? ?
+*
+*
+* X'80' Data Chaining
+* X'40' Command Chaining
+* X'20' Suppress Incorrect Length
+* X'10' Skip data transfer
+* X'08' Program Controlled Interruption
+* X'04' Indirect Data Address Word
+*
+CCWREAD  CCW   X'4B',MOUNT,X'60',L'MOUNT  Mount tape CCW
+         CCW   X'07',0,X'60',1    Rewind the tape
+         CCW   X'02',INVOL1,X'60',80  Read the VOL1 label
+         CCW   X'02',INHDR1,X'60',80  Read the HDR1 label
+CCWRUN   CCW   X'0F',0,X'20',1    Rewind-unload the tape
+*
+CCWSENSE CCW   X'04',SENSE,X'20',32  Read sense information
+*
+* The sense is checked to see if a tape is still on the
+* drive to know if an unload is needed.  Tape sense byte 21
+* should have bit X'10' on if a tape is loaded.
+* Since Flex-ES will unload the tape when the next one
+* is called for, an unload is not required.  If the
+* last tape, the operating system will unload the tape.
+*
+MOUNT    DC    CL21'/tape?/???/??????.aws'  Mount command
+MOUNT1   EQU   MOUNT+5,1          Last byte of file-system name
+MOUNT3   EQU   MOUNT+7,3          First three bytes of tape VolSer
+MOUNT6   EQU   MOUNT+11,6         Tape VolSer
+*
+         EJECT ,
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*      Data Control Blocks Follow
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+SYSIN    DCB   DDNAME=SYSIN,DSORG=PS,MACRF=GL,RECFM=FB,EODAD=EODAD
+STATS    DCB   DDNAME=STATS,DSORG=PS,MACRF=PM,RECFM=FB,LRECL=59
+TAPEDD   DC    CL8'TAPESTAT'      DDNAME of tape
+TAPEDCB  DS    0D
+         EJECT ,
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*      DSECTs Follow
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE 1
+SAVEAREA DSECT ,
+         DS    9D                 Register save area
+CLEARSIZ EQU   *-SAVEAREA
+         SPACE 1
+*
+DWORK    DS    D                  Double word work area
+*
+WORKSIZE EQU   *-SAVEAREA
+*
+*
+*
+         DCBD  DSORG=PS,DEVD=DA   Map the Data Control Block
+*
+         IEFTIOT1 ,               Map the Task Input/Output Table
+*
+PSA      IHAPSA DSECT=YES         Prefix Storage Area
+*
+         CVT   DSECT=YES,LIST=YES Communication Vector Table
+*
+IOCSTUFF DSECT ,
+         IECDIOCM ,               I/O Communication area DSECT
+*
+*
+TAPESTAT CSECT ,
+         EJECT ,
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*     REGISTER EQUATES
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         SPACE
+R0       EQU   0                  Register equate for register 0
+R1       EQU   1                  Register equate for register 1
+R2       EQU   2                  Register equate for register 2
+R3       EQU   3                  Register equate for register 3
+R4       EQU   4                  Register equate for register 4
+R5       EQU   5                  Register equate for register 5
+R6       EQU   6                  Register equate for register 6
+R7       EQU   7                  Register equate for register 7
+R8       EQU   8                  Register equate for register 8
+R9       EQU   9                  Register equate for register 9
+R10      EQU   10                 Register equate for register 10
+R11      EQU   11                 Register equate for register 11
+R12      EQU   12                 Register equate for register 12
+R13      EQU   13                 Register equate for register 13
+R14      EQU   14                 Register equate for register 14
+R15      EQU   15                 Register equate for register 15
+         END   ,                  The end of the program
+//L.SYSLMOD DD DISP=SHR,DSN=????.LOAD????,SPACE=
+   SETCODE AC(1)
+   NAME TAPESTAT

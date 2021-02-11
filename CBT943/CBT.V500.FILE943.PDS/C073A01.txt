@@ -1,0 +1,121 @@
+A DFHTRAP for inefficient File Control coding
+
+After some performance problems in a complex application, I
+decided to trap all situations where strings and VSAM CI
+exclusive locks were being held for longer than absolutely
+necessary.  Many programmers code File Control calls which
+hold strings and locks and then rely on a syncpoint (coded or
+forced by end-of-task) to release them.  This can cause
+response time delays and, in extreme circumstances, can lead
+to deadly embraces.  The main offenders are READ for
+UPDATE, which should be followed by a REWRITE or
+UNLOCK; WRITE MASSINSERT, which should be followed
+by an UNLOCK; and STARTBR, which should be followed by
+an ENDBR.
+
+IBM even warns against STARTBR without an ENDBR on
+page 86 of the Application Programmer's Reference Manual
+SC33-0241-0 by pointing out that "unpredictable results may
+occur" - whatever that means.
+
+It is all too easy to miss this pairing.  For example, during a
+browse which had been added to a program, a READNEXT
+generates the ENDFILE condition and control is passed to a
+generalized HANDLE CONDITION routine which was
+originally designed to handle an ENDFILE from a READ,
+therefore no ENDBR is done.
+
+CICS cleans up strings and locks for abending tasks - these are
+not intercepted by the trap.  It is not necessary to perform
+string release operations if an EXEC CICS ABEND is issued,
+but they do have to be considered if HANDLE CONDITION
+ERROR/ABEND routines are used which do not result in a
+task abend or syncpoint (rollback).
+
+DFHTRAP is essentially an exit to the trace program
+(DFHTRP).  The code shown below is based on a simple
+premise: each string request to VSAM (eg STARTBR) causes a
+GETMAIN for a VSWA (task storage type X'8F'), and each
+string release operation (eg ENDBR) FREEMAINs this
+storage.  Therefore, if a VSWA is still on the task storage
+chain at a syncpoint, a string is held that could have been
+released earlier.
+
+A note for those poor souls still burdened with macro-level file
+control calls: it was not common practice amongst macro-level
+coders to FREEMAIN VSWA control blocks, especially near
+the end of the task.  Thus, this trap may be fired too often to
+make it useful in these circumstances.  Command level is
+typically over-efficient as it always FREEMAINs VSWAs at a
+string release operation.
+
+The code shown sets the flag to take a region dump, which is a
+bit heavy handed, but provides all the information to locate the
+offending dataset and task.  If I were less lazy, I would have
+constructed a nice message suitable for a WTO.
+
+The trap has been included in several CICS 1.7 production
+systems with no appreciable overhead and should work
+unchanged for CICS Version 2.  The principle applies equally
+to CICS Version 3, but owing to the restructure of both the
+trace entries and the VSWA chaining mechanism it will have to
+be recoded.
+
+A recent CICS Update article outlined the main principles of
+coding and operating DFHTRAP; suffice it now to refer the
+reader to the Problem Determination Guide, SC33-0242-0,
+page 113.
+
+
+DFHTRAP  CSECT
+         DFHREGS
+         COPY  DFHCSADS
+         DFHTCA CICSYST=YES
+         COPY  DFHTRADS
+         DFHTRACE TYPE=DSECT
+DFHTRAP  CSECT
+         DFHVM TRAP
+         ENTRY DFHTRANA
+DFHTRANA DS    0F
+         BALR  R3,0               BASE
+         USING *,R3
+         USING DFHTRADS,R1        R1 -> PARM LIST
+         L     R5,TRACURTA        CURRENT TRACE ENTRY
+         USING ZTRENTRY,R5
+         CLI   ZTRID,X'D8'        SYNCPOINT TRACE ?
+         BNE   TRAPRTN            NO, RETURN
+         TM    ZTRTR+1,X'03'      SYNCPOINT ENTRY ?
+         BNO   TRAPRTN            NO, RETURN
+         CLI   ZTRDATA1,X'03'     USER (01) OR SYSTEM (02) SYNCPOINT ?
+         BNL   TRAPRTN            NO, RETURN
+*
+* WE NOW HAVE A SYNCPOINT ENTRY TRACE, USER OR SYSTEM
+*
+         USING DFHSYTCA,R6
+         L     R6,TCASYAA         ADDRESS SYSTEM TCA
+         L     R7,TCASCCA         FIRST TASK STORAGE
+VSWSCAN  EQU   *
+         CLI   0(R7),X'8A'        BACK TO SYSTCA ?
+         BE    TRAPRTN            YES, RETURN
+         CLI   0(R7),X'8F'        FILE STORAGE ?
+         BNE   VSWCHN             EXIT IF NOT
+         CLI   11(R7),X'4C'       RPL/VSWA ?
+         BE    VSWBAD             EXIT IF IT IS
+VSWCHN   EQU   *
+         L     R7,4(R7)           NEXT TASK STORAGE
+         B     VSWSCAN            LOOP THROUGH ALL TASK STORAGE
+VSWBAD   EQU   *
+* WE HAVE A VSWA AT SYNCPOINT, BAD NEWS
+         L     R4,TRAFLGSA        ADDRESS RETURN ACTIONS FLAGWORD
+* CLEVER PROGRAMMERS CAN DO MORE EXCITING CODING HERE
+         OI    0(R4),TRAPDUMP     TAKE A DUMP
+TRAPRTN  EQU   *
+* CUT A FEW MICROSECONDS BY CODING REGISTER BRANCHES TO R14
+         BR    R14
+         LTORG
+         DFHEND DFHTRANA
+
+
+Melvyn Maltz
+Systems Programmer (UK)
+

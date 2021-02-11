@@ -1,0 +1,53 @@
+
+## $$$DOC.txt
+```
+SMP/E Helper Tools
+
+   This simple collection consists of 2 CLISTs, and 3 articles from
+"Technical Support" magazine, showing how to use them.  The CLISTs
+are:
+
+      PTF       -  A CLIST to browse PTFs using the REVIEW command
+                   from the CBT Tape (File 134).  The "database"
+                   containing your PTFs is none other than the
+                   SMPPTS dataset.  Therefore, it is advisable not
+                   to purge PTFs after you ACCEPT them.  In any
+                   case, you can at least look at the ones you have
+                   currently.
+
+      SMPCLIST  -  This invokes SMP/E in the foreground as if it
+                   were running in background.  You enter background
+                   commands on the terminal, and GIMSMP's results
+                   are displayed line-by-line, on the terminal.
+                   Logging can be turned on or off.  Look at the
+                   CLIST to see the options.  I use this CLIST to
+                   make certain kinds of inquiries that are not
+                   easily made with the SMP/E ISPF interface.  Also,
+                   I use this CLIST to do UCLIN interactively, using
+                   LIST commands to check my work.
+
+                   Note - This CLIST was originally in VB-Lrecl 255
+                          format, and was converted to FB-Lrecl 80
+                          format by the clist conversion program on
+                          File 187 of the CBT Tape.  Therefore many
+                          of the long lines have been folded over.
+
+
+I have written several articles for "Technical Support" magazine
+regarding these CLISTS.  #ARTPTF is an article about the PTF clist.
+#ARTSMPC is about the SMPCLIST clist.  #ARTEXMP describes cases
+in which both clists were put to practical use.
+
+If you have any questions or inquiries on this material, please
+contact:
+
+       Sam Golob
+       P.O. Box 906
+       Tallman, NY 10982-0906
+
+    email:  sbgolob@attglobal.net  and/or  sbgolob@aol.com
+
+Good Luck.
+
+```
+

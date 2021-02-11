@@ -1,0 +1,215 @@
+Timestamping a DASD volume
+
+We often need to copy volumes and keep track of when this
+was done. We do this for two reasons: to copy a SYSRES to
+apply maintenance and to create a 'clone' system. A reliable
+method was required to 'timestamp' the volume, regardless of
+what it was clipped to.
+
+The first option I looked at was to put the information in the
+VTOC. There is a 9-byte reserved field in the format-4 DSCB
+which looked tempting as it has never been used, but in the end
+I decided against this.
+
+We solved the problem by writing a program to allocate a
+dataset of zero size on the volume, with date and time
+information in the name. The program also deletes previous
+versions of the dataset, but this is optional, and may not be
+desirable at all sites.
+
+We run this COPYDATE program, parts of which are shown
+below, as the second step of a DSS volume copy job, but it
+might also be used in a one-step implementation, if adapted to
+link to ADRDSSU.
+
+
+SAMPLE JCL
+
+//DSS     EXEC PGM=ADRDSSU,REGION=4M
+//SYSPRINT DD SYSOUT=*
+//OLDRES   DD VOL=REF=SYS1.PARMLIB,DISP=OLD  (CURRENT SYSRES)
+//NEWRES   DD UNIT=AFF=OLDRES,VOL=(PRIVATE,SER=ZVS00S),DISP=OLD
+//SYSIN    DD *
+   COPY INDD(OLDRES) OUTDD(NEWRES) PURGE
+//*
+//*   STAMP THE VOLUME
+//*
+//STAMP   EXEC PGM=COPYDATE             (,PARM=NOSCRATCH)
+//VTOC     DD VOL=REF=*.DSS.NEWRES,DISP=OLD
+//SYSPRINT DD  SYSOUT=*
+
+
+THE CODE
+
+I have omitted standard linkages etc as I know people have
+their own local standards. The first bit of code just opens the
+VTOC (which has the 44-byte dataset name X'0404...04'):
+
+START    LA    R11,CVPL#DEF
+         USING CVPL#MAP,R11
+*---           READ IN THE JFCB                                   ---*
+         RDJFCB VTOC                   READ THE JFCB
+         USING INFMJFCB,R2             ESTABLISH ADDRESSABILITY
+         LA    R2,JFCBAREA             POINT TO JFCB
+         LTR   R15,R15                 TEST IF DD CARD PRESENT
+         BNZ   ERROR1                  DD CARD IS PRESENT
+*---           OPEN THE VTOC                                     ---*
+DDOK     MVI   JFCBDSNM,X'04'          CREATE DSNAME
+         MVC   JFCBDSNM+1(43),JFCBDSNM    - 44X'04'
+         OI    JFCBTSDM,JFCNWRIT       DO NOT WRITE JFCB DURING OPEN
+         MVC   VOLUME,JFCBVOLS         SAVE VOLUME SERIAL NUMBER
+         DROP  R2
+         CLC   =C'NOSCRATCH',PARM
+         BE    DYN
+         OPEN  (VTOC,(INPUT)),TYPE=J
+
+The next bit initializes the Buffer Criteria List and Filter List
+for the CVAFFILT macro. The code was largely taken from
+the sample in the manual. (I have allowed for deleting up to
+three previous versions in one run of the program - see the
+value of BFLE#N in the data areas, below.)
+
+*--- INITIALIZE THE BUFFER LIST HEADER (BFLH) AND ELEMENTS (BFLE)
+DO       XC    BFLH#DEF(BFL#SIZE),BFLH#DEF  SET BUFR LIST AREA TO ZERO
+         LA    R1,BFLH#DEF           R1 -> BUFFER LIST HEADER
+         USING BFL#MAP,R1            ESTABLISH ADDRESSABILITY
+         MVI   BFLHNOE,BFLE#N        SET NUMBER OF BUFFER ELEMENTS
+         OI    BFLHFL,BFLHDSCB       IDENTIFY AS DSCB BUFR ELEMNT LIST
+         LA    R2,BFLH#DEF+BFLHLN    R2 -> FIRST BUFFER LIST ELEMENT
+         USING BFLE,R2               ESTABLISH ADDRESSABILITY
+         LA    R3,DSCB#DEF           R3 -> FIRST DSCB BUFFER
+         LA    R4,BFLE#N             R4 = NUMBER OF ELEMENTS AND BUFRS
+BFLE#INT OI    BFLEFL,BFLECHR        REQUEST CCHHR ON RETURN
+         MVI   BFLELTH,DSCB#SIZ      SET BUFR LNGTH TO FULL DSCB SIZE
+         ST    R3,BFLEBUF            SET ADDR(DSCB BUFFER)
+         LA    R2,BFLELN(R2)         R2 -> NEXT BUFFER LIST ELEMENT
+         LA    R3,DSCB#SIZ(R3)       R3 -> NEXT DSCB BUFFER
+         BCT   R4,BFLE#INT           LOOP THROUGH ALL ELEMENTS
+         DROP  R1,R2                 DROP TEMP USING
+*--- INITIALIZE THE FILTER CRITERIA LIST (FCL) HEADER AND ELEMENT
+         XC    FCL#DEF(FCL#SIZE),FCL#DEF  SET FCL AREA TO ZERO
+         LA    R1,FCL#DEF            R1 -> FCL HEADER
+         USING FCL#MAP,R1            ESTABLISH ADDRESSABILITY
+         MVC   FCLID,FCL#ID          SET THE EYECATCHER 'FCL '
+         MVC   FCLCOUNT,=H'1'        SET NUMBER OF FCL ELEMENTS
+         LA    R2,FCLHDEND           R2 -> FIRST (ONLY) FCL ELEMENT
+         USING FCLDSN,R2             ESTABLISH ADDRESSABILITY
+         MVI   FCLDSNLG,X'10'        SET LENGTH(DSN PATTERN) 16
+         LA    R3,DSNPREF            R3 -> HLQ
+         ST    R3,FCLDSNA            SET ADDR(DSN PATTERN)
+         L     R3,VTOC+DCBDEBAD-IHADCB
+         ST    R3,CVDEB
+         CVAFFILT ACCESS=READ,FCL=FCL#DEF,BUFLIST=BFLH#DEF,          X
+               MF=(E,CVPL#DEF)
+TEST#RET LTR   R15,R15               IF DSCB RETURN IS COMPLETE
+         BZ    DELETE     ****          GO COUNT LAST SET OF DSCBS
+
+Now we delete the dataset:
+
+DELETE   EQU   *
+         CLOSE (VTOC)
+         SR    R0,R0
+         CLC   DSCB#DEF,=X'00'            TEST DSNAME
+         BE    DYN
+         MVC   SCRDSN(30),DSCB#DEF        GET DSNAME
+         MVC   SCRVOL,VOLUME              GET VOLSER
+         SCRATCH SCRCAM
+         ST    R15,REG15               STORE  RETURN CODE
+         LTR   R15,R15                 RETURN OK ?
+         BNZ   ERROR5                  BRANCH IF ZERO
+
+Finally, the important bit. We dynamically allocate the
+timestamp dataset. We use the name
+SYS1.COPYDATE.DYYJJJ.THHMMSS:
+
+DYN      MVC   DS99DSN(14),DSNPREF       DSNAME FOR SVC99
+         TIME  DEC,TIMEDATE,LINKAGE=SYSTEM,DATETYPE=YYYYDDD
+         UNPK  DS99DSN+15(8),DATE(5)
+         MVC   DS99DSN+13(2),=C'.D'
+         UNPK  DS99DSN+24(7),TIME(4)
+         MVC   DS99DSN+22(2),=C'.T'
+         MVI   DS99DSN+30,C' '
+         MVC   DS99VOL,VOLUME            SAVE VOLUME SERIAL NUMBER
+         LA    R1,S99RBP               => REQ BLK PTR
+         SVC   99                      DYN ALLOC THE DUMP
+         ST    R15,REG15               STORE SVC 99 RETURN CODE
+         LTR   R15,R15                 DYNALLOC OK ?
+         BNZ   ERROR4                  BRANCH IF NOT ZERO
+         B     DONE       ****       ELSE GO COUNT CURRENT DSCB SET
+
+The data areas you may need are as follows:
+
+VTOC     DCB   DDNAME=VTOC,DSORG=PS,RECFM=U,KEYLEN=44,BLKSIZE=96,    X
+               MACRF=(R),EXLST=RDJFLIST,EODAD=CLOSE
+RDJFLIST DC    X'87',AL3(JFCBAREA)
+JFCBAREA DC    176X'0'
+TIMEDATE DS    4F  HHMMSSTHMIJU0000 YYYYDDD
+TIME     EQU   TIMEDATE,6
+DATE     EQU   TIMEDATE+8,8
+DSNPREF  DC    C'SYS1.COPYDATE.**'
+VOLUME   DS    CL6
+REG15    DS    F
+MVCHARS  MVC   PARM(0),0(R3)
+PARM     DC    CL9' '
+SCRCAM   CAMLST SCRATCH,SCRDSN,,SCRVOLP,,OVRD
+SCRDSN   DC    CL44' '
+SCRVOLP  DC    H'1'
+         DC    X'3030200E'           3380 DEVICES
+SCRVOL   DC    CL6' '
+         DC    H'0'
+*              FIELDS FOR DYNAMIC DSNAME ALLOCATION
+         DS    0F
+S99RBP   DC    XL1'80',AL3(S99RB)    SVC 99 RB POINTER
+S99RB    DS    0F                    SVC 99 REQUEST BLK (MAC IEFZB4D0)
+         DC    XL1'14'               S99RBLN
+         DC    XL1'01'               S99VERB (01=DSNAME ALLOCATION)
+         DC    H'0'                  S99FLAG1
+         DC    F'0'                  S99ERROR/S99INFO
+         DC    A(DS99TUPL)           => TEXT UNIT POINTERS
+         DC    2F'0'                 EXTENSION & FLAGS2
+*              SVC99 TEXT UNIT POINTERS FOR DSNAME ALLOCATION
+DS99TUPL DS    0A                    SVC 99 TEXT UNIT POINTERS
+         DC    A(DS9A)                TU PTR, DSNAME
+         DC    A(DS9B)
+         DC    A(DS9C)
+         DC    A(DS9D)
+         DC    A(DS9E)
+         DC    A(DS9F)
+         DC    XL1'80',AL3(DS9G) TU PTR, DISP
+*              SVC99 TEXT UNITS: DSNAME ALLOCATION
+DS9A     DC    H'02',H'1',H'44'        DSN (NEXT LINE)
+DS99DSN  DC    CL44' '                 ACTUAL DSNAME
+DS9B     DC    H'04',H'1',H'1',X'04'   DISP=NEW
+DS9C     DC    H'05',H'1',H'1',X'08'           ,KEEP
+DS9D     DC    H'07',H'0'              TRKS
+DS9E     DC    H'10',H'1',H'3',XL3'0'      ,0
+DS9F     DC    H'16',H'1',H'6'         VOLSER (NEXT LINE)
+DS99VOL  DS    XL6'0'                  ACTUAL VOLSER
+DS9G     DC    H'21',H'1',H'8',CL8'SYSALLDA' UNIT
+*---     SPACE ALLOCATION FOR CVPL, FCL, BFL, AND DSCB BUFFERS
+CVPL#DEF CVAFFILT MF=L,BRANCH=NO,FLTAREA=KEEP
+FCL#ID   DC    CL4'FCL '
+FCL#DEF  DS    (FCLHDLEN+FCLDSNEL)X   FCL HEADER AND ONE FCL ELEMENT
+FCL#SIZE EQU   *-FCL#DEF
+BFLE#N   EQU   3   NUMBER OF BUFFER LIST ELEMENTS AND BUFFERS DESIRED
+* DEFINE A CVAF BUFFER LIST WITH N BUFFER LIST ELEMENTS
+BFLH#DEF DS    (BFLHLN)X           BUFFER LIST HEADER
+         DS    (BFLE#N*BFLELN)X    BUFFER LIST ELEMENTS
+BFL#SIZE EQU   *-BFLH#DEF
+* DEFINE N FULL DSCB BUFFERS
+DSCB#DEF DS    (BFLE#N*DSCB#SIZ)X    N DSCBS
+CVPL#MAP ICVAFPL CVPLFSA=YES
+FCL#MAP  ICVFCL
+BFL#MAP  ICVAFBFL
+DSCB#MAP DSECT
+         IECSDSL1 (1)     USE FORMAT 1 DSCB MAPPING TO GET BUFFER SIZE
+DSCB#SIZ EQU   *-IECSDSL1     LENGTH OF FULL DSCB
+JFCB     DSECT
+         IEFJFCBN
+DCBD     DCBD  DSORG=PS,DEVD=DA
+
+
+Clive Russell
+Senior Systems Programmer
+M & G Group (UK)                                       c M & G Group 1993
+

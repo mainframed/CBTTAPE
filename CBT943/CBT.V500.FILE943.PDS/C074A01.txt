@@ -1,0 +1,530 @@
+Programmed shut-down for CICS 3.1
+
+A frequent operational problem with CICS systems is 'sticky'
+shut-down, where a 'hung' task or terminal prevents CICS
+shutting down after the CEMT P SHUT command.  A skilled
+operator can, with patience, find and purge the stuck resources,
+but impatient or inexperienced operators often cancel the
+region, leaving a legacy of recovery problems if the region is
+subsequently cold started.  If a CICS region is cancelled while
+it has stuck DB2 threads, the subsequent restart status of the
+region is particularly important.
+
+The new CICS System Programming (SP) interface for CICS
+3.1 allowed me to write a simple program, SSHUT, to resolve
+most shut-down problems.  If it cannot resolve a problem, the
+program will issue diagnostics and operator messages to help
+ensure that the appropriate operator or programmer action is
+taken.  It should be noted that SSHUT does not attempt the
+sledgehammer (FORCEPURGE) approach for stuck resources,
+since this would create further recovery problems.
+
+There should be two entries in the PLT for SSHUT: for PLTSD
+stage 1 and stage 2 (it should be the last entry at both stages).
+SSHUT first issues an INQUIRE SYSTEM command to see
+what stage CICS is at.  If SSHUT gets control at stage 1, it
+takes the following actions:
+
+1      Waits 15 seconds to allow tasks to complete.
+
+2      Lists all active tasks (using the SP command INQUIRE
+      TASK LIST).
+
+3      Performs a PURGE (but not a FORCEPURGE) for any
+      active user tasks, issuing a message for both successful and
+      unsuccessful PURGEs.  This uses the SP command SET TASK.
+
+4      Performs a PURGE (but not a FORCEPURGE) for any
+      acquired terminals, setting any printers 'out of service'
+      using the SP command SET TERMINAL.  A message is
+      issued for failed PURGEs.  Note that printers will need to
+      be set back in service by the program if the TCT is not
+      cold started.
+
+5      Issues a SET VTAM FORCE command to disconnect
+      VTAM.  This should clean up any stuck terminals.
+
+6      Lists the numbers of purged tasks and terminals.
+
+If SSHUT gets control at stage 2 of PLTSD, it takes these actions:
+
+1      If any tasks are still active, lists them (to assist diagnosis)
+      and warns the operator that a cold start should not be
+      attempted for the first restart after cancelling.
+
+2      If DB2 is still active, it takes the following series of actions:
+
+      a      Waits 15 seconds.
+
+      b      Checks the DB2 status.  If it is inactive or more that
+            ten waits have occurred, it goes to  step c, otherwise it
+            returns to step a.
+
+      c      Issues a message asking the operator to cancel CICS
+            and call DB2 support to deal with stuck threads.
+
+
+SOURCE CODE
+
+         TITLE 'SSHUT - SHUTS DOWN CICS AS GRACEFULLY AS POSSIBLE'
+* SSHUT GETS CONTROL DURING PLTSD PROCESSING - CICS 3.1
+* LOGIC OVERVIEW
+* INITIALIZE
+* IF CICS NOT IN SHUTDOWN STAGE 1 OR 2, EXIT
+* WAIT 15 SECS (GIVES OTHER TASKS A CHANCE TO COMPLETE)
+* ISSUE 'INQUIRE TASK LIST' COMMAND
+* DO UNTIL END OF TASKS
+*    IF SHUTDOWN STAGE 1
+*       IF TASK NOT SYSTEM TASK AND NOT DB2 AND NOT THIS TASK
+*          PURGE TASK ( ** DON'T FORCEPURGE **)
+*          NOTIFY NAME OF PURGED TRANSACTION
+*       ENDIF
+*    ELSE (SHUTDOWN STAGE 2)
+*       NOTIFY NAMES OF ALL ACTIVE TRANSACTIONS
+*       IF DB2 ACTIVE
+*          DO 10 TIMES OR UNTIL DB2 INACTIVE
+*             ISSUE OPS MSG 'DO NOT SHUTDOWN YET'
+*             WAIT 15 SECS
+*          END
+*          IF DB2 STILL ACTIVE ISSUE 'NOTIFY DB2 SUPPORT' MSG
+*       ENDIF
+*    ENDIF
+*    BUMP TASK PTR
+* ENDDO
+* IF SHUTDOWN STAGE 1
+*    START BROWSE OF TERMINALS
+*    DO UNTIL END OF TERMINALS
+*       GET NEXT TERMINAL NAME
+*    IF TERMINAL IN SERVICE, PURGE IT
+*    ENDDO
+*    SAY HOW MANY TASKS, TERMINALS WERE PURGED
+*    FIND VTAM STATUS
+*    IF VTAM OPEN OR CLOSING, FORCECLOSE IT
+* ENDIF
+TASKCNT  EQU   4                    TASKS PURGED
+TERMCNT  EQU   5                    TERMINALS PURGED
+LINK     EQU   8                    LINK REGISTER
+CODEREG  EQU   9
+DATAREG  EQU   10
+EIBREG   EQU   11
+DFHEISTG DSECT
+RC       DS    F                    CICS COMMAND RESPONSE FIELDS
+RCSAVE   DS    F
+RESP2    DS    F
+RESP2SAV DS    F
+DEVICE   DS    F                    TERMINAL DEVICE TYPE
+TASK     DS    PL4                  TASK ID
+NOTASKS  DS    F                    NUMBER OF TASKS
+TRANS    DS    F                    TRANSACTION NAME
+STATUS   DS    F                    CICS SHUTDOWN STATUS
+TSTAT    DS    F                    TERMINAL STATUS
+VSTAT    DS    F                    VTAM STATUS
+PTYPE    DS    F                    PURGETYPE
+TERMINAL DS    F                    TERMINAL NAME
+OPLEN    DS    F                    OPS MSG LENGTH
+         ORG   OPLEN+2
+TDLEN    DS    H                    WRITEQ TD LENGTH
+MSGFILL DS     CL3
+MSGPREF DS     CL11                 CSMT MSG AREA PREFIX
+         ORG   MSGPREF+6
+MSGNO    DS    CL2                  MSG NO
+         ORG   MSGPREF+L'MSGPREF
+MSG      DS    CL45                 CSMT MSG AREA
+RSA1     DS    F                    REGISTER SAVE AREA 1
+RSA2     DS    F                    REGISTER SAVE AREA 2
+RSA3     DS    F                    REGISTER SAVE AREA 3
+RSA4     DS    F                    REGISTER SAVE AREA 4
+RSA5     DS    F                    REGISTER SAVE AREA 5
+RSA6     DS    F                    REGISTER SAVE AREA 6
+RSA7     DS    F                    REGISTER SAVE AREA 7
+RSA8     DS    F                    REGISTER SAVE AREA 8
+RSA9     DS    F                    REGISTER SAVE AREA 9
+WORK4    DS    F                    WORK FIELDS FOR CONVERSION
+WORKD    DS    D
+WORK10   DS    CL10
+WORK16   DS    XL16
+DB2COMM  DS    0F                   CSDB2UP COMMAREA
+DB2REQ   DS    CL1                  REQUEST CODE - 'C' OR 'A'
+DB2RC    DS    CL1                  RETURN CODE - 'Y' OR 'N'
+SSHUT DFHEIENT CODEREG=(9),DATAREG=(10),EIBREG=(11)
+         EXEC  CICS HANDLE ABEND LABEL(EXITPGM)
+* INITIALIZE
+         XR    TASKCNT,TASKCNT               INIT PURGE COUNT
+         XR    TERMCNT,TERMCNT               INIT PURGE COUNT
+         XC    OPLEN,OPLEN
+         MVC   TDLEN,=AL2(L'MSGPREF+L'MSG)   SET MSG LENGTH
+         MVC   MSG,BLANK50                   SET MSGAREA TO BLANKS
+         MVC   MSGFILL,=CL3' '
+         MVC   MSGPREF(L'PREFIX),PREFIX      MOVE IN PREFIX
+* FIND CICS STATUS
+         EXEC  CICS INQUIRE SYSTEM CICSSTATUS(STATUS)                  +
+               RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                     CHECK RETURN CODE
+         BE    NOSYS                          IF BAD, TELL & EXIT
+* IF CICS IN STAGE 2 SHUTDOWN, LIST ACTIVE TASKS AND
+* CHECK IF DB2 ACTIVE
+         CLC   STATUS,DFHVALUE(FIRSTQUIESCE)  PLT SD STAGE 1 ?
+         BE    STAGE1                         YES, PROCESS
+         CLC   STATUS,DFHVALUE(FINALQUIESCE)  PLT SD STAGE 2 ?
+         BNE   EXITPGM                        NO, EXIT NOW
+STAGE2   DS    0H
+         BAS   LINK,SCANTASK                  LIST TASKS
+         BAS   LINK,DB2UP                     DB2 UP ?
+         LTR   R1,R1
+         BZ    EXITPGM                        NO, EXIT
+         BAS   LINK,DB2PROC                   DB2 PROCESSING
+         B     EXITPGM                        AND EXIT
+* STAGE 1 SHUTDOWN
+* WAIT 15 SECONDS BEFORE PURGING TASKS (ALLOWS PREVIOUS STAGE 1
+* PROGRAMS TO COMPLETE).
+STAGE1   DS    0H
+         MVC   MSGNO,=CL2'01'
+         MVC   MSG(31),=CL31'PURGING TASKS IN 15 SECONDS ...'
+         BAS   LINK,PUTMSG
+         EXEC  CICS DELAY INTERVAL(15) REQID('SSHUT')                  +
+               RESP(RC) RESP2(RESP2)
+* SCAN ALL TASKS, PURGING THEM
+         BAS   LINK,SCANTASK
+* SCAN ALL TERMINALS, PURGING THEM
+         BAS   LINK,SCANTERM
+* SAY HOW MANY TASKS WERE PURGED
+         MVC   MSGNO,=CL2'02'                MSG NO
+         LTR   R1,TASKCNT                    ANY PURGED ?
+         BNZ   GOTTASK                       YES, SAY HOW MANY
+         MVC   MSG(15),=CL15'NO TASKS PURGED'
+         B     TELLTASK
+GOTTASK  DS    0H
+         BAS   LINK,CONVERTD                 CONVERT TO DECIMAL
+         MVC   MSG(4),WORK16+L'WORK16-4
+         MVC   MSG+4(13),=CL13' TASKS PURGED'
+TELLTASK DS    0H
+         BAS   LINK,PUTMSG
+* SAY HOW MANY TERMINALS WERE PURGED
+         MVC   MSGNO,=CL2'03'                 SET MSG NO
+         LTR   R1,TERMCNT                     ANY PURGED ?
+         BNZ   GOTTERM                        YES, SAY HOW MANY
+         MVC   MSG(19),=CL19'NO TERMINALS PURGED'
+         B     TELLTERM
+GOTTERM  DS    0H
+         BAS   LINK,CONVERTD                  CONVERT TO DECIMAL
+         MVC   MSG(4),WORK16+L'WORK16-4
+         MVC   MSG+4(17),=CL17' TERMINALS PURGED'
+TELLTERM DS    0H
+         BAS   LINK,PUTMSG
+* FIND VTAM STATUS
+         EXEC  CICS INQUIRE VTAM OPENSTATUS(VSTAT) RESP(RC)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    BADVTAM                     GO IF PROBLEM
+* DISCONNECT VTAM IF OPEN OR CLOSING
+         CLC   VSTAT,DFHVALUE(OPEN)           VTAM OPEN ?
+         BE    DISCONN                        YES, END IT
+         CLC   VSTAT,DFHVALUE(CLOSING)        VTAM CLOSING ?
+         BNE   EXITPGM                        NO, QUIT NOW
+DISCONN  DS    0H
+         MVC   VSTAT,DFHVALUE(FORCECLOSE)     FORCE VTAM OFF
+         EXEC  CICS SET VTAM OPENSTATUS(VSTAT) RESP(RC)
+         MVC   MSGNO,=CL2'04'
+         MVC   MSG(17),=CL17'VTAM DISCONNECTED'
+         BAS   LINK,PUTMSG
+EXITPGM  DS    0H                             EXIT POINT
+         EXEC  CICS RETURN
+* CHECK IF DB2 UP - R1 = 0 IF NOT, ELSE 1
+DB2UP    DS    0H
+         ST    LINK,RSA1
+         MVI   DB2REQ,C'C'                    CONTINUE IF DB2 NOT UP
+         EXEC  CICS LINK PROGRAM('SDB2UP') COMMAREA(DB2COMM)           +
+               LENGTH(2) RESP(RC) RESP2(RESP2)
+         XR    R1,R1                          DEFAULT = DB2 NOT UP
+         CLI   DB2RC,C'Y'                     DB2 UP ?
+         BNE   DB2EXIT                        NO, EXIT
+         LA    R1,1                           FLAG IF DB2 UP
+DB2EXIT  DS    0H
+         L     LINK,RSA1
+         BR    LINK
+* PROCESSING IF DB2 STILL UP AT STAGE 2 SHUTDOWN
+DB2PROC  DS    0H
+         ST    LINK,RSA2
+DB2NO    EQU   10                              NO OF TIMES TO CHECK
+         LA    R2,DB2NO
+DB2LOOP  DS    0H                    DO UNTIL MAX CHECKS OR DB2 DOWN
+         MVC   MSGNO,=CL2'05'
+         MVC   MSG(40),=CL40'PLEASE WAIT ... DB2 THREAD STILL ACTIVE'
+         BAS   LINK,PUTMSG
+         EXEC  CICS DELAY INTERVAL(000100) RESP(RC)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    STILLUP                     IF PROBLEM, GIVE UP
+         BAS   LINK,DB2UP                     DB2 UP ?
+         LTR   R1,R1
+         BZ    NOTUP                          NO, EXIT
+         BCT   R2,DB2LOOP
+STILLUP  DS    0H
+         MVC   MSGNO,=CL2'06'
+         MVC   MSG(41),=CL41'PLEASE CANCEL CICS AND NOTIFY DB2 SUPPORT'
+         BAS   LINK,PUTMSG
+         B     DB2EXIT1
+NOTUP    DS    0H
+         MVC   MSGNO,=CL2'07'
+         MVC   MSG(23),=CL23'DB2 THREAD NOW INACTIVE'
+         BAS   LINK,PUTMSG
+DB2EXIT1 DS    0H
+         L     LINK,RSA2
+         BR    LINK
+* SCAN ALL TASKS AND PURGE THEM
+* NB TASKS WILL NOT BE PURGED IF THEY ARE SPURGE=NO
+SCANTASK DS    0H
+         ST    LINK,RSA3
+* GET TASK IDS
+         EXEC  CICS INQUIRE TASK LIST LISTSIZE(NOTASKS) SET(R2)        +
+               RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                 CHECK RETURN CODE
+         BE    BADLIST
+         L     R3,NOTASKS                 GET NO OF TASKS
+         LTR   R3,R3                      ZERO TASKS ?
+         BZ    TASKEXIT                   YES, EXIT NOW
+         BM    TASKEXIT                   YES, EXIT NOW
+         LA    R3,1(R3)                   ADJUST COUNTER
+TASKLOOP DS    0H                         DO WHILE NOT END OF TASKS
+         BCT   R3,CONTINUE                IF PROBLEM, CHECK NEXT TASK
+         B     TASKEXIT                   END OF TASKS, SO EXIT
+CONTINUE DS    0H
+         MVC   TASK,0(R2)                 GET TASK ID
+         CLC   TASK,EIBTASKN              THIS TASK ?
+         BE    ENDLOOP                    YES, DON'T PURGE IT
+         EXEC  CICS INQUIRE TASK(TASK) TRANSACTION(TRANS)              +
+               RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    ENDLOOP                     IF PROBLEM, TRY NEXT TASK
+* IF SHUTDOWN STAGE 2, JUST LIST THE ACTIVE TRANSACTIONS
+         CLC   STATUS,DFHVALUE(FINALQUIESCE)  PLT SD STAGE 2 ?
+         BNE   CHEKTASK                    NO, CHECK TASK
+         MVC   MSGNO,=CL2'08'
+         MVC   MSG(L'TRANS),TRANS
+         MVC   MSG+L'TRANS(7),=CL7' ACTIVE'
+         BAS   LINK,PUTMSG
+         B     ENDLOOP                     GO TO NEXT TASK
+* IF SHUTDOWN STAGE 1, DON'T PURGE CICS OR DB2 TASKS
+CHEKTASK DS    0H
+         CLI   TRANS,C'C'                  CICS ?
+         BE    EXEMPT                      YES, LEAVE ALONE
+         CLC   TRANS,=CL4'DSNC'            DB2 ?
+         BNE   PURGE                       NO, PURGE IT
+EXEMPT   DS    0H
+         MVC   MSGNO,=CL2'09'              SAY WHAT WAS BYPASSED
+         MVC   MSG(L'TRANS),TRANS
+         MVC   MSG+L'TRANS(11),=CL11' NOT PURGED'
+         BAS   LINK,PUTMSG
+         B     ENDLOOP                     GO TO NEXT TASK
+* PURGE ELIGIBLE TASKS
+PURGE    DS    0H
+         MVC   PTYPE,DFHVALUE(PURGE)       SET TO PURGE
+         EXEC  CICS SET TASK(TASK) PURGETYPE(PTYPE)                    +
+               RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    BADSET                      PROBLEM
+* SAY WHAT WAS PURGED
+         LA    TASKCNT,1(TASKCNT)          BUMP PURGE COUNT
+         MVC   MSGNO,=CL2'10'
+         MVC   MSG(L'TRANS),TRANS
+         MVC   MSG+L'TRANS(7),=CL7' PURGED'
+         BAS   LINK,PUTMSG
+ENDLOOP  DS    0H
+         LA    R2,4(R2)                    BUMP TASK PTR
+         B     TASKLOOP                    ELSE NEXT ONE
+TASKEXIT DS    0H
+         L     LINK,RSA3
+         BR    LINK
+* SCAN ALL SIGNED ON TERMINALS, PURGING THEM
+SCANTERM DS    0H
+         ST    LINK,RSA4
+* START TERMINAL BROWSE
+         EXEC  CICS INQUIRE TERMINAL START RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    NOSTART                     GO IF PROBLEM
+* BROWSE THROUGH INSERVICE TERMINALS, PURGING THEM
+TERMLOOP DS    0H
+         EXEC  CICS INQUIRE TERMINAL(TERMINAL) SERVSTATUS(TSTAT)       +
+               DEVICE(DEVICE) RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BE    TERMEXIT                    EXIT IF 'EOF' OR PROBLEM
+         CLC   TSTAT,DFHVALUE(INSERVICE)   IN SERVICE ?
+         BNE   TERMLOOP                    NO, BYPASS
+****     MVC   PTYPE,DFHVALUE(FORCEPURGE)  AND FORCEPURGE
+         MVC   PTYPE,DFHVALUE(PURGE)       AND PURGE
+         CLC   DEVICE,DFHVALUE(TERMINAL)   TERMINAL ?
+         BE    TERMIT                      YES, JUST PURGE IT
+         CLC   DEVICE,DFHVALUE(T3277L)     TERMINAL ?
+         BE    TERMIT                      YES, JUST PURGE IT
+         CLC   DEVICE,DFHVALUE(T3277R)     TERMINAL ?
+         BE    TERMIT                      YES, JUST PURGE IT
+         CLC   DEVICE,DFHVALUE(T3284R)     PRINTER ?
+         BE    PRINTER                     YES, PURGE & O/S
+         CLC   DEVICE,DFHVALUE(T3284L)     PRINTER ?
+         BE    PRINTER                     YES, PURGE & O/S
+         CLC   DEVICE,DFHVALUE(T3286R)     PRINTER ?
+         BE    PRINTER                     YES, PURGE & O/S
+         CLC   DEVICE,DFHVALUE(T3286L)     PRINTER ?
+         BE    PRINTER                     YES, PURGE & O/S
+         CLC   DEVICE,DFHVALUE(T3790SCSP)  PRINTER ?
+         BE    PRINTER                     YES, PURGE & O/S
+         BE    TERMLOOP                    ANYTHING ELSE, DON'T TOUCH
+PRINTER  DS    0H                          IF NOT A TERMINAL
+         MVC   TSTAT,DFHVALUE(OUTSERVICE)  SET OUT-OF-SERVICE
+         EXEC  CICS SET TERMINAL(TERMINAL) SERVSTATUS(TSTAT)           +
+               PURGETYPE(PTYPE) RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETCODE
+         BNE   PRINTER1                    CONTINUE IF OK
+         BAS   LINK,BADTERM                SAY IF PURGE FAILED
+* PUT PRINTER BACK IN SERVICE IF TCT IS NOT COLD STARTED
+PRINTER1 DS    0H
+         LA    TERMCNT,1(TERMCNT)          BUMP PURGE COUNT
+         MVC   TSTAT,DFHVALUE(INSERVICE)   AND SET BACK IN SERVICE
+         EXEC  CICS SET TERMINAL(TERMINAL) SERVSTATUS(TSTAT)           +
+               RESP(RC) RESP2(RESP2)
+         B     TERMLOOP                    NEXT TERMINAL
+TERMIT   DS    0H                          IF TERMINAL
+         EXEC  CICS SET TERMINAL(TERMINAL) PURGETYPE(PTYPE)            +
+               RESP(RC) RESP2(RESP2)
+         BAS   LINK,CHECK                  CHECK RETURN CODE
+         BNE   PURGEOK                     CONTINUE IF OK
+         BAS   LINK,BADTERM                SAY IF PURGE FAILED
+         B     TERMLOOP                    NEXT TERMINAL
+PURGEOK  DS    0H
+         LA    TERMCNT,1(TERMCNT)          BUMP PURGE COUNT
+         B     TERMLOOP                    NEXT TERMINAL
+TERMEXIT DS    0H
+         EXEC  CICS INQUIRE TERMINAL END RESP(RC) RESP2(RESP2)
+         L     LINK,RSA4
+         BR    LINK
+* NOTIFY IF TERMINAL PURGE FAILED
+BADTERM  DS    0H
+         ST    LINK,RSA5
+         MVC   MSG(L'TERMINAL),TERMINAL
+         MVC   MSG+L'TRANS(13),=CL13' PURGE FAILED'
+         BAS   LINK,PUTMSG
+         L     LINK,RSA5
+         BR    LINK
+* CHECK RETURN CODE FROM CICS COMMAND
+* RETURNS - COND CODE IS 'EQ' IF PROBLEMS, ELSE 'NE'
+CHECK    DS    0H
+         CLC   RC,DFHRESP(NOTFND)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(ILLOGIC)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(INVREQ)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(END)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(NOTFND)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(LENGERR)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(SYSIDERR)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(IOERR)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(NOTAUTH)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(DISABLED)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(NOTOPEN)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(ISCINVREQ)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(TERMIDERR)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(NOTFND)
+         BE    CHEKEXIT
+         CLC   RC,DFHRESP(PGMIDERR)
+CHEKEXIT DS    0H
+         BR    LINK
+* WRITE MSG TO OPERATOR
+PUTMSG   DS    0H
+         ST    LINK,RSA6
+* WRITE TO OPERATOR
+         EXEC  CICS WRITE OPERATOR TEXT(MSGPREF) TEXTLENGTH(OPLEN)
+* CLEAN UP MSG AREA
+         MVC   MSG,BLANK50                  SET MSGAREA TO BLANKS
+         MVC   MSGPREF(L'PREFIX),PREFIX     MOVE IN PREFIX
+MSGEXIT  DS    0H
+         L     LINK,RSA6
+         BR    LINK
+* CONVERT BINARY NO. TO PRINTABLE DECIMAL
+* INPUT   - R1
+* RETURNS - WORK16 (LAST 2 DIGITS)
+CONVERTD DS    0H
+         ST    LINK,RSA7
+         CVD   R1,WORKD
+         MVC   WORK16,EDIT1
+         ED    WORK16,WORKD
+         L     LINK,RSA7
+         BR    LINK
+EDIT1    DC    XL16'F0202020202020202020202020202120'
+* CONVERT BINARY NO. TO PRINTABLE HEX
+* INPUT   - WORK4, RETURNS - WORK10 (LAST 2 DIGITS)
+CONVERTH DS    0H
+         ST    LINK,RSA8
+         XC    WORK10,WORK10
+         UNPK  WORK10(9),WORK4(5)
+         TR    WORK10(8),HEXTAB-240
+         L     LINK,RSA8
+         BR    LINK
+* PRINT RESP & RESP2 VALUES
+DIAG     DS    0H
+         ST    LINK,RSA9
+         MVC   WORK4,RCSAVE                GET RETCODE
+         BAS   LINK,CONVERTH               CONVERT TO PRINTABLE
+         MVC   MSG(7),=CL7'RESP = '
+         MVC   MSG+7(10),WORK10
+         MVC   WORK4,RESP2SAV              GET RESP2
+         BAS   LINK,CONVERTH               CONVERT TO PRINTABLE
+         MVC   MSG+7+10(10),=CL10', RESP2 = '
+         MVC   MSG+7+10+10(10),WORK10
+         BAS   LINK,PUTMSG                 PRINT DIAGNOSTIC
+         L     LINK,RSA9
+         BR    LINK
+* PROGRAM ERROR HANDLERS
+BADSHUT  DS    0H
+         MVC   MSGNO(2),=CL2'51'
+         MVC   MSG(28),=CL28'SHUTDOWN UNSUCCESSFUL'
+         B     FINALMSG
+BADSET   DS    0H
+         MVC   MSGNO(2),=CL2'52'
+         MVC   MSG(L'TRANS),TRANS
+         MVC   MSG+L'TRANS(20),=CL20' COULD NOT BE PURGED'
+         BAS   LINK,PUTMSG
+         B     TASKLOOP               *** NB ***
+NOSYS    DS    0H
+         MVC   MSGNO(2),=CL2'53'
+         MVC   MSG(27),=CL27'INQUIRE SYSTEM UNSUCCESSFUL'
+         B     FINALMSG
+BADLIST  DS    0H
+         MVC   MSGNO(2),=CL2'54'
+         MVC   MSG(30),=CL30'INQUIRE TASK LIST UNSUCCESSFUL'
+         B     FINALMSG
+NOSTART  DS    0H
+         MVC   MSGNO(2),=CL2'55'
+         MVC   MSG(33),=CL33'INQUIRE TERM STARTBR UNSUCCESSFUL'
+         B     FINALMSG
+BADVTAM  DS    0H
+         MVC   MSGNO(2),=CL2'56'
+         MVC   MSG(18),=CL18'VTAM INQUIRE ERROR'
+         BAS   LINK,PUTMSG
+         B     FINALMSG
+FINALMSG DS    0H
+         MVC   RCSAVE,RC
+         MVC   RESP2SAV,RESP2
+         BAS   LINK,PUTMSG
+         BAS   LINK,DIAG               PRINT RESP, RESP2
+         B     EXITPGM
+CONSTNTS DS    0F
+         LTORG
+BLANK50  DC    CL50' '
+HEXTAB   DS    0F
+         DC    C'0123456789ABCDEF'
+PREFIX   DC    CL11'SSHUT 00I'  MSG IDENTIFIER
+         END   SSHUT
+
+
+David Roth
+Systems Programmer (Australia)                                     Xephon 1992
+

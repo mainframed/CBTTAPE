@@ -1,0 +1,445 @@
+//RESUME00 JOB  ACCOUNT,'Brian Vogt',
+//* ===> RESUME <===
+//            CLASS=G,MSGCLASS=X,MSGLEVEL=(1,1),NOTIFY=&SYSUID
+//*
+//ASM      EXEC PGM=ASMA90,PARM='OBJ,NODECK,XREF(SHORT)'
+//SYSLIB   DD   DSN=SYS1.RACF.MODGEN,DISP=SHR      <-- your RACF maclib
+//         DD   DSN=SYS1.MODGEN,DISP=SHR
+//         DD   DSN=SYS1.MACLIB,DISP=SHR
+//SYSUT1   DD   SPACE=(TRK,(2,2)),UNIT=VIO
+//SYSPRINT DD   SYSOUT=*
+//SYSLIN   DD   DSN=&&OBJ(RESUME),
+//           UNIT=SYSDA,SPACE=(CYL,(1,1,1)),DISP=(NEW,PASS),
+//           DCB=(RECFM=FB,LRECL=80,BLKSIZE=3120,DSORG=PO)
+//SYSIN    DD   *,DLM=$$
+ TITLE 'RESUME - Unset the "REVOKE" flag in a RACF USER profile'
+ PRINT GEN
+*-- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --*
+*
+* AUTHOR - Brian Vogt        e-mail:  brian.vogt@eds.com
+*
+* DATE   - November 1987.    MVS/SP 2.1.7 with RACF 1.7.0.
+*          SMF logging and updating of last access added July 1988.
+*          Tested ok on MVS 5.2.2 with RACF 2.2 and also on OS/390 2.6
+*
+* FUNCTION -
+*          Use ICHEINTY to modify the following in a RACF USER profile
+*           (1) unset FLAG4 (REVOKE attribute).
+*           (2) zero out REVOKECT (revoke count).
+*           (3) set LJTIME & LJDATE to the current time & date.
+*           (4) For the benefit of the RACF Auditor, write a type 80
+*               SMF record (pretending to be ALTUSER with the RESUME
+*               parameter).
+*
+*          The most likely practical applications are :
+*           (a) A hacker revokes all of the privileged userids in the
+*               system, by submitting many batch jobs with incorrect
+*               passwords.  (Never trust an Operator to reply correctly
+*               to message ICH302D).  This program cannot be thwarted,
+*               as it does not run under a RACF userid.
+*           (b) The userid of a production batch job becomes revoked
+*               overnight.  The MVS Operator can overcome this, with a
+*               bit of information from the on-call Security Admin.
+*
+* SETUP DOCUMENTATION -
+*          (1) This program must be invoked from a started task.
+*                //RESUME   PROC U=,PW=
+*                //RESUME   EXEC PGM=RESUME,PARM='&USER,&PW'
+*          (2) The started task name must be RESUME.
+*          (3) Do NOT put the started task name into the RACF Started
+*              Procedures Table (ICHRIN03) or create a STARTED profile
+*              for it.  The task doesn't need a userid, and is better
+*              off without one.
+*
+* USER DOCUMENTATION -
+*          (1) The function is invoked via this MVS command:
+*                S RESUME,U=userid,PW=password
+*          (2) The userid (U keyword) must be specified.
+*          (3) The password (PW keyword) must match the RVARY SWITCH
+*              password.  If there is no RVARY SWITCH password
+*              (RCVTSWPW is binary zeroes), this parameter is ignored,
+*              and may be entirely omitted from the START command.
+*          (4) The RVARY SWITCH password should be changed by the RACF
+*              Security Administrator as soon as practicable after use.
+*
+* APF -    This code needs to be APF authorized for the following
+*          functions :  RACROUTE (encrypt), ICHEINTY, SMFWTM
+*
+* AMODE -  31 because at least one system table (OUCB) resides above
+*          the 16M line in MVS/XA.
+*
+* REFERENCE PUBLICATIONS -
+*          SC28-1913 Security Server (RACF) System Programmer's Guide
+*          SC28-1914 Security Server (RACF) Macros and Interfaces
+*          GC28-1922 Security Server External Security Interface
+*                    (RACROUTE) Macro Reference
+*          SY28-1164 to 1168 MVS Data Areas
+*          GC28-1783 MVS System Management facilities
+*
+*-- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --*
+RESUME   CSECT
+RESUME   AMODE 31
+RESUME   RMODE 24
+         SAVE  (14,12),,*              save registers
+         LR    R12,R15                 R12 -> RESUME csect
+         USING RESUME,R12              base addressing
+         LA    R9,SAVE                 R9 -> LSA
+         ST    R13,4(R9)               HSA in LSA
+         ST    R9,8(R13)               LSA in HSA
+         LR    R13,R9                  R13 -> LSA
+         B     START
+         DC    C'DATE &SYSDATE      TIME &SYSTIME'  an eye-catcher
+         CNOP  0,4
+*
+START    EQU   *
+         USING PSA,R0                  R0 -> PSA
+         L     R2,PSAAOLD              R2 -> ASCB
+         DROP  R0
+         USING ASCB,R2
+         L     R3,ASCBJBNI             R3 -> batch job name
+         LTR   R3,R3                   does it exist ?
+         BNZ   BADUSER                 yes -- nick off pal
+         L     R3,ASCBOUCB             R3 -> OUCB
+         USING OUCB,R3
+         TM    OUCBYFL,OUCBSTT         started task ?
+         BNO   BADUSER                 no -- nick off pal
+         DROP  R3
+         L     R3,ASCBJBNS             R3 -> started task job name
+         CLC   0(8,R3),=C'RESUME  '    correct task name ?
+         BNE   BADUSER                 no -- nick off pal
+         DROP  R2
+*
+*   This is a good guy.
+*   Get the parameter text string, and separate
+*   it into the 2 pieces (userid and password).
+*                                      R1 -> parameter address vector
+*                                      (Only the first word is used).
+         L     R1,0(R1)                R1 -> parameter address
+         LH    R2,0(R1)                R2 = length of parameter string
+         LA    R1,2(R1)                R1 -> parameter text string
+         LA    R3,USERID+1             R3 -> first destination for move
+         XR    R4,R4                   initialize character count
+PARMLOOP EQU   *
+         LTR   R2,R2                   any parameter characters left ?
+         BNH   CHECKPW                 no -- go check the password
+         CLI   0(R1),C','              is next character a comma ?
+         BE    COMMA                   yes -- switch move destinations
+         MVC   0(1,R3),0(R1)           copy 1 character to destination
+         BCTR  R2,0                    decrement counter by 1
+         LA    R1,1(R1)                increment source address by 1
+         LA    R3,1(R3)                increment destn. address by 1
+         LA    R4,1(R4)                increment counter by 1
+         B     PARMLOOP
+*
+COMMA    EQU   *
+         MVC   SMFRUID(8),USERID+1     copy userid into SMF record
+         STC   R4,USERID               store length of userid
+         XR    R4,R4                   re-initialize character count
+         LA    R3,PASSWORD+1           R3 -> new destination for move
+         BCTR  R2,0                    decrement counter by 1
+         LA    R1,1(R1)                increment source address by 1
+         B     PARMLOOP
+*
+*   The parameter string has been cracked into its 2 pieces.
+*   Now check that the correct password has been specified.
+*
+CHECKPW  EQU   *
+         STC   R4,PASSWORD             store length of password
+         LTR   R4,R4                   any password specified ?
+         BZ    ENCRPTOK                no -- nothing to encrypt
+         LA    R2,PASSWORD             R2 -> string to be encrypted
+         LA    R3,PASSWORD+1           R3 -> encryption key
+*
+*   Use RACROUTE instead of RACXTRT, because we are in AMODE 31.
+         GETMAIN R,LV=512,SP=230
+         LR    R10,R1                  keep address of work area
+RACXTRT  CNOP  0,4
+         RACROUTE REQUEST=EXTRACT,WORKA=(R10),TYPE=ENCRYPT,            #
+               ENCRYPT=((2),DES),ENTITY=(3)
+         FREEMAIN R,A=(10),LV=512,SP=230
+*
+         ST    R15,CONDCODE            save condition code
+         LTR   R15,R15                 did RACROUTE fail ?
+         BZ    ENCRPTOK                no -- continue
+*                                      else issue error message
+         MVC   BINARY(4),RACXTRT+4     R15 from RACXTRT function
+         UNPK  CODED(9),BINARY(5)
+         TR    CODED(8),TABLE-X'F0'
+         MVC   R15MSG1(3),CODED+5      store numbers into message
+         MVC   BINARY(4),RACXTRT+8     R0 from RACXTRT function
+         UNPK  CODED(9),BINARY(5)
+         TR    CODED(8),TABLE-X'F0'
+         MVC   R00MSG1(3),CODED+5      store numbers into message
+         WTO   MF=(E,WTO1)             issue failure message
+         B     RETURN
+ENCRPTOK EQU   *                       encryption worked ok.
+*                                      Now check if the passwords match
+         USING PSA,R0                  R0 -> PSA
+         L     R2,FLCCVT               R2 -> CVT
+         DROP  R0
+         USING CVT,R2
+         L     R3,CVTRAC               R3 -> RCVT
+         USING RCVT,R3
+         MVC   SMF80VER(1),RCVTVERS    copy RACF version into SMF rec
+         L     R2,CVTSMCA              R2 -> SMCA
+         USING SMCABASE,R2
+         MVC   SMF80SID,SMCASID        copy system-id into SMF record
+         DROP  R2
+*
+         CLC   RCVTSWPW,ZEROBITS       does the Switch password exist ?
+         BE    PWOK                    no -- nothing to check against
+*                                      else the correct pw is required
+         XR    R2,R2                   start with all zero bits
+         IC    R2,PASSWORD             R2 = length of supplied password
+         LTR   R2,R2                   is it zero ?
+         BZ    PWBAD                   yes -- issue message and return
+*                                      else test the supplied password
+         BCTR  R2,0                    decrement length by 1 for EX
+         EX    R2,EXCLC                is encrypted password the same
+         DROP  R3                                 as that in the RCVT ?
+         BE    PWOK                    yes -- continue
+PWBAD    EQU   *                       supplied password was correct
+         WTO   MF=(E,WTO2)             else issue error message
+         LA    R2,8
+         ST    R2,CONDCODE             set condition code to 8
+         MVI   SMF80EVQ,1              Event Qual. - insuffic. auth.
+         OI    SMFKFI3,B'10000000'     RESUME ignored
+         BAL   R5,WRITESMF
+         B     RETURN
+PWOK     EQU   *                       supplied password was correct
+         TIME  DEC
+         ST    R0,C$TIME
+         ST    R1,C$DATE
+         PRINT NOGEN
+         ICHEINTY ALTER,TYPE='USR',ENTRY=USERID,                       #
+               ACTIONS=(ACTN1,ACTN2,ACTN3,ACTN4)
+         PRINT GEN
+         ST    R15,CONDCODE            save condition code
+         LTR   R15,R15                 did ICHEINTY fail ?
+         BZ    MODSOK                  no -- continue
+*                                      else issue error message
+         ST    R15,BINARY
+         UNPK  CODED(9),BINARY(5)
+         TR    CODED(8),TABLE-X'F0'
+         MVC   R15MSG3(3),CODED+5      store numbers into message
+         ST    R0,BINARY
+         UNPK  CODED(9),BINARY(5)
+         TR    CODED(8),TABLE-X'F0'
+         MVC   R00MSG3(3),CODED+5      store numbers into message
+         WTO   MF=(E,WTO3)             issue failure message
+         B     RETURN
+MODSOK   EQU   *                       ICHEINTY worked ok.
+         BAL   R5,WRITESMF
+         WTO   MF=(E,WTO0)             issue success message
+*
+RETURN   EQU   *
+         L     R13,4(R13)              R13 -> HSA
+         L     R15,CONDCODE            set condition code
+         RETURN (14,12),RC=(15)        return
+*
+*   Write out a type 80 SMF record.  (Pretend that we are ALTUSER).
+*
+WRITESMF EQU   *
+         TIME  BIN                     get time and date
+         ST    R0,SMF80TME             store into smf record
+         ST    R1,SMF80DTE             store into smf record
+         USING PSA,R0                  R0 -> PSA
+         L     R2,PSATOLD              R2 -> TCB
+         DROP  R0
+         USING TCB,R2
+         L     R2,TCBTCT               R2 -> TCT
+         USING SMFTCT,R2
+         L     R2,TCTJMR               R2 -> JMR
+         USING JMR,R2
+         MVC   SMF80JBN(8),JMRJOB
+         MVC   SMF80RST(4),JMRENTRY
+         MVC   SMF80RSD(4),JMREDATE
+         MVC   SMF80UID(8),JMRUSEID
+         DROP  R2
+         SMFWTM SMFRCD80               write the SMF record
+         BR    R5
+*
+*
+*   The program was not called from a started task named RESUME.
+*   A TSO/E user may be trying to execute a Clist named RESUME.
+*
+BADUSER  EQU   *
+         ABEND X'806',,,SYSTEM
+         EJECT
+*---------------------------------------------------------------*
+*        Constants and Workarea                                 *
+*---------------------------------------------------------------*
+         SPACE 3
+SAVE     DC    18F'0'
+*
+CONDCODE DC    F'0'                    condition code for termination
+*
+ZEROBITS DC    XL8'00'
+*
+C$TIME   DS    F                       current time
+C$DATE   DS    F                       current date
+*
+USERID   DC    XL1'00',CL44' '
+PASSWORD DC    XL1'00',CL60' '
+*
+         USING RCVT,R3
+EXCLC    CLC   RCVTSWPW(1),PASSWORD+1  executed instruction
+         DROP  R3
+*
+         PRINT NOGEN
+WTO0     WTO   'EDS09750I RESUME function completed ok.',              #
+               ROUTCDE=(9,11),MF=L
+*
+WTO1     WTO   'EDS09751E RESUME - Error in RACXTRT.   R15=000, R0=000.#
+                 Task failed.',ROUTCDE=(9,11),MF=L
+R15MSG1  EQU   WTO1+47
+R00MSG1  EQU   WTO1+55
+*
+WTO2     WTO   'EDS09752E RESUME - Incorrect password specified.  Permi#
+               ssion denied.',ROUTCDE=(9,11),MF=L
+*
+WTO3     WTO   'EDS09753E RESUME - Error in ICHEINTY.  R15=000, R0=000.#
+                 Task failed.',ROUTCDE=(9,11),MF=L
+R15MSG3  EQU   WTO3+47
+R00MSG3  EQU   WTO3+55
+         PRINT GEN
+*
+BINARY   DS    F
+         DC    XL1'00'
+CODED    DS    CL8
+         DS    1C
+         SPACE 1
+TABLE    DC    C'0123456789ABCDEF'     digit encoding table
+*
+*
+*  SMF RECORD FORMAT
+*
+*    STANDARD SMF RECORD HEADER
+SMFRCD80 DS    0F
+SMF80LEN DC    AL2(SMFRLEN)            record length
+SMF80SEG DC    H'0'                    record not spanned
+SMF80FLG DC    AL1(0)                  system indicator (added by SMF)
+SMF80RTY DC    AL1(80)                 record type 80
+SMF80TME DS    CL4                     time
+SMF80DTE DS    CL4                     date
+SMF80SID DS    CL4                     system identification
+*    USER-DEFINED SECTION
+SMF80DES DC    BL2'00100000'           descriptor flags
+SMF80EVT DC    AL1(13)                 event code 13 (ALTUSER)
+SMF80EVQ DC    AL1(0)                  event code qualifier
+SMF80USR DC    CL8'RESUME'             userid (jobname)
+SMF80GRP DC    CL8'RESUME'             group (stepname)
+SMF80REL DC    AL2(OFFSET)             offset to first relocate section
+SMF80CNT DC    AL2(2)                  number of relocate sections
+SMF80ATH DC    BL1'01110000'           authorities used
+SMF80REA DC    BL1'01110100'           reason for logging
+SMF80TLV DC    AL1(0)                  terminal level number
+SMF80ERR DC    XL1'0'                  command processing error flag
+SMF80TRM DC    CL8'CONSOLE'            terminal id
+SMF80JBN DC    CL8'RESUME'             job name
+SMF80RST DC    AL4(0)                  reader time of job
+SMF80RSD DC    AL4(0)                  reader date of job
+SMF80UID DC    CL8'RESUME'             user identification
+SMF80VER DC    AL1(0)                  RACF version number
+SMFRELOC EQU   *                       relocate section
+SMF80DTP DC    AL1(6)                  data type
+SMF80DLN DC    AL1(DATALEN1)           length of data
+SMF80DTA EQU   *
+SMFKF0   DC    BL1'00000000'           keyword flag byte 0
+SMFKF1   DC    BL1'00000000'           keyword flag byte 1
+SMFKF2   DC    BL1'00000000'           keyword flag byte 2
+SMFKF3   DC    BL1'10000000'           keyword flag byte 3
+SMFKFI0  DC    BL1'00000000'           keyword ignored flag byte 0
+SMFKFI1  DC    BL1'00000000'           keyword ignored flag byte 1
+SMFKFI2  DC    BL1'00000000'           keyword ignored flag byte 2
+SMFKFI3  DC    BL1'00000000'           keyword ignored flag byte 3
+         DC    AL4(0)                  more keyword ignored flags
+         DC    XL1'0'                  other violation flags
+SMFRUID  DC    CL8'        '           userid
+         DC    XL8'0000000000000000'   DFLTGRP keyword
+         DC    XL8'0000000000000000'   GROUP keyword
+         DC    BL1'00000000'           flags for AUTHORITY keyword
+         DC    BL1'00000000'           flags for UACC keyword
+         DC    XL8'0000000000000000'   OWNER keyword
+         DC    XL2'0000'               flags for CLAUTH keyword
+         DC    XL2'0000'               flags for CLAUTHs ignored
+         DC    XL2'0000'               flags for additional keywords
+         DC    XL2'0000'               flags for additional keywords
+         DC    XL2'0000'               flags for CLAUTHs ignored
+         DC    XL3'000000'             Logon time
+         DC    XL3'000000'             Logoff time
+         DC    BL1'00000001'           Logon day
+         DC    XL4'00000000'           REVOKE date
+         DC    XL4'00000000'           RESUME date
+         DC    XL44'00'                SECLEVEL name specified
+DATALEN1 EQU   *-SMF80DTA
+TMF80DTP DC    AL1(38)                 data type
+TMF80DLN DC    AL1(DATALEN2)           length of data
+TMF80DTA EQU   *
+         DC    CL8'        '           profile owner
+DATALEN2 EQU   *-TMF80DTA
+OFFSET   EQU   SMFRELOC-SMFRCD80-4
+SMFRLEN  EQU   *-SMFRCD80
+*
+         PRINT NOGEN
+ACTN1    ICHEACTN FIELD=FLAG4,FLDATA=(1,NEWFLAG4)
+ACTN2    ICHEACTN FIELD=REVOKECT,FLDATA=(1,NEWREVCT)
+ACTN3    ICHEACTN FIELD=LJTIME,FLDATA=(4,C$TIME)
+ACTN4    ICHEACTN FIELD=LJDATE,FLDATA=(3,C$DATE+1)
+         PRINT GEN
+*
+NEWFLAG4 DC    AL1(0)                  new revoke flag
+NEWREVCT DC    AL1(0)                  new revoke count
+*
+*
+*-----------------------------------------------------------------*
+*                WORKAREA DSECT                                   *
+*-----------------------------------------------------------------*
+         PRINT NOGEN
+         IHAPSA
+         IHAASCB
+         IRAOUCB
+         CVT   DSECT=YES
+         ICHPRCVT
+         IEESMCA
+         IKJTCB
+         IEFTCT
+         IEFJMR
+*        IFASMFR9 80       Can't use it.
+*                          This program contains pre-made data
+         PRINT GEN
+*
+*
+*-----------------------------------------------------------------*
+*                REGISTER EQUATES                                 *
+*-----------------------------------------------------------------*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+         END RESUME
+$$
+//*
+//LKED     EXEC PGM=IEWL,PARM='XREF,LIST,LET',COND=(4,LT,ASM)
+//SYSLMOD  DD   DSN=SYS3A.LINKLIB,DISP=SHR         <-- your APF linklib
+//SYSUT1   DD   SPACE=(TRK,(2,2)),UNIT=VIO
+//SYSPRINT DD   SYSOUT=*
+//SYSLIB   DD   DSN=&&OBJ,DISP=SHR
+//SYSLIN   DD   *
+ INCLUDE SYSLIB(RESUME)
+ SETCODE AC(1)
+ NAME RESUME(R)
+/*

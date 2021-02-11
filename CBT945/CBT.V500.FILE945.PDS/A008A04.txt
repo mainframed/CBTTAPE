@@ -1,0 +1,287 @@
+Analysing variable length files
+
+I was recently involved in a tuning effort involving variable
+length VSAM KSDS files. Although KSDS files are variable
+length by definition, most tend to have fixed length records. In
+cases where the records are truly variable, it is important to
+know the breakdown of various record lengths when tuning
+such attributes as CI SIZE and CI FREESPACE. For example,
+it probably wouldn't make sense to have a CI FREESPACE of
+10% with a 4096 CI SIZE if 95 percent of the variable length
+records are 500 bytes. On the other hand, if the maximum
+length is 500 but 95% of the records are less than 50 bytes, a
+FREESPACE value of 10 might be very beneficial. To add to
+the difficulty in tuning these types of files, I had some
+associated with third-party software. In those cases, the nature
+of the file was not as well understood as it was with in-house
+written software. Thus, having an idea of record length
+distribution would be a step in the right direction when trying
+to tune.
+
+I decided to write an Assembler program, called VSLRECL, to
+analyse record lengths in a truly variable VSAM KSDS file.
+VSLRECL determines all record lengths along with the count
+and percentage of distribution associated with each length. It
+then prints a listing with one line per length detected. A listing
+might appear as follows:
+
+      LENGTH: 00100 COUNT: 0105000 PERCENT: 084
+      LENGTH: 00250 COUNT: 0015000 PERCENT: 012
+      LENGTH: 00275 COUNT: 0004990 PERCENT: 003
+      LENGTH: 00600 COUNT: 0000010 PERCENT: < 1
+      TOTAL NUMBER OF RECORDS IN FILE: 0125000
+
+This report indicates there are four different record lengths
+(100, 250, 275, and 600) in a file. A majority of the 125,000
+total records are 100 bytes (84%). Using this information,
+various tuning changes can be made with some idea of what the
+effect will be. Percentages are trunc-ated to the nearest whole
+digit, with those under one showing as '< 1'. The program
+utilizes deferred updates on the work file and the JCL sets data
+buffers to 50 which optimizes the run time. The JCL also uses
+the DFP Release 3 technique of defining temporary VSAM
+files. If this is not applicable to your shop, just predefine the
+VSAM work file.
+
+
+JCL
+
+//* THIS JOB CAN ANALYSE THE RECORD LENGTHS OF A VARIABLE LENGTH
+//* VSAM DATASET. FOR EACH LENGTH, ITS COUNT AND PERCENT ARE LISTED.
+//*
+//STEP1    EXEC PGM=VSLRECL
+//SYSOUT   DD   SYSOUT=*
+//WORKFILE DD   DSN=&&TEMP,DISP=(,DELETE),KEYLEN=4,
+//   KEYOFF=0,LRECL=8,SPACE=(CYL,(1,1)),RECORG=KS
+//*
+//*   CHANGE THE FOLLOWING DSN= TO THE DATASET BEING ANALYSED
+//*
+//CHEKFILE DD   DSN=VSAM.FILE.TO.ANALYZE,DISP=SHR,AMP=('BUFND=50')
+
+
+VSLRECL ASSEMBLER
+
+R1        EQU     1                     GETMAIN POINTER
+R5        EQU     5                     WORK
+R6        EQU     6                     WORK
+R7        EQU     7                     WORK
+R8        EQU     8                     WORK
+R9        EQU     9                     WORK
+R12       EQU     12
+R13       EQU     13                    PROGRAM BASE
+R14       EQU     14
+R15       EQU     15
+VSLRECL   CSECT
+          STM     R14,R12,12(R13)       SAVE
+          LA      R14,0(R13)                 CALLERS
+          BAL     R13,84(R15)                        REGISTERS
+          USING   *,R13
+          DS      18F                   SAVE AREA
+          ST      R14,4(R13)            SAVE ADDR OF CALLERS SAVE AREA
+          ST      R13,8(R14)            SAVE ADDR OF OUR SAVE AREA
+          OPEN    (SYSOUT,OUTPUT)       OPEN PRINT FILE
+*    INITIALIZE THE WORK FILE SO IT CAN BE OPENED FOR DIRECT UPDATE
+          BAL     R5,WRKOPEN            OPEN WORK FILE
+          BAL     R5,WRKPUT             WRITE WORK RECORD
+          BAL     R5,WRKCLOSE           CLOSE WORK FILE
+*    BUILD LOCAL SHARED POOL FOR DEFFERED UPDATES
+          BLDVRP  BUFFERS=(22528(10),512(20)),STRNO=2,TYPE=LSR
+          MODCB   ACB=WORKACB,MACRF=(DIR,LSR)  GET READY FOR UPDATES
+          MODCB   RPL=WORKRPL,OPTCD=(DIR,UPD)
+          BAL     R5,WRKOPEN            OPEN WORK FILE
+          BAL     R5,CHKOPEN            OPEN CHECK FILE
+*    DETERMINE MAXIMUM RECORD LENGTH OF FILE BEING PROCESSED
+          SHOWCB  ACB=CHEKACB,AREA=DISPLAY,FIELDS=LRECL,LENGTH=4
+          L       R7,LRECL              SAVE LRECL
+          GETMAIN R,LV=(R7)             GET LRECL AMOUNT OF STORAGE
+          LR      R6,R1                 SAVE STORAGE LOCATION
+          MODCB   RPL=CHEKRPL,AREA=(R6),AREALEN=(R7),RECLEN=(R7)
+          LA      R9,0                  ZERO REG 9
+GETCHEK   GET     RPL=CHEKRPL           READ NEXT CHECK RECORD
+          LTR     R15,R15               READ OK?
+          BNZ     CHKEND                IF NOT, CHECK FOR END
+          LA      R9,1(R9)              ADD 1 TO RECORD COUNT
+*    DETERMINE LENGTH OF RECORD JUST READ
+          SHOWCB  RPL=CHEKRPL,FIELDS=RECLEN,AREA=DISPLAY,LENGTH=4
+          MVC     WORKKEY(4),LRECL      SAVE RECORD LENGTH
+          GET     RPL=WORKRPL           READ WORK RECORD
+          LTR     R15,R15               READ OK?
+          BZ      ADDONE                IF YES, GO ADD 1
+*    DETERMINE WHY WORK READ DIDN'T WORK
+          SHOWCB  RPL=WORKRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          CLC     FDBKCDE+3(1),=X'10'   NOT FOUND?
+          BE      ITSNEW                IF YES, ITS A NEW RECORD
+          LA      R8,GETMSG2            PRIME ERROR MESSAGE
+          B       ISSUEMSG              UNEXPECTED FEEDBACK ON READ
+ITSNEW    ZAP     WORKCNT,=P'1'         INITIALIZE TO 1
+          MODCB   RPL=WORKRPL,OPTCD=(NUP)  ALLOW PUT NO UPDATE
+          BAL     R5,WRKPUT             WRITE WORK RECORD
+          MODCB   RPL=WORKRPL,OPTCD=(UPD)  ALLOW PUT UPDATE
+          B       GETCHEK               GO GET NEXT CHECK RECORD
+ADDONE    AP      WORKCNT,=P'1'         ADD 1 TO TOTAL
+          BAL     R5,WRKPUT             WRITE WORK RECORD
+          B       GETCHEK               GO GET NEXT CHECK RECORD
+SUMMARY   BAL     R5,CHKCLOSE           CLOSE CHECK FILE
+          BAL     R5,WRKCLOSE           CLOSE WORK FILE
+*    CHANGE WORK FILE FOR SEQUENTIAL PROCESSING NO UPDATES
+          MODCB   ACB=WORKACB,MACRF=(SEQ,IN,NSR) CHANGE TO INPUT
+          MODCB   RPL=WORKRPL,OPTCD=(SEQ,NUP) SEQUENTIAL NO UPDATE
+          BAL     R5,WRKOPEN            OPEN WORK FILE
+          CVD     R9,WKFLD7             CONVERT TOTAL RECORD COUNT
+          L       R9,WKFLD8             LOAD CONVERTED COUNT
+          BAL     R5,WRKGET             SKIP LOW VALUES WORK RECORD
+WORKLOOP  BAL     R5,WRKGET             READ NEXT WORK RECORD
+          L       R8,WORKKEY            LOAD KEY (RECORD LENGTH)
+          CVD     R8,WKFLD7             CONVERT RECORD LENGTH
+          UNPK    WKFLD1(5),WKFLD7      PREPARE FOR PRINT
+          OI      WKFLD1+4,X'F0'        MAKE LAST CHARACTER PRINTABLE
+          MVC     MSGLEN,WKFLD1         PUT LENGTH IN MESSAGE
+          UNPK    WKFLD2(7),WORKCNT     PREPARE TO PRINT COUNT
+          OI      WKFLD2+6,X'F0'        MAKE LAST CHARACTER PRINTABLE
+          MVC     MSGCNT,WKFLD2         PUT COUNT IN MESSAGE
+          ZAP     WKFLD4,=P'0'          INITIALIZE WORK FIELDS
+          ZAP     WKFLD7,=P'0'
+          ST      R9,WKFLD8             SAVE TOTAL RECORD COUNT
+          MVC     WKFLD6,WORKCNT        MULTIPLY RECORD
+          MP      WKFLD4,ONEHUND            COUNT BY 100
+          DP      WKFLD4,WKFLD8         DIVIDE BY TOTAL RECORDS
+          CP      WKFLD5,=P'0'          IS % < 1?
+          BE      LESSONE               IF YES, INDICATE SO
+          UNPK    WKFLD3(3),WKFLD5      PREPARE TO PRINT %
+          OI      WKFLD3+2,X'F0'        MAKE LAST CHARACTER PRINTABLE
+          MVC     MSGPCT,WKFLD3         PUT % IN MESSAGE
+          B       WRITEMSG              GO PRINT MESSAGE
+LESSONE   MVC     MSGPCT,=C'< 1'        INDICATE % IS LESS THAN 1
+WRITEMSG  PUT     SYSOUT,COUNTMSG       PRINT MESSAGE
+          B       WORKLOOP              GO PROCESS NEXT RECORD LENGTH
+PRNTTOTL  ST      R9,WORKCNT            STORE TOTAL COUNT
+          UNPK    WKFLD2(7),WORKCNT     PREPARE TO PRINT TOTAL
+          OI      WKFLD2+6,X'F0'        MAKE LAST CHARACTER PRINTABLE
+          MVC     MSGTOT,WKFLD2         PUT TOTAL IN MESSAGE
+          PUT     SYSOUT,TOTALMSG       PRINT TOTAL MESSAGE
+          CLOSE   (SYSOUT)              CLOSE SYSOUT
+          BAL     R5,WRKCLOSE           CLOSE WORK FILE
+          L       R13,4(R13)            RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)       RELOAD CALLERS REGISTERS
+          LA      R15,0                 END WITH RETURN CODE 0
+          BR      R14                   GO BACK TO CALLER
+*    DETERMINE WHY CHECK READ DIDN'T WORK
+CHKEND    SHOWCB  RPL=CHEKRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          CLC     FDBKCDE+3(1),=X'04'   AT END?
+          BE      SUMMARY               IF YES, TIME TO SUMMARIZE
+          LA      R8,GETMSG1            PRIME ERROR MESSAGE
+          B       ISSUEMSG              UNEXPECTED FEEDBACK ON READ
+*    DETERMINE IF THIS IS END OF WORK FILE
+WRKEND    SHOWCB  RPL=WORKRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          CLC     FDBKCDE+3(1),=X'04'   AT END?
+          BE      PRNTTOTL              IF YES, GET OUT
+          LA      R8,GETMSG2            PRIME ERROR MESSAGE
+          B       WRKERROR              GO PRINT ERROR
+CHKOPEN   LA      R8,OPENMSG1           PRIME ERROR MESSAGE
+          OPEN    CHEKACB               OPEN CHEKFILE
+          LTR     R15,R15               OPEN OK?
+          BNZ     CHKERROR              IF NOT, TERMINATE
+          BR      R5
+CHKCLOSE  LA      R8,CLOSMSG1           PRIME ERROR MESSAGE
+          CLOSE   CHEKACB               CLOSE CHEKFILE
+          LTR     R15,R15               CLOSE OK?
+          BNZ     CHKERROR              IF NOT, TERMINATE
+          BR      R5
+WRKOPEN   LA      R8,OPENMSG2           PRIME ERROR MESSAGE
+          OPEN    WORKACB               OPEN WORKFILE
+          LTR     R15,R15               OPEN OK?
+          BNZ     WRKERROR              IF NOT, TERMINATE
+          BR      R5
+WRKCLOSE  LA      R8,CLOSMSG2           PRIME ERROR MESSAGE
+          CLOSE   WORKACB               CLOSE WORKFILE
+          LTR     R15,R15               CLOSE OK?
+          BNZ     WRKERROR              IF NOT, TERMINATE
+          BR      R5
+WRKGET    GET     RPL=WORKRPL           READ WORKFILE RECORD
+          LTR     R15,R15               READ OK?
+          BNZ     WRKEND                IF NOT, CHECK FOR END
+          BR      R5
+WRKPUT    LA      R8,PUTMSG PRIME ERROR MESSAGE
+          PUT     RPL=WORKRPL           WRITE WORKFILE RECORD
+          LTR     R15,R15               WRITE OK?
+          BNZ     WRKERROR              IF NOT, TERMINATE
+          BR      R5
+WRKERROR  ST      R15,RC                SAVE RETURN CODE
+*    RETRIEVE UNEXPECTED WORKFILE FEEDBACK CODE
+          SHOWCB  RPL=WORKRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          B       ISSUEMSG
+CHKERROR  ST      R15,RC                SAVE RETURN CODE
+*    RETRIEVE UNEXPECTED CHEKFILE FEEDBACK CODE
+          SHOWCB  RPL=CHEKRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+ISSUEMSG  PUT     SYSOUT,0(R8)          PRINT APPROPRIATE ERROR MSG
+          UNPK    WKFLD,FDBKCDE+2(3)    UNPACK THE FEEDBACK CODE
+          TR      WKFLD(3),TRTBL-C'0'   MAKE SURE ITS PRINTABLE
+          MVC     MSGCDE,WKFLD          PUT FEEDBACK INTO MESSAGE
+          PUT     SYSOUT,MSGFDBK        WRITE OUT THE FEEDBACK CODE
+          L       R13,4(R13)            RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)       RELOAD CALLERS REGISTERS
+          L       R15,RC                LOAD RETURN CODE
+          BR      R14                   GO BACK TO CALLER
+          LTORG
+OPENMSG1  DC      CL80' * ERROR OPENING CHEKFILE *'
+OPENMSG2  DC      CL80' * ERROR OPENING WORKFILE *'
+PUTMSG    DC      CL80' * ERROR WRITING WORKFILE *'
+GETMSG1   DC      CL80' * ERROR READING CHEKFILE *'
+GETMSG2   DC      CL80' * ERROR READING WORKFILE *'
+ERASEMSG  DC      CL80' * ERROR ERASING WORKFILE *'
+CLOSMSG1  DC      CL80' * ERROR CLOSING CHEKFILE *'
+CLOSMSG2  DC      CL80' * ERROR CLOSING WORKFILE *'
+DISPLAY   DS      0D
+LRECL     DS      F                     CHECKFILE RECORD LENGTH
+FDBKCDE   DS      F                     VSAM FEEDBACK CODE
+RC        DS      F                     UNEXPECTED RETURN CODE
+TRTBL     DC      C'0123456789ABCDE'
+ONEHUND   DC      X'000100C'
+WORKREC   DS      0D                    WORK FILE RECORD
+          ORG     WORKREC
+WORKKEY   DC      X'00000000'           KEY (CHEKFILE RECORD LENGTH)
+WORKCNT   DC      X'00000000'           COUNT (CHEKFILE RECORD COUNT)
+          ORG
+WKFLD     DS      CL4                   VARIOUS WORK FIELDS
+WKFLD1    DS      CL5
+WKFLD2    DS      CL7
+WKFLD3    DS      CL3
+WKFLD4    DS      0D
+WKFLD5    DS      F
+WKFLD6    DS      F
+WKFLD7    DS      0D
+FILLER    DS      F
+WKFLD8    DS      F
+COUNTMSG  DS      CL80' '               INDIVIDUAL COUNTS MESSAGE
+          ORG     COUNTMSG
+          DC      C' LENGTH: '
+MSGLEN    DS      CL5
+          DC      C' COUNT: '
+MSGCNT    DS      CL7
+          DC      C' PERCENT: '
+MSGPCT    DS      CL3
+          ORG
+TOTALMSG  DS      CL80' '               TOTAL MESSAGE
+          ORG     TOTALMSG
+          DC      C' TOTAL NUMBER OF RECORDS IN FILE: '
+MSGTOT    DS      CL7
+          ORG
+MSGFDBK   DS      CL80' '               FEEDBACK MESSAGE
+          ORG     MSGFDBK
+          DC      CL24' VSAM FEEDBACK CODE IS: '
+MSGCDE    DS      CL3
+          ORG
+          LTORG
+SYSOUT    DCB   BLKSIZE=80,LRECL=80,DDNAME=SYSOUT,DSORG=PS,MACRF=PM,   C
+               RECFM=F
+CHEKACB   ACB   MACRF=(KEY,SEQ,IN),DDNAME=CHEKFILE
+CHEKRPL   RPL   ACB=CHEKACB,OPTCD=(SEQ,LOC)
+WORKACB   ACB   MACRF=(KEY,SEQ,OUT,DFR),DDNAME=WORKFILE
+WORKRPL   RPL   ACB=WORKACB,OPTCD=(KEY,SEQ,NUP,SYN,MVE),RECLEN=8,      C
+               AREALEN=8,KEYLEN=4,ARG=WORKKEY,AM=VSAM,AREA=WORKREC
+          END
+
+Ernie Ishman
+Senior Systems Programmer
+Geisinger System Services (USA)
+

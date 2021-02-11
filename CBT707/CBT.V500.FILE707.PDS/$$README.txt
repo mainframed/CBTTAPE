@@ -1,0 +1,23 @@
+
+     J.D. Acevedo      neither expresses nor implies any warranty
+     as to the fitness of these computer programs for any function.
+     The use of these programs or the results therefrom is entirely
+     at the risk of the user.  Consequently, the user may modify
+     these programs in any way he/she thinks fit.
+
+             --------------------------------------------
+             |This software is provided on an asis basis|
+             |              and                         |
+             |       no warranty is provided            |
+             --------------------------------------------
+
+     These programs are Freeware and may be freely copied.  They
+     may be freely distributed to any other party on condition
+     that no inducement beyond reasonable handling costs is
+     offered or accepted by either side for such distribution.
+
+     I would be interested to hear of comments and/or proposed
+     enhancements, if so, please email me at:  j_d_a@eresmas.com
+
+     Thanks
+

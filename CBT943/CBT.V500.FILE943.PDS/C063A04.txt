@@ -1,0 +1,259 @@
+The results are unpredictable
+
+Within a CICS system, the DFHPCP governs the flow of
+control between application programs under the direction of
+those program control commands like LINK, XCTL, and
+RETURN.  There are two options associated with them:
+COMMAREA and LENGTH.  The COMMAREA option
+allows data to be passed from one application program to
+another while the LENGTH option specifies its length.
+
+The CICS/OS/VS 1.7 Application Programmer's Command
+Level Reference Manual - SC33-0241 specifies two important
+points regarding the length of the COMMAREA:
+
+1      The LENGTH value being passed must not be greater than
+      the length of the data area specified in the COMMAREA
+      option.  If it is, the results are unpredictable.  (Applicable
+      to all three commands : LINK, XCTL, and RETURN.)
+
+2      The receiving data area must not be longer than the length
+      of the COMMAREA being passed.  If it is, the results are
+      also unpredictable.  (Applicable only to LINK and XCTL).
+
+Why is this so?  There are two combined causes.  The first is
+because of the way that CICS manages its own storage.  The
+second is because of the way the MVCL instruction works.
+MVCL is a System/370 instruction which CICS employs to do
+the copying.  These two causes combined together will explain
+why  overstating the LENGTH value will produce
+unpredictable results.
+
+For point 1, CICS will copy the COMMAREA according to the
+LENGTH value for both XCTL and RETURN commands
+while, for the LINK command, the linked-to program is passed
+with a pointer to the COMMAREA.  This is only true when the
+COMMAREA being passed is under the 16-megabyte line and
+the linked-to program has the AMODE=24 attribute.
+Addressing Mode (AMODE) 24 means the linked-to program
+expects to get control with a 24-bit address length.
+
+If the COMMAREA is above the 16-megabyte line and the
+linked-to program is AMODE=24, DFHEPC must copy that
+COMMAREA so that it can be accessed by that linked-to
+program.  To copy the COMMAREA, DFHEPC always uses
+the MVCL instruction.  DFHEPC doesn't use the MVC
+instruction because the maximum length that MVC can copy is
+256 bytes.
+
+Before the execution of MVCL, DFHEPC has to pick up the
+length of data from a 2-byte field, EISCALEN, which is the
+stored value specified in the LENGTH option.  DFHEPC
+accepts the value without making any authentication except
+checking its sign.  If it is negative, DFHEPC resets
+EISCALEN to zero, thereby nullifying the copying.
+
+MVCL is a powerful instruction.  It consists of two operands.
+Each operand field specifies an even-odd pair of general
+registers.  In our discussion, DFHEPC specifies MVCL
+R6,R14.
+
+To prepare the move,  DFHEPC performs the following steps:
+
+o      A GETMAIN to obtain storage with
+      LENGTH=EISCALEN from DSA.  As CICS manages its own
+      storage, the DSA is actually  divided into 6 subpools.  The
+      newly-acquired storage will be allocated from the task
+      subpool, which is used for all the storage required
+      throughout the life of a CICS transaction.  Register 6,  the
+      target pointer, is initialized to point at this piece of newly-
+      acquired storage while register 14, the source pointer, is
+      the given pointer of the passed COMMAREA.
+
+o      Initialization of both registers 7 and 15 with the value of
+      EISCALEN.
+
+Finally,  MVCL is executed.
+
+The movement of data starts at the left end of both fields,
+pointed at respectively by register 6 and register 14, then
+proceeds to the right.  As part of the execution of the
+instruction, a check is made for destructive overlap of the
+operands, which happens when the first operand location is
+used as a source after data has been moved into it.  When this
+happens, the operation stops, resulting in not a single byte
+being moved, followed by the condition code 3 being set.
+
+How can the destructive overlap happen in the CICS region?  It
+is because the use of the storage within the DSA is very
+dynamic.  The task subpool, together with the other 5
+subpools, are not permanently assigned, but are dynamically
+acquired as needed a page at a time from the DSA.  When
+Program A first starts, DFHPCP allocates the storage for its
+working storage, which contains an area for COMMAREA.
+When Program B comes into the picture through LINK,
+XCTL, or RETURN commands, DFHEPC determines that the
+COMMAREA has to be copied, so it issues a GETMAIN.
+DFHSCP starts to search for storage using the first-fit
+algorithm.  As the use of the DSA is so dynamic, it usually
+happens that the newly-acquired storage is allocated just close
+enough to Program A's COMMAREA.  Because the LENGTH
+of the COMMAREA is overstated, destructive overlap may
+happen.
+
+So much for point 1.  However, an example raised below to
+illustrate point 2 will further consolidate the concepts discussed
+so far.
+
+For point 2, the causes are identical to point 1 except the
+MVCL instruction is now generated by the language compiler
+rather than being the CICS code itself.
+
+The following COBOL example, using the IBM OS/VS
+COBOL compiler Program Product 5740-CB1 Release 2.3,
+though created artificially, will correctly and comprehensively
+reflect the whole scenario with much more technical detail.
+
+In the following tables, the left hand side represents the
+COBOL statements, while on the right hand side is the
+corresponding storage allocated by DFHSCP from the task
+subpool, the contents of which are surrounded by two 8-byte
+SAAs.
+
+
+ PROGRAM A:                |
+ WORKING-STORAGE SECTION.  |
+ 01 AREA PIC X(296).       |
+ EXEC CICS XCTL            | LOCATION
+      PROGRAM('PROGRAMB')  | 003160D0
+      COMMAREA(AREA)       |
+      LENGTH(296)          | CONTENTS
+      END-EXEC.            | 8C1C0138 003142A0 <296 for COMMAREA>
+                           |                   <  8 FILLERS >
+                           | 8C1D0138 003142A0
+
+The execution of this EXEC CICS statement results in
+DFHPCP requesting DFHSCP to allocate, at location
+003160D0, the storage of CLASS=USER X'8C', with length
+X'138' (312 decimal) to accommodate a copy of AREA,
+before control is given to Program B.  Note that the length of
+312 is calculated by adding 8 bytes (the first SAA) to 304,
+where 304 is the nearest 4-word boundary rounded up from
+296.
+
+
+ PROGRAM B:                |
+ DATA DIVISION.            |
+ WORKING-STORAGE SECTION.  | LOCATION
+ 01 WORKAREA PIC X(513).   | 00316270
+                           | CONTENTS
+                           | 8C1D0688 00316210 <4 for chaining from
+                           |                               TCAPCDSA>
+                           |                   <   4 for padding  >
+                           |                   <15*4 for RSA>
+                           |                  <1024 for WORKING STORAGE>
+                           |                   < 560 for TGT >
+                           |                   <  12 FILLERS>
+                           | 8C1D0688 00316210
+                           | NOTE:
+                           | a) TCAPCDSA is the head of the chain of
+                           |    dynamic storage used to make the
+                           |    PROGRAM B reenterable.
+                           | b) RSA is the Registers Save Area used
+                           |    by COBOL's INIT routines.
+                           | c) 1024-byte working storage is generated
+                           |    by the COBOL compiler.  Out of this,
+                           |    the first 513 bytes are for WORKAREA.
+                           |    The rest is for the generated
+                           |    variables eg DFHEIV0, inserted by
+                           |    the CICS Command Language Translator.
+                           | d) Within the PPT entry of PROGRAMB,
+                           |    PPTCCR contains the size of TGT;
+                           |    PPTCOTP contains the sum of the sizes
+                           |    of RSA, WORKING STORAGE and TGT.
+                           |    To support quasi-reentrancy, DFHPCP
+                           |    picks up the length value from
+                           |    PPTCOTP, adds 8 bytes more, then
+                           |    requests DFHSCP to allocate the
+                           |    required storage.   ie
+                           |    X'688' = 1672
+                           |           = (4+4+15*4+1024+560+12)+8
+                           |    where 12 fillers are due to the
+                           |    "4-word boundary rule" imposed by
+                           |    DFHSCP.
+                           |    After DFHSCP passes back the
+                           |    pointer of the newly allocated storage,
+                           |    DFHPCP copies into it with the
+                           |    PROGRAM B's original contents of
+                           |    RSA, WORKING STORAGE and TGT.
+ -------------------------------------------------------------------
+ LINKAGE SECTION.          |
+ 01 DFHCOMMAREA PIC X(296).|
+ PROCEDURE DIVISION.       |
+ MOVE DFHCOMMAREA TO       | Note : The length of the receiving
+      WORKAREA.            |        area is overstated.
+ EXEC CICS RETURN END-EXEC.|
+ GOBACK.                   |
+
+The COBOL compiler, based on the statement 'MOVE
+DFHCOMMAREA TO WORKAREA' generates the following
+Assembler codes:
+
+R0 <--- 003162B4    TARGET; X'00316270+8+3C'
+R1 <--- 00000201    LENGTH; 513 bytes
+R2 <--- 003160D8    SOURCE; X'003160D0+8'
+R3 <--- 40000128    LENGTH; 296 bytes.  Where X'40' is the padding byte,
+
+               MVCL R0,R2
+
+Graphically, the execution of MVCL can be depicted as
+follows:
+
+ Data movement ---->
+
+ Source                  Target
+ 003160D8(R2)            003162B4(R0)
+ |-----------------------|-------------------------------|
+                         |<--------- x'201' ------------>|
+                         xxxxx <----overlap destruction occurs here
+ |<-------- x'201' ---------->|
+                              003162D9
+
+As shown, the first overlap destruction occurs at location
+X'003162B4', which is the first operand location currently
+being used as a source after the data has initially been moved
+into it from location X'003160D8'.  You may notice that the
+length of the WORKAREA is artificially set to 513 bytes.  This
+is intended to illustrate that, for the COBOL compiler to
+generate the MVCL instruction,  the cut-off point is 512 bytes.
+That is, for a length equal to 512 or under, the MVC
+instruction is generated instead.  Should MVC be used, no
+overlap destruction will occur.
+
+Assume the length of DFHCOMMAREA remains 296, the
+WORKAREA now becomes 512.  The Assembler code for the
+COBOL statement 'MOVE DFHCOMMAREA TO
+WORKAREA' is generated as follows:
+
+
+         MVC 000(256,R6),0(R7)     DFHCOMMAREA <--- R7
+         MVC 256(40,R6),256(R7)    WORKAREA    <--- R6
+         MVI 296(R6),X'40'
+         MVC 297(215,R6),296(R6)
+
+As seen,  after the first 296 bytes of WORKAREA are filled
+with DFHCOMMAREA, the next 216 bytes are filled with
+blanks.
+
+In conclusion, the problem described in CICS Update,
+February 1989 in the article Apparent loss of
+DFHCOMMAREA contents will not occur if the size doesn't
+exceed 512 bytes.  More importantly, the absence of the
+condition code checking after the execution of the MVCL
+instruction and the way that DFHSCP manages its storage lead
+to the statement "the results are unpredictable".
+
+
+Richard Li
+Technical Specialist (Canada)
+

@@ -1,0 +1,644 @@
+STEMPUSH TITLE 'PUSH ONE OR MORE REXX STEMS INTO A DATASPACE STACK'
+*-------------------------------------------------------------------*
+* Name            : STEMPUSH
+*
+* Function        : This program provides an external REXX function
+*                   to place REXX stem variables onto a stack that
+*                   can be passed to another REXX exec running within
+*                   the same address space.
+*
+*                   The 'stack' is in fact a dataspace whose STOKEN
+*                   is passed back in EBCDIC form to the REXX result
+*                   value. This 'token' can then be used in any
+*                   other REXX as an argument to the STEMPULL
+*                   function to retrieve the contents of the
+*                   dataspace.
+*
+* Syntax          : token = STEMPUSH(maxblk,'stem1.',,'stemn.')
+*
+*                   where :   token  -  16 byte token that identifies
+*                                       the 'stack' that the stems have
+*                                       been 'pushed' onto. If this
+*                                       is set to '0', then the
+*                                       function has failed.
+*
+*                             maxblk -  Optional keyword that specifies
+*                                       the size of the 'stack'. The
+*                                       format is 'MAXBLOCKS=nnnnn'
+*                                       where 'nnnnn' is the size of
+*                                       'stack' in 4K blocks.
+*                                       The minimum value is 10.
+*                                       The maximum value is 99999.
+*                                       The default value is 4000.
+*
+*                             stemn  -  The stem name(s) that are to be
+*                                       pushed onto the 'stack'. The
+*                                       variable names MUST be enclosed
+*                                       in quotes and the last char in
+*                                       each name MUST be a dot.
+*
+*
+* Example         : /* REXX - EXEC1 */
+*                   fname.0 = 2
+*                   fname.1 = 'Fred'
+*                   fname.2 = 'Barney'
+*                   sname.0 = 2
+*                   sname.1 = 'Fred'
+*                   sname.2 = 'Barney'
+*                   token = STEMPUSH('MAXBLOCKS=10','fname.','sname.')
+*                   if token <> 0 then call EXEC2 token
+*                   exit
+*
+*                   /* REXX - EXEC2 */
+*                   arg token
+*                   status = stempull(token)
+*                   if status = 0 then do
+*                     say fname.1 sname.1
+*                     say fname.2 sname.2
+*                   end
+*                   exit
+*
+*
+* IBM Macros Used : MODID, STORAGE, LOAD, TCBTOKEN, DSPSERV, ALESERV,
+*                   SYSSTATE, ABEND, DELETE, IRXEFPL, IRXENVB,
+*                   IRXEVALB, IRXARGTB, IRXSHVB
+*
+* Attributes      : Amode(31)
+*                   Rmode(Any)
+*                   RENT
+*                   REUS
+*                   NOREFR
+*                   AC(0)
+*
+* Register Usage  :
+*
+* R1  - Parms passed              : +0 ---> REXX EFPL
+* R2  - EFPL
+* R3  - EVALBLOCK
+* R4  - REXX Arg Table
+* R5  - REXX Arg pointer
+* R6  - REXX Arg length
+* R7  - Work
+* R8  - Dataspace base address
+* R9  - Dataspace current pointer (RSST)
+* R10 - Branch and Link
+* R11 - SHVBLOCK
+* R12 - Base reg
+* R13 - Workarea
+*
+*
+* Possible ABEND Codes :
+*
+* User Abend 111  - TCBTOKEN Failed
+* User Abend 112  - ALESERV Failed
+* User Abend 113  - DSPSERV Failed
+*
+*-------------------------------------------------------------------*
+* (c) Scott Enterprise Consultancy Ltd
+*-------------------------------------------------------------------*
+* Changes
+* 17/06/1998  Rob Scott  Code Written                            V1.0
+* 24/07/1998  Rob Scott  Add code to convert the 8-byte STOKEN to
+*                        its EBCDIC equivalent. This ensures that
+*                        the token can be passed easily to STEMPULL
+*                        by REXX without suffering from uppercase
+*                        translation and code page problems.     V1.1
+* 29/07/1998  Rob Scott  Use MVCL to copy the data from the RSST.
+*                        This allows values > 256 bytes long to
+*                        be copied into the RSST.                V1.2
+* 14/08/1998  Rob Scott  Ensure AR15 is zero prior to the copy
+*                        from the RSST. This prevents 0E0 abends
+*                        in OS/390 2.5.                          V1.3
+* 04/09/1998  Rob Scott  Cope with RSST being full by setting the
+*                        RSSTFULL flag to indicate truncation has
+*                        occurred.
+*                        Add the optional 'MAXBLOCKS' keyword so
+*                        users can specify the maximum size of the
+*                        dataspace stack.                        V1.4
+*-------------------------------------------------------------------*
+STEMPUSH CSECT
+STEMPUSH AMODE 31
+STEMPUSH RMODE ANY
+         BAKR  R14,R0                 linkage stack
+         LAE   R12,0(R15,0)           set R12 as base
+         USING STEMPUSH,R12           address it
+         MODID ,                      eyecatcher
+         LR    R2,R1                  copy any parms passed
+GETWORK  EQU   *
+*--------------------------------------------------------------------*
+* Get some workarea storage and init to zeros. We also load the
+* address of IRXEXCOM for later calls.
+*--------------------------------------------------------------------*
+         STORAGE OBTAIN,              get the workarea storage         X
+               LENGTH=WORKLEN,        this much                        X
+               ADDR=(R13),            address in r13                   X
+               SP=0,KEY=8,            subpool 0 storage key 8          X
+               LOC=ANY,               above the line                   X
+               COND=NO                unconditional
+         USING WORKAREA,R13           address workarea
+         LR    R14,R13                Copy workarea address
+         L     R15,=A(WORKLEN)        Get length of workarea
+         XR    R0,R0                  Clear
+         XR    R1,R1                  Clear
+         MVCL  R14,R0                 Init to zeros
+         MVC   4(4,R13),=C'F1SA'      set label in savearea
+         LOAD  EP=IRXEXCOM            Get address of IRXEXCOM
+         ST    R0,AIRXEXCM            Store for later
+         MVC   MAXBLKS,=F'4000'       Default MAXBLKS (1000*4K)
+GETPARMS EQU   *
+*--------------------------------------------------------------------*
+* Process the parms passed to this REXX function. These will be the
+* names of the stem variables that are to be pushed onto the stack.
+* We must have at least 1 parameter. We also process the optional
+* MAXBLOCKS keyword if specified.
+*--------------------------------------------------------------------*
+         USING EFPL,R2                address REXX function parms
+         L     R3,EFPLEVAL            Get pointer to Eval_Block
+         L     R3,0(R3)               REXX Eval_Block address
+         USING EVALBLOCK,R3           Address it
+         L     R4,EFPLARG             REXX Argument table
+         USING ARGTABLE_ENTRY,R4      Address it
+         CLC   0(8,R4),HEXFF          No arguments passed ?
+         BE    RETURNCC               then error
+*--------------------------------------------------------------------*
+* Check if MAXBLOCKS has been specified.
+*--------------------------------------------------------------------*
+         L     R5,ARGTABLE_ARGSTRING_PTR
+         L     R6,ARGTABLE_ARGSTRING_LENGTH
+         C     R6,=F'11'              at least 11 chars long ?
+         BL    GETSHVB                no - ignore
+         C     R6,=F'15'              up to 15 bytes max
+         BH    GETSHVB                longer - ignore
+         LR    R1,R6                  Copy length of parm
+         BCTR  R1,R0                  Minus 1 for execute
+         EX    R1,CONVUPPR            ensure uppercase
+         CLC   0(10,R5),=C'MAXBLOCKS=' user specifying stack size ?
+         BNE   GETSHVB                no - ignore
+         S     R6,=F'11'              yes - how many numbers?
+         LA    R5,10(R5)              point to start of numbers
+         MVC   UWORK(7),=C'0000000'   init maxblocks (unpacked)
+         LA    R7,UWORK+6             Point to last number
+         SR    R7,R6                  Adjust for length
+         EX    R6,MOVEBLKS            Move in the parm
+         TRT   UWORK(7),NUMBERS       Check for numbers
+         BNZ   RETURNCC               if not - error
+         PACK  PWORK(4),UWORK(7)      Pack the MAXBLKS
+         CVB   R7,ENTNUM              Convert to binary
+         C     R7,=F'10'              greater than 10 ?
+         BNH   RETURNCC               no - error
+         C     R7,=F'99999'           greater than 99999 ?
+         BH    RETURNCC               yes - error
+         STCM  R7,B'1111',MAXBLKS     Store as MAXBLKS (binary)
+GETSHVB  EQU   *
+*--------------------------------------------------------------------*
+* We have at least 1 parm, so now we need to get storage for the
+* REXX SHVB (required by IRXEXCOM). We reserve 250 bytes for the
+* variable name and 3K for the variable value.
+*--------------------------------------------------------------------*
+         STORAGE OBTAIN,              get the SHVBLOCK storage         X
+               LENGTH=4096,           this much                        X
+               ADDR=(R11),            address in r11                   X
+               SP=0,KEY=8,            subpool 0 storage key 8          X
+               LOC=ANY,               above the line                   X
+               COND=NO                unconditional
+         USING SHVBLOCK,R11           address SHVBLOCK
+         LA    R15,SHVBLEN(R11)       Point to name buffer
+         ST    R15,ASHVNAMA           Store for IRXEXCOM
+         MVC   NAMALEN,=F'250'        Set length of name buffer
+         LA    R15,256(R15)           Point to value buffer
+         ST    R15,ASHVVALA           Store for IRXEXCOM
+         MVC   VALALEN,=F'3072'       Set length of value buffer
+GETDSP   EQU   *
+*--------------------------------------------------------------------*
+* Now it is time to set up the 'stack'. This is going to be a
+* dataspace that is created under the ownership of the Jobstep TCB.
+* Assigning the ownership to the Jobstep TCB allows the dataspace
+* to exist until the address space terminates - otherwise it will
+* be deleted at TCB termination.
+*--------------------------------------------------------------------*
+         SAC   512                    Switch into AR mode
+         SYSSTATE ASCENV=AR           Set Global bit for AR mode
+*--------------------------------------------------------------------*
+* To set the ownership to the JSTCB, we need to acquire the TCBTOKEN
+*--------------------------------------------------------------------*
+         TCBTOKEN TYPE=JOBSTEP,       Get the TCB Token (Jobstep)      x
+               TTOKEN=DSPTTOKN,       Store for DSPSERV                x
+               MF=(E,TCBTOKN1)
+         LTR   R15,R15                Test rc
+         BNZ   ABEND111
+         MVC   DSPNAME(8),=CL8'RSS'   Set name suffix
+*--------------------------------------------------------------------*
+* TCB Token acquired, create the dataspace named 'RSS.....' with
+* 'maxblks' amount of 4K blocks. This is set initially to 4000*4K
+* (approx 16meg).
+*--------------------------------------------------------------------*
+         DSPSERV CREATE,              Create a dataspace               x
+               STOKEN=DSPDTOKN,       Store STOKEN here                x
+               TYPE=BASIC,            Indicate dataspace               x
+               NAME=DSPNAME,          Name of dataspace                x
+               GENNAME=YES,           Make name unique                 x
+               OUTNAME=DSPNAME,       Place name here                  x
+               ORIGIN=DSPORIG,        Place origin address here        x
+               BLOCKS=MAXBLKS,        Maximum blocks                   x
+               TTOKEN=DSPTTOKN,       Use Jobstep TCB Token            x
+               MF=(E,DSPSERV1)
+         LTR   R15,R15                Test rc
+         BNZ   ABEND112
+*--------------------------------------------------------------------*
+* Get the dataspace ALET and establish addressability.
+* We always set the origin to x'1000' to overcome any incompatability
+* between processors - we may waste the first 4K but that's tough.
+*--------------------------------------------------------------------*
+         ALESERV ADD,                 Get the ALET                     x
+               STOKEN=DSPDTOKN,       For the dataspace STOKEN         x
+               ALET=DSPALET,          Place ALET here                  x
+               AL=PASN,               Available globaly                x
+               MF=(E,ALESERV1)
+         LTR   R15,R15                Test rc
+         BNZ   ABEND113
+         MVC   DSPORIG(4),=F'4096'    Set origin to 4K
+         LAM   R8,R8,DSPALET          Load AR8-AR9 with ALET
+         CPYA  R9,R8                  Copy AR8 to AR9
+*--------------------------------------------------------------------*
+* Initialize the RSST control block within the dataspace
+*--------------------------------------------------------------------*
+         L     R8,DSPORIG             Load R8 with start address
+         USING RSST,R8                Address DSECT
+         LR    R9,R8                  Copy address to R9
+         MVC   RSSTID,=CL4'RSST'      Indicate Eye-catch
+         MVC   RSSTNMBR,=F'0'         Set number of entries to zero
+         MVC   RSSTSIZE,=AL4(RSSTHSIZ) Init size of table
+         MVC   HIGHADDR,RSSTSIZE      Copy init size to high used addr
+         L     R7,MAXBLKS             Get the maximum blocks
+         SLL   R7,12                  x4096 = K
+         ST    R7,MAXADDR             Store as maximum address
+         LA    R9,RSSTENT             Point to first entry
+VARLOOP  EQU   *
+*--------------------------------------------------------------------*
+* Loop through all of the known REXX variables and see if they match
+* any of the passed stem names. If so we add the REXX variable name
+* and value as an entry in the RSST.
+* We find all of the known REXX variables by invoking IRXEXCOM with
+* the 'Fetch Next' option in the SHVB until the SHVLVAR bit is set
+* in SHVRET. When calling IRXEXCOM we have to reset the AR mode
+* indicator.
+*--------------------------------------------------------------------*
+         LA    R1,EXCOMID             Point to IRXEXCOM id
+         ST    R1,AEXCOMP1            Store in parm list
+         LA    R1,ZERO                Point to fullword zero
+         ST    R1,AEXCOMP2            Store in parm list
+         ST    R1,AEXCOMP3            Store in parm list
+         ST    R11,AEXCOMP4           Store SHVB as parm #4
+         LA    R1,ZERO                Point to fullword zero
+         ST    R1,AEXCOMP5            Store in parm list
+         LA    R1,EXCOMRC             Point to return code
+         ST    R1,AEXCOMP6            Store in parm list
+         OI    AEXCOMP6,X'80'         Indicate end of list
+         MVI   SHVCODE,SHVNEXTV       Indicate "Fetch Next"
+         MVC   SHVNAMA,ASHVNAMA       Point to name buffer
+         MVC   SHVVALA,ASHVVALA       Point to value buffer
+         MVC   SHVUSER,NAMALEN        Set name buffer length
+         MVC   SHVNAML,NAMALEN        Set name buffer length
+         MVC   SHVVALL,VALALEN        Set value buffer length
+         MVC   SHVBUFL,VALALEN        Set value buffer length
+         SYSSTATE ASCENV=P            Reset AR Mode
+         SAC   0
+         LA    R1,EXCOMPRM            Point to the parm list
+         L     R15,AIRXEXCM           Load address of routine
+         BALR  R14,R15                Call it
+         ICM   R15,B'1111',EXCOMRC    Test rc
+         BNZ   VARFINI                if not 0 - exit
+         SAC   512                    Switch into AR mode
+         SYSSTATE ASCENV=AR           Set Global bit for AR mode
+         TM    SHVRET,SHVLVAR         Last variable ?
+         BO    VARFINI                Yes - tidy up and go
+COMPNAME EQU   *
+*--------------------------------------------------------------------*
+* We have a variable returned from IRXEXCOM, we need to point to the
+* first REXX stem name passed to this program and then loop through
+* the stemnames until we get a match or run out of names.
+*--------------------------------------------------------------------*
+         L     R4,EFPLARG             REXX Argument table
+         USING ARGTABLE_ENTRY,R4      Address it
+ARGLOOP  EQU   *
+         CLC   0(8,R4),HEXFF          End of arg list ?
+         BE    NEXTVAR                Yes - get next variable
+         ICM   R5,B'1111',ARGTABLE_ARGSTRING_PTR
+         BZ    NEXTARG                if zero address - get next arg
+         ICM   R6,B'1111',ARGTABLE_ARGSTRING_LENGTH
+         BZ    NEXTARG                if zero length - get next arg
+         BCTR  R6,R0                  Minus 1 for execute
+         LR    R15,R5                 Quick copy of parm address
+         AR    R15,R6                 Point to last char of name
+         CLI   0(R15),C'.'            Is it a stem ?
+         BNE   NEXTARG                No - ignore
+         EX    R6,CONVUPPR            Make name uppercase
+         L     R15,ASHVNAMA           Point to name buffer
+         EX    R6,NAMECLC             Do they match ?
+         BNE   NEXTARG                No - check next arg
+MATCHARG EQU   *
+*--------------------------------------------------------------------*
+* We have found a match, we now need to add the variable name and
+* value to the RSST.
+* We also maintain a counter of the number of variables copied to the
+* RSST and the current size of the RSST (including header). This
+* allows us to release unused dataspace storage at the end of the
+* program.
+*--------------------------------------------------------------------*
+         L     R7,HIGHADDR            Get current end address
+         A     R7,SHVNAML             Add the name length
+         A     R7,SHVVALL             Add the value length
+         LA    R7,8(R7)               Add the two length words
+         C     R7,MAXADDR             Would there be enough room
+         BNL   DSPFULL                No - we are full
+         ICM   R15,B'1111',SHVNAML    Get the name length
+         STCM  R15,B'1111',0(R9)      Store in RSST
+         LA    R9,4(R9)               Point to name area
+         L     R15,ASHVNAMA           Point to name buffer
+         ICM   R6,B'1111',SHVNAML     Get the name length
+         BCTR  R6,R0                  Minus 1 for execute
+         CPYA  R15,R12                Ensure AR15 is same as AR12
+         EX    R6,MVCRSST             Move in the name value
+         ICM   R15,B'1111',SHVNAML    Get the name length
+         AR    R9,R15                 Point to value length
+         ICM   R15,B'1111',SHVVALL    Get the value length
+         STCM  R15,B'1111',0(R9)      Store in RSST
+         LA    R9,4(R9)               Point to value area
+         LR    R14,R9                 Copy address for MVCL
+         CPYA  R14,R9                 Copy AR9 to AR14 as well
+         L     R0,ASHVVALA            Point to value buffer
+         ICM   R15,B'1111',SHVVALL    Get the value length
+         LR    R1,R15                 Copy to R1 for MVCL
+         MVCL  R14,R0                 Move in the value
+         ICM   R15,B'1111',SHVVALL    Get the value length
+         AR    R9,R15                 Point to next entry
+         ST    R9,HIGHADDR            Store as new high used address
+*--------------------------------------------------------------------*
+* Add to variables 'pushed' and the RSST size
+*--------------------------------------------------------------------*
+         L     R15,RSSTNMBR           Get the number of vars 'pushed'
+         LA    R15,1(R15)             Add to it
+         ST    R15,RSSTNMBR           and store it back
+         L     R15,RSSTSIZE           Get current size
+         LA    R15,8(R15)             Add space for two length fields
+         A     R15,SHVNAML            Add the length of the name
+         A     R15,SHVVALL            Add the length of the value
+         ST    R15,RSSTSIZE           Store back in RSST
+         B     NEXTVAR                and look at next variable
+NEXTARG  EQU   *
+*--------------------------------------------------------------------*
+* Get the next stem name
+*--------------------------------------------------------------------*
+         LA    R4,8(R4)               Point to next arg
+         B     ARGLOOP                and check again
+NEXTVAR  EQU   *
+*--------------------------------------------------------------------*
+* Get the next REXX variable from IRXEXCOM
+*--------------------------------------------------------------------*
+         B     VARLOOP                No - do it again
+DSPFULL  EQU   *
+         OI    RSSTFLAG,RSSTFULL      Indicate full
+         B     RETURN00               and return
+VARFINI  EQU   *
+*--------------------------------------------------------------------*
+* We have finished browsing the REXX variables. We now round up the
+* storage used in the dataspace to a 4K boundary and release the
+* unused blocks. If we have found no matches, we still return rc=00
+* as the STEMPULL function examines RSSTNMBR before doing anything.
+*--------------------------------------------------------------------*
+         LR    R1,R9                  Copy High-used address
+         A     R1,=F'4095'            Add 4K-1
+         SRL   R1,12                  How many 4K blocks ?
+         ST    R1,USEDBLKS            Remember for later
+         SLL   R1,12                  Round the address to 4K
+         ST    R1,HIGHADDR            Store for later
+         L     R15,MAXBLKS            Load up maximum blocks
+         S     R15,USEDBLKS           Subtract used blocks
+         BNP   RETURN00               If not > 0 byapss RELEASE
+         ST    R15,FREEBLKS           = blocks to be release
+         DSPSERV RELEASE,             Release unused space             x
+               STOKEN=DSPDTOKN,       Using this STOKEN                x
+               START=HIGHADDR,        From this start address          x
+               BLOCKS=FREEBLKS,       for this many blocks             x
+               MF=(E,DSPSERV1)
+RETURN00 EQU   *
+*--------------------------------------------------------------------*
+* Return to the user and pass back the 'token'
+*--------------------------------------------------------------------*
+         SYSSTATE ASCENV=P            Reset AR Mode
+         SAC   0
+         BAL   R10,HEX2CHAR           Convert dataspace token to EBCDIC
+         MVC   EVALBLOCK_EVLEN(4),=F'16' Set length of result
+         MVC   EVALBLOCK_EVDATA(16),TOKEN
+         BAL   R10,RELSHVB            free the SHVB area
+         BAL   R10,RELWORK            free the workarea
+         XR    R15,R15                set rc to zero
+         PR                           return
+RETURNCC EQU   *
+*--------------------------------------------------------------------*
+* Return to the user and indicate failed
+*--------------------------------------------------------------------*
+         BAL   R10,RELWORK            free the workarea
+         MVC   EVALBLOCK_EVLEN(4),=F'1'  Set length of result
+         MVC   EVALBLOCK_EVDATA(2),=C'0' Move in result data
+         PR                           return
+*
+*--------------------------------------------------------------------*
+* General Routines
+*--------------------------------------------------------------------*
+*
+HEX2CHAR EQU   *
+*--------------------------------------------------------------------*
+* Convert a hex string to EBCDIC
+* We convert the 8-byte dataspace token '8ABC00...' to its 16-byte
+* EBCDIC equivalent eq 'F8C1C2C3F0F0....'
+*--------------------------------------------------------------------*
+         LA    R1,DSPDTOKN            Point to the dataspace token
+         LA    R15,TOKEN              Point to the EBCDIC token
+         LA    R0,8                   Set length of input
+LEFTHALF EQU   *
+         XR    R7,R7                  Clear
+         ICM   R7,B'0001',0(R1)       Load up a byte (000000ab)
+         SRL   R7,4                   Remove last 4 bits (0000000a)
+LEFTNUM  EQU   *
+         CH    R7,=H'9'               00000000 - 00000009 ?
+         BH    LEFTLTTR               higher - must be A-F
+         AH    R7,=H'240'             xlate to F0-F9
+         B     LEFTDONE
+LEFTLTTR EQU   *
+         AH    R7,=H'183'             xlate to C1-C6
+LEFTDONE EQU   *
+         STCM  R7,B'0001',0(R15)      Store in token
+         LA    R15,1(R15)             Point to next char
+RGHTHALF EQU   *
+         XR    R7,R7                  Clear
+         ICM   R7,B'0001',0(R1)       Load up a byte (000000ab)
+         SLL   R7,28                  Remove first 4 bits (b0000000)
+         SRL   R7,28                  and reset           (0000000b)
+RGHTNUM  EQU   *
+         CH    R7,=H'9'               00000000 - 00000009 ?
+         BH    RGHTLTTR               higher - must be A-F
+         AH    R7,=H'240'             xlate to F0-F9
+         B     RGHTDONE
+RGHTLTTR EQU   *
+         AH    R7,=H'183'             xlate to C1-C6
+RGHTDONE EQU   *
+         STCM  R7,B'0001',0(R15)      Store in token
+         LA    R15,1(R15)             Point to next char
+         LA    R1,1(R1)               Point to next token byte
+         BCT   R0,LEFTHALF            Loop for all bytes
+         BR    R10                    return
+*
+RELWORK  EQU   *
+*--------------------------------------------------------------------*
+* Release workarea storage
+*--------------------------------------------------------------------*
+         DELETE EP=IRXEXCOM           Delete IRXEXCOM from storage
+         STORAGE RELEASE,             release workarea storage         X
+               LENGTH=WORKLEN,        this much                        X
+               ADDR=(R13),            address in R13                   X
+               SP=0,KEY=8,            subpool 0 storage key 8          X
+               COND=NO                unconditional
+         BR    R10                    return
+*
+RELSHVB  EQU   *
+*--------------------------------------------------------------------*
+* Release SHVB storage
+*--------------------------------------------------------------------*
+         STORAGE RELEASE,             release SHVB storage             X
+               LENGTH=4096,           this much                        X
+               ADDR=(R11),            address in R11                   X
+               SP=0,KEY=8,            subpool 0 storage key 8          X
+               COND=NO                unconditional
+         BR    R10                    return
+*
+ABEND111 ABEND 111,DUMP               TCBTOKEN failed
+ABEND112 ABEND 112,DUMP               ALESERV failed
+ABEND113 ABEND 113,DUMP               DSPSERV failed
+*
+*-------------------------------------------------------------------*
+* Executed instructions
+*-------------------------------------------------------------------*
+*
+CONVUPPR TR    0(0,R5),UPPER          Xlate to upper case
+NAMECLC  CLC   0(0,R15),0(R5)         Compare variable names
+MVCRSST  MVC   0(0,R9),0(R15)         Copy in the name
+MOVEBLKS MVC   0(0,R7),0(R5)          Copy in the name
+*
+*-------------------------------------------------------------------*
+* Constants, Variables and DSECTs
+*-------------------------------------------------------------------*
+*
+         LTORG
+UPPER    DS    0CL256
+         DC    X'000102030405060708090A0B0C0D0E0F'
+         DC    X'101112131415161718191A1B1C1D1E1F'
+         DC    X'202122232425262728292A2B2C2D2E2F'
+         DC    X'303132333435363738393A3B3C3D3E3F'
+         DC    X'404142434445464748494A4B4C4D4E4F'
+         DC    X'505152535455565758595A5B5C5D5E5F'
+         DC    X'606162636465666768696A6B6C6D6E6F'
+         DC    X'707172737475767778797A7B7C7D7E7F'
+         DC    X'80C1C2C3C4C5C6C7C8C98A8B8C8D8E8F'
+         DC    X'90D1D2D3D4D5D6D7D8D99A9B9C9D9E9F'
+         DC    X'A0A1E2E3E4E5E6E7E8E9AAABACADAEAF'
+         DC    X'B0B1B2B3B4B5B6B7B8B9BABBBCBDBEBF'
+         DC    X'C0C1C2C3C4C5C6C7C8C9CACBCCCDCECF'
+         DC    X'D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDF'
+         DC    X'E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF'
+         DC    X'F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF'
+*
+NUMBERS  DC    256X'FF'               Translate table - Numbers
+         ORG   NUMBERS+C'0'
+         DC    10X'00'
+*
+HEXFF    DC    XL8'FFFFFFFFFFFFFFFF'  High values
+EXCOMID  DC    CL8'IRXEXCOM'          IRXEXCOM ID
+ZERO     DC    F'0'                   Zero fullword
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                    save area
+TOKEN    DS    CL16                   Token passed back
+DSPTTOKN DS    CL16                   TCB Token
+DSPNAME  DS    CL8                    Dataspace name
+DSPDTOKN DS    CL8                    Dataspace token
+DSPORIG  DS    F                      Dataspace origin
+DSPALET  DS    F                      Dataspace ALET
+AIRXEXCM DS    F                      address of IRXEXCOM
+ASHVNAMA DS    F                      address of SHVB name buffer
+ASHVVALA DS    F                      address of SHVB value buffer
+NAMALEN  DS    F                      length of SHVB name buffer
+VALALEN  DS    F                      length of SHVB value buffer
+EXCOMRC  DS    F                      Return code from IRXEXCOM
+EXCOMPRM DS    0F                     Parm list for IRXEXCOM
+AEXCOMP1 DS    F                      ---> IRXEXCOM ID
+AEXCOMP2 DS    F                      ---> 0
+AEXCOMP3 DS    F                      ---> 0
+AEXCOMP4 DS    F                      ---> SHVBLOCK
+AEXCOMP5 DS    F                      ---> ENVBLOCK
+AEXCOMP6 DS    F                      ---> Return Code
+         DS    0D
+ENTNUM   DS    F
+PWORK    DS    F                      Fullword work area
+UWORK    DS    CL8                    Character work area
+         DS    0F
+MAXBLKS  DS    F                      Max size of data space n*4K
+USEDBLKS DS    F                      Used Dataspace blocks
+FREEBLKS DS    F                      Used Dataspace blocks
+HIGHADDR DS    F                      High-used address in dataspace
+MAXADDR  DS    F                      Maximum address in dataspace
+         DSPSERV MF=(L,DSPSERV1)      List form of DSPSERV
+TCBTOKN1 TCBTOKEN MF=L                List form of TCBTOKEN
+ALESERV1 ALESERV MF=L                 List form of ALESERV
+         DS    0D
+WORKLEN  EQU   *-WORKAREA
+*
+RSST     DSECT
+*-------------------------------------------------------------------*
+* The Pushed REXX Stem Variable Storage Table (RSST)
+*
+* The RSST consists of a 12 byte header plus a variable amount of
+* individual entries. Each entry is constructed as follows :
+* Namel     DS   AL4(Name)        Length of name
+* Name      DS   CL(Namel)        REXX Variable Name
+* Valuel    DS   AL4(Value)       Length of value
+* Value     DS   CL(Valuel)       REXX Variable value
+*
+* For example, an entry for a variable 'STEM.11' with a value 'FRED'
+* would look like this :
+*   Namel   Name          Valuel  Value
+* x'00000007E2E3C5D44BF1F100000004C6D9C5C4'
+*-------------------------------------------------------------------*
+RSSTID   DS    CL4                    Eyecatcher
+RSSTNMBR DS    CL4                    Number of entries
+RSSTSIZE DS    CL4                    Size of table (including header)
+RSSTFLAG DS    X                      Flag byte
+RSSTFULL EQU   X'80'                  RSST is full
+         DS    XL3                    Reserved
+RSSTHSIZ EQU   *-RSST                 Size of header
+RSSTENT  DS    0C                     Entry
+*
+*
+         IRXEFPL                      REXX External Function
+         IRXEVALB                     REXX Evaluation Block
+         IRXENVB                      REXX Environment Block
+         IRXSHVB                      REXX Shared Variable Block
+         IRXARGTB DECLARE=YES         REXX Argument Table
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END

@@ -1,0 +1,213 @@
+Validating the APF table using a REXX EXEC
+
+Because of the arrival of new 3390 disks in our DASD farm and
+the implementation of DFSMS at our site, we have been very
+busy migrating files from one disk to another. Maintaining the
+APF table for MVS is an error-prone (although not complex) task
+when that table may contain hundreds of entries. Thanks to some
+recent PTFs, IBM has made it easier: the syntax rules were
+enhanced in order to avoid specifying the volume parameter for
+SMS libraries or the SYSRES volume name for system libraries
+(this was formerly known in cataloging operations as 'indirect
+VOLSER specification'). Moreover, LPALST libraries need no
+longer be listed in the IEAAPFxx member. Check on this support:
+PTFs for APARs OY26695 and OY41408 should be applied on
+your system. APAR OY26695 provides the list of changes that
+were made to the APFLST. Should you lack this support, turn off
+the flag in the EXEC (change the first line to FLAG = 0).
+
+The following REXX EXEC should help you have a correct and
+up-to-date APF table, even if your DASD migrations are very
+complicated. It considers as an error every entry corresponding to
+a profile not protected (by RACF or equivalent), because libraries
+in the APFLST must be carefully protected from programs being
+copied onto them allowing intruders to bypass all possible
+security (this kind of breach has been emphasized for a long time
+and is well known). Other cases considered as errors by the
+EXEC are a file not being a PDS and improperly omitting the
+VOLSER for non-SMS libraries. Warnings are issued for SMS
+libraries for which a VOLSER was specified, or for non-existent
+files or volumes. See Figure 1 to get an idea of the more frequent
+errors.
+
+ /*    REXX EXEC TO VERIFY AND VALIDATE THE MVS APF TABLE        */
+ FLAG = 1              /* <-- SET FLAG = 0 IF NEW FACILITIES     */
+                       /*    ARE NOT SUPPORTED ON YOUR SYSTEM    */
+                       /*  (PTFS FOR APARS OY26695, OY41408      */
+                       /*          STILL NOT APPLIED)            */
+ SYSRES = ''
+ /*--------------------------------------------------------------*/
+ /* 1) IF NEW FACILITIES ARE SUPPORTED, GET VOLID OF SYSRES      */
+ /*--------------------------------------------------------------*/
+ IF FLAG   = 1  THEN DO
+   ADR = 10
+   LONG = 4
+   DATA = STORAGE(ADR,LONG)          /* CVT ADDRESS IN MEMORY  */
+   DATAH = C2X(DATA)                 /*                        */
+   ADDUCB = STORAGE(DATAH,52)        /* GET BEGINNING OF CVT   */
+   ADDUCB = SUBSTR(ADDUCB,49,4)      /* GET ADDRESS OF UCB     */
+   UCBSYSH = C2X(ADDUCB)             /*                        */
+   UCBSYS = STORAGE(UCBSYSH,50)      /* GET UCB OF SYSRES VOL  */
+   SYSRES = SUBSTR(UCBSYS,29,6)      /* GET VOLID OF SYSRES    */
+   SAY ' SYSRES IS : ' SYSRES        /*                        */
+   SAY ' NEW FACILITIES OF APFLST ARE TAKEN INTO ACCOUNT'
+   END
+ /*--------------------------------------------------------------*/
+ /* 2) READ THE APF TABLE IN SYS1.PARMLIB                        */
+ /*--------------------------------------------------------------*/
+ ARG SUFFIX
+ IF SUFFIX = '' THEN DO
+         SAY ' ** ENTER THE SUFFIX XX FOR IEAAPFXX (DEFAULT=00) :'
+         PULL SUFFIX
+         END
+ IF SUFFIX = '' THEN SUFFIX = '00'
+ MBR = 'IEAAPF'||SUFFIX
+ FILE = 'SYS1.PARMLIB('||MBR||')'
+ IF SYSDSN(FILE) ^= 'OK' THEN DO
+         SAY  FILE ':' SYSDSN(FILE)
+         EXIT
+         END
+'FREE  F(PARMLIB)'
+'ALLOC F(PARMLIB) DA('||FILE||') SHR'
+'EXECIO * DISKR PARMLIB (STEM RECORD. FINIS '
+'FREE  F(PARMLIB)'
+IF RECORD.0 = 0 THEN DO
+         SAY  '** ' FILE 'IS EMPTY, EARLY TERMINATION  **'
+         EXIT
+         END
+K = 0             /*       LOOP VARIABLE                         */
+MAXCC = 0         /*    MAXIMUM CONDITION CODE                   */
+TOTAL = 0         /*       TOTAL NO OF DATASETS WE PROCESSED     */
+DSERR = 0         /*             NO OF DATASETS IN ERROR         */
+DSWAR = 0         /*             NO OF DATASETS IN WARNING       */
+COMMA = ","
+ /*--------------------------------------------------------------*/
+ /* 3) LOOP TO VERIFY EACH ENTRY OF THE TABLE                    */
+ /*--------------------------------------------------------------*/
+DO FOREVER WHILE K <= RECORD.0
+K = K + 1
+ /*                                                              */
+SAY SUBSTR(RECORD.K,1,79)            /* PRINT ONLY 79 BYTES      */
+DSN =  WORD(RECORD.K,1)              /* DATASET NAME             */
+VOL =  WORD(RECORD.K,2)              /* VOLSER PLUS COMMA        */
+IF POS(COMMA,VOL) > 0 THEN DO
+                          POS_COMMA = POS(COMMA,VOL)-1
+                          VOL =  SUBSTR(VOL,1,POS_COMMA)
+                          END
+                     ELSE K = RECORD.0+1    /* NO COMMA,  END OF */
+                                            /* THE TABLE REACHED */
+IF DSN = '' THEN DO
+            SAY '        ** ERROR, BLANK LINE FOUND'
+            MAXCC = 16
+            LEAVE             /* END OF TABLE */
+            END
+TOTAL = TOTAL+1
+ /*   VOLSER NOT SPECIFIED   (OLD STYLE, NO NEW FACILITY)        */
+IF VOL = '' &   FLAG ^= 1  THEN DO
+            SAY '        ** VOLUME NOT SPECIFIED FOR DSN :' DSN
+            MAXCC = 16
+            DSERR = DSERR + 1
+            ITERATE
+            END
+ /*    IF VOLSER=****** (NEW FACILITY), TAKE SYSRES INSTEAD      */
+IF VOL = '******' &   FLAG = 1 THEN DO
+            VOL = SYSRES
+            END
+ /*    IS THE FILE CATALOGUED ?  GET THE VOLUME IN 'CATVOL' VAR. */
+X = LISTDSI(DSN NORECALL)
+IF X  <= 4  THEN CATVOL = SYSVOLUME
+            ELSE CATVOL = ''          /* DATASET NOT CATALOGUED  */
+ /*--------------------------------------------------------------*/
+ /*   THE FILE IS CATALOGUED. IF NEW FACILITIES ARE INSTALLED,   */
+ /*   WE VERIFY WHETHER THE FILE IS SMS-MANAGED (LISTDS COMMAND) */
+ /*   - IF IT IS, NO NEED TO INDICATE VOLSER IN APF TABLE        */
+ /*   - IF IT IS NOT, THE VOLSER MUST BE INDICATED               */
+ /*--------------------------------------------------------------*/
+IF    FLAG = 1   &   CATVOL ^= ''  THEN DO
+ /*   TRAP OUTPUT LINES AFTER 'LISTDS' COMMAND                   */
+            O = OUTTRAP("LINE.",'*',"NOCONCAT")
+            ADDRESS TSO   "LISTD "||DSN||"   LABEL"
+            IF LINE.0 < 8 THEN DO
+                        SAY '     ** LISTDS FAILED FOR FILE 'DSN
+                        IF MAXCC < 8 THEN MAXCC = 8
+                        DSERR = DSERR+1
+                        ITERATE
+                        END
+            O = SUBSTR(LINE.8,7,1)
+ /*    IN DSCB-1, BIT DS1SMSDS (VALUE X'80') IS TURNED ON        */
+ /*               IN FLAG DS1SMSFG FOR SMS-MANAGED FILE          */
+            IF O='8' | O='9' | O='A' | O='B' | ,
+                O='C' | O='D' | O='E' | O='F' ,
+                   THEN DO
+                        IF CATVOL = VOL THEN DO
+                           SAY '     ** FILE' DSN 'IS SMS-MANAGED,' ,
+                           'VOLUME NAME SHOULD BE OMITTED'
+                           DSWAR = DSWAR + 1
+                           IF MAXCC < 4 THEN MAXCC = 4
+                           END
+                        END
+                   ELSE DO
+                        IF VOL = ''  THEN DO
+                           SAY '     ** FILE' DSN 'NOT SMS-MANAGED,',
+                           'VOLUME NAME IS MISSING'
+                           IF MAXCC < 8 THEN MAXCC = 8
+                           DSERR = DSERR+1
+                           ITERATE
+                           END
+                        END
+            O = OUTTRAP("LINE.",0)   /* DON'T TRAP OUTPUT ANY MORE */
+            END
+ /*--------------------------------------------------------------*/
+ /*    FILE IS NOT CATALOGUED    OR                              */
+ /*    FILE IS CATALOGUED ON ANOTHER VOLUME :                    */
+ /*    WE LOCATE THE FILE ON THE VOLUME GIVEN IN THE APF TABLE   */
+ /*--------------------------------------------------------------*/
+IF CATVOL = "" | (CATVOL ^= "" & CATVOL ^= VOL & VOL ^= "") THEN DO
+   LOCATION = 'VOLUME('||VOL||')'
+   X = LISTDSI(DSN LOCATION)
+   IF X  > 0 THEN DO
+         COM = ''
+         IF CATVOL ^= '' THEN COM='(BUT CATALOGUED ON '||CATVOL||')
+         SAY '     **' DSN 'NOT ON VOL:' VOL COM
+         IF MAXCC < 4 THEN MAXCC = 4
+         DSWAR = DSWAR+1
+         END
+   END
+ /*--------------------------------------------------------------*/
+ /*    IF THE FILE EXISTS, VERIFY ITS PROTECTION (RACF PROFILE)  */
+ /*--------------------------------------------------------------*/
+IF X = 0 THEN DO
+   IF SYSRACFA = 'NONE' THEN DO
+          SAY '     **' DSN  'NOT PROTECTED BY RACF'
+          IF MAXCC < 8 THEN MAXCC = 8
+          DSERR = DSERR+1
+          END
+   END
+ /*--------------------------------------------------------------*/
+ /*    IF THE FILE EXISTS, VERIFY IT IS A PARTITIONED DATASET    */
+ /*--------------------------------------------------------------*/
+IF X = 0 THEN DO
+   IF SUBSTR(SYSDSORG,1,2)  ^= 'PO'  THEN DO
+          SAY '     **' DSN  'IS NOT A PDS, DSORG=' SYSDSORG
+          IF MAXCC < 8 THEN MAXCC = 8
+          DSERR = DSERR+1
+          END
+   END
+END       /* END OF "DO FOREVER WHILE K"                         */
+ /*--------------------------------------------------------------*/
+ /*  END OF EXEC, GIVE SOME STATISTICS                           */
+ /*--------------------------------------------------------------*/
+SAY
+SAY          FILE 'VERIFIED, MAX CONDITION CODE ' MAXCC
+SAY          RECORD.0 'RECORDS READ,' TOTAL ' DATASETS VERIFIED'
+SAY          '('||DSERR||' IN ERROR,' DSWAR 'WARNINGS)'
+IF TOTAL < RECORD.0 THEN DO
+   SAY          RECORD.0-TOTAL 'RECORDS WERE IGNORED'
+   END
+EXIT
+
+
+Thierry Falissard
+MVS Manager
+Banque la Henin (France)                                                          c Xephon 1994
+

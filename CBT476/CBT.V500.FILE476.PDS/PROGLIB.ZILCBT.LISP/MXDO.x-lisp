@@ -1,0 +1,378 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; The DO macro expander.
+;
+; E.G.: (these are sort-of expansions, not always exactly this way)
+;
+;  (DO ((I1 A1 (CDR I1))
+;       (I2 A2 (ADD1 I2))
+;       (I3 A3 (SUB1 I3))
+;      )
+;      ((ATOM I1) (SOME STUFF) (SOME VALUE))
+;      (DO SOMETHING)
+;      (DO SOMETHING ELSE)
+;  )
+;       -->
+;
+; ((LAMBDA (I1 I2 I3)
+;    (PROG ()
+;      LOOP
+;       (COND (ATOM I1)
+;             (RETURN (PROGN (SOME STUFF) (SOME VALUE))))
+;       (DO SOMETHING)
+;       (DO SOMETHING ELSE)
+;       (PSETQ I1 (CDR I1) I2 (ADD1 I2) I3 (SUB1 I3))
+;       (GO LOOP)))
+;  (A1 A2 A3)
+; )
+;
+; The DO* macro expander.
+;
+; E.G.:
+;
+;  (DO* ((I1 A1 (CDR I1))
+;        (I2 A2 (ADD1 I2))
+;        (I3 A3 (SUB1 I3))
+;       )
+;       ((ATOM I1) (SOME STUFF) (SOME VALUE))
+;       (DO SOMETHING)
+;       (DO SOMETHING ELSE)
+;   )
+;       -->
+;
+; ((LAMBDA (I1)
+;   ((LAMBDA (I2)
+;     ((LAMBDA (I3)
+;       (PROG ()
+;         LOOP
+;          (COND (ATOM I1)
+;                (RETURN (PROGN (SOME STUFF) (SOME VALUE))))
+;          (DO SOMETHING)
+;          (DO SOMETHING ELSE)
+;          (PSETQ I1 (CDR I1) I2 (ADD1 I2) I3 (SUB1 I3))
+;          (GO LOOP)))
+;        A3))
+;    A2))
+;  A1)
+;
+
+
+(eval-when (eval)
+ (defun do macro (x) (mxdo x))
+ (defun do* macro (x) (mxdo x))
+ (defun dolist macro (x) (mxdo x))
+ (defun dotimes macro (x) (mxdo x))
+)
+
+(defun mxdo (x)
+ (case (car x)
+       (dotimes   (mxdotimes (cdr x)))
+       (dolist    (mxdolist  (cdr x)))
+       ((do do*)  (mxdo-ijk  x))
+       (t (zerror "Unknown caller of MXDO" (car x)))))
+
+(defun mxdo-ijk (arg &aux
+                          (macroname (car arg))
+                          (x (cdr arg))
+                )
+ (unless x (zerror "Missing args" macroname))
+ (cond
+  ((listp (car x))
+   (unless (cdr x) (zerror "Invalid syntax" arg))
+   (let (((i j . k) x))
+                          i ; the list of iteration constructs
+                          j ; the termination construct
+                          k ; the body
+        (case macroname
+              (do      (mxdo1 i j k i 'psetq))
+              (do*     (mxdo* i j k i)))))
+  (t
+   (mxdo-old x))))
+
+;
+; MXDO1 - operates on 4 arguments:
+;
+;   I - the list of iteration triples for initialization
+;   J - the termination pair
+;   K - the body (rest of the form) in form (declarations . body)
+;   L - the list of iteration triples for incrementing
+;
+(defun mxdo1 (i j k l setq-or-psetq)
+ (let (((dcls . body) (do-split-body k))
+       (loop (gensym)) (cond nil) (term nil))
+  (if j
+      (if (atom j)
+          (zerror "Invalid DO termination form" j)
+          (setq cond (car j)
+                term `((return (progn . ,(cdr j)))))))
+
+  `((lambda ,(mapcar #'do-var i)            ; Local variable list.
+            ,.dcls                          ; Declarations.
+            (prog ()
+                  ,loop                     ; Iteration tag.
+                  . ,(mxdo-body cond                ; Termination test.
+                                term                ; Return forms.
+                                `(
+                                  ,@body            ; Body.
+                                  ,(do-incr l setq-or-psetq);
+                                                    ; Step DO variables.
+                                  ,(and j `(go ,loop)) ; Iterate.
+                                 )
+                  )))
+    ,.(mapcar #'do-bind i))))               ; Initial binding of locals.
+
+(defun do-var (x)
+ (cond ((atom x) x) (t (car x)))
+)
+
+(defun do-bind (x)
+ (and (consp x) (cdr x) (cadr x))
+)
+
+(defun do-cond (x)
+ (if x
+     (if (atom x)
+         (zerror "Invalid DO termination form" x)
+         `(cond (,(car x) (return (progn . ,(cdr x))))))
+     nil))
+
+(defun do-incr (x setq-or-psetq)
+ (prog (y v)
+  loop (or x (return `(,setq-or-psetq . ,(nreverse v))))
+       (setq y (car x))
+       (when (and (consp y) (cdr y) (cddr y))
+             (and (cdddr y) (zerror "Invalid DO initialization form" y))
+             (push (car y) v)
+             (push (caddr y) v))
+       (setq x (cdr x))
+       (go loop)))
+
+(defun mxdo-old (x) ; The old-style Maclisp DO.
+ (unless (and (cdr x)
+              (cddr x)
+              (cdddr x))
+         (zerror "Invalid DO syntax" x))
+ (let*(
+       ((var init repeat endtest . rest) x)
+       ((dcls . body) (do-split-body rest))
+       (loop (gensym))
+       (g (gensym))
+      )
+      `(let ((,var ,init))
+            ,.dcls
+            (prog ()
+                  ,loop
+                  . ,(mxdo-body endtest
+                                '(
+                                  (return nil)
+                                 )
+                                `(
+                                  ,@body
+                                  (setq ,var ,repeat)
+                                  (go ,loop)))))))
+
+
+;
+; The DO* macro expander.
+;
+;
+; MXDO* - operates on 4 arguments:
+;
+;   I - the list of iteration triples for initialization
+;   J - the termination pair
+;   K - the body (rest of the form)
+;   L - the list of iteration triples for incrementing
+;
+
+(defun mxdo* (i j k l)
+ (cond
+  ((null i)        (mxdo1 () j k l 'setq))
+  ((null (cdr i))  (mxdo1  i j k l 'setq))
+  (t
+   (let* ((var (do-var (car i)))
+         )
+    (multiple-value-bind (d b)
+                         (mxdo*-extract-declarations var k)
+     `((lambda (,var)
+               ,.d
+               ,(mxdo* (cdr i) j b l))
+       ,(do-bind (car i))))))))
+
+(defun mxdo*-extract-declarations (a b)
+
+;;; This function returns two values:
+;;;
+;;; (1) NIL or a DECLARE SPECIAL form for args in A that are special
+;;;     (that is, a list of one such form for nconcability)
+;;; (2) a copy of the body B with possibly macroexpanded forms in it
+;;;
+;;; First, locate any declarations in the body.  We won't take them
+;;; out of there, but we do want to know which variables are
+;;; declared special therein.  Any variables that are declared
+;;; special and also occur in the local DO* variables must have
+;;; SPECIAL declarations inserted in the appropriate places between
+;;; the inner DOs.
+;;;
+;;; Note that we can get away with leaving the original special
+;;; declarations where they were found, because SPECIAL declarations
+;;; are defined to be pervasive wrt REFERENCES, and we assume that
+;;; either no BINDINGS of those variables are duplicated further in
+;;; or (if they are, which is probably an error anyway, though this
+;;; has been hotly debated) they're SPECIAL too!
+;;;
+
+ (multiple-value-bind (nil declarations body pmxform pmxvalid)
+                      (parse-body b)
+
+  (when pmxvalid (setq body (cons pmxform (cdr body))))
+
+  (let (
+        (d nil)
+       )
+   (mapc #'(lambda (declaration)
+                   (and (consp declaration)
+                        (eq (car declaration) 'special)
+                        (memq a (cdr declaration))
+                        (not (memq a d))
+                        (push a d)))
+         declarations)
+
+;;; "d" is now a list of the variables that need to be declared
+;;; special in the currently enclosing DO.
+
+   (when d (setq d `((declare (special . ,d))))) ; To be NCONCed in.
+
+   (when declarations
+         (setq body `((declare . ,declarations) . ,body)))
+
+   (values d body))))
+
+
+;
+;***********************************************************************
+;*                                                                     *
+;* The DOLIST macro expander.                                          *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defun mxdolist (x)
+ (unless (and x (cdr x))
+         (zerror "Invalid DOLIST syntax"))
+ (let (((a . b) x))        ; a = iteration spec, b = body
+      (when (or (atom a) (atom (cdr a)))
+            (zerror "Invalid DOLIST variable definition" a))
+      (let (((v w r) a)    ; v = the step variable
+                           ; w = the list
+                           ; r = the result, defaulting to NIL.
+            ((dcls . body) (do-split-body b))
+                           ; dcls = declarations, body = body
+            (g (gensym))   ; a variable to hold the list.
+            (l (gensym)))  ; a variable to hold the loop tag.
+           `((lambda (,g)
+                     (prog (,v)
+                           ,.dcls
+                           ,l
+                           . ,(mxdo-body `(not ,g)
+                                         `(
+                                           (setq ,v nil)
+                                           (return ,r)
+                                          )
+                                         `(
+                                           (setq ,v (zcar ,g))
+                                           ,@body
+                                           (setq ,g (cdr ,g))
+                                           (go ,l)
+                                          )
+                      )))
+             ,w))))
+
+
+;
+;***********************************************************************
+;*                                                                     *
+;* The DOTIMES macro expander.                                         *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defun mxdotimes (x)
+ (unless (and x (cdr x))
+         (zerror "Invalid DOTIMES syntax"))
+ (let (((a . b) x))        ; a = iteration spec, b = body
+      (when (or (atom a) (atom (cdr a)))
+            (zerror "Invalid DOTIMES variable definition" a))
+      (let (((v w r) a)    ; v = the step variable
+                           ; w = the limit
+                           ; r = the result, defaulting to NIL.
+            ((dcls . body) (do-split-body b))
+                           ; dcls = declarations, body = body
+            (g (gensym))   ; a variable to hold the limit.
+            (l (gensym)))  ; a variable to hold the loop tag.
+            (let ((prog `(prog (,v)
+                           ,.dcls
+                           (setq ,v 0)
+                           ,l
+                           . ,(mxdo-body
+                                `(not (lessp ,v ,(if (integerp w) w g)))
+                                `(
+                                  (return ,r)
+                                 )
+                                `(
+                                  ,@body
+                                  (setq ,v (add1 ,v))
+                                  (go ,l)
+                                 )
+                              ))))
+
+                (if (integerp w)
+                    prog
+                    `((lambda (,g) ,prog) ,w))))))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* This function processes a condition/termination/body group.         *
+;*                                                                     *
+;***********************************************************************
+;
+(defun mxdo-body (cond term body)
+ (cond
+  ((null cond)
+   body)         ; Old body, declarations and all
+  ((mapor #'(lambda (x) (and x (atom x))) body) ; Any GO tags in body?
+   `((cond (,cond . ,term)) . ,body))  ; If so, must branch around body
+  (t                                   ; Else branch out to return...
+   `((cond (,(mxdo-negate cond) . ,body)) . ,term)))) ; compiles better
+
+(defun mxdo-negate (cond)
+ (if (and (consp cond)
+          (cdr cond)
+          (or (eq (car cond) 'not)
+              (eq (car cond) 'null)))
+     (cadr cond)
+     `(not ,cond)))
+
+;
+;***********************************************************************
+;*                                                                     *
+;* This function extracts declarations from a body.                    *
+;*                                                                     *
+;***********************************************************************
+;
+
+(defun do-split-body (body)
+ (multiple-value-bind (nil pdecls pbody pmxform pmxvalid)
+                      (parse-body body)
+  (when pmxvalid
+        (setq pbody (cons pmxform (cdr pbody))))
+  (when pdecls (setq pdecls `((declare . ,pdecls))))
+  (cons pdecls pbody)))
+

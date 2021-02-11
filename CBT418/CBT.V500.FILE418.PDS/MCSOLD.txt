@@ -1,0 +1,470 @@
+MCS      TITLE      'DISPLAY MASTER CONSOLE SIB ON TSO TERMINAL'
+***********************************************************************
+*                                                                     *
+* TO USE:                                                             *
+*                                                                     *
+*     1) ENTER MCS. YOU MUST BE OUTSIDE OF SPF DUE TO SPF/APF         *
+*        AUTHORIZATION RESTRICTIONS. (OR USE AN AUTHORIZATION SVC     *
+*        TO TURN ON THE JSCBAUTH BIT FOR THE CURRENT TCB).            *
+*                                                                     *
+*     2) THE MASTER CONSOLE SCREEN IMAGE BUFFER WILL BE DISPLAYED ON  *
+*        YOUR TSO TERMINAL. FOR USERS WITH OPER AUTHORITY, AN INPUT   *
+*        BUFFER WILL BE PROVIDED AT THE BOTTOM OF THE SCREEN WHICH    *
+*        CAN BE USED TO ENTER ANY MVS OR JES2 COMMAND. IF YOU HIT     *
+*        ENTER WITHOUT ANY COMMAND, THE SCREEN WILL BE UPDATED AND    *
+*        REDISPLAYED.  IF YOU DON'T WANT THE COMMAND ECHOED ON THE    *
+*        CONSOLE, PRECEED THE COMMAND WITH A NOT SIGN (¬).            *
+*                                                                     *
+*     3) TO PLACE YOURSELF INTO AUTO-ROLL MODE, HIT THE PA2 KEY.      *
+*        THIS WILL REFRESH THE SCREEN EVERY SECOND. TO RETURN TO      *
+*        NORMAL MODE, HIT THE PA1 KEY.                                *
+*                                                                     *
+*     4) TO TERMINATE MCS, HIT ANY PF KEY.                            *
+*                                                                     *
+*                                                                     *
+* CHANGE HISTORY:                                                     *
+*                                                                     *
+*     1) I DISCOVERED AN INTERESTING FACT THAT WHEN YOU EXTRACT       *
+*        ANOTHER ADDRESS SPACE'S AUTHORIZATION INDEX (AXEXT) AND      *
+*        USE THAT VALUE TO SET YOUR AUTHORIZATION INDEX (AXSET)       *
+*        THE AX VALUE YOU SET DOES NOT RETURN BACK TO YOUR ORIGINAL   *
+*        VALUE BY FREEING THE AUTHORIZATION INDEX (AXFRE).            *
+*                                                                     *
+*        A SECOND SET SECONDARY ADDRESS SPACE (SSAR) ATTEMPT BY A     *
+*        PROGRAM IMMEDIATELY AFTER THIS MAY OR MAY NOT REQUIRE A      *
+*        AXEXT OR AXSET SEQUENCE OF INSTRUCTIONS BEFORE ISSUING THE   *
+*        SSAR INSTRUCTION SINCE THE AX VALUE WAS PREVIOUSLY SET AND   *
+*        WILL STAY THAT VALUE UNLESS EXPLICITY CHANGED OR ADDRESS     *
+*        SPACE COMPLETION.                                            *
+*                                                                     *
+*        I CHANGED MCS TO SAVE THE USERS ORIGINAL AX VALUE AND        *
+*        RESTORE IT UPON COMPLETION OF MCS.  07/10/87  TOM BRYANT     *
+*                                                                     *
+*     2) SINCE THE CONSOLE ASID HAS CHANGED A LOT IN MVS THROUGH THE  *
+*        YEARS (SEE DIAGRAM BELOW), I DECIDED TO SEARCH FOR THE       *
+*        CONSOLE ASCB/ASID AND LOAD THE ASID WHEN FOUND FOR LATER     *
+*        SSAR PROCESSING.        02/04/87   TOM BRYANT                *
+*                                                                     *
+*        ASID 5 FOR MVS/SP 1.3.0.                                     *
+*        ASID 6 FOR MVS/XA PRE-DFP 2.1.0.                             *
+*        ASID 7 FOR MVS/XA DFP 2.1.0.                                 *
+*                                                                     *
+*     3) ADDED THE VTAM STFSMODE AND STLINENO TO PREVENT YOUR TERMINAL*
+*        MESSAGES BEING OVERLAID BY A FULLSCREEN WRITE AND TO ENSURE  *
+*        THAT THE NEXT NON-FULLSCREEN WRITE BEGINS ON LINE 1.         *
+*        02/04/87    TOM BRYANT                                       *
+*                                                                     *
+*     4) DUE TO 3290 TERMINAL PA2 PROBLEMS, THE PA2 FUNCTION HAS BEEN *
+*        DISABLED UNTIL RESOLUTION OF THE 3290 PROBLEM.  THE PA2 WILL *
+*        PERFORM A 'REDISPLAY' INSTEAD OF GOING TO A TIMER ROUTINE.   *
+*                                                                     *
+*                                                                     *
+*        IF ANYONE HAS SUCCESSFULLY RUN WITH AUTOROLL USING A 3290    *
+*        PLEASE CALL ME AT (312) 769-8414.  02/04/87  TOM BRYANT      *
+*                                                                     *
+***********************************************************************
+         EJECT
+MCS      CSECT
+***********************************************************************
+*                                                                     *
+*        ENTRANCE JUNK                                                *
+*                                                                     *
+***********************************************************************
+         SAVE  (14,12),,CONSOLE_DISPLAY_ON_TSO_TERMINAL
+         LR    R12,R15             USE R12 AS PROG BASE
+         USING MCS,R12             TELL ASSEMBLER ABOUT BASE REG
+         LR    R9,R1               SAVE ADDR OF CPPL
+         USING CPPL,R9             TELL ASSEMBLER
+         ST    R13,SAVE+4          CHAIN
+         LA    R3,SAVE              SAVE
+         ST    R3,8(,R13)            AREAS
+         LR    R13,R3                 TOGETHER
+         EJECT
+***********************************************************************
+*                                                                     *
+*        ESTABLISH ENVIRONMENT                                        *
+*                                                                     *
+***********************************************************************
+         GTSIZE
+         LTR   R0,R0               IS THIS A 3270 TYPE DEVICE
+         BZ    ERROR               NO - CANNOT BE MCS CONSOLE
+         L     R4,CPPLPSCB         GET ADDR OF PSCB
+         USING PSCB,R4
+         LA    R0,1                ** TURN ON AUTHORIZATION **
+         SVC   255                 ** ISSUE AUTHORIZATION SVC **
+         CLC   PSCBUSER(2),=CL2'SS' IS THIS A SYSTEMS PROGRAMMER?
+         BNE   CHKAUTH             NO, DON'T SET SYSPFLG
+         OI    BITS,SYSPFLG        SET SYSPFLG
+***********************************************************************
+*        NOTE: A NON-SS USER OF MCS MUST USE IT OUTSIDE OF ISPF/PDF   *
+*              DUE TO THE AUTHORIZATION SVC ONLY ALLOWING SS-PREFIXED *
+*              USERS.   TOM BRYANT                                    *
+***********************************************************************
+CHKAUTH  DS    0H
+         TM    PSCBATR1,PSCBCTRL   DOES USER HAVE OPER AUTH
+         BZ    NOTAUTH             NO, SKIP SETTING AUTH BIT
+         OI    BITS,AUTHFLG        INDICATE COMMAND AUTHORITY
+         DROP  R4
+NOTAUTH  DS    0H
+         STAX  STAXEXIT            ESTABLISH ATTENTION EXIT
+         LTR   R15,R15             TEST RETURN CODE
+         BNZ   STAXERR             BRANCH ON ERROR
+         ESTAE ESTAEXIT            ESTABLISH ESTAE EXIT
+         LTR   R15,R15             TEST RETURN CODE
+         BNZ   ESTAERR             BRANCH ON ERROR
+***********************************************************************
+*                                                                     *
+*        SEARCH FOR CONSOLE ASCB/ASID STARTING WITH HIGHEST ASCB      *
+*        IN ORDER TO GET ASID FOR LATER SSAR INSTRUCTION.             *
+*                                                                     *
+***********************************************************************
+         L     R1,CVTPTR           GET ADDR OF CVT
+         USING CVTMAP,R1           SET ADDRESSABILITY
+         L     R14,CVTASCBH        HIGHEST ASCB ADDRESS
+         USING ASCB,R14            SET ADDRESSABILITY
+LOOPNM   ICM   R15,15,ASCBJBNI     IS IT A BATCH JOB ?
+         BZ    NOBATCH              IF NOT, CHECK IF STC
+         B     CHKJOBNM            CHECK JOBNAME
+NOBATCH  ICM   R15,15,ASCBJBNS     IS IS A STARTED TASK ?
+         BZ    NXTASCB             IF NOT, GET NEXT ASCB
+CHKJOBNM CLC   0(8,R15),CNSL       CONSOLE ADDRESS SPACE?
+         BE    PROCESS               IF SO, GET ASID
+NXTASCB  ICM   R14,15,ASCBFWDP     GET NEXT ASCB
+         BZ    FINIS               IF NO MORE LEAVE NOW!
+         B     LOOPNM              CONTINUE THE SEARCH
+PROCESS  LH    R4,ASCBASID         LOAD CONSOLE ASID FOR SSAR
+         DROP  R1,R14              DONE WITH ADDRESSABILITY
+***********************************************************************
+*                                                                     *
+*        PREPARE FOR FULLSCREEN OPERATIONS                            *
+*                                                                     *
+***********************************************************************
+         STFSMODE ON,INITIAL=YES   LET VTAM KNOW ABOUT FULLSCREEN
+         LA    R1,ERASE            POINT TO ERASE CNTL CHARS
+         LA    R0,L'ERASE          GET THE LENGTH
+         TPUT  (1),(0),FULLSCR     ERASE THE 3270 SCREEN
+         MODESET KEY=ZERO,MODE=SUP GET INTO SUPERVISOR STATE/KEY ZERO
+         AXRES AXLIST=AXLIST       RESERVE AN AX
+         EPAR  R1                  EXTRACT PRIMARY ASN
+         AXEXT ASID=(1)            EXTRACT OUR AX INTO R0
+         ST    R0,OLDAX            SAVE OUR ORIGINAL AX VALUE
+         AXEXT ASID=(4)            EXTRACT AX OF CONSOLE INTO R0
+         AXSET AX=(0)              SET OUR AX TO THAT OF CONSOLE
+         SSAR  R4                  SET 'CONSOLE' AS SEC'NDY ADDR SPC
+         EJECT
+***********************************************************************
+*                                                                     *
+*        INITIALIZE POINTERS                                          *
+*                                                                     *
+***********************************************************************
+         L     R5,CVTPTR           GET ADDR OF CVT
+         USING CVTMAP,R5
+         L     R5,CVTCUCB          GET CONSOLE UCM BASE ADDR
+         DROP  R5
+         LA    R5,0(,R5)           INSURANCE
+         S     R5,=F'4'            BACK UP FOUR BYTES
+         L     R5,0(,R5)           GET ADDR OF UCM PREFIX
+         USING UCMPRFX,R5
+         L     R5,UCMMCENT         GET ADDR OF MASTER CONSOLE UCM
+         DROP  R5
+         USING UCMLIST,R5
+         MVC   CONSOLE,UCMID       GET CONSOLE UCMID
+         L     R6,UCMXB            GET ADDR OF RDCM
+         L     R7,0(,R6)           GET ADDR OF TDCM
+         LA    R1,4                LENGTH FOR MVCP
+         SLR   R0,R0               ZERO R0 FOR MVCP
+         MVCP  SIBPTR(R1),X'30'(R7),R0 MOVE ADDR OF SCREEN IMAGE BUFFER
+         L     R2,SIBPTR           PICK UP SIB POINTER
+         SH    R2,=H'6'            BACK UP SIX BYTES (FOR CNTL CHARS)
+         L     R3,=A(21*84)        DISPLAY 21 LINES (79-DATA/5-CONTROL)
+         STM   R2,R3,SAVER23       SAVE SIB ADDRESS/LENGTH
+         B     DISPLAY             SKIP OVER TIMER ROUTINE
+         EJECT
+***********************************************************************
+*                                                                     *
+*        TIMER ROUTINE                                                *
+*                                                                     *
+***********************************************************************
+         DS    0D                  ALIGNMENT
+TIMER    DS    0H
+         NI    BITS,255-ATTNFLG    RESET ATTN FLAG
+         OI    BITS,TIMEFLG        SET TIMER FLAG
+         STIMER WAIT,DINTVL=WAITTIME WAIT FOR 1 SEC
+***********************************************************************
+*                                                                     *
+*        DISPLAY CONSOLE SCREEN                                       *
+*                                                                     *
+***********************************************************************
+DISPLAY  DS    0H
+         LM    R2,R3,SAVER23       RESTORE SIB ADDRESS/LENGTH
+         LA    R10,SCREEN          POINT TO MY SCREEN AREA
+         SSAR  R4                  R4 CONTAINS ASID FOR 'CONSOLE'
+         SLR   R0,R0               ZERO R0 FOR MVCP
+MVCP     DS    0H
+         MVCP  0(R3,R10),0(R2),R0  MOVE SIB TO MY ADDRESS SPACE
+         BZ    GOTITALL            MAKE SURE WE GOT IT ALL
+         A     R2,=F'256'          ADJUST REGS FOR MVCP
+         A     R10,=F'256'               "      "
+         S     R3,=F'256'                "      "
+         B     MVCP                GO GET THE REST
+GOTITALL DS    0H
+         LA    R10,SCREEN-1        BACK UP ONE FOR WCC X'C3'
+         MVI   WCC,X'C3'           NORMAL WCC (RESTORE/RESET)      CICA
+         L     R11,SAVER23+4       GET LEN FOR TPUT
+         LA    R11,1(,R11)         LEN +1 FOR WCC
+         XC    CMDBUFF,CMDBUFF     BLANK CMDBUFF                   CICA
+         TM    BITS,ATTNFLG+TIMEFLG CHECK FLAG BITS                CICA
+         BZ    CHEKAUTH            NEITHER ONE - GO CHECK AUTH     CICA
+         BO    RESET               BOTH - RESET BITS AND MSG AREA  CICA
+         TM    BITS,TIMEFLG        ARE WE IN AUTO-ROLL MODE?       CICA
+         BO    ROLLMODE            YES, GO DISPLAY AUTO-ROLL MSG   CICA
+*                                  NO, MUST BE A RESHOW REQUEST!   CICA
+         MVI   WCC,X'C2'           SPECIAL WCC (RESTORE/NO RESET)  CICA
+         L     R1,SAVELEN          GET LENGTH TO MOVE COMMAND TEXT CICA
+         EX    R1,MOVESAVE         MOVE SAVECMD TO CMDBUFF         CICA
+         NI    BITS,255-ATTNFLG    RESET ATTN FLAG                 CICA
+         B     CHEKAUTH            GO TO CHECK AUTH ROUTINE        CICA
+ROLLMODE DS    0H                                                  CICA
+         LA    R8,0(R11,R10)       POINT TO END OF SCREEN BUFFER
+         MVC   0(AUTOL,R8),AUTO    DISPLAY AUTO-ROLL MESSAGE
+         LA    R11,AUTOL(,R11)     INCREMENT TPUT COUNT
+         B     TPUT                DISPLAY SIB WITH AUTO-ROLL MSG
+RESET    DS    0H                                                  CICA
+         NI    BITS,255-ATTNFLG+TIMEFLG  ELSE RESET ATTN AND TIME FLAGS
+         LA    R8,0(R11,R10)       POINT TO END OF SCREEN BUFFER
+         MVI   0(R8),0             BLANK AUTO-ROLL MSG (ELSE, IT WILL
+         MVC   1(AUTOL-1,R8),0(R8) LEFT SHOWING FOR NON-AUTH USERS)
+         LA    R11,AUTOL(,R11)     INCREMENT TPUT COUNT
+CHEKAUTH DS    0H
+         TM    BITS,AUTHFLG        ALLOW COMMANDS?
+         BZ    TPUT                NO - BRANCH
+         LA    R8,0(R11,R10)       POINT TO END OF SCREEN BUFFER
+         MVC   0(READLEN,R8),READ  SETUP INPUT FIELD ON SCREEN
+         LA    R11,READLEN(,R11)   INCREMENT TPUT COUNT
+TPUT     DS    0H
+*    THE FOLLOWING TWO LINES ARE NECESSARY BECAUSE, IN ORDER TO ISSUE
+*    ANY SVC'S, PRIMARY AND SECONDARY ASN'S NEED TO BE THE SAME.
+         EPAR  R1                  EXTRACT PRIMARY ASN
+         SSAR  R1                  SET SECONDARY ASN TO CURRENT PRIMARY
+         TPUT  (10),(11),FULLSCR   WRITE THE SCREEN IMAGE BUFFER
+         TM    BITS,TIMEFLG        ARE WE IN AUTO-ROLL MODE?
+         BO    TIMER               GO WAIT SOME MORE
+         TGET  REPLY,166,ASIS      INPUT AND/OR CONTINUE
+         LTR   R15,R15             GOOD READ ?
+         BZ    ACTION              IF SO THEN BRANCH
+         TCLEARQ  INPUT            ELSE CLEAR BUFFERS
+         B     DISPLAY             AND REDISPLAY
+         EJECT
+***********************************************************************
+*                                                                     *
+*        DETERMINE RESPONSE FROM TERMINAL                             *
+*                                                                     *
+***********************************************************************
+ACTION   DS    0H
+         CLI   REPLY,X'6E'         PA2 KEY?
+*        BE    TIMER               YES - ENTER AUTO-ROLL MODE
+         BE    DISPLAY             *** PA2 HAS BEEN DISABLED ***   CICA
+         CLI   REPLY,X'60'         NO ACTION BY 3270 OPERATOR
+         BE    DISPLAY             YES - REDISPLAY
+         CLI   REPLY,X'7D'         ENTER KEY STRUCK ?
+         BNE   EOJ                 NO - END OF PROG
+         EJECT
+***********************************************************************
+*                                                                     *
+*        TEST FOR AUTHORITY TO ENTER COMMANDS                         *
+*                                                                     *
+***********************************************************************
+         TM    BITS,AUTHFLG        ALLOW COMMANDS?
+         BZ    DISPLAY             NO - REDISPLAY
+         SH    R1,=H'7'            LENGTH TO RECOVER INPUT COMMAND
+         BM    DISPLAY             NONE ENTERED - REDISPLAY
+         MVI   COMMAND+4,C' '      BLANK COMMAND BUFFER
+         MVC   COMMAND+5(159),COMMAND+4  FINISH BLANKING BUFFER
+         EX    R1,SPACES           ALL BLANKS ENTERED?
+         BE    DISPLAY             YES - REDISPLAY
+         EX    R1,INSERT           MVC   COMMAND+4(0),REPLY+6
+         ST    R1,SAVELEN                                          CICA
+         MVC   SAVECMD(160),COMMAND+4 SAVE COMMAND BUFFER TEXT     CICA
+         LA    R1,5(,R1)           GET COMMAND LEN+4
+         STH   R1,COMMAND          STORE INTO RDW
+         CLI   COMMAND+4,C'¬'      TEST FOR NO-ECHO COMMAND (¬)
+         BE    NOTSIGN             SKIP WTO IF PRESENT
+         TM    BITS,SYSPFLG        SYSTEMS PROGRAMMER?
+         BO    ISSUECMD            IF SO, SKIP WTO
+         LA    R1,COMMAND          PUT MSG ADDR INTO REG 1
+         OI    2(R1),X'41'         REG0 + QREG0
+         OI    3(R1),X'04'         NO HARD COPY
+         SR    R0,R0               ZERO R0 FOR INSERT
+         IC    R0,CONSOLE          INSERT MASTER CONSOLE ID
+         SVC   35                  ISSUE WTO - DISPLAY COMMAND
+         B     ISSUECMD            GO ISSUE THE COMMAND
+NOTSIGN  DS    0H
+         MVI   COMMAND+4,C' '      CLEAR THE NOT SIGN (¬)
+ISSUECMD DS    0H
+         LA    R1,COMMAND          PUT MSG ADDRESS INTO REG 1
+         SR    R0,R0               ZERO R0 FOR INSERT
+         IC    R0,CONSOLE          INSERT MASTER CONSOLE ID
+         SVC   34                  SCHEDULE CSCB
+         XC    COMMAND,COMMAND     ZERO MCS FLAGS IN CASE OF REPLY
+         B     DISPLAY             NOW REDISPLAY
+         EJECT
+***********************************************************************
+*                                                                     *
+*        END OF JOB ROUTINE                                           *
+*                                                                     *
+***********************************************************************
+EOJ      DS    0H
+         LA    R1,ERASE            POINT TO ERASE CNTL CHARS
+         LA    R0,L'ERASE          GET THE LENGTH
+         TPUT  (1),(0),FULLSCR     ERASE THE 3270 SCREEN
+         EPAR  R1                  EXTRACT PRIMARY ASN
+         SSAR  R1                  SET SECONDARY ASN TO CURRENT PRIMARY
+         L     R0,OLDAX            RELOAD OUR ORIGINAL AX VALUE
+         AXSET AX=(0)              SET OUR AX TO THAT OF US
+         AXFRE AXLIST=AXLIST       FREE THE AX
+         MODESET KEY=NZERO,MODE=PROB SET PROTECT KEY TO NONZERO
+         SLR   R0,R0               ** TURN OFF AUTHORIZATION **
+         SVC   255                 ** ISSUE AUTHORIZATION SVC **
+         ESTAE 0                   DELETE ESTAE EXIT
+STAXOFF  DS    0H
+         STAX
+RETURN   DS    0H
+FINIS    STFSMODE OFF,INITIAL=NO   NO MORE FULLSCREEN WRITES
+         STLINENO LINE=1,MODE=OFF  GO BACK TO LINE 1 FOR NEXT ONE
+         L     R13,SAVE+4          RESTORE SAVE AREA POINTER
+         RETURN (14,12),T,RC=0     RETURN
+         EJECT
+***********************************************************************
+*                                                                     *
+*        ERROR ROUTINES                                               *
+*                                                                     *
+***********************************************************************
+ERROR    DS    0H
+         LA    R1,ERRORMSG         LOAD ADDRESS OF MESSAGE
+         LA    R0,L'ERRORMSG       LOAD LENGTH OF MESSAGE
+         TPUT  (1),(0),R           TELL USER ABOUT ERROR
+         B     RETURN
+STAXERR  DS    0H
+         LA    R1,STAXMSG          LOAD ADDRESS OF MESSAGE
+         LA    R0,L'STAXMSG        LOAD LENGTH OF MESSAGE
+         TPUT  (1),(0),R           TELL USER ABOUT ERROR
+         B     RETURN
+ESTAERR  DS    0H
+         LA    R1,ESTAEMSG         LOAD ADDRESS OF MESSAGE
+         LA    R0,L'ESTAEMSG       LOAD LENGTH OF MESSAGE
+         TPUT  (1),(0),R           TELL USER ABOUT ERROR
+         B     STAXOFF
+         EJECT
+***********************************************************************
+*                                                                     *
+*        ESTAE EXIT ROUTINE                                           *
+*                                                                     *
+***********************************************************************
+ESTAEXIT DS    0H
+         USING ESTAEXIT,R15
+         MODESET KEY=NZERO,MODE=PROB SET PROTECT KEY TO NONZERO
+         STAX
+         XR    R15,R15             SET CODE FOR ABEND
+         BR    R14                 GO TO ABNORMAL TERMINATION
+         DROP  R15
+         EJECT
+***********************************************************************
+*                                                                     *
+*        STAX EXIT ROUTINE                                            *
+*                                                                     *
+***********************************************************************
+STAXEXIT DS    0H
+         USING STAXEXIT,R15
+         OI    BITS,ATTNFLG        SET ATTN FLAG
+         BR    R14                 RETURN
+         DROP  R15
+         EJECT
+*
+**       LITERALS
+*
+         LTORG
+         SPACE 2
+*
+**       EQUATES
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         EJECT
+*
+**       EXECUTED INSTRUCTIONS
+*
+INSERT   MVC   COMMAND+4(0),REPLY+6
+SPACES   CLC   REPLY+6(0),COMMAND+4
+MOVESAVE MVC   CMDBUFF(0),SAVECMD                                  CICA
+         SPACE 2
+*
+**       MESSAGES
+*
+CNSLE    DC    C'CONSOLE'
+ERRORMSG DC    C'MCS MUST BE INVOKED FROM A DISPLAY TERMINAL'
+STAXMSG  DC    C'ERROR ESTABLISHING STAX EXIT'
+ESTAEMSG DC    C'ERROR ESTABLISHING ESTAE EXIT'
+         SPACE 2
+*
+**       CONSTANTS AND WORK AREAS
+*
+SAVE     DC    18F'0'              SAVE AREA
+OLDAX    DS    F                   OUR ORIGINAL AX VALUE ON PGM ENTRY
+SAVER23  DC    2F'0'               SIB POINTER AND LENGTH SAVE AREA
+SIBPTR   DS    F                   POINTER TO SCREEN IMAGE BUFFER
+AXLIST   DC    H'1',H'0'           AXRES PARM LIST
+*                HHMMSSHT
+WAITTIME DC    C'00000100'         1 SECOND WAIT TIME
+CONSOLE  DC    XL1'00'             CONSOLE ID FROM UCMID
+CNSL     DC    CL8'CONSOLE'
+*
+BITS     DC    X'0'                PROGRAM SWITCHES
+AUTHFLG  EQU   X'80'
+ATTNFLG  EQU   X'40'
+TIMEFLG  EQU   X'20'
+SYSPFLG  EQU   X'10'
+*
+AUTO     DC    X'115A501DE813',C' MCS AUTO-ROLL MODE / HIT PA1 TO RETURX
+               N TO NORMAL MODE'
+AUTOL    EQU   *-AUTO
+ERASE    DC    X'27F5401D40'       USED TO CLEAR 3270 TERMINAL BUFFER
+COMMAND  DC    F'0'
+         DC    CL160' '            OPERATOR COMMAND
+SAVECMD  DC    CL160' '            OPERATOR COMMAND SAVE AREA      CICA
+SAVELEN  DC    F'0'                LENGTH FOR SAVECMD              CICA
+REPLY    DC    XL166'00'           OPERATOR COMMAND SAVE AREA      CICA
+READ     DC    X'115A501DC913'     SET HIGHINTENS/UNPROT/MDT FIELD CICA
+CMDBUFF  DC    XL166'00'           INPUT FROM TERMINAL             CICA
+         DC    X'1D60'             SET PROT FIELD                  CICA
+READLEN  EQU   *-READ              LENGTH OF READ AREA             CICA
+WCC      DC    X'C3'               WCC                             CICA
+SCREEN   DS    CL1024              IMAGE OF
+         DS    CL1024              CONSOLE BUFFER
+         EJECT
+*
+**       DSECTS
+*
+         PRINT ON,NOGEN
+         IKJCPPL
+         SPACE 2
+         IKJPSCB
+         SPACE 2
+         CVT   DSECT=YES,PREFIX=YES,LIST=YES
+         SPACE 2
+         IEECUCM FORMAT=NEW
+         IHAASCB
+         END

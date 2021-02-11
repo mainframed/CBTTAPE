@@ -1,0 +1,454 @@
+/* rexx */
+trace o
+parse source . . rexxname .    /* rexxname in upper case            */
+parse arg dsn .
+
+/* Input:  dsn                                                      */
+/* Output: flatdsn     in IEBUPDTE input format with                */
+/*                     ./ NAME control cards                        */
+/*         flatdsnjcl  JCL to reload dsn from flatdsn               */
+/*                     with IEBUPDTE                                */
+/* Output dsnames are in uppercase without quotes.                  */
+/* Example:                                                         */
+/* Command ===> tso flat bozo.cntl                                  */
+/*   Input:  BOZO.CNTL           Library                            */
+/*   Output: BOZO.CNTL.FLAT      Sequential (replaced if it exists) */
+/*           BOZO.CNTL.FLAT.JCL  Sequential (replaced if it exists) */
+
+/*_________________________________________________________________*/
+/*                                                                 */
+/* Help starts                                                     */
+/* FLAT is a rexx and edit macro.                                  */
+/*                                                                 */
+/* It sequentializes a library using successively IEBPTPCH and     */
+/* SORT.                                                           */
+/* The library should have a fixed record format                   */
+/* (RECFM=F or RECFM=FB or RECFM=FBA) and LRECL=80.                */
+/*                                                                 */
+/* The output is in the form of input to the IEBUPDTE utility      */
+/* (which permits to reload a library or to update it).            */
+/* The output sequential file may be edited before reload          */
+/* (in ISPF Edit, in batch with DFSORT, with bpxwunix and awk      */
+/* command, etc...).                                               */
+/* ISPF statistics are lost.                                       */
+/* FLAT produces, apart of the sequential file, another file       */
+/* containing a JCL sample to reload the first file.               */
+/*                                                                 */
+/* Note: The PDSMAN PDSM09 batch utility accepts RECFM=FB or       */
+/* RECFM=VB and a LRECL different of 80.                           */
+/*                                                                 */
+/* Examples of use:                                                */
+/*                                                                 */
+/* Command ===> tso flat                       <- shows help       */
+/* Command ===> tso flat help                                      */
+/*                                                                 */
+/* Command ===> tso flat bozo.cntl                                 */
+/* Command ===> tso flat 'bozo.cntl(mbr1)'     <- same as above    */
+/*                                                mbr1 ignored     */
+/* Created or replaced files:                                      */
+/* BOZO.CNTL.FLAT    and                                           */
+/* BOZO.CNTL.FLAT.JCL                                              */
+/*                                                                 */
+/*                                                                 */
+/* In ISPF 3.4:                                                    */
+/*          Data Sets Matching BOZO                                */
+/* Command ===>                                                    */
+/*                                                                 */
+/* Command - Enter "/" to select action                            */
+/* ------------------------------------                            */
+/*          BOZO.CNTL                                              */
+/* flat     BOZO.CNTL2            <- flat alone.                   */
+/*                                                                 */
+/* Created or replaced files:                                      */
+/* BOZO.CNTL2.FLAT    and                                          */
+/* BOZO.CNTL2.FLAT.JCL                                             */
+/*                                                                 */
+/*                                                                 */
+/* In Edit or View:                                                */
+/*            BOZO.CNTL(MBR1)                                      */
+/* Command ===> flat bozo.source  <- edit macro                    */
+/* 000001 //JOB1 JOB ...             It sequentializes the full    */
+/* 000002 //STEP01 ...               library BOZO.SOURCE. No edit. */
+/*                                                                 */
+/*            BOZO.CNTL(MBR1)                                      */
+/* Command ===> flat              <- flat alone.                   */
+/* 000001 //JOB1 JOB ...             It sequentializes the full    */
+/* 000002 //STEP01 ...               library BOZO.CNTL.            */
+/*                                                                 */
+/* Help ends                                                       */
+/*_________________________________________________________________*/
+/*                                                                 */
+
+/*                                                                 */
+/* Thanks to Claus E. Mikkelsen. I used his tip:                   */
+/* http://mainframesupport.dk/tips/tip1214.html                    */
+/*                                                                 */
+
+/* If edit macro                                                   */
+address isredit
+'macro (dsn)' /* previous value of dsn unchanged if not an edit macro */
+              /* previous value of dsn overridden if an edit macro    */
+macro_rc = rc
+if macro_rc = 0 then                   /* edit macro               */
+   if dsn = ''  then '(dsn) = dataset' /* default                  */
+address /* from isredit                                            */
+/* End of if edit macro                                            */
+
+call is_help_needed(dsn)
+call build_output_dsnames
+call execute_iebptpch  /* input dsn,       output flatdsn81        */
+call execute_sort      /* input flatdsn81, output flatdsn          */
+call generate_reload_jcl
+call show_list_of_output_datasets
+exit
+
+/*_________________________________________________________________*/
+build_output_dsnames: procedure expose dsn flatdsn81 flatdsn flatdsnjcl
+
+/* Input and output: dsn    will be in uppercase without quotes    */
+
+/* Output: flatdsn     in IEBUPDTE input format with               */
+/*                     ./ NAME control cards                       */
+/*         flatdsnjcl  JCL to rebuild dsn from flatdsn             */
+/*                     with IEBUPDTE                               */
+/* flatdsn81 is a temporary file, output from IEBPTPCH             */
+/*                           and  input to SORT.                   */
+/* Output dsnames are in uppercase without quotes.                 */
+
+dsn  = translate(dsn)        /* uppercase                          */
+dsn  = strip(dsn,,"'")       /* remove quotes if any               */
+/* If member present, it is not used.                              */
+parse var dsn dsn '(' member ')' . /* extract dsn if member present  */
+ldsn = length(dsn)           /* Ok up to 40 included               */
+
+/* Check dsn validity: library with fixed record format and LRECL=80 */
+
+listdsi_rc = listdsi("'"dsn"'")
+if listdsi_rc       <>   0  !, /* or                               */
+   left(sysdsorg,2) <> 'PO' !,
+   left(sysrecfm,1) <> 'F'  !,
+   syslrecl         <>  80       then do /* invalid dsn            */
+   say               dsn' should be an accessible library'
+   say  copies(' ',ldsn)' with fixed record format and LRECL=80.'
+
+   select
+     when listdsi_rc <> 0 then do
+       say dsn' cannot be accessed. listdsi_rc = 'listdsi_rc
+       say sysdsn("'"dsn"'")
+     end /* when listdsi_rc <> 0                                   */
+     when left(sysdsorg,2) <> 'PO' then
+       say dsn' should be a library.'
+     when left(sysrecfm,1) <> 'F'  then
+       say dsn' should have a fixed record format.'
+     when syslrecl <>  80          then
+       say dsn' should have a record length of 80.'
+     otherwise nop
+   end /* select                                                   */
+
+   if listdsi_rc = 0 then
+       say 'It has DSORG = 'sysdsorg,
+           'RECFM = 'sysrecfm' LRECL = 'syslrecl
+
+   say "We exit with return code 8.         "
+   zispfrc = 8
+   if sysvar(sysispf) = 'ACTIVE' then address ispexec "vput zispfrc"
+   exit zispfrc
+end /* invalid dsn                                                 */
+
+select /* according to dsn length (Ok up to 40 included)           */
+  when ldsn <= 44 - length('.FLAT.JCL') then do
+       flatdsn81  = dsn'.FLAT81' /* temporary file                 */
+       flatdsn    = dsn'.FLAT'
+       flatdsnjcl = dsn'.FLAT.JCL'
+  end /* when ldsn <= 44 - length('.FLAT.JCL)                      */
+  when ldsn <= 44 - length('.FLAT.J') then do
+       flatdsn81  = dsn'.FLAT81'
+       flatdsn    = dsn'.FLAT'
+       flatdsnjcl = dsn'.FLAT.J'
+  end /* when ldsn <= 44 - length('.FLAT.J)                        */
+  when ldsn <= 44 - length('.F.J') then do
+       flatdsn81  = dsn'.F81'
+       flatdsn    = dsn'.F'
+       flatdsnjcl = dsn'.F.J'
+  end /* when ldsn <= 44 - length('.F.J)                           */
+  otherwise do /* dsname length greater than 40                    */
+      say "Input dsname length greater than 40."
+      say "Output dsnames cannot be built.     "
+      say "We exit with return code 8.         "
+      zispfrc = 8
+      if sysvar(sysispf) = 'ACTIVE' then address ispexec "vput zispfrc"
+      exit zispfrc
+  end /* otherwise    dsname length greater than 40                */
+end /* select according to dsn length                              */
+
+return
+/*_________________________________________________________________*/
+execute_iebptpch: procedure expose dsn flatdsn flatdsn81
+
+address tso
+
+/* Build SYSIN control card ______________________________________ */
+"alloc fi(sysin)  space(1,1) tracks lrecl(80) blksize(80)",
+      "new        recfm(f,b) unit(vio) reuse"
+       alloc_sysin_rc = rc
+       call check_rc alloc_sysin_rc,0,'alloc sysin for IEBPTPCH'
+"newstack"
+queue " PUNCH TYPORG=PO"
+"execio "queued()" diskw sysin (fini"
+       execio_sysin_rc = rc
+       call check_rc execio_sysin_rc,0,'Execio on sysin for IEBPTCH'
+"delstack"
+
+ /* Allocate sysut1 (input) and sysut2 (output) for IEBPTPCH______ */
+"alloc fi(sysut1) da('"dsn"') shr reuse"
+msg_prev = msg(off)
+  "del '"flatdsn81"'"
+msg_off = msg(msg_prev)
+"alloc fi(sysut2) da('"flatdsn81"') new catalog",
+  "like('"dsn"') dsorg(ps) recfm(f,b,a) lrecl(81) blksize(0) reuse"
+  alloc_sysut2_rc = rc
+  call check_rc alloc_sysut2_rc,0,'Alloc flatdsn81 SYSUT2 for IEBPTPCH'
+
+/* Allocate sysprint file                                          */
+"alloc fi(sysprint) dummy reuse"
+
+/* Execute iebptpch                                                */
+"call *(iebptpch)"
+  iebptpch_rc = rc
+  call check_rc iebptpch_rc,0,'Execution of IEBPTPCH'
+
+"free fi(sysin sysprint sysut1 sysut2)"
+address /* from TSO                                                */
+return
+
+/*_________________________________________________________________*/
+execute_sort: procedure expose dsn flatdsn81 flatdsn
+
+/* Replace IEBPTPCH member header by IEBUPDTE member header.       */
+/* input flatdsn81, output flatdsn                                 */
+
+"alloc fi(sortin)  da('"flatdsn81"') shr reuse"
+msg_prev = msg(off)
+  "del '"flatdsn"'"
+msg_off = msg(msg_prev)
+"alloc fi(sortout) da('"flatdsn"') new catalog",
+  "like('"dsn"') dsorg(ps) recfm(f,b) lrecl(80) blksize(0) reuse"
+  alloc_sortout_rc = rc
+  call check_rc alloc_sortout_rc,0,'Alloc flatdsn SORTOUT for SORT'
+"alloc fi(sysout) dummy reuse"
+"alloc fi(sysin)  space(1,1) tracks lrecl(80) blksize(80)",
+      "new        recfm(f,b) unit(vio) reuse"
+       alloc_sysin_rc = rc
+       call check_rc alloc_sysin_rc,0,'alloc sysin'
+drop sysin.
+
+sysin.1  = "  OPTION COPY"
+sysin.2  = "  INREC  FIELDS=(2,80) Suppress ASA first character"
+sysin.3  = "* Replace 'MEMBER NAME  ' after ASA character"
+sysin.4  = "  OUTREC IFTHEN=(WHEN=(1,13,CH,EQ,C'MEMBER NAME  '),"
+sysin.5  = "                       OVERLAY=(1:C'./ ADD  NAME='))"
+sysin.0  = 5
+"execio * diskw SYSIN (stem sysin. finis"
+       execio_sysin_rc = rc
+       call check_rc execio_sysin_rc,0,'execio SYSIN for DFSORT'
+address linkmvs "SORT"
+       sort_rc = rc
+       call check_rc sort_rc,0,'sort'
+drop sysin.
+msg_prev = msg(off)
+  "del '"flatdsn81"'" /* delete temporary file                     */
+  "free  fi(sortin sortout sysout)"
+msg_off = msg(msg_prev)
+return
+
+/*_________________________________________________________________*/
+generate_reload_jcl: procedure expose dsn flatdsn flatdsnjcl
+
+address tso
+msg_prev = msg(off)
+  del "'"flatdsnjcl"'"
+msg_off = msg(msg_prev)
+"alloc fi(jcl) da('"flatdsnjcl"') new catalog",
+  "dsorg(ps) recfm(f,b) lrecl(80) blksize(0)",
+  "tracks space(1,1) reuse"
+  alloc_flatdsnjcl_rc = rc
+  call check_rc alloc_flatdsnjcl_rc,0,'Alloc flatdsnjcl'
+
+"newstack"
+queue "//Jobname JOB     <-- Please complete                          "
+queue "//*                                                            "
+queue "//RELOAD EXEC PGM=IEBUPDTE,PARM=NEW Replace or Add             "
+queue "//SYSPRINT DD DUMMY    SYSOUT=* will list all members          "
+
+/* comments                                                        */
+queue "//*"copies('_',58)"*" /* separator */
+queue "//* Possibly replace dsname in //SYSUT2 by a new dataset name. "
+queue "//* With PARM=NEW, IEBUPDTE will add new members and           "
+queue "//* replace existing members.                                  "
+queue "//*                                                            "
+queue "//* SYSUT2 refers to the output library to be updated.         "
+queue "//* SYSIN contains members separated by ./ ADD cards           "
+queue "//*"copies('_',58)"*" /* separator */
+queue "//*                                                            "
+
+queue "//SYSUT2 DD DISP=SHR,DSN="dsn
+queue "//SYSIN  DD DISP=SHR,DSN="flatdsn
+"execio "queued()" diskw jcl (fini"
+       execio_jcl_rc = rc
+       call check_rc execio_jcl_rc,0,'Execio JCL for IEBPUPDTE'
+"delstack"
+address /* from tso                                                */
+
+return
+/*_________________________________________________________________*/
+show_list_of_output_datasets: procedure expose dsn
+
+/* Equivalent to: Command ===> dslist pattern                      */
+/* DSL in caps                                                     */
+pattern = dsn
+"ispexec select pgm(isrdslst) parm(DSL '"pattern"') suspend scrname(dslist)"
+return
+
+/*_________________________________________________________________*/
+check_rc:
+trace_previous = trace("o") /* no trace                            */
+
+ /* call example:    call check_rc rc,0,'libdef isptlib'           */
+ /* In case of error:
+ ZEDMSGNO (message identifier), ZEDISMSG (short message text) and ZEDILMSG
+ */
+ if arg(1)<=arg(2) then do
+    return
+    trace(trace_previous)
+ end /* if arg(1)<=arg(2)                                          */
+ /* ISPEXEC or ISREDIT error:                                      */
+ if ZERRSM   <> 'ZERRSM'   then say 'ZERRSM   = 'ZERRSM
+ if ZERRLM   <> 'ZERRLM'   then say 'ZERRLM   = 'ZERRLM
+ if ZEDMSGNO <> 'ZEDMSGNO' then say 'ZEDMSGNO = 'ZEDMSGNO
+ if ZEDISMSG <> 'ZEDISMSG' then say 'ZEDISMSG = 'ZEDISMSG
+ if ZEDILMSG <> 'ZEDILMSG' then say 'ZEDILMSG = 'ZEDILMSG
+ say 'rc = 'arg(1)
+ if debug='DEBUG' then do
+   say 'FUNC='arg(3) 'RC='arg(1)
+   if zerrmsg <> '' & zerrmsg <> 'ZERRMSG' then say 'ZERRMSG='zerrmsg
+ end /* if debug='DEBUG'                                           */
+ zispfrc = 16
+ if sysvar(sysispf) = 'ACTIVE' then address ispexec "vput zispfrc"
+ exit zispfrc
+/*_________________________________________________________________*/
+
+is_help_needed:
+ parse arg dsn
+
+ select
+   when dsn = '' & macro_rc <> 0 then call show_help /* rexx no arg  */
+   when wordpos(translate(dsn),'HELP -HELP H -H ? -? /? AIDE SOS') > 0
+        then call show_help
+   otherwise return
+ end /* select                                                       */
+
+ zispfrc = 0
+ if sysvar(sysispf) = 'ACTIVE' then address ispexec 'vput zispfrc'
+ exit zispfrc
+/*___________________________________________________________________*/
+
+show_help:
+
+ say ' Help for 'rexxname':'
+ /* Show help between 'Help starts' and 'Help ends'                  */
+ help = 'no'
+ line_counter = 0
+ do i = 1 to sourceline()
+    if pos('Help starts',sourceline(i)) > 0 then do
+       help = "yes"
+       iterate
+    end /* if pos('Help starts',sourceline(i)) > 0                   */
+    if pos('Help ends',sourceline(i)) > 0 then leave
+    if help = 'yes' then do /* record sourceline(i)                  */
+       line_counter = line_counter + 1
+       line.line_counter = sourceline(i)
+    end /* if help = 'yes'                                           */
+ end /* do i = 1 to sourceline()                                     */
+ line.0 = line_counter
+ call visualize
+return
+/*___________________________________________________________________*/
+
+ visualize: procedure expose line. rexxname
+ /* Visualize.                                                */
+ if line.0 > 0 then do
+    if sysvar(sysispf) <> 'ACTIVE' then do
+       do i = 1 to line.0
+          say line.i
+       end /* do i = 1 to line.0                              */
+       zispfrc = 0
+       exit zispfrc
+    end /* if sysvar(sysispf) <> 'ACTIVE'                     */
+    else do /*       ispf ACTIVE                              */
+
+       /* Allocate visualization file.                        */
+       address tso
+       ran  = right(random(1,99999),5,'0')
+       ddnm = 'dd'ran                          /* choose random ddname */
+       call set_up_prefix /* create prefix for new file                */
+       dsnprint = prefix"."rexxname".R"ran
+       msg_prev = msg('off')
+       "alloc file("ddnm") da('"dsnprint"') new catalog",
+       "tracks space(5,5) reuse lrecl(132) recfm(f b) blksize(0)"
+       alloc_rc = rc
+       if alloc_rc <> 0 then do
+          say rexxname "could not allocate the visualization file."
+          say "We exit with code 16."
+          say "alloc rc = "alloc_rc
+          zispfrc = 16
+          address ispexec 'vput zispfrc'
+          exit zispfrc
+       end /* if alloc_rc <> 0                                */
+       msg_off  = msg(msg_prev)
+       /* End of allocate visualization file.                 */
+
+       /* Write on visualization file.                        */
+       "execio" line.0  "diskw" ddnm "(stem line. finis"
+       execio_rc = rc
+       if execio_rc <> 0 then do
+          say rexxname "could not write on visualization file."
+          say "We exit with code 16."
+          say "execio rc = "execio_rc
+          zispfrc = 16
+          address ispexec 'vput zispfrc'
+          exit zispfrc
+       end /* if execio_rc <> 0                               */
+       /* End of write on visualization file.                 */
+
+       /* Visualize.                                          */
+       zedsmsg = 'F3 to exit'  /* top right corner            */
+       zedlmsg = 'To exit, press F3.',
+                 'Temporary help file will be deleted.'
+       ispexec "setmsg msg(isrz000)"
+       ispexec "view dataset('"dsnprint"')"
+       /* End of visualize.                                   */
+
+       /* Clean up.                                           */
+       msg_prev = msg('off')
+          "free fi("ddnm")"
+          "del  '"dsnprint"'"
+       msg_off  = msg(msg_prev)     /* reset                  */
+       /* End of clean up.                                    */
+
+    end /* ispf ACTIVE                                        */
+ end /* if line.0 > 0                                         */
+
+ return
+ /*___________________________________________________________________*/
+
+ set_up_prefix:
+
+ /* Set up new output file prefix.                                    */
+ prefix = sysvar('syspref')              /* tso profile prefix        */
+ uid    = sysvar('sysuid')               /* tso userid                */
+ if prefix = '' then prefix = uid        /* use uid if null prefix    */
+ if prefix <> '' & prefix <> uid then    /* different prefix than uid */
+    prefix = prefix'.'uid                /* use prefix.uid            */
+
+ return
+ /*___________________________________________________________________*/

@@ -1,0 +1,184 @@
+
+## $$$$$DOC.txt
+```
+************************************************************************
+* This EXIT has been tested and utilized in MVS/ESA 5.2.2
+************************************************************************
+
+//* This library contains a sample CSVLLIX1 LLA EXIT,
+//* which is used to build a table in memory to reflect usage of
+//* selected LLA modules (list contained in CSVLPGMS)
+//* by selected MVS JOBs (list contained in CSVLJOBS)
+//*
+//* As seen from LLA, the EXIT always returns the same 0/0 return code,
+//* so it is "transparent" to it.
+//* In case of errors in the EXIT, LLA just disables it and goes on
+//* (no harm done to anybody).
+//*
+//* The table resides in ECSA
+//* (no problems with virtual storage constraint)
+//* and the address of the used table is given to the user
+//* in a message to the log when the table is created.
+//*
+//* A couple of programs (CSVLLLST and CSVLL1X1) can be used
+//* to list the table in memory, having its address as a PARM.
+//* While the activation of the EXIT depends on usual LLA processing,
+//* the creation/deletion of the table is triggered by a user program,
+//* so that monitoring can be done in different periods of time,
+//* as decided by the end-users.  CSVLLACT / CSVLLDEA  do this.
+
+Module list
+
+  $$$$$DOC  the module you are reading now, documentation
+  CSVLJOBS  example of a list of jobnames to be monitored by the EXIT
+  CSVLLACC  compilation   of CSVLLACT
+  CSVLLACJ  execution JCL of CSVLLACT
+  CSVLLACT  source of the USER module for activation of the EXIT
+  CSVLLAL1  sys1.parmlib member to refresh    the EXIT
+  CSVLLAOF  sys1.parmlib member to deactiveta the EXIT
+  CSVLLAON  sys1.parmlib member to activate   the EXIT
+  CSVLLDEA  source of the USER module for deactivation of the EXIT
+  CSVLLDEC  compilation   of CSVLLDEA
+  CSVLLDEJ  execution JCL of CSVLLDEA
+  CSVLLIXC  compilation   of CSVLLIX1
+  CSVLLIX1  source of the user EXIT
+            it does not need any macro (except the system ones),
+            and it includes (via COPY)
+            CSVLJOBS and CSVLPGMS
+  CSVLLLSC  compilation   of CSVLLLST
+  CSVLLLSJ  execution JCL of CSVLLLST
+  CSVLLLST  sample program to list usage table, in printable form
+  CSVLL1XC  compilation   of CSVLL1X1
+  CSVLL1XJ  execution JCL of CSVLL1X1
+  CSVLL1X1  sample program to list usage table, output length 80,
+            one result per line (useful for later sorting via ISPF
+            or for putting into some EXCEL file)
+  CSVLPGMS  example of a list of pgms (routines) to monitor
+  CSVOUT    example of OUTPUT from CSVLL1X1
+  J         a JOB card, used just to avoid retyping it
+  _other_   macros needed for compilation of CSVLLLST, CSVLL1X1
+
+************************************************************************
+*
+* IF THE EXIT IS PRESENT AT IPL, IT IS ACTIVATED (BY DEFAULT)
+*
+************************************************************************
+*
+************************************************************************
+*
+* TO INACTIVATE EXIT AT IPL TIME:
+*
+************************************************************************
+ EDIT       SYS1.PARMLIB(IEACMD00)
+ CHANGE
+ COM='START LLA,SUB=MSTR'
+ INTO
+ COM='START LLA,SUB=MSTR,LLA=OF'
+ TO AVOID STARTING THE EXIT BY DEFAULT AT IPL
+************************************************************************
+*
+* TO ACTIVATE THE EXIT:
+*
+************************************************************************
+/F LLA,UPDATE=L1    (CLOSES PREVIOUS EXIT AND LOADS THE NEW ONE)
+/F LLA,UPDATE=OF    (DEACTIVATES EXIT)
+  CSV210I LIBRARY LOOKASIDE UPDATED
+  CSV246I LLA EXIT CSVLLIX1 ALREADY DEACTIVATED
+
+ -RO MVS1,F LLA,UPDATE=OF
+  CSV210I LIBRARY LOOKASIDE UPDATED
+
+ -F LLA,UPDATE=OF
+  CSV210I LIBRARY LOOKASIDE UPDATED
+  CSV246I LLA EXIT CSVLLIX1 DEACTIVATED
+
+/F LLA,UPDATE=ON    (ACTIVATES EXIT)
+
+************************************************************************
+* ONCE ACTIVATED, THE EXIT DOES NOT DO ANYTHING UNTIL ASKED
+* BY THE USER, USING THE CSVLLACT PROGRAM, WHICH ACTS AS TRIGGER
+* PS CSVLLACT MUST BE IN LINKLIST, OR THE EXIT WILL NEVER NOTICE IT
+************************************************************************
+* ONCE COLLECTING STATISTICS, THE EXIT STOP DOING IT ONLY WHEN ASKED
+* BY THE USER, USING THE CSVLLDEA PROGRAM, WHICH ACTS AS TRIGGER
+* PS CSVLLDEA MUST BE IN LINKLIST, OR THE EXIT WILL NEVER NOTICE IT
+************************************************************************
+*
+*  TO CHANGE MONITORED JOBS/PGMS
+*
+************************************************************************
+THE TABLE CONTAINING THE LIST OF MONITORED JOBS IS IN MODULE
+CSVLJOBS
+
+THE TABLE CONTAINING THE LIST OF MONITORED PROGRAMS IS IN MODULE
+CSVLPGMS
+
+MODIFY IT AND REASSEMBLE THE EXIT
+
+COMPILAZIONE JOBSTREAM IS IN:
+CSVLLIXC
+
+************************************************************************
+*
+*  RECOVERY (from ibm manual dealing with user exits
+*
+************************************************************************
+
+THE LLA RECOVERY ROUTINE PROTECTS CSVLLIX1.
+THE RECOVERY ROUTINE RECORDS DIAGNOSTIC INFORMATION
+IN THE SYSTEM DIAGNOSTIC WORK AREA (SDWA),
+RECORDS THE ERROR IN THE LOGREC DATA SET,
+AND THEN TAKES AN SVC DUMP.
+
+************************************************************************
+*
+* messages produced when the exit goes broken
+*
+************************************************************************
+*
+  CSV232I LLA HAS DEACTIVATED EXIT CSVLLIX1. ABEND=S0C4 U000,REASON=0000
+  0010
+  IEA794I SVC DUMP HAS CAPTURED: 771
+  DUMPID=002 REQUESTED BY JOB (JOBNAME )
+  DUMP TITLE=COMPON=PROGRAM MANAGER LIBRARY-LOOKASIDE,COMPID=SC1C
+             J,ISSUER=CSVLLXIT
+  IEF170I 3 JOBNAME  IEA995I SYMPTOM DUMP OUTPUT 774
+  SYSTEM COMPLETION CODE=0C4  REASON CODE=00000010
+   TIME=14.08.42  SEQ=03148  CPU=0000  ASID=00C8
+   PSW AT TIME OF ERROR  070C2000   9597E07C  ILC 6  INTC 10
+     NO ACTIVE MODULE FOUND
+     NAME=UNKNOWN
+     DATA AT PSW  1597E076 - 40204130  C447D504  2000C442
+     GPR  0-3  00000000  7F879DD4  53D3D811  1597E487
+     GPR  4-7  D3D3D7F1  7F879F1E  7F879CB8  00000001
+     GPR  8-11 812F3310  0000001F  00000001  00000000
+     GPR 12-15 9597E040  7F879E70  812F362E  9597E040
+   END OF SYMPTOM DUMP
+  IEA995I SYMPTOM DUMP OUTPUT 773
+THE RECOVERY ROUTINE ISSUES  MESSAGE CSV232I
+TO INDICATE THAT CSVLLIX1 EITHER COULD NOT BE ACTIVATED
+OR HAD TO BE DEACTIVATED BECAUSE OF A FAILURE.
+LLA THEN RETRIES TO A POINT WITHIN LLA MODULE FETCH
+AFTER THE CALL TO CSVLLIX1.
+************************************************************************
+*
+* Example of the contents of the area passed to the EXIT
+* The pointer area starts wtih "LLP1"
+*
+************************************************************************
+7F879DD0   00000000   D3D3D7F1   02000098   0154BD9C   | ....LLP1...Q...
+7F879DE0   00000000   055BDE82   D7C7D4C6   000000FE   | .....$.BPGMF...
+7F879DF0   000234A9   C9C5C6C9   C2F6F0F0   06210500   | ...ZIEFIB600...
+7F879E00   012E0621   0E000000   0000C2E2   00B0F844   | ..........BS..8
+7F879E10   48000000   98000200   01116228   01000000   | ....Q..........
+7F879E20 TO 7F879E3F (X'00000020' BYTES)--ALL BYTES CONTAIN X'00'
+7F879E40   E2E8E2F1   4BD3C9D5   D2D3C9C2   40404040   | SYS1.LINKLIB
+7F879E50 TO 7F879E5F (X'00000010' BYTES)--ALL BYTES CONTAIN X'40', C' '
+7F879E60   40404040   40404040   40404040   00000000   |             ...
+7F879E70   016813D8   7F8797F8   00000000   812F362E   | ...Q"GP8....A..
+7F879E80   9597E040   00000000   7F879DD4   00000000   | NP\ ...."G.M...
+7F879E90   008FDE88   1597E010   7F879F1E   7F879CB8   | ...H.P\."G.."G.
+7F879EA0   00000001   812F3310   0000001F   00000001   | ....A..........
+7F879EB0   00000000   7F879E70   00000000   00000000   | ...."G.........
+```
+

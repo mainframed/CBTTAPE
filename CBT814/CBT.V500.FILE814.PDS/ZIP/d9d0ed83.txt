@@ -1,0 +1,726 @@
+IOQ scanner
+
+In our environment, the only way of checking where the
+activity to a particular DASD occurred was the use of GTF
+trace and IBM's GTFPARS batch utility. When we moved
+from MVS/XA to MVS/ESA, we found that GTFPARS would
+not work! We did not have any other IBM or third-party tools
+to view what was happening to our DASD in terms of what
+was being accessed and whereabouts on the DASD the actual
+I/O was being directed. There was not much hope of buying in
+a new tool either, so I decided to write my own utility for
+monitoring I/O requests to our DASD.
+
+This article describes the utility, IOQ scanner, which was
+created. IOQ scanner has been tested under the following
+environment: MVS/ESA 3.1.1, DFP 3.1.1, and MVS/ESA
+3.1.3, DFP 3.2.0 - both with TSO/E 2.1.0 and ISPF 2.3.0. It
+consists of the following components.
+
+REXX EXECs - placed in the CLIST/EXEC library:
+
+o      IOQ - on-line IOQ scanner
+
+o      IOQBAT - batch version of IOQ scanner.
+
+ISPF dialogs - placed in the ISPPLIB/ISPMLIB libraries:
+
+o      IOQPAN - main on-line IOQ scanner panel
+
+o      IOQHPAN - help panel for on-line IOQ scanner
+
+o      IOQM00 - IOQ error message member.
+
+Assembler source - they need to be in a STEPLIB library:
+
+o      VTOCX - manipulate in-storage DASD VTOC
+
+o      VTOCRD2 - reads requested VTOC into storage
+
+o      GETJOBN - gets STC/TSU/JOBNAME for given ASID.
+
+JCL:
+
+o      IOQBATJ - JCL for executing batch version of IOQ scanner
+
+o      ASMCL - JCL to compile and link-edit assembler source.
+
+
+On-line IOQ Scanner
+
+The on-line utility is invoked by executing the IOQ EXEC
+from ISPF. The IOQPAN panel is presented to the user,
+allowing the VOLSER of a DASD, for which I/O activity is to
+be monitored, to be entered. On hitting the ENTER key on the
+IOQPAN panel, the IOQ scanner reads the VTOC of the
+specified DASD into storage, using the multi-function VTOCX
+external function. The VTOC is read in using the VTOCRD2
+external function. This is based on the VTOC read utility
+published in Issue 39 of MVS Update (December 1989).
+
+The VTOCX external function performs three functions:
+
+1      Reads in the VTOC of a specified DASD, using
+      VTOCRD2.
+
+2      Returns the dataset, at a given CCHH (cylinder head
+      position) on the DASD, by searching through the in-
+      storage VTOC read in previously by VTOCRD2 - up to
+      sixteen dataset extents are catered for.
+
+3      Discards the in-storage VTOC, and thus frees the space
+      occupied by it in storage.
+
+The GETJOBN external function uses the LOCASCB, IBM-
+supplied macro, to locate the ASCB for a given ASID, and to
+determine its STC/TSU/JOBNAME.
+
+Once the IOQ scanner has been started, it continues to loop
+around the MVS IOQ chain, looking for I/O requests to the
+specified VOLSER.
+
+The IOQPAN panel will display:
+
+1      The total number of cylinders and UCB address for the
+      specified VOLSER.
+
+2      The CCHHR of the I/O request in hexadecimal.
+
+3      A graphical representation of the head movement on the DASD.
+
+4      The name of the dataset being accessed.
+
+5      The user-id of the STC/TSU/JOB making the I/O request.
+
+The display will be updated dynamically as I/O requests are
+made to the DASD. The display will automatically scroll.
+
+At any time you may hit the attention key to stop the IOQ
+scanner.
+
+Once you have stopped the dynamic updating, you have the
+following options:
+
+1      Enter a new VOLSER and monitor it.
+
+2      Look at the historical data (which is maintained in storage)
+      for all VOLSERs that the IOQ scanner has been
+      monitoring so far.
+
+Sample output of the on-line IOQ scanner is shown in Figure 1.
+
+
+Batch IOQ Scanner
+
+The batch utility, IOQBAT, is invoked by submitting the
+IOQBATJ JCL. This is essentially the same as the on-line
+version, except that the invocation must include the number of
+times the IOQ scanner is to loop around the MVS IOQ chain.
+
+
+IOQ: On-line IOQ scanner REXX EXEC
+
+/*------------------------------ Rexx -------------------------------*/
+/* Function   : Dynamic IOQ monitor for I/O to specified DASD.       */
+/* Callers    : None                                                 */
+/* Dependency : VTOCRD2,VTOCX,GETJOBN external REXX functions.       */
+/* Syntax     : IOQ <volser>                                         */
+/*-------------------------------------------------------------------*/
+arg volser .
+/*-------------------------------------------------------------------*/
+/* System related information from CVT                               */
+/*-------------------------------------------------------------------*/
+cvt = storage(10,4)
+cpup = storage(208,4)                        /* find CPU type        */
+cpu = storage(d2x(c2d(cpup) + 12),4)
+cvtsname = d2x(c2d(cvt) + c2d('154'x))       /* find sys-id          */
+sid = storage(cvtsname,8)
+cvtprod = d2x(c2d(cvt) - c2d('28'x))         /* find os level        */
+splvl = storage(cvtprod,16)
+/*-------------------------------------------------------------------*/
+/* Setup constants/variables                                         */
+/*-------------------------------------------------------------------*/
+uid = SYSVAR(SYSUID)
+ovol = ''
+row = ''
+getvtoc = 'GETVTOC '            /* Command verbs for the VTOCX     */
+getdsn  = 'GETDSN  '            /* REXX external function -        */
+frevtoc = 'FREEVTOC'            /* used in later on in this exec   */
+hist.0 = 0                   /* number of historical entries so far */
+cur_ent = 0
+call INIT
+/*-------------------------------------------------------------------*/
+/* Set ATTN handling exit                                            */
+/*-------------------------------------------------------------------*/
+stoppit = 0                      /* variable used to halt processing */
+call ON HALT
+/*-------------------------------------------------------------------*/
+/* Get volser if non-specified (also if Attn has been hit)           */
+/*-------------------------------------------------------------------*/
+do forever
+  ispfret = 16
+  if (volser = '') | stoppit then
+    do while(ispfret ^= 0)
+       msg = 'Enter VolSer to trace, PF3 to END ',
+             'or PF11 to view history file'
+       pdate = date('U')
+       ptime = time()
+       address ispexec "DISPLAY PANEL(IOQPAN)"
+       ispfret = RC
+       if ispfret = 8 then exit
+       if stoppit then stoppit = 0
+       if pfk = 'PF11' then
+         do
+           call HISTORY
+           ispfret = 16
+         end
+    end
+  /*-----------------------------------------------------------------*/
+  /* Free the in-storage VTOC if new volser is different to current. */
+  /*-----------------------------------------------------------------*/
+  if ovol ^= volser then
+    do
+      if ovol ^= '' then x = VTOCX(frevtoc,handle)
+      ovol = volser
+      call INIT
+      msg = 'Reading VTOC for 'volser' into storage'
+      pdate = date('U')
+      ptime = time()
+      address ispexec "CONTROL DISPLAY LOCK"
+      address ispexec "DISPLAY PANEL(IOQPAN)"
+      /*-------------------------------------------------------------*/
+      /* Check to see if new volser is available to this system.     */
+      /*-------------------------------------------------------------*/
+      ucbadd = UCBSCAN(volser)
+      if ucbadd = 0 then
+        do
+          address ispexec "SETMSG MSG(IOQM001)"
+          ovol = ''
+          stoppit = 1
+        end
+      /*-------------------------------------------------------------*/
+      /* Read the VTOC of specified volser into storage.             */
+      /*-------------------------------------------------------------*/
+      if stoppit=0 then
+        do
+          dev = storage(d2x(c2d(ucba) + c2d('0d'x)),3)
+          fmt4 = obtain(volser)
+          ds4devsz = substr(fmt4,19,4)
+          cyls = c2d(substr(ds4devsz,1,2))-1
+          address TSO "ALLOC FI(VOLUME) DSN('"uid"."volser".VTOC.LIST')
+                  SPACE(0,0) TRACKS VOL("volser") UNIT(DASD) NEW DELETE"
+          handle = VTOCX(getvtoc,volser)
+          address TSO "FREE FI(VOLUME)"
+          retc = RC
+          if retc ^= 0 then
+            do
+              say 'Allocation of DDname(VOLUME) failed with RC='retc
+              say 'resolve problem then try again.'
+              exit
+            end
+          /*--- Get address of the IOQ chain ---*/
+          ucbioq = storage(d2x(c2d(ucbadd) - c2d('4'x)),4)
+        end
+    end
+  /*-----------------------------------------------------------------*/
+  /* Search the MVS IOQ - process any entries for specified volser.  */
+  /*-----------------------------------------------------------------*/
+  li = 1; y = ' '                               /* loop indicator */
+  oldseek = 'FFFFFFFFFFFFFFFF'
+  do forever
+    if stoppit then leave
+    msg = 'Scanning IOQ chain for I/O to 'volser' -',
+          'Press <Attn> then enter HI to stop'
+    iosb_fnd = 0
+    ioq = ucbioq
+/*                                                */
+/*  /* update loop indicator */                   */
+/*  y = substr('|/-\|/-\',li,1)                   */
+/*  li=li+1                                       */
+/*  if li>8 then li=1                             */
+/*  if stoppit then leave                         */
+/*  address ispexec "CONTROL DISPLAY LOCK"        */
+/*  address ispexec "DISPLAY PANEL(IOQPAN)"       */
+    /*---------------------------------------------------------------*/
+    /* Loop around IOQ chain for one that matches our UCB.           */
+    /*---------------------------------------------------------------*/
+    do while(ioq ^= '00000000'x)
+      if stoppit then leave
+      /*--- find IOQ element for our UCB ---*/
+      if storage(d2x(c2d(ioq) + c2d('18'x)),4) = ucbadd then
+        do
+          /*--- Get next IOSB and associated ASID for our UCB ---*/
+          ioqiosb = storage(d2x(c2d(ioq) + c2d('8'x)),4)
+          ioqasid = storage(d2x(c2d(ioq) + c2d('1c'x)),2)
+          iosb_fnd = 1
+          leave
+        end
+      /*--- Get next IOQ element in primary IOQ chain ---*/
+      ioq = storage(d2x(c2d(ioq) + c2d('74'x)),4)
+    end
+    /*---------------------------------------------------------------*/
+    /* Process the SEEK address into DSN and get ID of requestor.    */
+    /*---------------------------------------------------------------*/
+    if iosb_fnd then
+      do
+        /*--- Get SEEK address for our UCB ---*/
+        ioseeka = c2x(storage(d2x(c2d(ioqiosb) + c2d('64'x)),8))
+        if ioseeka ^= oldseek then
+          do
+            if ioseeka = '' then ioseeka = '0000000000000000'
+            oldseek = ioseeka
+            cc = (x2d(substr(ioseeka,7,4))/cyls)*25
+            if (cc <= 25) & (ioseeka ^= '0000000000000000') then
+             do
+               call SCROLLDN
+               cchhd = substr(ioseeka,7,10)         /* Extract CCHHD */
+               jobd = ''
+               jobd = GETJOBN(ioqasid)           /* Get requestor ID */
+               bard = copies('*',format(cc,3,0))
+               cchh = x2c(substr(ioseeka,7,8))
+               dsd = VTOCX(getdsn,handle,cchh)            /* Get DSN */
+               t = '';b = '+'
+               pdate = date('U')
+               ptime = time()
+               address ispexec "CONTROL DISPLAY LOCK"
+               address ispexec "DISPLAY PANEL(IOQPAN)"
+               /*----------------------------------------------------*/
+               /* Update the historical (in-storage) database.       */
+               /*----------------------------------------------------*/
+               cur_ent = cur_ent + 1
+               if cur_ent > 1000 then cur_ent = 1
+               if hist.0 < 1000 then hist.0 = hist.0 + 1
+               if bard = '' then bard = '@'
+               hist.cur_ent = ptime' 'dev' 'volser' 'cyls' 'cchhd,
+                              ' 'bard' 'dsd' 'jobd
+               if bard = '@' then bard = ''
+             end
+          end
+      end
+  end
+end
+exit
+/*-------------------------------------------------------------------*/
+/* Internal subroutines called by the mainline code follow.          */
+/*-------------------------------------------------------------------*/
+HISTORY:
+ /*-------------------------*/
+ /* Display historical data */
+ /*-------------------------*/
+ call INIT
+ msg = '* * H I S T O R Y   F I L E * *   ',
+       'PF3 to END or PF7/PF8 to scroll'
+ hi = 'ff'x
+ t = '';b = ''
+ ent = cur_ent
+ l1 = ent
+ l2 = l1
+ lines_displayed = 1
+ pdate = date('U')
+ ptime = word(hist.ent,1)
+ dev = word(hist.ent,2)
+ volser = word(hist.ent,3)
+ cyls = word(hist.ent,4)
+ cchh0 = word(hist.ent,5)
+ bar0 = word(hist.ent,6)
+ if bar0 = '@' then bar0 = ''
+ ds0 = word(hist.ent,7)
+ job0 = word(hist.ent,8)
+ do while(pfk ^= 'PF03')
+   row = 'ROW:'hi||l1'-'l2'/'hist.0
+   address ispexec "DISPLAY PANEL(IOQPAN)"
+   ispfret = RC
+   if ispfret = 8 then leave
+   if pfk = 'PF07' then
+     do
+       ent = l1
+       if ent > 1 then
+        do
+          /*--- move everything 1 line down ---*/
+          /*--- and show the previous entry ---*/
+          call SCROLLUP
+          ent = ent - 1
+          pdate = date('U')
+          ptime = word(hist.ent,1)
+          dev = word(hist.ent,2)
+          volser = word(hist.ent,3)
+          cyls = word(hist.ent,4)
+          cchh0 = word(hist.ent,5)
+          bar0 = word(hist.ent,6)
+          if bar0 = '@' then bar0 = ''
+          ds0 = word(hist.ent,7)
+          job0 = word(hist.ent,8)
+          t = '+';b = ''
+          l1 = ent
+          lines_displayed = lines_displayed + 1
+          if lines_displayed > 14 then
+            do
+              lines_displayed = 14
+              l2 = l2 - 1
+            end
+        end
+     end /*--- pfk = 'PF07' ---*/
+   if pfk = 'PF08' then
+     do
+       ent = l2
+       /*--- move everything 1 line up ---*/
+       /*--- and show the next entry   ---*/
+       if l1 < hist.0 then
+         do
+           call SCROLLDN
+           l1 = l1 + 1
+           if l2 < hist.0 then
+             do
+               ent = ent + 1
+               l2 = l2 + 1
+               pdate = date('U')
+               ptime = word(hist.ent,1)
+               dev = word(hist.ent,2)
+               volser = word(hist.ent,3)
+               cyls = word(hist.ent,4)
+               cchhd = word(hist.ent,5)
+               bard = word(hist.ent,6)
+               if bard = '@' then bard = ''
+               dsd = word(hist.ent,7)
+               jobd = word(hist.ent,8)
+               t = '';b = '+'
+             end
+           else
+             do
+               ent = l1
+               pdate = date('U')
+               ptime = word(hist.ent,1)
+               dev = word(hist.ent,2)
+               volser = word(hist.ent,3)
+               cyls = word(hist.ent,4)
+               cchhd = ''
+               bard = ''
+               dsd = ''
+               jobd = ''
+               t = '+';b = ''
+             end
+           lines_displayed = l2 - l1 + 1
+         end
+     end /*--- pfk = 'PF08' ---*/
+ end /*--- while(pfk ^= 'PF03') ---*/
+ call INIT
+ row = ''
+return 0
+INIT:
+  /*----------------------*/
+  /* Initialize variables */
+  /*----------------------*/
+  t = '';b = ''
+  dev = '???'
+  cyls = 0
+  cchh0='';cchh1='';cchh2='';cchh3='';cchh4='';cchh5='';cchh6=''
+  cchh7='';cchh8='';cchh9='';cchha='';cchhb='';cchhc='';cchhd=''
+  bar0='';bar1='';bar2='';bar3='';bar4='';bar5='';bar6=''
+  bar7='';bar8='';bar9='';bara='';barb='';barc='';bard=''
+  job0='';job1='';job2='';job3='';job4='';job5='';job6=''
+  job7='';job8='';job9='';joba='';jobb='';jobc='';jobd=''
+  ds0='';ds1='';ds2='';ds3='';ds4='';ds5='';ds6='';ds7='';ds8='';ds9=''
+  dsa='';dsb='';dsc='';dsd=''
+return 0
+SCROLLUP:
+  /*----------------------*/
+  /* Scroll the screen up */
+  /*----------------------*/
+  cchhd = cchhc;bard = barc;dsd = dsc;jobd = jobc
+  cchhc = cchhb;barc = barb;dsc = dsb;jobc = jobb
+  cchhb = cchha;barb = bara;dsb = dsa;jobb = joba
+  cchha = cchh9;bara = bar9;dsa = ds9;joba = job9
+  cchh9 = cchh8;bar9 = bar8;ds9 = ds8;job9 = job8
+  cchh8 = cchh7;bar8 = bar7;ds8 = ds7;job8 = job7
+  cchh7 = cchh6;bar7 = bar6;ds7 = ds6;job7 = job6
+  cchh6 = cchh5;bar6 = bar5;ds6 = ds5;job6 = job5
+  cchh5 = cchh4;bar5 = bar4;ds5 = ds4;job5 = job4
+  cchh4 = cchh3;bar4 = bar3;ds4 = ds3;job4 = job3
+  cchh3 = cchh2;bar3 = bar2;ds3 = ds2;job3 = job2
+  cchh2 = cchh1;bar2 = bar1;ds2 = ds1;job2 = job1
+  cchh1 = cchh0;bar1 = bar0;ds1 = ds0;job1 = job0
+return 0
+SCROLLDN:
+  /*------------------------*/
+  /* Scroll the screen down */
+  /*------------------------*/
+  cchh0 = cchh1;bar0 = bar1;ds0 = ds1;job0 = job1
+  cchh1 = cchh2;bar1 = bar2;ds1 = ds2;job1 = job2
+  cchh2 = cchh3;bar2 = bar3;ds2 = ds3;job2 = job3
+  cchh3 = cchh4;bar3 = bar4;ds3 = ds4;job3 = job4
+  cchh4 = cchh5;bar4 = bar5;ds4 = ds5;job4 = job5
+  cchh5 = cchh6;bar5 = bar6;ds5 = ds6;job5 = job6
+  cchh6 = cchh7;bar6 = bar7;ds6 = ds7;job6 = job7
+  cchh7 = cchh8;bar7 = bar8;ds7 = ds8;job7 = job8
+  cchh8 = cchh9;bar8 = bar9;ds8 = ds9;job8 = job9
+  cchh9 = cchha;bar9 = bara;ds9 = dsa;job9 = joba
+  cchha = cchhb;bara = barb;dsa = dsb;joba = jobb
+  cchhb = cchhc;barb = barc;dsb = dsc;jobb = jobc
+  cchhc = cchhd;barc = bard;dsc = dsd;jobc = jobd
+return 0
+UCBSCAN:
+  /*-----------------------------------------------------*/
+  /* Find the UCB address for the specified on-line DASD */
+  /*-----------------------------------------------------*/
+  dasd_ucb = '20'x
+  online = '80'x
+  ucba = storage(d2x(c2d(cvt) + c2d('4e4'x)),4)
+  do while(ucba ^= '00000000'x)
+    ucbstat = storage(d2x(c2d(ucba) + c2d('03'x)),1)
+    bit0 = bitand(ucbstat,online)
+    ucbtbyt3 =  storage(d2x(c2d(ucba) + c2d('12'x)),1)
+    bit2 = bitand(ucbtbyt3,dasd_ucb)
+    if (storage(d2x(c2d(ucba) + c2d('1c'x)),6) = volser) &,
+       (bit2 = dasd_ucb) & (bit0 = online) then,
+       return ucba
+    ucba = storage(d2x(c2d(ucba) + c2d('08'x)),4)
+  end
+return 0
+HALT:
+ /*-----------------------------------------*/
+ /* User has requested a halt in processing */
+ /*-----------------------------------------*/
+ stoppit = 1
+ "CLS"
+ y = ' '                                   /* loop indicator symbol */
+ msg = 'Enter VolSer to trace, PF3 to END ',
+       'or PF11 to view history file'
+ address ispexec "CONTROL DISPLAY REFRESH"
+return 0
+
+
+IOQBAT: batch version of IOQ scanner REXX EXEC
+
+/*------------------------------ Rexx -------------------------------*/
+/* Function   : Display seek address information for DASDs.          */
+/* Callers    : None                                                 */
+/* Dependency : VTOCRD2,VTOCX,GETJOBN external REXX functions.       */
+/* Syntax     : IOQ volser #_loops_around_IOQ_chain                  */
+/*-------------------------------------------------------------------*/
+arg volser loops .
+if volser = '' then
+  do
+    volser = 'PRM006'
+  end
+if loops = '' then
+  do
+    loops = 250
+  end
+say
+say 'IOQ Scanner 1.6'
+say 'äääääääääääääää'
+/* System related information from CVT etc. */
+cvt = storage(10,4)
+/* find CPU type */
+cpup = storage(208,4)
+cpu = storage(d2x(c2d(cpup) + 12),4)
+/* find sys-id   */
+cvtsname = d2x(c2d(cvt) + c2d('154'x))
+sid = storage(cvtsname,8)
+/* find os level */
+cvtprod = d2x(c2d(cvt) - c2d('28'x))
+splvl = storage(cvtprod,16)
+/*--- setup constants/variables ---*/
+uid = SYSVAR(SYSUID)
+getvtoc = 'GETVTOC '
+getdsn  = 'GETDSN  '
+frevtoc = 'FREEVTOC'
+ucbadd = ucbscan(volser)
+if ucbadd = 0 then
+  do
+    say 'Invalid volser: 'volser', MUST be a valid'
+    say 'online DASD volume!'
+    exit
+  end
+dev = storage(d2x(c2d(ucba) + c2d('0d'x)),3)
+fmt4 = obtain(volser)
+ds4devsz = substr(fmt4,19,4)
+cyls = c2d(substr(ds4devsz,1,2))-1
+address TSO "ALLOC FI(VOLUME) DSN('"uid"."volser".VTOC.LIST')
+        SPACE(0,0) TRACKS VOL("volser") UNIT(DASD) NEW DELETE"
+handle = VTOCX(getvtoc,volser)
+address TSO "FREE FI(VOLUME)"
+retc = RC
+if retc ^= 0 then
+  do
+    say 'Allocation of DDname(VOLUME) failed with RC='retc
+    say 'resolve problem then try again.'
+    exit
+  end
+/*--- Get address of the IOQ chain ---*/
+ucbioq = storage(d2x(c2d(ucbadd) - c2d('4'x)),4)
+say 'CPU: 'cpu' SYS-ID: 'sid' MVS-Level: 'splvl' Userid: 'uid
+say
+say 'Parameters specified (or defaulted):'
+say
+say '                                           IOQ Scan Loops: 'loops
+say '                                                   VolSer: 'volser
+say
+say '                                                 Dev Addr: 'dev
+say '                                                     Cyls: 'cyls
+say
+say '                                    Relative Position'
+say 'MM/DD/YY HH:MM C C H H R  0----20---40---60---80---100',
+    'Dataset Name                                 Jobname'
+oldseek = 'FFFFFFFFFFFFFFFF'
+do i = 1 to loops
+  iosb_fnd = 0
+  ioq = ucbioq
+  /*----------------------------------------------------*/
+  /* Loop around IOQ chain for one that matches our UCB */
+  /*----------------------------------------------------*/
+  do while(ioq ^= '00000000'x)
+    /*--- find IOQ element for our UCB ---*/
+    if storage(d2x(c2d(ioq) + c2d('18'x)),4) = ucbadd then
+      do
+        /*--- Get next IOSB and associated ASID for our UCB ---*/
+        ioqiosb = storage(d2x(c2d(ioq) + c2d('8'x)),4)
+        ioqasid = storage(d2x(c2d(ioq) + c2d('1c'x)),2)
+        iosb_fnd = 1
+        leave
+      end
+    /*--- Get next IOQ element in primary IOQ chain ---*/
+    ioq = storage(d2x(c2d(ioq) + c2d('74'x)),4)
+  end
+  if iosb_fnd then
+    do
+      /*--- Get SEEK address for our UCB ---*/
+      ioseeka = c2x(storage(d2x(c2d(ioqiosb) + c2d('64'x)),8))
+      if ioseeka ^= oldseek then
+        do
+          if ioseeka = '' then ioseeka = '0000000000000000'
+          oldseek = ioseeka
+          cc = (x2d(substr(ioseeka,7,4))/cyls)*25
+          if (cc <= 25) & (ioseeka ^= '0000000000000000') then
+           do
+             cchhr = substr(ioseeka,7,10);job = getjobn(ioqasid)
+             bar = substr(copies('*',format(cc,3,0)),1,28)
+             cchh = x2c(substr(ioseeka,7,8))
+             dsn = VTOCX(getdsn,handle,cchh)
+             pdate = date('U')
+             ptime = time()
+             say pdate ptime cchhr bar dsn job
+           end
+        end
+    end
+end
+say
+say 'IOQ scan of 'volser' ended normally.'
+say
+exit
+ucbscan:
+  /*-----------------------------------------------------*/
+  /* Find the UCB address for the specified on-line DASD */
+  /*-----------------------------------------------------*/
+  dasd_ucb = '20'x
+  online = '80'x
+  ucba = storage(d2x(c2d(cvt) + c2d('4e4'x)),4)
+  do while(ucba ^= '00000000'x)
+    ucbstat = storage(d2x(c2d(ucba) + c2d('03'x)),1)
+    bit0 = bitand(ucbstat,online)
+    ucbtbyt3 =  storage(d2x(c2d(ucba) + c2d('12'x)),1)
+    bit2 = bitand(ucbtbyt3,dasd_ucb)
+    if (storage(d2x(c2d(ucba) + c2d('1c'x)),6) = volser) &,
+       (bit2 = dasd_ucb) & (bit0 = online) then,
+       return ucba
+    ucba = storage(d2x(c2d(ucba) + c2d('08'x)),4)
+  end
+return 0
+
+
+IOQPAN: main on-line IOQ scanner panel
+
+)Attr
+   # type(text) color(blue) caps(off) hilite(reverse)
+   + type(text) color(green) caps(off)
+   @ type(text) color(yellow) caps(off)
+   $ type(output) color(red) caps(off)
+   ä type(output) color(turq) caps(off)
+   ! type(output) color(yellow) caps(off)
+   | type(output) color(white) caps(off) just(left)
+   " area(dynamic) scroll(on) extend(off)
+  ff type(dataout) intens(high) color(red)
+)Body Expand(\\) smsg(smsg)
+# \ \ IOQ Scanner 1.6 \ \
++        CPU:!cpu +SYSID:!sid +REL:!splvl   +DATE:!pdate   +TIME:!ptime   +
+%Command ===>_zcmd                                             +"row           "
++                            VolSer:_volser+               Dev Addr:$dev+
++                                  !y+                   Total Cyls:$cyls+
++               @Relative Position+
++C C H H R  0----20---40---60---80---100 Dataset Name                   JOBname
+!cchh0     äbar0                     $t!ds0                            äjob0
+!cchh1     äbar1                     + !ds1                            äjob1
+!cchh2     äbar2                     + !ds2                            äjob2
+!cchh3     äbar3                     + !ds3                            äjob3
+!cchh4     äbar4                     + !ds4                            äjob4
+!cchh5     äbar5                     + !ds5                            äjob5
+!cchh6     äbar6                     + !ds6                            äjob6
+!cchh7     äbar7                     + !ds7                            äjob7
+!cchh8     äbar8                     + !ds8                            äjob8
+!cchh9     äbar9                     + !ds9                            äjob9
+!cchha     äbara                     + !dsa                            äjoba
+!cchhb     äbarb                     + !dsb                            äjobb
+!cchhc     äbarc                     + !dsc                            äjobc
+!cchhd     äbard                     $b!dsd                            äjobd
++C C H H R  0----20---40---60---80---100
++                            äsmsg
+  |msg
+)Init
+ .help = IOQHPAN
+)Proc
+ver (&volser,NB)
+ver (&loops,range,1,99999)
+&pfk = .PFKEY
+)End
+
+
+IOQHPAN: help panel for on-line IOQ scanner
+
+)Attr default(|+_)
+  $ type(output) intens(high) color(yellow) just(right) caps(off) pad(' ')
+  ! type(text) intens(high) color(green) caps(off) hilite(reverse)
+  + type(text) intens(low) color(turq) caps(off)
+  $ type(input) intens(high) color(red) caps(on)
+  @ type(text) intens(high) color(blue)
+)Body expand(\\)
+! \ \ IOQ Scanner Help \ \
++        CPU:$cpu +SYSID:$sid +REL:$splvl   +DATE:$pdate   +TIME:$ptime   +
+|Command ===>_zcmd
++
++IOQ Scanner@allows you to dynamically monitor the I/O requests to DASD.
+@The field descriptions are as follows:
++
++   VolSer:@This field identifies the DASD volume for which you want the
+@           dynamic monitoring.
++
++   Dev Addr@and+Total Cyls@fields will be automatically updated.
++
++   C C H H R @Values are the seek addresses on the volume being monitored.
+@              The dataset name that the CCHHR equates to will be shown only
+@              if the CCHHR falls within the 1st sixteen extents of a dataset.
++
++   JOBname   @This is the JOBname making the I/O request.
++
++   PF11      @Takes you into the history file - up to 1000 most recent I/O
+@              requests are held. The current entry is identified by a+plus@
+@              sign next to it.
++
+\ \ |PF3+END \ \
+)Init
+)Proc
+)End
+
+
+IOQM00: IOQ ISPF error message member
+
+IOQM001 'Invalid VolSer: &VOLSER'  .ALARM=NO
+'VolSer &VOLSER, is invalid or OFFLINE!'
+
+We shall be concluding this article in next month's issue with
+the publication of the remaining components of the IOQ
+scanner.
+
+Ghias Din
+Senior Technical Consultant
+IMI Computing Ltd (UK)                              c Xephon 1993
+

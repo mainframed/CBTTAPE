@@ -1,0 +1,841 @@
+//jobname JOB (account),userid,CLASS=S,MSGCLASS=Y,REGION=4M
+//*
+//* First modify JOB card and data set names to your environment
+//* Assemble and Link program/module
+//*
+//ASMH    EXEC PGM=ASMA90,REGION=4M,
+//        PARM='RENT,OBJECT,NODECK,NOXREF,BATCH'
+//SYSLIB   DD  DISP=SHR,DSN=SYS1.MACLIB
+//         DD  DISP=SHR,DSN=SYS3.UTILITY.MACLIB.TEST    <== hlq.MACLIB
+//SYSUT1   DD  UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD  SYSOUT=*
+//SYSLIN   DD  UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//SYSIN    DD  *
+*=====================================================================*
+     TITLE '$OPEN: Dynamic OPEN-READ-UPDATE-WRITE-CLOSE interface'
+*---------------------------------------------------------------------*
+* History of Changes (last comes first):
+*
+* ?????????? SVM OPENC - create dataset with the same attrs
+*                    as currently open (DCB must point to it)
+*                    use default space attr or pass in bufaddr(?)
+*                    then open as another DDName
+* 02/03/2003 SVM Fixed minor bugs
+* 01/24/2003 SVM Modified to return to A-31 caller
+* 01-07-2002 SVM Added Write for PDS member
+* 10-24-2001 SVM Created by old program
+*.....................................................................*
+* FUNCTION:
+*               1) Allocates & processes Dataset using DYNALLOC.
+*               2) Read/write DASD datasets with DSORG=PO or PS.
+*                  Use BSAM.
+*               3) PO and no MEMBER - reads PDS directory blocks.
+*                  Use BPAM, BSAM.
+*               4) Supports RECFM=F/FB/FBA/V/VB/VBA/U.
+*
+* PARM ($PARM DSECT):
+*               R1=Addr of word containing Addr of the following
+*               structure: > is input, < is output parm:
+*                 RC       DS F      <Return Code
+*                 DSNAME   DS CL44   >Dataset Name
+*                 MEMBER   DS CL8    >PDS Member Name/blanks
+*                 VOLUME   DS CL6    >Volume Name/blanks
+*                 RECLEN   DS H      <Current Record Length
+*                 DCBADDR  DS F     ><DCB Address
+*                 BUFADDR  DS F     ><Buffer Address
+*                 LENGTH   DS F      <Data Length in Buffer (bytes)
+*                 RECADDR  DS A      <Current Record Addr
+*
+* ENTRY POINTS:
+*
+*               $OPENx Allocates and Opens the Data Set:
+*               - If PDS and Member is blank - Open Directory.
+*               - If DCBADDR=0, allocate DCB, BUFFER and SVMPAR6.
+*               - If re-open other Member in PDS BLDL+POINT used.
+*               - If re-open same PS dataset, POINT used.
+*               - If Other Dsn/Vol, $CLOSE is forced before $OPEN.
+*               - If was WRITE, $CLOSE is forced before re-opening.
+*               - If I/O error, then buffer contains SYNAD message.
+*
+*               $OPEN, - Open the DataSet for Input.
+*               $OPENI - Open the DataSet for Input.
+*               $OPENU - Open the DataSet for Update.
+*               $OPENW - Open the DataSet for Output.
+*                        When used for PDS, create/replace the MEMBER
+*                      - If the member exists, Buffer will contain
+*                        its directory entry (TTRZ in col 12-15)
+*
+*               $CLOSE - Close the DataSet, Unallocate Data Set.
+*
+*               $READ  - Read Block of Data to Buffer,
+*                        or reset record addr/length to the next rec,
+*                        Set Data buffer Length = Block size.
+*                        If RECFM=FB,FBA,VB,VBA,VBS then
+*                        set/reset Current Record Length and Address.
+*                        If PO and no MEMBER, read Dir Block (BLDL).
+*
+*               $WRITE - UPDATE: Rewrite current block from Buffer.
+*                      - OUTPUT: Write block to dataset from Buffer.
+*                      - RECFM=FB: Caller program must maintain record
+*                        blocking. Block length if different than
+*                        BLKSIZE must be placed to LENGTH.
+*                      - RECFM=U: the current block length must
+*                        be placed to RECLEN.
+*
+* ATTRIBUTES:
+*               REENTRANT, AMODE=24.
+* !             Caller might have AMODE=31, but must
+* !             allocate SAVAREA and $PARM below 16M.
+* !             and use BASSM for call.
+*---------------------------------------------------------------------
+* Use in PL/I:
+*               DECLARE $OPEN ENTRY RETURNS(BIT(1))
+*               RETURNed value '1'B is equivalent to RC=0.
+*   example:    DO WHILE($READ(RAPMPTR));
+*                  Process record just read;
+*                  END; /*EOF or error encountered */
+*--------------------------------------------------------------------
+* Use in MVS:
+*               1. LINK.
+*               2. LOAD then CALL. (BASSM from above 16M)
+*               3. Call as a EP Link Edited into the same pgm.
+* Register Use:
+*               R12  - Base of program
+*               R13  - Base of WA
+*               R4   - DCB
+*               R5   - PARM
+*               R7   - SVMPAR6
+*               R8   - Copy of R1
+*
+* Extenals:     SVMALC6 - DYNALLOC inteface
+*--------------------------------------------------------------------
+         EJECT
+*--------------------------------------------------------------------
+$OPEN    CSECT
+         SPLEVEL SET=2                 REQUEST MVS/XA MACROS
+$OPEN    AMODE 24
+$OPEN    RMODE 24
+*--------------------------------------------------------------------
+         $PARM                         PARM data structure
+*PARM     DSECT
+*RC       DS   F                       <Return Code
+*DSNAME   DS   CL44                    >Dataset Name
+*MEMBER   DS   CL8                     >PDS Member Name (optional)
+*VOLUME   DS   CL6                    <>Volume Name     (optional)
+*RECLEN   DS   H                      < Current Record Length
+*TYPE     EQU   RECLEN            work  Open type (for OPEN only)
+*DCBADDR  DS   A                      <>DCB Address
+*OLDTYPE  EQU   DCBADDR               < After OPEN (saved TYPE)
+*BUFADDR  DS   A                      <>Buffer Address
+*LENGTH   DS   F                      < Data Length in Buffer (bytes)
+*RECADDR  DS   A                      < Current Record Addr
+*---------------------------------------------------------------------
+$OPEN    CSECT
+*
+*        List of entry points:
+*
+         ENTRY $CLOSE,$READ,$WRITE,$OPENI,$OPENU,$OPENW
+$OPENI   SAVE (14,12)                  Save registers
+         LA    R2,0                    Set Switch offset
+         LA    R3,0                    Set Base Offset
+         B     92(R15)
+$OPENU   SAVE (14,12)                  Save registers
+         LA    R2,20                   Set Switch offset
+         LA    R3,16                   Set Base Offset
+         B     76(R15)
+$OPENW   SAVE (14,12)                  Save registers
+         LA    R2,16                   Set Switch offset
+         LA    R3,32                   Set Base Offset
+         B     60(R15)
+$READ    SAVE  (14,12)                 Save registers
+         LA    R2,4                    Set Switch offset
+         LA    R3,48                   Set Base Offset
+         B     44(R15)
+$WRITE   SAVE  (14,12)                 Save registers
+         LA    R2,8                    Set Switch offset
+         LA    R3,64                   Set Base Offset
+         B     28(R15)
+$CLOSE   SAVE  (14,12)                 Save registers
+         LA    R2,12                   Set Switch offset
+         LA    R3,80                   Set Base Offset
+*======================================================================
+* Common Continuation:                 Prolog Section
+         SR    R15,R3                  Addr $OPEN
+         LR    R12,R15
+         USING $OPEN,R12               Set the Base for $OPEN
+         L     R5,0(R1)                R5=Addr of Paramater
+         LA    R5,0(R5)                Clear leftmost byte
+         USING $PARM,R5                Set the Base for $PARM
+         LR    R8,R1                   Save R1 until EXIT
+* Obtain WA storage:
+         GETMAIN RC,LV=LENGWA,SP=1     Get RAM for WA
+         LTR   R15,R15                 If OK
+         BNZ   E#NOMAIN                N
+         ST    R13,4(R1)               Store old in new
+         ST    R1,8(R13)               Store new in old
+         LR    R13,R1                  Switch to new SaveArea
+         USING WA,R13                  Address WorkArea
+*---------------------------------------------------------------------
+* Switch to the requested function:
+         LA    1,SWITCH
+         LA    1,0(2,1)
+         BR    1
+SWITCH   B     OPENI
+         B     READ
+         B     WRITE
+         B     CLOSE
+         B     OPENW
+         B     OPENU
+*---------------------------------------------------------------------*
+*        $OPEN: Check Parameters:
+*---------------------------------------------------------------------*
+OPENU    MVI   TYPE,UPDATE             Set Update
+         B     OPEN
+OPENW    MVI   TYPE,OUTPUT             Set Output (invalid for PO)
+         B     OPEN
+OPENI    MVI   TYPE,INPUT              Set Input
+*        B     OPEN
+OPEN     XC    RC(4),RC                Clear RC
+*
+         CLI   DSNAME,C' '             DSNAME not blank?
+         BE    E#NODSN                 Error: No DSNAME
+         SR    R4,R4
+         ICM   R4,7,DCBADDR+1          DCB Address exists?
+         LTR   R4,R4
+         BNZ   OLDDCB                  Y - Check if can re-use it
+         B     ALLOCATE                N - Allocate Data Set
+*
+REALLOC  BAL   R10,CLOSER
+         B     ALLOCATE
+*---------------------------------------------------------------------*
+*    R4->DCB: Check if it can be just re-opened
+*---------------------------------------------------------------------*
+         USING IHADCB,R4               DCB mapping
+         USING SVMPAR6,R7              Set Base for SVMPAR6
+OLDDCB   L     R7,DCBEXLST
+         SLL   R7,8                    Addr of old SVMPAR6
+         SRL   R7,8                    Addr of old SVMPAR6
+* --- mistery, but LA R7,0(R7) leaves 1st byte as X'10' ---?????
+         CLC   DSNAME(44),TDSN         Same DSNAME ?
+         BNE   REALLOC                 Y
+*
+         CLC   VOLUME(6),TVOL          Same VOLUME ?
+         BNE   REALLOC                 N - Close and Reallocate
+*
+         CLI   OLDTYPE,OUTPUT          Was OUTPUT?
+         BE    REALLOC                 Y - Close and Reallocate
+*
+         CLI   TYPE,OUTPUT             Now Output ?
+         BE    REALLOC                 Y - Close and Reallocate
+*
+         CLI   MEMBER,C' '             IF MEMBER=blank
+         BE    CKOLDMEM                Y - Check old member
+         CLI   STOWLST,C' '            N - Old member blank?
+         BE    REALLOC                     Y - re-allocate
+         B     CHGMEM                      N - switch member
+*
+CKOLDMEM CLI   STOWLST,C' '            Y - Old member blank?
+         BE    REOPENPS                    Y - Re-open PS dataset
+         B     REALLOC                     N - re-allocate
+*----------------------------------------------------------------------
+* Switch Member in the same PDS for Input/Update:
+*----------------------------------------------------------------------
+CHGMEM   L     R3,BUFADDR              Prepare
+         LA    R0,1                    Parameter
+         STH   R0,0(R3)                for BLDL
+         LA    R0,58                   in the 1-st word
+         STH   R0,2(R3)                of the Buffer
+         MVC   4(8,R3),MEMBER
+         BLDL  (4),(3)                 Get Directory elem into Buffer
+         LTR   R15,R15
+         BNZ   E#NOMEMB
+         POINT (4),12(3)               Point DCB to the Member
+         LA    R0,60                   Set data length=60
+         ST    R0,LENGTH               Done
+         B     NORMEXIT
+*----------------------------------------------------------------------
+* Re-Open the same PS dataset:
+*----------------------------------------------------------------------
+REOPENPS L     R0,TTRZ                 TTRZ
+         LTR   R0,R0
+         BZ    E#DCBOPN                Error: No TTRZ in DCB
+         POINT (4),TTRZ                Position to file top
+         XC    LENGTH(4),LENGTH        Clear Length
+         XC    RECLEN(2),RECLEN        Clear RECLEN & TYPE in $PARM
+         B     NORMEXIT                Done
+*=====================================================================*
+*        Allocate the New Data Set
+*---------------------------------------------------------------------*
+ALLOCATE DS    0H
+         LA    R0,TLEN                 Length of SVMPAR6
+         A     R0,SP1
+         GETMAIN R,LV=(0),LOC=BELOW    Get RAM for SVMPAR6
+         LTR   R15,R15                 If OK
+         BNZ   E#NOMAI2                N
+*- Fill parameter for allocate:
+         LR    R7,R1                   Addr of SVMPAR6
+         XC    SVMPAR6(TLEN),SVMPAR6   Clear SVMPAR6
+         MVC   TDSN(44),DSNAME         Move Dsname to SVMPAR6
+         MVC   TVOL(6),VOLUME          Move Volume to SVMPAR6
+         MVC   TDDN(8),=CL8' '         Clear TDDN  in SVMPAR6
+*- Call Dynalloc Interface (R1->SVMPAR6):
+*
+         CALL  SVMALC6                 DYNALLOC interface
+*
+         LTR   R15,R15
+         BNZ   E#NODD                  Dynalloc failed
+*- Return VOLUME if blank:
+         CLC   VOLUME,=C'      '
+         BNE   CHKORG
+         MVC   VOLUME(6),TVOL
+*
+CHKORG   DS    0H
+         TM    TDSORG,DCBDSGPO         DSORG=PO ?
+         BNO   CHKPS                   N - Check if PS
+         CLI   TYPE,OUTPUT               PO & output ?
+         BNE   MKDCB                     N - proceed with make DCB
+         CLI   MEMBER,C' '                 PO & output & no member ?
+         BE    E#DSORG                     Y - Error
+         B     MKDCB                       N - proceed
+*
+CHKPS    TM    TDSORG,DCBDSGPS         DSORG=PS ?
+         BO    IFMEMB                  Y-Check Member Name
+         TM    TDSORG,DCBDSGDA         DSORG=DA ?
+         BNO   E#DSORG                 Error: DSORG not supported
+IFMEMB   CLI   MEMBER,C' '
+         BNE   E#PO                    Error: MEMBER for DSORG=PS/DA
+*
+*=====================================================================*
+*        Create new DCB & DECB,
+*        OPEN DCB,
+*        R4-DCB, R5-$PARM, R7-SVMPAR6.
+*---------------------------------------------------------------------*
+MKDCB    DS    0H
+         LA    R0,LENDCBS              DCB + DECB + STOW
+         A     R0,SP1
+         GETMAIN R,LV=(0) SP=1         Get RAM
+         LR    R4,R1                   R4=Addr of DCB
+         ST    R4,DCBADDR              Store DCBADDR in $PARM
+         XC    0(LENDCBS,R4),0(R4)     Clear DCB storage
+         MVC   DCB(DCBLNGPO),DCBCPO    Init DCB as PO
+         ST    R7,DCBEXLST             Save Addr of SVMPAR6 in DCB
+*
+* Fill DCB & DECB1:
+*
+         TM    TDSORG,DCBDSGPO         DSORG=PO ?
+         BO    CHKMEMB                 Y
+         MVI   DCBDSORG,DCBDSGPS       N - Re-set DSORG to PS
+         B     INTDECB
+*
+CHKMEMB  CLI   MEMBER,C' '
+         BNE   INTDECB                 MEMBER is present
+*
+* No MEMBER for PO: Set to Read Directory:
+*
+         MVI   DCBRECFM,DCBRECF        RECFM=F
+         MVC   DCBBLKSI(2),=H'256'     BLKSIZE=256
+         MVC   DCBLRECL(2),=H'256'     LRECL=256
+*
+* Fill DECB:
+*
+INTDECB  MVC   DECB1(DECB1LN),DECB1C   Init DECB1 (next to DCB)
+         STCM  R4,7,DECBDCBA+1         Store Addr of DCB->DECB
+*                                      (except 0-byte with type)
+         MVC   DCBDDNAM(8),TDDN        Copy allocated DDNAME to DCB
+*
+         MVC   OLDTYPE(1),TYPE         Set type in $PARM.DCBADDR
+         XC    RECLEN(2),RECLEN        Clear RECLEN & TYPE in $PARM
+*
+* OPEN the DCB:
+*
+*        WTO   '$OPEN: Now opening DCB...',ROUTCDE=11
+NULL     LA    R1,DCBADDR              PARM for OPEN
+*-------------------
+         SVC   19                      OPEN DCB
+*-------------------
+*        WTO   '$OPEN: Open DCB complete...',ROUTCDE=11
+         TM    DCBOFLG,DCBOFOPN        Is DCB opened ?
+         BNO   OPENFAIL
+         XC    LENGTH(4),LENGTH        Clear LENGTH
+         XC    TTRZ(4),TTRZ            Clear TTRZ in DCB
+*----------------------------------------------------------------------
+* Get RAM for Buffer:
+*----------------------------------------------------------------------
+GETBUF   LH    R0,DCBBLKSI             Get DCBBLKSI
+         XC    BUFADDR(4),BUFADDR      Clear BUFADDR
+         GETMAIN RC,LV=(0),SP=1        Get RAM for Buffer
+         LTR   R15,R15
+         BNZ   OPENFAIL                No RAM available
+         ST    R1,BUFADDR
+         XC    LENGTH(4),LENGTH        Clear LENGTH
+*----------------------------------------------------------------------
+* If write to member, do not check if the member exists,
+* Else If MEMBER is present, Find the Member (R1=Addr of Buffer):
+*----------------------------------------------------------------------
+* Store MEMBER name to STOWLST:
+SETSTOW  MVC   STOWLST(8),MEMBER       Set STOW list
+         XC    STOWLST+8(4),STOWLST+8  (used for OUTPUT only)
+         CLI   MEMBER,C' '
+         BE    NOTEPS
+         CLI   OLDTYPE,OUTPUT          If OUTPUT, do not read Dir
+         BE    EXIT
+* If Read/Update, Then Read Dir entry to Buffer and set TTRZ:
+         LA    R0,1
+         STH   R0,0(R1)
+         LA    R0,58
+         STH   R0,2(R1)
+         MVC   4(8,R1),MEMBER
+         LR    R3,R1                   Point R3->Buffer
+         BLDL  (4),(3)                 Read Dir Element to Buffer
+         LTR   R15,R15
+         BNZ   E#NOMEMB
+         POINT (4),12(3)
+         L     R0,12(R3)
+         ST    R0,TTRZ                 Save TTRZ in DCB
+         B     EXIT                    Exit
+*======================================================================
+* PS-dataset: Store the top TTRZ:
+*----------------------------------------------------------------------
+NOTEPS   LA    R1,1                    TTRZ top of PS-dataset
+         ST    R1,TTRZ                 Store TTRZ in DCB
+         B     EXIT
+*======================================================================
+* OPEN FAILED:
+*----------------------------------------------------------------------
+OPENFAIL LR    R1,R7
+*
+         CALL  SVMDEL6                 Unallocate Data Set
+*
+         BAL   R14,FREEPAR             Remove SVMPAR6
+         BAL   R14,FREEBUF             Remove Buffer (if exists)
+         BAL   R14,FREEDCB             Remove DCB (if exists)
+         B     E#NOOP                  Error: OPEN FAILED
+*======================================================================
+* Remove just SVMPAR6 when Bad parameter Error:
+*----------------------------------------------------------------------
+OPRETU   LR    R1,R7                   Addr of SVMPAR6
+*
+         CALL  SVMDEL6                 Unallocate Data Set
+*
+         BAL   R14,FREEPAR             Delete SVMPAR6
+         B     EXIT
+*======================================================================
+NORMEXIT DS    0H                      WTO 'NORMEXIT',ROUTCDE=11
+         SR   R15,R15
+         ST   R15,RC
+         B    EXIT
+*======================================================================
+* Common Exit routine:
+*----------------------------------------------------------------------
+EXIT     DS    0H
+         LR    R1,R13                  Addr of WA
+         L     R13,4(R13)              Restore addr of old Savarea
+         FREEMAIN R,LV=LENGWA,A=(1),SP=1 Free Workarea
+*- WA    removed
+EXIT1    DS    0H                      Exit after "No RAM for WA"
+         L     R15,RC
+*
+* If two parms, return BIT(1)=(R15=0) for PL/I
+*
+         TM    0(R8),X'80'             Check VL BIT
+         BO    END                     Not 0 - One parm
+         L     R8,4(R8)                2-nd parm
+         L     R8,0(R8)                Addr of bit(8) string
+         LTR   R15,R15
+         BZ    TRUE
+FALSE    MVI   0(R8),0                 RETURN FALSE
+         B     END
+TRUE     MVI   0(R8),X'80'             RETURN TRUE
+END      DS    0H
+*  Modified to return to AMODE-31 caller:
+*        RETURN (14,12),RC=(15)
+         L     R14,R12(0,R13)
+         LM    R0,R12,20(R13)
+         BSM   0,R14
+*
+*======================================================================
+*  Free SVMPAR6 area:
+FREEPAR  DS    0H
+*        WTO   '$OPEN: Executing FREEPAR...',ROUTCDE=11
+         LR    R1,R7                   Take from Base register
+         LTR   R1,R1
+         BZ    NOPRM6
+         LA    R0,TLEN
+         A     R0,SP1
+         FREEMAIN R,LV=(0),A=(1) SP=1  Free SVMPAR6 area
+NOPRM6   BR    R14
+*======================================================================
+*  Free DCB area:
+FREEDCB  DS    0H
+*        WTO   '$OPEN: Executing FREEDCB...',ROUTCDE=11
+         SR    R1,R1
+         ICM   R1,7,DCBADDR+1          Take from $PARM
+         LTR   R1,R1
+         BZ    NODCB
+         LA    R0,LENDCBS
+         A     R0,SP1
+         FREEMAIN R,LV=(0),A=(1) SP=1  Free DCB & DECB area
+         XC    DCBADDR(4),DCBADDR      Clear DCBADDR in $PARM
+NODCB    BR    R14
+*======================================================================
+*  Free Buffer area: DCB must exist
+FREEBUF  DS    0H
+*        WTO   '$OPEN: Executing FREEBUF...',ROUTCDE=11
+         L     R1,BUFADDR              Take from $PARM
+         LTR   1,1
+         BZ    NOBUF
+         LH    R0,DCBBLKSI
+         A     R0,SP1
+         FREEMAIN R,LV=(0),A=(1)       Free Buffer area in SP=1
+         XC    BUFADDR(4),BUFADDR      Clear BUFADDR
+         XC    LENGTH(4),LENGTH        Clear LENGTH
+         XC    RECADDR(4),RECADDR      Clear RECADDR
+         XC    RECLEN(2),RECLEN        Clear RECLEN - save Type!
+NOBUF    BR    R14
+*=====================================================================*
+*        SET RETURN CODES
+*---------------------------------------------------------------------*
+*
+E#NODD   MVI  RC+3,4                   Dynalloc failed
+         B    EXIT
+E#NOOP   MVI  RC+3,16                  OPEN error or no RAM for Buffer
+         B    EXIT
+E#NODSN  MVI  RC+3,24                  DSNAME invalid
+         B    EXIT
+E#NOMEMB MVI  RC+3,28                  MEMBER not found
+         B    EXIT      Do not close - other member might be requested
+*32 - End Of File, see $READ
+*
+E#DSORG  MVI  RC+3,36                  DSORG not supported
+         B    OPRETU
+*40 - I/O error, see $READ
+*
+E#PO     MVI  RC+3,44                  MEMBER present for PS
+         B    OPRETU
+E#NORADR MVI  RC+3,52                  READ, but Addr of DCB=0
+         B     RETRD
+E#NOROPN MVI  RC+3,56                  READ, but DCB is not Opened
+         B     RETRD
+E#NOMAIN MVI  RC+3,60                  Cannot obtain RAM (WA)
+         B     EXIT1
+E#NOMAI2 MVI  RC+3,60                  Cannot obtain RAM (SVMPAR6)
+         B     EXIT
+E#NOWADR MVI  RC+3,64                  WRITE, but Addr(DCB) or Buffer=0
+         B     RETWR
+E#NOWOPN MVI  RC+3,68                  WRITE, but DCB is not Opened
+         B     RETWR
+E#DCBOPN MVI  RC+3,72                  Re-Open PS, but no TTRZ avail.
+         B    EXIT
+E#STWER  MVI  RC+3,76                  STOW failed for adding member
+         B    CLOSE1
+*=====================================================================*
+*        CLOSE DATASET, release SVMPAR6, DCB, BUFFER
+*        Come here from $CLOSE
+*---------------------------------------------------------------------*
+CLOSE    LA    R10,EXIT                Addr of Exit: EXIT or
+*                                      to OPEN (when DSNAME change)
+*        Come here from REALLOC:
+*                                      to OPEN (when DSNAME change)
+CLOSER   XC    RC(4),RC
+         SR    R4,R4
+         ICM   R4,7,DCBADDR+1
+         LTR   R4,R4                   DCB present ?
+         BZ    RETCL                   DCB not present
+* If Previous was PDS Member output - store member:
+         TM    DCBDSORG,DCBDSGPO       DSORG=PO ?
+         BNO   CLOSE1                  N
+         CLI   OLDTYPE,OUTPUT          PO & Was Output?
+         BNE   CLOSE1                  N
+*        WTO   '$CLOSE: Issuing STOW...',ROUTCDE=11
+         STOW  (4),STOWLST,R           Add/Replace the member
+*
+CLOSE1   BAL   R14,FREEBUF
+         TM    DCBOFLG,DCBOFOPN        Is DCB opened ?
+         BNO   UNALLOC                 DCB is not Opened
+*
+         CLOSE ((4))                   Close DCB
+*
+* Deallocate DDNAME (SVMPAR6.DDN):
+*
+UNALLOC  L     R7,DCBEXLST
+         SLL   R7,8
+         SRL   R7,8                    Clear 1st byte
+         LR    R1,R7                   Addr of SVMPAR6
+*
+         CALL  SVMDEL6                 Unallocate Data Set
+*
+         BAL   R14,FREEPAR
+*
+         BAL   R14,FREEDCB
+*
+RETCL    L     R15,RC
+         BR    R10                     Exit (EXIT or OPEN)
+*=====================================================================*
+*        $READ: Read Data block, locate Record:
+*---------------------------------------------------------------------*
+*
+* Check Parameters:
+*
+READ     XC    RC(4),RC
+         SR    R4,R4
+         ICM   R4,7,DCBADDR+1
+         LTR   R4,R4
+         BZ    E#NORADR                Error: No DCBADDR
+         L     R2,BUFADDR
+         LTR   R2,R2
+         BZ    E#NORADR                Error: No BUFADDR
+         TM    DCBOFLG,DCBOFOPN        Is DCB opened ?
+         BNO   E#NOROPN                Error: DCB not Opened
+         L     R7,DCBEXLST
+         SLL   R7,8
+         SRL   R7,8
+*
+* R2=Addr of Buffer: Check for block of Data
+*
+         LH    REG,RECLEN              R3
+         LTR   REG,REG                 R3
+         BZ    RDNXTBLK                Read 1-st Block
+*                                      (In OPEN RECLEN was cleared)
+         TM    DCBRECFM,BLOCKED
+         BNO   RDNXTBLK                Not Blocked - Read Block
+*
+* Blocked Format:
+*
+*        WTO   'Blocked format',ROUTCDE=11
+         TM    DCBRECFM,UNDEF
+         BO    RDNXTBLK                Not Blocked - Read Block
+         TM    DCBRECFM,FIXED
+         BNO   VARY1                   Not Fixed - Variable
+*
+* Fixed Format:
+*
+         LH    REG,DCBLRECL
+         STH   REG,RECLEN
+MOVETEK  A     REG,RECADDR
+         ST    REG,RECADDR             Next Record
+         S     REG,BUFADDR
+         C     REG,LENGTH
+         BNL   RDNXTBLK                End of Block reached
+         B     RETRD                   Record located
+*
+* VB - Format:
+*
+VARY1    LH    REG,RECLEN
+         A     REG,RECADDR             Addr of Index of Next Record
+         ST    REG,RECADDR             Save temporarily
+         S     REG,BUFADDR             Offset
+         C     REG,LENGTH
+         BNL   RDNXTBLK                End of Block reached
+         L     REG,RECADDR             Restore Addr of Index of Record
+*
+* Set Length and position of V-record REG->Record Index
+*
+GETVREC  MVC   RECLEN(2),0(REG)        Not aligned
+         LA    REG,4(REG)              Record Text Addr
+         ST    REG,RECADDR             - Stored
+         LH    REG,DCBLRECL
+         LTR   REG,REG                 If DCBLRECL not =0
+         BNZ   GETV1                   Skip to compare to DCBLRECL
+         LH    REG,RECLEN              Rec length with Index
+         C     REG,LENGTH              Compare to Length of Data
+         BNH   GETVREC1                No RDW error
+         B     GETVERR
+GETV1    LH    REG,RECLEN              Rec length with Index
+         CH    REG,DCBLRECL
+         BNH   GETVREC1                No RDW error
+*
+GETVERR  MVI   RC+3,76                 Error length of V-record
+         NI    RECLEN,0                leave not more than 255
+         LH    REG,RECLEN              Rec length with Index
+GETVREC1 SH    REG,=H'4'               Rec length without Index
+         STH   REG,RECLEN              - Stored
+         B     RETRD                   Exit
+*
+* Read Block of Data:
+*
+RDNXTBLK READ  DECB1,SF,DCB,(R2),'S',MF=E
+         CHECK DECB1
+GETLAST  LH    R3,DCBBLKSI             DCBBLKSI
+         L     R6,DCBIOBA              DCBIOBA
+         LH    R6,22(R6)               Number of Free bytes
+         SR    R3,R6                   Number of Occupied bytes
+         ST    R3,LENGTH               ->LENGTH
+*
+* Locate (1-st) Record:
+*
+         TM    DCBRECFM,UNDEF
+         BO    UNBLOCKD                U - Format
+         TM    DCBRECFM,VARYING
+         BO    VARY2                   V - Format
+*
+* Fixed Format:
+*
+         TM    DCBRECFM,BLOCKED
+         BO    BLOCKED1
+*
+* Not Blocked:
+*
+UNBLOCKD MVC   RECADDR(4),BUFADDR      Addr = BUFADDR
+         L     REG,LENGTH
+         STH   REG,RECLEN
+*        WTO   'UNBLOCKD',ROUTCDE=11
+         B     RETRD                   Exit
+*
+* Blocked Format:
+*
+BLOCKED1 LH    REG,DCBLRECL
+         STH   REG,RECLEN              Length = LRECL
+         L     REG,BUFADDR
+         ST    REG,RECADDR             Addr = BUFADDR
+*        WTO   'BLOCKED1',ROUTCDE=11
+         B     RETRD                   Exit
+*
+* V - Format:
+*
+VARY2    L     REG,BUFADDR
+         LA    REG,4(REG)              Skip Block Index
+         B     GETVREC
+* Exit from $READ:
+RETRD    B     EXIT
+*----------------------------------------------------------------------
+EODAD    MVI   RC+3,32                 ** End Of File **
+         B     RETRD
+*
+SYNAD    DS    0H
+         SYNADAF ACSMETH=BPAM
+         LH    R3,DCBBLKSI             DCBBLKSI
+         LA    R0,77                   Text length-1
+         CR    R0,R3
+         BL    SYNORM
+         SR    R0,R3
+         LA    R1,50(R0,R1)            Start address
+         LA    R0,1
+         SR    R3,R0                   Length-1
+         LA    R6,1(R3)                Length
+         ST    R6,LENGTH               Store to LENGTH
+         STH   R6,RECLEN
+         EX    R3,SYMVC
+         B     SYEND
+SYMVC    MVC   0(1,R2),0(R1)
+SYNORM   MVC   0(78,R2),50(R1)
+         LA    R6,78                   Text Length
+         ST    R6,LENGTH               Store to LENGTH
+         STH   R6,RECLEN
+SYEND    MVI   RC+3,40                 ** I/O Error **
+         MVC   RECADDR(4),BUFADDR
+         SYNADRLS
+         B     RETRD
+FIXED    EQU   DCBRECF                 X'80'
+VARYING  EQU   DCBRECV                 X'40'
+BLOCKED  EQU   DCBRECBR                X'10'
+UNDEF    EQU   DCBRECU                 X'C0'
+REG      EQU   3                       Work Register for Read
+INPUT    EQU   X'80'                   Open mode
+UPDATE   EQU   X'84'                   Open mode
+OUTPUT   EQU   X'8F'                   Open mode
+*=====================================================================*
+*        $WRITE: Write Block of Data from Buffer
+*---------------------------------------------------------------------*
+*
+* Check Parameters:
+*
+WRITE    XC    RC(4),RC
+         SR    R4,R4
+         ICM   R4,7,DCBADDR+1
+         LTR   R4,R4
+         BZ    E#NOWADR                Error: No DCBADDR
+         L     R2,BUFADDR
+         LTR   R2,R2
+         BZ    E#NOWADR                Error: No BUFADDR
+         TM    DCBOFLG,DCBOFOPN        Is DCB opened ?
+         BNO   E#NOWOPN                Error: DCB not Opened
+*
+* R2=Addr of Buffer, Execute Write:
+*
+         TM    DCBRECFM,UNDEF          Undef records ?
+         BNO   WNEXT                   N - just write
+* Set data length for U-records:
+*        WTO   '$WRITE: Writing U- block...',ROUTCDE=11
+         LH    R3,RECLEN
+         WRITE DECB1,SF,DCB,(R2),(R3),MF=E Write/Update block
+         CHECK DECB1
+         B     RETWR
+*
+WNEXT    TM    DCBRECFM,BLOCKED        Blocked records ?
+         BNO   WNORM                   N - just write
+         LH    R3,DCBBLKSI             Save DCBBLKSI
+         C     R3,LENGTH               Length = Blocksize ?
+         BE    WNORM                   Y - (re)write regular block
+WLAST    DS    0H                      N - (re)write the last/U block
+         MVC   DCBBLKSI(2),LENGTH+2    Copy Length to DCBBLKSI
+*        WTO   '$WRITE: Writing short block...',ROUTCDE=11
+*
+WNORM    DS    0H
+         WRITE DECB1,SF,DCB,(R2),MF=E Write/Update block
+         CHECK DECB1
+         STH   R3,DCBBLKSI              Restore DCBBLKSI
+* Exit from $WRITE:
+RETWR    DS    0H
+         B     EXIT
+*=====================================================================*
+*        CONSTANTS for OPEN/CLOSE
+*---------------------------------------------------------------------*
+         DS    0F
+SP1      DC    XL4'01000000'           Indicate SP=1
+*
+*        Descriptive Macros:
+*
+         READ DECB1C,SF,DCBCPO,,MF=L     BLOK DECB1
+DECB1LN  EQU  *-DECB1C
+DCBCPO   DCB  MACRF=(R,W),DSORG=PO,EODAD=EODAD,SYNAD=SYNAD
+*DCBCPS   DCB  MACRF=(RP,WP),DSORG=PS,EODAD=EODAD,SYNAD=SYNAD
+*---------------------------------------------------------------------
+*        DSECTS:
+*---------------------------------------------------------------------
+         DCBD DSORG=PO,DEVD=DA
+DCBDECB  EQU   IHADCB
+DCB      EQU   IHADCB
+         ORG   IHADCB+DCBLNGPO+4       (DCB+92)
+TTRZ     DS    A
+*
+LENDCB   EQU   *-DCB                   96
+DECB1    DS    0H
+DECBECB  DS    A
+DECBTYPE DS    H
+DECBLEN  DS    H
+DECBDCBA DS    A
+DECBAREA DS    A
+DECBINDA DS    A
+*
+STOWLST  DS    CL8,AL4                 STOW area (MEMBER,TTR,C)
+LENDCBS  EQU   *-DCB                   Total data length
+*
+SVMPAR6  SVMPAR6 DSECT=YES             Parm for SVMALC6/SVMDEL6
+TLEN     EQU   *-SVMPAR6
+*
+WA       DSECT
+S        DS    18F
+TYPE     DS    X
+         DS    0D
+LENGWA   EQU   *-WA
+*
+$OPEN    CSECT
+         YREGS
+         END
+//*
+//LKED    EXEC PGM=HEWLKED,
+//        PARM='CAL,LIST,MAP,RENT,RMOD=24,AMOD=24',
+//        COND=(8,LE)
+//SYSLMOD  DD DISP=SHR,DSN=SYS3.UTILITY.LINKLIB.TEST   <== IRXFLOC lib
+//SYSLIB   DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST      <== hlq.LOAD
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//         DD *
+     ALIAS $OPENU
+     ALIAS $OPENW
+     ALIAS $OPENI
+     ALIAS $CLOSE
+     ALIAS $READ
+     ALIAS $WRITE
+     NAME  $OPEN(R)
+//*

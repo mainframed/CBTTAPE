@@ -1,0 +1,949 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; ZIL-MVS only.  ISPF version 2 required.
+;;;
+;;; ZFSEXEC
+;;;
+;;; This is the underlying driver for ZIL-based interactive applications
+;;; that wish to use the full-screen interface.
+;;;
+;;; Syntax:
+;;;
+;;; (ZFSEXEC :panel-name           <string>
+;;;          :panel-library        <string>
+;;;          :long-appl            <string>
+;;;          :short-appl           <string>
+;;;          :terpri-exit-function <function>
+;;;          :initialize-function  <function>
+;;;          :terminate-function   <function>
+;;;          :panel-init-function  <function>
+;;;          :echo-input-function  <function>
+;;;          :expr-list-function   <function>
+;;;          :refreshp-function    <function>
+;;;          :eval-expr-function   <function>
+;;;          :good-eval-function   <function>
+;;;          :bad-eval-function    <function>
+;;;          :post-eval-function   <function>
+;;;          :display-function     <function>
+;;;          :output-row-function  <function>
+;;;;;;;;;;;;;:grind-form-function  <function>
+;;; )
+;;;
+;;; where:
+;;;
+;;; :panel-name            is the name of the ISPF display panel used.
+;;; :panel-library         is the panel data set where the panel lives.
+;;; :long-appl             describes the application, printed on SAVEs.
+;;; :short-appl            describes the application in error messages.
+;;; :terpri-exit-function  is called whenever a TERPRI is trapped.
+;;; :initialize-function   is called to initialize the FS environment.
+;;; :terminate-function    is called to terminate the FS environment.
+;;; :panel-init-function   is called each time prior to panel display.
+;;; :echo-input-function   is called to process input FS strings.
+;;; :expr-list-function    is called to return expressions from FS input
+;;; :refreshp-function     is called to see whether to refresh screen.
+;;; :eval-expr-function    is called to evaluate each expression.
+;;; :good-eval-function    is called for each value gotten from eval'ing
+;;; :bad-eval-function     is called for each failure to evaluate.
+;;; :post-eval-function    is called to do processing after evaluation.
+;;; :display-function      is called to generate the output to display.
+;;; :output-row-function   is called on each output row before adding.
+;;;;:grind-form-function   is called to convert a form to an FS string.
+;;;
+
+;======================================================================
+
+(eval-when ()
+ #.(progn
+    (rminit)               ; Use Common Lisp syntax, not Maclisp syntax
+    (defvar ttyoff     '¬W); Maclisp printer variable
+    (defvar writefilep '¬R); Maclisp printer variable
+    (defvar pt%tyo       0)
+    (defvar pt%princ     1)
+    (defvar pt%prin1     5)
+    (defvar pt%terpri    2)
+    (defvar pt%cterpri  10)
+    (defvar pt%charpos  16)
+    (defvar pt%clrscrn  42)
+    (defvar *low-intensity*  (string #x05))
+    (defvar *high-intensity* (string #x0D))
+    (defvar *initial-array-size* 1000)
+   ))
+
+(defargs zmsprint 3 3 nil)
+
+(declare (special #.ttyoff #.writefilep))
+(declare (special *print-trap-string-list* *zfs-terpri-function*
+                  *zil-current-printer* *zil-previous-printer*
+                  *zil-override-printer*
+                  *zil-print-trap-hook-override*
+                  *zil-panel-library*))
+
+(defmacro ispnum      (x)   `(make-number (zisget ,x)))
+(defmacro nullstringp (x)   `(zerop (string-length ,x)))
+(defmacro string-eql  (x y) `(eql ,x ,y))
+(defmacro usymbol     (x)   `(intern (string-upcase ,x)))
+
+(defmacro yspexec (&rest args &aux (g (gensym)))
+  `(let ((,g (zisexec . ,args)))
+        (cond ((< ,g 12) ,g)
+              (t (zerror "ISPF dialog service error"
+                         (zisget "zerrsm") (zisget "zerrlm"))))))
+
+(defmacro fscall ((thing f &optional (retval nil))
+                   &rest args &aux (g (gensym)))
+ `(let ((,g (,thing ,f)))
+       (if ,g (funcall ,g . ,args) ,retval)))
+
+(defmacro with-printer (f &body body)
+ `(unwind-protect (let* ((*zil-previous-printer* *zil-current-printer*)
+                         (*zil-current-printer* ,f))
+                        (setprt *zil-current-printer*)
+                        . ,body)
+                  (setprt *zil-current-printer*)))
+
+(defstruct (fsstruct (:conc-name nil))
+ (finger          nil)
+ (fingerlist      nil)
+ (expression      nil)
+ (quitp           nil)
+ (morep           nil)
+ (array-size      #.*initial-array-size*)
+ (line-array      (make-vector #.*initial-array-size* ""))
+ (line-index      0)
+ (current-row     0)
+ (input-list      nil)
+ (depth           0)
+ (lvline          0)
+ (cursor          "IN")
+ (csrpos          0)
+ (find-string     nil)
+ (find-direction  nil)
+ (find-row        nil)
+ (find-pos        nil)
+ (text-not-found  nil)
+ (getinput        nil)
+ (inputx          0)
+ (print-trap      nil)
+ (libdefp         nil)
+ (interrupted     nil)
+ (panel-name      nil)
+ (panel-library   nil)
+ (long-appl       nil)
+ (short-appl      nil)
+ (initialize-function    nil)
+ (terminate-function     nil)
+ (panel-init-function    nil)
+ (echo-input-function    nil)
+ (expr-list-function     nil)
+ (refreshp-function      nil)
+ (eval-expr-function     nil)
+ (good-eval-function     nil)
+ (bad-eval-function      nil)
+ (post-eval-function     nil)
+ (display-function       nil)
+ (output-row-function    nil)
+;(grind-form-function    nil)
+)
+
+;======================================================================
+
+(defun zfsexec
+ (&key
+  (panel-name           "ZFSEXEC")
+  (panel-library        (string-append "'" *zil-panel-library* "'"))
+  (long-appl            "ZFSEXEC")
+  (short-appl           "ZFSEXEC")
+  (terpri-exit-function nil)
+  (initialize-function  nil)
+  (terminate-function   nil)
+  (panel-init-function  nil)
+  (echo-input-function  nil)
+  (expr-list-function   nil)
+  (refreshp-function    nil)
+  (eval-expr-function   nil)
+  (good-eval-function   nil)
+  (bad-eval-function    nil)
+  (post-eval-function   nil)
+  (display-function     nil)
+  (output-row-function  nil)
+ )
+ (unless (ispfp)
+  (zerror
+   "ISPF environment not active.  Full screen services not available."
+  ))
+ (let (
+       (f (make-fsstruct))
+      )
+  (setf (panel-name f)           panel-name)
+  (setf (panel-library f)        panel-library)
+  (setf (long-appl f)            long-appl)
+  (setf (short-appl f)           short-appl)
+  (setq *zfs-terpri-function*    terpri-exit-function)
+  (setf (initialize-function f)  initialize-function)
+  (setf (terminate-function f)   terminate-function)
+  (setf (panel-init-function f)  panel-init-function)
+  (setf (echo-input-function f)  echo-input-function)
+  (setf (expr-list-function f)   expr-list-function)
+  (setf (refreshp-function f)    refreshp-function)
+  (setf (eval-expr-function f)   eval-expr-function)
+  (setf (good-eval-function f)   good-eval-function)
+  (setf (bad-eval-function f)    bad-eval-function)
+  (setf (post-eval-function f)   post-eval-function)
+  (setf (display-function f)     display-function)
+  (setf (output-row-function f)  output-row-function)
+  (zfsexec-initialize f)
+  (fscall (initialize-function f) (depth f))
+  (loop do (zisexec "control display refresh") ; Recover from attentions
+        until (catch t (zfsexec-read-eval-print f) t))
+  (zfsexec-terminate f)
+  (fscall (terminate-function f))
+  nil
+ )
+)
+
+;======================================================================
+
+(defun zfsexec-read-eval-print (f)
+ (block zfsexec-loop
+  (loop
+   (zfsexec-read f)
+   (when (quitp f) (return-from zfsexec-loop))
+   (zfsexec-tabexpand f
+                      (fscall (echo-input-function f (getinput f))
+                              (getinput f))
+                      t)
+   (zfsexec-eval-and-print f)
+  )))
+
+(defun zfsexec-read (f)
+ (prog (zverb)
+
+ regenerate-display
+
+   ;;;
+   ;;; Set up the data lines to be displayed.
+   ;;;
+
+  (loop for i from (current-row f)
+              to (min (+ (depth f) (current-row f) -1) (line-index f))
+        collect (vref (line-array f) i) into z
+        finally (zisput "FSDATA" (string-appendl z)))
+
+    (setf (current-row f) (min (current-row f) (line-index f)))
+
+    (zisput "fsmsg"
+     (cond
+      ((< (current-row f) (line-index f))
+       (string-append "Row " (tostring (1+ (current-row f)))
+                      " of " (tostring (line-index f))))
+      (t "Bottom of data")))
+
+before-display
+
+  ;;;
+  ;;; (Perform processing associated with )INIT section of panel.
+  ;;;
+
+  (fscall (panel-init-function f))
+
+  (cond
+   ((string-eql (cursor f) "AMT")
+    (setf (cursor f) "ZCMD")
+    (setf (csrpos f) 1))
+   ((string-eql (cursor f) "ZCMD")
+    (setf (csrpos f) 0)))
+  (zisput "moremsg"
+          (if (morep f) "More data follows.  Scroll down to view."  ""))
+
+  ;;;
+  ;;; Display the screen and get input from the user.
+  ;;;
+
+  (case
+   (zisexec "display cursor(" (cursor f) ") csrpos(" (csrpos f) ")")
+   (0 nil)
+   (8 (setf (quitp f) t)
+      (return))
+   (t (format t
+              "ISPF panel display error:~%~A - ~A"
+              (zisget "zerrsm")
+              (zisget "zerrlm"))
+      (zerror "zfsexec failure")))
+
+after-display
+
+  (setf (morep f) nil)
+  (setf (lvline f) (ispnum "fslvlin"))
+  (setf (cursor f) (zisget "xcursor"))
+  (setf (csrpos f) (ispnum "xcsrpos"))
+  (setq zverb (zisget "zverb"))
+  (case (char zverb 0)
+        ((NIL #\SP) ; no scroll request
+         (go process))
+        (#\U ; UP
+         (let ((fsa (zfsexec-scroll-amount f)))
+              (zfsexec-nullify-cursor f)
+              (if (minusp fsa) ; DOWN MAX?
+                  (setf (current-row f) 0)
+                  (decf (current-row f) fsa))))
+        (#\D ; DOWN
+         (let ((fsa (zfsexec-scroll-amount f)))
+              (zfsexec-nullify-cursor f)
+              (if (minusp fsa) ; DOWN MAX?
+                  (zfsexec-down-max f)
+                  (incf (current-row f) fsa))))
+        (#\L ; LEFT
+         (cond
+;;;;;;;;;;((string-eql (cursor f) "FSDATA")
+;;;;;;;;;;;(zfsexec-retrieve-form f))
+          ((eq (finger f) t)
+           (when (setf (finger f) (input-list f))
+                 (zfsexec-fetch-input f (car (finger f)) nil)))
+          ((cdr (finger f))
+           (push (pop (finger f)) (fingerlist f))
+           (zfsexec-fetch-input f (car (finger f)) nil))
+          ((finger f)
+           (zfsexec-fetch-input f (car (finger f)) nil))))
+        (#\R ; RIGHT
+         (cond
+;;;;;;;;;;((string-eql (cursor f) "FSDATA")
+;;;;;;;;;;;(zfsexec-retrieve-form f))
+          ((eq (finger f) t)
+           (when (setf (finger f) (input-list f))
+                 (zfsexec-fetch-input f (car (finger f)) t)))
+          ((fingerlist f)
+           (push (pop (fingerlist f)) (finger f))
+           (zfsexec-fetch-input f (car (finger f)) nil))
+          ((finger f)
+           (zfsexec-fetch-input f (car (finger f)) t))))
+        (t (zerror "Unknown ZVERB value" zverb)))
+
+ rescreen
+
+  (setf (current-row f) (max 0 (min (current-row f) (line-index f))))
+  (go regenerate-display)
+
+ process
+
+  (setf (getinput f) (zisget "IN"))
+
+  (clear-ispf-message)
+
+;; Experimental ISPF-command-processing code would go here -
+;; see 'SEB1525.ZIL.LISP(XFSMAXC)'
+
+;; Non-experimental ISPF-command-processing
+
+  (let ((cmdlist
+         (catch nil (string-scan (zisget "ZCMD") " ," "" "\"\\"))))
+   (when cmdlist
+    (when (string-eql (cursor f) "IN")
+          (setf (cursor f) "ZCMD"))
+    (let ((cmd (string-upcase (car cmdlist))))
+         (unless
+          (ok
+           (case cmd
+            (("L" "LOC" "LOCATE") (zfsexec-locate f cmdlist))
+            (("F" "FIND")         (zfsexec-find   f cmdlist))
+            (("RFIND")            (zfsexec-rfind  f cmdlist))
+            (("SAVE")             (zfsexec-save   f cmdlist))
+            (t (error-ispf-message "Invalid command"
+                (string-append "Command " cmd " unknown."))))
+            t
+          )
+          (error-ispf-message (string-append cmd " failed.")
+  (string-append "A severe error occurred during the " cmd " command.")
+         )))
+    (go rescreen)))
+
+  (setf (finger f) t)
+  (setf (fingerlist f) nil)
+
+  (when (nullstringp (getinput f)) (go before-display))
+
+  (setf (inputx f) (line-index f))
+
+  (push (list (inputx f)
+              (getinput f)
+              (if (string-eql (cursor f) "IN") (csrpos f) 0))
+        (input-list f))
+
+ ))
+
+(defun zfsexec-eval-and-print (f &aux (trapper
+                                       #'(lambda (x)
+                                          (with-printer (print-trap f)
+                                                        (funcall x)))))
+
+ (let ((exprlist (fscall (expr-list-function f) (getinput f) trapper)))
+  (setf (getinput f) "")  ; Blank out for input next time
+  (when exprlist (zisput "IN" ""))
+  (loop for (nil expr fsdisplayp) in exprlist
+        do (setf (csrpos f) 0)
+           (setf (interrupted f) nil)
+           (zfsexec-evaluate-expression f expr fsdisplayp trapper)
+           (when (interrupted f)
+                 (zfsexec-dump-it f)
+                 (zfsexec-add-row f t "*** ATTENTION INTERRUPT ***"))
+  )
+ )
+
+ (zfsexec-dump-it f)
+
+ (let ((lines-generated (- (line-index f) (inputx f)))
+       (lines-displayed (- (line-index f) (current-row f))))
+      (cond
+       ((>= lines-generated (lvline f))
+        (setf (current-row f) (inputx f))
+        (setf (morep f) t))
+       ((>= lines-displayed (lvline f))
+        (zfsexec-down-max f))))
+
+ (when (fscall (refreshp-function f t))
+       (zisexec "control display refresh"))
+
+)
+
+(defun zfsexec-dump-it (f)
+ (dolist (line (nreverse *print-trap-string-list*))
+         (zfsexec-tabexpand f line nil))
+ (setq *print-trap-string-list* (list ""))
+)
+
+(defun zfsexec-evaluate-expression (f expr fsdisplayp trapper
+                                    &aux vals errorp attnp)
+ (setq errorp t attnp t)
+ (zisexec "control display save")
+ (unwind-protect
+  (catch t
+   (catch nil
+    (setq vals
+     (fscall (eval-expr-function f (values nil nil))
+             expr fsdisplayp trapper))
+    (setq errorp nil))
+   (setq attnp nil))
+  (zisexec "control display restore"))
+ (cond
+  (attnp
+   (setf (interrupted f) t)
+   (fscall (bad-eval-function f))
+   (error-ispf-message "Attention interrupt."
+"Expression evaluation was terminated because the PA1 key was pressed."
+   ))
+  (errorp
+   (fscall (bad-eval-function f))
+   (zfsexec-add-row f nil "")
+   (error-ispf-message "Evaluation failed."
+    (string-append "An error occurred while "
+                   (short-appl f)
+                   " was evaluating your expression.")))
+  (t
+   (setf (csrpos f) 0)
+   (setf (cursor f) "IN")
+   (fscall (good-eval-function f) vals fsdisplayp)
+   (when fsdisplayp
+    (unless (ok (with-printer (print-trap f)
+                 (cterpri)
+                 (fscall (display-function f) vals)))
+            (zfsexec-add-row f nil "")
+            (error-ispf-message "Display failed."
+             (string-append "An error occurred during "
+                            (short-appl f)
+                            "'s display processing."))))
+  ))
+ (fscall (post-eval-function f)))
+
+;======================================================================
+
+(defun error-ispf-message (smsg lmsg &key (alarm "YES") (help "*"))
+ (zisput "zerrsm" smsg)
+ (zisput "zerrlm" lmsg)
+ (zisput "zerralrm" alarm)
+ (zisput "zerrhm" help)
+ (zisexec "setmsg msg(isrz002)")
+)
+
+(defun clear-ispf-message ()
+ (zisput "zerrsm" "")
+ (zisput "zerrlm" "")
+ (zisput "zerralrm" "no")
+ (zisput "zerrhm" "*")
+ (zisexec "setmsg msg(isrz002)")
+)
+
+;======================================================================
+
+(defun macsyma-print-trap-hook (a f b)
+  (if (or (null f) (eq f t))
+      (let ((y #.ttyoff) (w #.writefilep))
+           (prog1 (unless y (print-trap-hook-dispatch a b))
+                  (when w (funcall *zil-previous-printer* a w b))))
+      (funcall *zil-previous-printer* a f b)))
+
+(defun zil-print-trap-hook (a f b)
+ (if (or (null f) (eq f t))
+     (print-trap-hook-dispatch a b)
+     (funcall *zil-previous-printer* a f b)))
+
+(defun print-trap-hook-dispatch (a b)
+ (if *zil-print-trap-hook-override*
+  (funcall *zil-override-printer* a t b)
+  (case b
+   (#.pt%tyo    (setf (car *print-trap-string-list*)
+                      (string-append (car *print-trap-string-list*)
+                                     (string a))))
+   (#.pt%princ  (setf (car *print-trap-string-list*)
+                      (string-append (car *print-trap-string-list*)
+                                     (princ-to-string a))))
+   (#.pt%prin1  (setf (car *print-trap-string-list*)
+                      (string-append (car *print-trap-string-list*)
+                                    (prin1-to-string a))))
+   (#.pt%terpri (when *zfs-terpri-function*
+                      (let ((*zil-print-trap-hook-override* t))
+                           (funcall *zfs-terpri-function*
+                                    (car *print-trap-string-list*))))
+                (push "" *print-trap-string-list*)
+                t)
+   ((#.pt%cterpri
+     #.pt%clrscrn) (unless (nullstringp (car *print-trap-string-list*))
+                           (push "" *print-trap-string-list*)
+                           t))
+   (#.pt%charpos ; a = new integer value or NIL to return current value
+                (let (
+                 (c (1+ (string-length (car *print-trap-string-list*))))
+                     )
+                  (cond
+                   ((null a)
+                    c)
+                   ((or (not (integerp a))
+                        (minusp a)
+;;;;;;;;;;;;;;;;;;;;;;;;(> a 79)
+                        (< a c))
+                    (zerror "Invalid CHARPOS or ZGETFPO update value" a)
+                   )
+                   (t
+                    (setf (car *print-trap-string-list*)
+                      ;;; (format nil "~VA" (1- a)
+                      ;;;;;;;;;;;;;;; (car *print-trap-string-list*))
+                          (zilspad (car *print-trap-string-list*)
+                                   (1- a) #\sp nil 1)
+                    )))))
+
+   (t (zerror "PRINT-TRAP-HOOK-DISPATCH got unknown value" a b)))))
+
+;======================================================================
+
+(defun zfsexec-initialize (f)
+
+ ;;;
+ ;;; Set up the global variables.
+ ;;;
+
+ (setq *print-trap-string-list* (list ""))
+ (setq *zil-print-trap-hook-override* nil)
+
+ ;;;
+ ;;; Set up the correct printer trapping.
+ ;;;
+
+ (cond
+  ((featurep 'macsyma)
+   (setf (print-trap f) #'macsyma-print-trap-hook)
+   (setq *zil-override-printer* #'zmsprint)
+   (setq *zil-current-printer* #'zmsprint)
+   (setq *zil-previous-printer* #'zmsprint))
+  (t
+   (setf (print-trap f) #'zil-print-trap-hook)
+   (setq *zil-override-printer* #'zdprint)
+   (setq *zil-current-printer* #'zdprint)
+   (setq *zil-previous-printer* #'zdprint)))
+
+ ;;;
+ ;;; Create the ISPF data structures to hold the display.
+ ;;;
+
+ (vfill (line-array f) "")
+ (setf (line-index f)  0)
+ (setf (current-row f) 0)
+
+
+ ;;;
+ ;;; See if the ISPF panel is available.   If not, make it available.
+ ;;;
+
+ (zisexec "control errors return")
+ (zisexec "control nondispl end")
+ (when (eql 12 (zisexec "display panel(" (panel-name f) ")"))
+  (yspexec "libdef ispplib dataset id(" (panel-library f) ") uncond")
+  (setf (libdefp f) t)
+  (yspexec "display panel(" (panel-name f) ")"))
+
+ ;;;
+ ;;; Determine the initial number of rows to display.
+ ;;;
+
+ (when (eql 8 (yspexec "pquery panel(" (panel-name f)
+                       ") areaname(fsdata) depth(fslvlin)"))
+       (zerror "Bad ISPF panel definition for panel" (panel-name f)))
+ (setf (depth f) (ispnum "fslvlin"))
+ (zisexec "control errors cancel")
+
+ ;;;
+ ;;; Trap the RFIND command.
+ ;;;
+
+ (zisput "zctverb" "RFIND")
+ (zisexec "tbtop ispcmds")
+ (case (zisexec "tbscan ispcmds arglist(zctverb)")
+       (0 (unless (string-eql (zisget "zctact") "&YRFIND")
+                  (zisexec "tbtop ispcmds")
+                  (zisput "zctact" "&YRFIND")
+                  (zisexec "tbadd ispcmds")))
+       (8         (zisexec "tbtop ispcmds")
+                  (zisput "zctact" "&YRFIND")
+                  (zisexec "tbadd ispcmds")))
+
+ (zisput "yrfind" "PASSTHRU")          ; Make RFIND command a PASSTHRU.
+
+ (zisexec "vget (fsmamt) profile")     ; Get remembered scroll amount.
+ (let ((amt (zisget "fsmamt")))
+      (when (nullstringp amt)
+            (setq amt "PAGE")
+            (zisput "fsmamt" amt))     ; Set to PAGE if not in profile.
+      (zisput "amt" amt))              ; Put it on the panel.
+ (zisput "IN" "")                      ; Clear input field.
+ (zisput "FSDATA" "")                  ; Clear the dynamic area.
+)
+
+(defun zfsexec-terminate (f)
+ (zisexec "control display refresh")
+ (zisput "fsmamt" (zisget "amt"))
+ (zisexec "vput (fsmamt) profile")
+ (zisput "yrfind" "")
+ (when (libdefp f)
+  (zisexec "libdef ispplib dataset"))
+ t)
+
+;======================================================================
+
+(defun zfsexec-add-row
+       (f highp x &aux (new-index (1+ (line-index f))))
+ (when (>= new-index (array-size f))
+       (let* ((new-array-size (+ (array-size f) #.*initial-array-size*))
+              (new-line-array (make-vector new-array-size ""))
+             )
+            (dotimes (i (array-size f))
+                     (setf (vref new-line-array i)
+                           (vref (line-array f) i))
+            )
+            (setf (line-array f) new-line-array
+                  (array-size f) new-array-size)))
+
+ (setf (vref (line-array f) (line-index f))
+   ;;; (format nil "~A~79A"
+   ;;;             (if highp #.*high-intensity* #.*low-intensity*)
+   ;;;             (fscall (output-row-function f x) x))
+       (string-append (if highp #.*high-intensity* #.*low-intensity*)
+                      (zilspad (fscall (output-row-function f x) x)
+                               79 #\sp nil 1))
+ )
+
+ (setf (vref (line-array f) new-index)
+       #.(format nil "~A~79,,,'*:@<~A~>"
+                     #.*low-intensity*
+                     " Bottom of data "))
+ (setf (line-index f) new-index)
+)
+
+(defun zfsexec-nullify-cursor (f)
+ (setf (text-not-found f) nil)
+ (zisput "IN" "")
+ (cond
+  ((string-eql (cursor f) "IN")
+   (setf (csrpos f) 1))
+  (t
+   (setf (cursor f) "ZCMD"))))
+
+(defun zfsexec-fetch-input (f entry cursorposp)
+ (setf (current-row f) (car entry))
+ (zisput "IN" (cadr entry))
+ (setf (cursor f) "IN")
+ (setf (csrpos f) (if cursorposp (caddr entry) 0)))
+
+;(defun zfsexec-retrieve-form (f &aux n)
+; (let ((q (quotient (1- (csrpos f)) 80)))
+;      (if (>= q (line-index f))
+;          (error-ispf-message "Invalid cursor position."
+;           "The cursor is outside of the output data area."))
+;      (setq n (+ (current-row f) q))
+;      (zisput "IN" (fscall (grind-form-function f) ...))
+;      (setf (cursor f) "IN")
+;      (setf (csrpos f) 0)
+;))
+
+(defun zfsexec-down-max (f)
+ (setf (current-row f) (max 0 (- (line-index f) (lvline f) -1))))
+
+(defun zfsexec-scroll-amount (f)
+ (case (char (zisget "zscrolla") 0)
+       (#\M ; MAX
+        -1)
+       (t (ispnum "zscrolln"))))
+
+(defmacro !new-row! ()
+ '(zfsexec-add-row f highp (string-appendl (nreverse z))))
+
+(defun zfsexec-tabexpand (f line highp)
+ (do ((cl (exploden line) (cdr cl))
+      (n 0)
+      (z nil))
+     ((null cl)
+      (!new-row!))
+     (case (car cl)
+           ((#\cr #\nl)
+                  (!new-row!)
+                  (setq z nil n 0))
+           (#\tab (loop do    (push " " z)
+                              (incf n)
+                        until (zerop (remainder n 8))))
+           (t     (push (string (car cl)) z)
+                  (incf n)))
+     (when (> n 78)
+           (!new-row!)
+           (setq z nil n 0))))
+
+;======================================================================
+
+(defun zfsexec-locate (f cmdlist &aux (c (cdr cmdlist)) n)
+ (cond
+  ((null c)
+   (error-ispf-message "Missing operand."
+                       "The LOCATE command requires an operand."))
+  ((not (null (cdr c)))
+   (error-ispf-message "Too many operands."
+                       "The LOCATE command takes only one operand."))
+  ((not (fixnump (setq n (make-number (car c)))))
+   (error-ispf-message "Invalid operand."
+                       "A number must be specified with LOCATE."))
+  (t
+   (zisput "ZCMD" "")
+   (zisput "IN" "")
+   (setf (current-row f)
+         (max 0 (min (line-index f) (1- n)))))))
+
+(defun zfsexec-rfind (f cmdlist)
+ (zisput "ZCMD" "")
+ (if (find-string f)
+     (zfsexec-process-find f (find-string f) (find-direction f))
+     (error-ispf-message "Enter a FIND command."
+                 "A FIND command must precede an RFIND request.")))
+
+(defun zfsexec-find (f cmdlist &aux (c (cdr cmdlist)))
+ (cond
+  ((null c)
+   (if (find-string f)
+       (zfsexec-process-find f (find-string f) 'next)
+       (error-ispf-message "Missing string."
+                       "The FIND command requires a string.")))
+  ((not (null (cddr c)))
+   (error-ispf-message "Too many operands."
+                "The FIND command takes no more than two operands."))
+  ((string-eql (car c) "*")
+   (if (find-string f)
+       (zfsexec-process-find f (find-string f)
+                               (if (cdr c) (cadr c) 'next))
+       (error-ispf-message "No string defined."
+         "* cannot be used until a FIND command has been executed.")))
+  (t
+   (setf (find-string f) (zfsexec-hack-string (car c)))
+   (zfsexec-process-find f (find-string f)
+                           (if (cdr c) (cadr c) 'next)))))
+
+(defun zfsexec-hack-string (x &aux (y (string-upcase x)))
+ (if (not (eql (char y 0) #\"))
+     y
+     (let ((l (exploden y)))
+          (loop for cl on (cdr l) with c
+                until (null (cdr cl))
+                do (setq c (car cl))
+                when (eql c #\\)
+                     collect (car (setq cl (cdr cl))) into z
+                else collect c into z
+                finally (return (tostring (implode z)))))))
+
+(defun zfsexec-process-find (f fstr fdir &aux (dir (usymbol fdir)))
+ (if (nullstringp fstr)
+     (error-ispf-message "Invalid string."
+                         "A null string is not permitted.")
+     (case dir
+       (next  (zfsexec-process-next  f fstr))
+       (prev  (zfsexec-process-prev  f fstr))
+       (first (zfsexec-process-first f fstr))
+       (last  (zfsexec-process-last  f fstr))
+       (t (error-ispf-message "Invalid operand."
+            "Specify NEXT, PREV, FIRST, or LAST (default is NEXT).")))))
+
+(defun zfsexec-process-first (f fstr)
+ (setf (text-not-found f) t)
+ (zfsexec-process-next f fstr t))
+
+(defun zfsexec-process-last (f fstr)
+ (setf (text-not-found f) t)
+ (zfsexec-process-prev f fstr t))
+
+(defun zfsexec-process-next (f fstr &optional firstorlastp)
+ (setf (find-direction f) 'next)
+ (zisput "ZCMD" "")
+ (zisput "IN" "")
+ (cond
+  ((or firstorlastp (text-not-found f))
+   (setf (find-row f) 0)
+   (setf (find-pos f) 0))
+  (t (zfsexec-find-cursor-to-row-and-pos f)))
+ (do ((row (find-row f) (1+ row))
+      (pos (1+ (find-pos f)) 1)
+      (i))
+     ((>= row (line-index f))
+      (zfsexec-dysreka f fstr "Bottom of data reached." "top."))
+     (setq i (string-index
+              (string-upcase (vref (line-array f) row))
+              fstr pos))
+     (when i
+           (zfsexec-eureka f fstr row i)
+           (return))))
+
+(defun zfsexec-process-prev (f fstr &optional firstorlastp)
+ (setf (find-direction f) 'prev)
+ (zisput "ZCMD" "")
+ (zisput "IN" "")
+ (cond
+  ((or firstorlastp (text-not-found f))
+   (setf (find-row f) (1- (line-index f)))
+   (setf (find-pos f) 80))
+  (t (zfsexec-find-cursor-to-row-and-pos f)))
+ (do ((row (find-row f) (1- row))
+      (pos (1- (find-pos f)) 80)
+      (rtsf (string-reverse fstr))
+      (fl   (string-length fstr))
+      (rl)
+      (i)
+      (p))
+     ((minusp row)
+      (zfsexec-dysreka f fstr "Top of data reached." "bottom."))
+     (setq rl (string-length (vref (line-array f) row)))
+     (setq p (+ pos fl -1))
+     (setq i (string-index
+              (string-upcase
+               (string-reverse
+                (string-substr (vref (line-array f) row) 1 p)))
+              rtsf
+              1))
+     (when i
+           (setq i (- (min p rl) i fl -2))
+           (zfsexec-eureka f fstr row i)
+           (return))))
+
+(defun zfsexec-eureka (f fstr row i
+                       &aux (pstr (prin1-to-string fstr)))
+ (setf (find-row f) row)
+ (setf (find-pos f) i)
+ (zfsexec-put-cursor f row i)
+ (setf (text-not-found f) nil)
+ (error-ispf-message
+  (string-append (if (> (string-length pstr) 16) "Text" pstr)
+                 " found.")
+  (string-append pstr " was found on line "
+                 (tostring (1+ row))
+                 ", column "
+                 (tostring (1- i))
+                 " of the output display.") :alarm "NO"))
+
+(defun zfsexec-dysreka (f fstr word1 word2
+                        &aux (pstr (prin1-to-string fstr)))
+ (cond
+  ((text-not-found f)
+  (setf (text-not-found f) nil)
+  (error-ispf-message
+   (string-append (if (> (string-length pstr) 12) "Text" pstr)
+                  " not found.")
+   "The requested text was not found anywhere in the output."))
+  (t
+   (setf (text-not-found f) t)
+   (error-ispf-message word1
+     (string-append "Text " pstr
+                    " not found.  RFIND to continue from " word2)))))
+
+(defun zfsexec-find-cursor-to-row-and-pos (f &aux (n (csrpos f)))
+ (if (string-eql (cursor f) "FSDATA")
+     (let ((q (quotient n 80))
+           (r (remainder n 80)))
+          (when (zerop r)
+                (setq q (1- q) r 80))
+          (setf (find-row f) (min (+ (current-row f) q)
+                                  (1- (line-index f)))
+                (find-pos f) r)
+     )
+     (setf (find-row f) (current-row f)
+           (find-pos f) 0)))
+
+(defun zfsexec-put-cursor (f row pos)
+ ;
+ ; row is absolute row.  To see if it's on the screen, we compute
+ ; screen-row to be absolute-row minus *zfsexec-current-row*.
+ ; If screen-row is negative, or
+ ; screen-row is greater than *zfsexec-lvline*, then it's off the
+ ; screen, and we have to scroll to bring it into view.
+ ;
+ (let ((srow (- row (current-row f))))
+      (cond
+       ((or (minusp srow) (>= srow (lvline f)))
+        (setf (current-row f) (max 0 (1- row))) ; up 1, like BROWSE FIND
+        (setq srow (if (zerop row) 0 1))))
+      (let ((off (+ (* 80 srow) pos)))
+           (setf (cursor f) "FSDATA")
+           (setf (csrpos f) off))))
+
+(defun zfsexec-save (f cmdlist &aux (c (cdr cmdlist)))
+ ; Syntax: SAVE dsname {old/mod}
+ (cond
+  ((null c)
+   (error-ispf-message "Enter data set name."
+     "The SAVE command requires a data set name to be specified."))
+  ((not (null (cddr c)))
+   (error-ispf-message "Too many operands."
+                       "Syntax:  SAVE datasetname {OLD / MOD }"))
+  (t
+   (catch 'zfsexec-save
+    (zfsexec-process-save
+     f
+     (string-upcase (car c))              ; data set name
+     (if (cdr c) (usymbol (cadr c)) 'old) ; disposition
+    )))))
+
+(defun zfsexec-process-save (f dsn disp)
+ (let ((option (case disp
+                     ((new shr old) :out)
+                     ((mod)         :append)
+                     (t (error-ispf-message "Invalid disposition."
+                          "Specify OLD or MOD (default is OLD).")
+                        (throw 'zfsexec-save nil)))))
+      (with-open-file (file dsn option)
+       (format file "~2%***  ~A - Output for ~A - ~A  ~A  ***~3%"
+                    (long-appl f) (userid) (pptime) (ppdate))
+       (dotimes (i (line-index f))
+        (princ (string-substr (vref (line-array f) i) 2 80) file)
+        (terpri file)))
+      (zisput "ZCMD" "")
+      (zisput "IN" "")
+      (error-ispf-message "Save successful."
+        (string-append "Session data was saved in " dsn)
+        :alarm "NO")))
+

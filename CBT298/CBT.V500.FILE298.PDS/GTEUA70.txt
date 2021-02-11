@@ -1,0 +1,739 @@
+         PRINT GEN
+         LCLC  &MYNAME                  LOCAL CONSTANT
+*
+&MYNAME  SETC  'GTEUA70'                CSECT NAME
+RBASE    EQU   12                       BASE REGISTER FOR CSECT
+RBAL     EQU   10                       BAL REGISTER
+*
+         TITLE '&MYNAME'                LISTING TITLE
+**********************************************************************
+***                                                                ***
+***                   GTEUA70                                      ***
+***                                                                ***
+***  DESCRIPTION:                                                  ***
+***                                                                ***
+***    The function of this program is to update a PDS with data   ***
+***    from a sequential file, and ISPF statistics from an input   ***
+***    parameter.  Also, this program can delete a PDS entry.      ***
+***                                                                ***
+***    The program accepts the ISPF statistics from the 42-byte    ***
+***    input parm.  It copies the data to the PDS, then uses the   ***
+***    input parm, which is in STOW format, to update the          ***
+***    directory of the PDS.  The program updates the ISPF 'SIZE'  ***
+***    field of the directory entry before performing the STOW     ***
+***    operation.                                                  ***
+***                                                                ***
+***    The sequential dataset must have a LRECL=80, and must have  ***
+***    a fixed length record format.  It must also have a BLKSIZE  ***
+***    of at least 80.                                             ***
+***                                                                ***
+***    BPAM is used for manipulating the directory of the PDS,     ***
+***    and writing the data to the output PDS.  QSAM is used to    ***
+***    read the input sequential dataset.                          ***
+***                                                                ***
+**********************************************************************
+         EJECT
+**********************************************************************
+***                                                                ***
+***  Invoking this program:                                        ***
+***                                                                ***
+***    This program is a callable subroutine.  The caller passes   ***
+***    the addresses of two parameters to this subroutine:         ***
+***                                                                ***
+***      1.  The address of a 42-byte area containing the ISPF     ***
+***          statistics in STOW format.                            ***
+***      2.  The address of an opened DCB with DSORG=PO, and       ***
+***          MACRF=W or MACRF=(R,W).                               ***
+***                                                                ***
+***    This program is Reenterable, Reusable, and Refreshable.     ***
+***    The following is sample reenterable code for invoking the   ***
+***    program.                                                    ***
+*** *  ---------------------------------------------------------   ***
+***          MVC   PDSDCB(PDSDCBL),PDSDCBD     INITIALIZE DCB      ***
+*** *                                                              ***
+***          MVC   PDOPENL(PDOPENLN),PDOPEND INITIALIZE OPEN LIST  ***
+***          OPEN  (PDSDCB,(OUTPUT)),MF=(E,PDOPENL) OPEN IT        ***
+*** *                                                              ***
+***          LA    R15,MAFUNCT              ADDR OF FUNCTION       ***
+***          ST    R15,PARM70+00              INTO PARM LIST       ***
+***          LA    R15,PDSDCB               ADDR OF DCB            ***
+***          ST    R15,PARM70+04              INTO PARM LIST       ***
+***          LA    R15,DIRENTRY             ADDR OF DIR ENTRY      ***
+***          ST    R15,PARM70+08              INTO PARM LIST       ***
+***          LA    R15,ALIAS                ADDR OF ALIAS PARM     ***
+***          ST    R15,PARM70+12              INTO PARM LIST       ***
+***          OI    PARM70+12,X'80'          MARK END OF LIST       ***
+***          LA    R1,PARM70                ADDRESS OF PARM LIST   ***
+***          L     R15,=V(GTEUA70)          ADDRESS OF SUBROUTINE  ***
+***          BALR  R14,R15                  PERFORM THE SUBROUTINE ***
+*** *                                                              ***
+***          MVC   PDCLOSL(PDCLOSLN),PDCLOSD INITIALIZE CLOSE LIST ***
+***          CLOSE (PDSDCB),MF=(E,PDCLOSL)  CLOSE IT               ***
+*** *  ---------------------------------------------------------   ***
+*** PDOPEND  OPEN  (,),MF=L                                        ***
+*** PDCLOSD  CLOSE (),MF=L                                         ***
+*** *                                                              ***
+*** PDSDCBD  DCB   DDNAME=PDS,DSORG=PO,MACRF=(R,W)                 ***
+*** *  ---------------------------------------------------------   ***
+*** WORKD    DSECT                                                 ***
+*** DIRENTRY GTEUM01 DSECT=NO               DIRECTORY ENTRY        ***
+*** *                                                              ***
+*** PARM70   DS    4F                       PARM LIST FOR GTEUA70  ***
+*** MAFUNCT  DS    CL12                    'UPDATE' 'DELETE' ETC.  ***
+*** *                                                              ***
+*** PDOPENL  OPEN  (,),MF=L                                        ***
+*** PDOPENLN EQU *-PDOPENL                                         ***
+*** PDCLOSL  CLOSE (),MF=L                                         ***
+*** PDCLOSLN EQU *-PDCLOSL                                         ***
+*** *                                                              ***
+*** PDSDCB   DCB   DDNAME=PDS,DSORG=PO,MACRF=(R,W)                 ***
+*** PDSDCBL  EQU   *-PDSDCB                                        ***
+*** *  ---------------------------------------------------------   ***
+**********************************************************************
+         EJECT
+**********************************************************************
+***                                                                ***
+***  FUNCTION:                                                     ***
+***                                                                ***
+***  1. Open the sequential file.                                  ***
+***  2. Initialize the DECB for the PDS.                           ***
+***  3. Get storage for input/output operations.                   ***
+***  4. Enqueue on the DSNAME and member name.                     ***
+***  5. Build output blocks of records.                            ***
+***  6. Write output records.                                      ***
+***  7. Dequeue the DSNAME and member name.                        ***
+***  8. Free storage for input/output operations.                  ***
+***  9. Update the size field of the ISPF statistics.              ***
+*** 10. Update the time and date modified, and ID fields of the    ***
+***     ISPF statistics.                                           ***
+*** 11. STOW the new directory entry into the PDS directory.       ***
+*** 12. Close the output file.                                     ***
+***                                                                ***
+***                                                                ***
+***  NOTES:                                                        ***
+***                                                                ***
+***  1. The input file DDNAME is in the macro at label SEQDCBD.    ***
+***                                                                ***
+***  2. The first bit of the 'C' field, at offset +11 (X'0B') in   ***
+***     the directory information field indicates that the entry   ***
+***     is an alias, not a true name.                              ***
+***                                                                ***
+***  3. Prior to performing the update, the program obtains an     ***
+***     exclusive enqueue on the 44-byte dsname followed by the    ***
+***     eight-byte member name.  Major name is at label QNAME.     ***
+***                                                                ***
+***  RETURN CODES:                                                 ***
+***                                                                ***
+***     00 - Operation was successful.                             ***
+***                                                                ***
+***     16 - A.  RECFM of seq file not F, FB, FA, or FBA           ***
+***          B.  LRECL of seq file not 80                          ***
+***          C.  BLKSIZE of seq file less than 80                  ***
+***          D.  Not enough storage for I/O operation, or FREEMAIN ***
+***              for the storage was unsuccessful.                 ***
+***          E.  STOW operation failed because the directory was   ***
+***              out of space.                                     ***
+***          F.  DDNAME for PDS not allocated.                     ***
+***          G.  Failure to enqueue or dequeue the dataset name.   ***
+***          H.  DELETE member name is not in PDS.                 ***
+***          I.  alias name already exists in PDS.                 ***
+***                                                                ***
+**********************************************************************
+         EJECT
+**********************************************************************
+***                                                                ***
+***  REGISTER USAGE:                                               ***
+***                                                                ***
+***     R0-R3   - Used by macros, and work registers.              ***
+***     R4-R5   - Work registers, not used to pass information     ***
+***               between routines.                                ***
+***     R6      - <unused>                                         ***
+***     R7      - <unused>                                         ***
+***     R8      - Base address of PDS DCB passed by caller.        ***
+***     R9      - Base address of directory entry work area.       ***
+***     R10     - Linkage register used with BAL.                  ***
+***     R11     - Base address if I/O work area.                   ***
+***     R12     - Base register of program code.                   ***
+***     R13     - Linkage registers and base of WORKD data area.   ***
+***     R14-R15 - Linkage registers.                               ***
+***                                                                ***
+***                                                                ***
+***  NON-IBM MACROS USED:                                          ***
+***                                                                ***
+***     GTEUM01  - Describes directory entry in STOW format.       ***
+***                                                                ***
+***                                                                ***
+***  ASSEMBLER OPTIONS:       RENT                                 ***
+***  LINKAGE EDITOR OPTIONS:  RENT, REUS, REFR                     ***
+***                                                                ***
+**********************************************************************
+         EJECT
+**********************************************************************
+***                                                                ***
+***  CULPRIT:                                                      ***
+***                                                                ***
+***     Chuck Hoffman, IBM Systems Programming                     ***
+***     GTE Laboratories, Technical Computation Center             ***
+***     40 Sylvan Road                                             ***
+***     Waltham, Massachusetts  02254                              ***
+***                                                                ***
+***                     617/466-2131    V/N 679-2131               ***
+***                                                                ***
+**********************************************************************
+         SPACE 3
+**********************************************************************
+***                                                                ***
+***  MAINTENANCE HISTORY:                                          ***
+***                                                                ***
+***  1.  A.  Initial version.                                      ***
+***      B.  ADD FOURTH PARM - ALIAS - TO CREATE ALIASES.          ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+***                                                                ***
+**********************************************************************
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      LINKAGE CONVENTIONS ENTERING PROGRAM                       ***
+***                                                                 ***
+***********************************************************************
+&MYNAME  CSECT ,
+         STM   R14,R12,12(R13)          SAVE REGS TO CALLER S.A.
+         B     (BEGIN-&MYNAME)(R15)     BRANCH AROUND EYECATCHER
+         DC    A(L'NAME)                LENGTH OF CSECT NAME
+NAME     DC    C'&MYNAME'               CSECT NAME
+         DC    C' &SYSDATE &SYSTIME '   ASSEMBLY DATE/TIME STAMP
+         PRINT NOGEN
+BEGIN    LR    RBASE,R15                LOAD BASE REGISTER
+         USING &MYNAME,RBASE              ADDRESSABILITY
+         GETMAIN R,LV=WORKDLEN          GET SAVE/WORK AREA
+         ST    R1,8(0,R13)              MY S.A. ADDR INTO CALLER S.A.
+         ST    R13,4(0,R1)              CALLER S.A. ADDR INTO MY S.A.
+         LR    R13,R1                   R13 POINTS TO MY S.A.
+         USING WORKD,R13                ADDRESSABILITY OF SAVE AREA
+         L     R1,4(0,R13)              R1 POINTS TO CALLER S.A.
+         LM    R15,R1,16(R1)            R15 R0 AND R1 ARE RESTORED
+*
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      MAINLINE ROUTINE                                           ***
+***                                                                 ***
+***********************************************************************
+MAIN     EQU   *                        BEGIN MAINLINE ROUTINE
+         ST    R1,R1SAVE                SAVE INITIAL R1
+         XC    COMPCODE,COMPCODE        CLEAR COMPLETION CODE
+         MVI   SWITCH0,B'00000000'      INITIALIZE SWITCH AREA 0
+*
+MAPARMS  L     R2,0(0,R1)               R2 POINTS TO FUNCTION
+         MVC   FUNCTION,0(R2)             MOVE IT INTO STORAGE
+         LM    R8,R9,4(R1)              R8 POINTS TO THE OPEN PDS DCB
+*                                       R9 POINTS TO DIR ENTRY AREA
+         USING PDSDCB,R8                ADDRESSABILITY
+         USING DIRENTRY,R9              ADDRESSABILITY
+         USING INAREA,R11               ADDRESSABILITY
+*
+MAJOBDSN BAL   RBAL,JOBDSN              FIND JOBNAME AND PDS DSNAME
+         CLC   RETCDE,F0                IF BAD RETURN
+         BNE   END16                      GO TO BAD ENDING
+*
+MADEL    CLC   FUNCTION,DELETE          IF FUNCTION IS 'DELETE'
+         BNE   MAALIAS                    THEN
+         BAL   RBAL,DLETE                   DELETE THE ENTRY
+         CLC   RETCDE,F0                IF RETURN CODE OKAY
+         BE    END00                      END WITH RC=00
+         B     END16                    ELSE END WITH RC=04
+MAALIAS  CLC   FUNCTION,ALIAS           IF FUNCTION IS 'ALIAS'
+         BNE   MAALEND                    THEN
+         BAL   RBAL,ALALIAS                 CREATE ALIAS
+         CLC   RETCDE,F0                IF RETURN CODE OKAY
+         BE    END00                      END WITH RC=00
+         B     END16                    ELSE END WITH RC=04
+MAALEND  NOPR  0
+*
+MAOPEN   BAL   RBAL,SQOPEN              OPEN THE SEQUENTIAL DATASET
+         CLC   RETCDE,F0                IF BAD RETURN
+         BNE   END16                      GO TO BAD ENDING
+*
+MAENQ    BAL   RBAL,ENQUEUE             ENQUEUE ON THE DATASET NAME
+         CLC   RETCDE,F0                IF BAD RETURN
+         BNE   END16                      GO TO BAD ENDING
+*
+MARW     BAL   RBAL,RWPROC              PERFORM READ/WRITE PROC
+         CLC   RETCDE,F0                IF BAD RETURN
+         BNE   END16                      GO TO BAD ENDING
+*
+MADEQ    BAL   RBAL,DEQUEUE             DEQUEUE THE DATASET NAME
+         CLC   RETCDE,F0                IF BAD RETURN
+         BNE   END16                      GO TO BAD ENDING
+*
+MACLOSE  BAL   RBAL,SCLOSE              CLOSE THE SEQUENTIAL DATASET
+*
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      LINKAGE CONVENTIONS EXITING PROGRAM                        ***
+***                                                                 ***
+***********************************************************************
+END00    LA    R15,0                    SET COMPLETION CODE 00
+         ST    R15,COMPCODE               INTO STORAGE
+         B     ENDING                   GO TO ENDING
+*
+END16    LA    R15,16                   SET COMPLETION CODE 16
+         ST    R15,COMPCODE               INTO STORAGE
+         B     ENDING                   GO TO ENDING
+*
+ENDING   L     R14,COMPCODE             R14 SAVES COMP CODE
+         LR    R1,R13                   R1 SAVES ADDR OF MY S.A.
+         L     R13,4(0,R1)              R13 RESTORED, PTR CALLER S.A.
+         FREEMAIN R,LV=WORKDLEN,A=(R1)  FREE MY SAVE/WORK AREA
+         LR    R15,R14                  R15 SET TO COMP CODE
+         LM    R0,R12,20(R13)           R0-R12 RESTORED
+         L     R14,12(0,R13)            R14 RESTORED
+         MVI   12(R13),X'FF'            SET COMPLETION SIGNAL
+         BR    R14                      RETURN TO CALLER
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  FIND JOBNAME AND PDS DSNAME                                   ***
+***                                                                ***
+**********************************************************************
+JOBDSN   ST    RBAL,JORBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         XR    R15,R15                  ADDRESS OF PSA
+         USING PSA,R15                    ASSIGN ADDRESSABILITY
+         L     R14,FLCCVT               ADDRESS OF CVT
+         USING CVTMAP,R14                 ASSIGN ADDRESSABILITY
+         DROP  R15                        DROP ADDRESSABILITY
+         L     R15,CVTTCBP              ADDRESS OF NEXT TCB POINTER
+         L     R15,4(0,R15)             ADDRESS OF CURRENT TCB
+         USING TCB,R15                    ASSIGN ADDRESSABILITY
+         DROP  R14                        DROP ADDRESSABILITY
+         L     R14,TCBTIO               ADDRESS OF TIOT
+         USING TIOT,R14                   ASSIGN ADDRESSABILITY
+         MVC   JOBNAME(8),TIOCNJOB      JOBNAME TO STORAGE
+*
+         DROP  R15                      DROP ADDRESSABILITY
+         LA    R15,TIOELNGH             ADDRESS OF FIRST TIOT ENTRY
+         USING TIOENTRY,R15               ASSIGN ADDRESSABILITY
+         NI    SWITCH0,X'FF'-X'02'      INITIALIZE PDS DDNAME FOUND SW
+JOLENGTH CLI   TIOELNGH,X'00'           IF ENTRY LNTH 0 (END OF CHAIN)
+         BE    JOENDDDN                   BRANCH OUT
+         CLC   TIOEDDNM(8),PDSDDN       IF MATCH ON DDNAME
+         BE    JODSN                      THEN
+         XR    R0,R0                    CLEAR FOR INSERT
+         IC    R0,TIOELNGH              R6 HAS LENGTH OF ENTRY
+         AR    R15,R0                   R15 POINTS TO NEXT ENTRY
+         B     JOLENGTH                 LOOP BACK UP
+*
+JODSN    OI    SWITCH0,X'02'            TURN ON PDS DDNAME FOUND SWITCH
+         XR    R1,R1                    CLEAR FOR INSERT
+         ICM   R1,7,TIOEJFCB            R1 POINTS TO JFCB
+         USING JFCB,R1                    ASSIGN ADDRESSABILITY
+         MVC   PDSDSN(44),JFCBDSNM      MOVE DSNAME TO STORAGE
+         MVC   PDSMEMNM(8),JFCBELNM     MOVE MEMBER NAME TO RNAME
+*
+JOENDDDN TM    SWITCH0,X'02'            IF DDNAME WAS FOUND
+         BO    JOEND                      GO TO ENDING
+         MVC   PDSDSN(44),BLANKS        ELSE BLANK OUT DSNAME
+         MVC   PDSMEMNM(8),BLANKS         AND MEMBER NAME
+         B     JORET04                    GO TO ERROR ENDING
+*
+         DROP  R14,R15,R1               DROP ADDRESSABILITY
+*
+JORET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     JOEND                    BRANCH TO ENDING
+*
+JOEND    L     RBAL,JORBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  ENQUEUE ON THE 52-BYTE RESOURCE NAME OF PDSDSN+GU01NAM        ***
+***                                                                ***
+***  NOTE: USE GU01NAM INSTEAD OF PDSMEMNM.  GU01NAM IS THE        ***
+***        MEMBER NAME FED FROM THE CALLER, WHILE PDSMEMNM IS      ***
+***        ONLY THE MEMBER NAME FROM ALLOCATION (JCL OR ALLOC)     ***
+***        WHICH HAS BEEN PICKED OUT OF THE JFCB.                  ***
+***                                                                ***
+**********************************************************************
+ENQUEUE  ST    RBAL,ENRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         MVC   RNAME(44),PDSDSN         DSN TO CHARS 1-44 OF RESOURCE
+         MVC   RNAME+44(8),GU01NAM      MEMBER NAME TO CHARS 45-52
+*
+         MVC   ENQ(ENQLN),ENQD          INITIALIZE ENQ PARM LIST
+         LA    R2,QNAME                 R2 POINTS TO QUEUE (MAJOR)
+         LA    R3,RNAME                 R3 POINTS TO RESOURCE (MINOR)
+         ENQ   ((R2),(R3),E,52,SYSTEM),MF=(E,ENQ)  ENQUEUE THE RESOURCE
+         LTR   R15,R15                  IF NON-ZERO RETURN
+         BNZ   ENRET04                    GO TO ERROR
+*
+         B     ENEND
+*
+ENRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     ENEND                    BRANCH TO ENDING
+*
+ENEND    L     RBAL,ENRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  DEQUEUE THE 52-BYTE RESOURCE NAME.                            ***
+***                                                                ***
+**********************************************************************
+DEQUEUE  ST    RBAL,DERBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         MVC   DEQ(DEQLN),DEQD          INITIALIZE DEQ PARM LIST
+         LA    R2,QNAME                 R2 POINTS TO QUEUE (MAJOR)
+         LA    R3,RNAME                 R3 POINTS TO RESOURCE (MINOR)
+         DEQ   ((R2),(R3),52,SYSTEM),MF=(E,DEQ)  DEQUEUE THE RESOURCE
+         LTR   R15,R15                  IF NON-ZERO RETURN
+         BNZ   DERET04                    GO TO ERROR
+*
+         B     DEEND
+*
+DERET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     DEEND                    BRANCH TO ENDING
+*
+DEEND    L     RBAL,DERBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  DELETE THE PDS DIRECTORY ENTRY                                ***
+***                                                                ***
+**********************************************************************
+DLETE    ST    RBAL,DLRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         STOW  PDSDCB,DIRENTRY,D        DELETE THE PDS ENTRY
+         LTR   R15,R15                  IF ENTRY NOT FOUND
+         BNZ   DLRET04                    GO TO HIGH RETURN
+*
+         B     DLEND
+*
+DLRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     DLEND                    BRANCH TO ENDING
+*
+DLEND    L     RBAL,DLRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  CREATE THE ALIAS ENTRY                                        ***
+***                                                                ***
+**********************************************************************
+ALALIAS  ST    RBAL,ALRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         L     R1,R1SAVE                RELOAD R1
+         L     R1,12(0,R1)              PUT ALIAS ADDR INTO R1
+         MVC   GU01NAM(8),0(R1)         PUT ALIAS INTO DIRENT NAME
+         OI    GU01C,X'80'              TURN ON ALIAS BIT
+         NI    GU01C,X'FF'-B'00011111'  TURN OFF REST OF DATA STATS
+         STOW  PDSDCB,DIRENTRY,A        ADD ALIAS ENTRY TO DIRECTORY
+*
+         ST    R15,RETCDE               RETURN CODE FROM STOW
+         B     ALEND                    BRANCH TO ENDING
+*
+ALEND    L     RBAL,ALRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  OPEN THE INPUT SEQUENTIAL DATASET                             ***
+***                                                                ***
+**********************************************************************
+SQOPEN   ST    RBAL,SQRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         MVC   SQOPENL(SQOPENLN),SQOPEND             INITIALIZE LIST
+         MVC   SEQDCB(SEQDCBL),SEQDCBD               INITIALIZE DCB
+         OPEN  (SEQDCB,(INPUT)),MF=(E,SQOPENL)       OPEN THE DCB
+*
+         TM    SEQDCB+(DCBRECFM-IHADCB),DCBRECF      IF NOT FIXED
+         BNO   SQRET04                                 BRANCH OUT
+         CLC   SEQDCB+(DCBLRECL-IHADCB)(2),=H'80'    IF NOT LRECL 80
+         BNE   SQRET04                                 BRANCH OUT
+         CLC   SEQDCB+(DCBBLKSI-IHADCB)(2),=H'80'    IF BLKSI LT 80
+         BL    SQRET04                                 BRANCH OUT
+         MVC   SEQBLKSI(2),SEQDCB+(DCBBLKSI-IHADCB)  SAVE THE BLKSI
+         MVC   SEQLRECL(2),SEQDCB+(DCBLRECL-IHADCB)  SAVE THE LRECL
+*
+         B     SQEND
+*
+SQRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     SQEND                    BRANCH TO ENDING
+*
+SQEND    L     RBAL,SQRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  CLOSE THE INPUT SEQUENTIAL DATASET                            ***
+***                                                                ***
+**********************************************************************
+SCLOSE   ST    RBAL,SCRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+         MVC   SQCLOSL(SQCLOSLN),SQCLOSD             INITIALIZE LIST
+         CLOSE (SEQDCB),MF=(E,SQCLOSL)               CLOSE THE DCB
+*
+         B     SCEND
+*
+SCRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     SCEND                    BRANCH TO ENDING
+*
+SCEND    L     RBAL,SCRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  INITIALIZE DECB FOR PDS.                                      ***
+***  GET STORAGE FOR INPUT/OUTPUT RECORDS.                         ***
+***  READ INPUT RECORDS.                                           ***
+***  BUILD OUTPUT BLOCKS OF RECORDS.                               ***
+***  WRITE OUTPUT RECORDS.                                         ***
+***  FREE STORAGE.                                                 ***
+***  UPDATE SIZE FIELD OF ISPF STATS.                              ***
+***                                                                ***
+**********************************************************************
+RWPROC   ST    RBAL,RWRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+RWDSCB   MVC   PDSDECB(PDDECBLN),PDSDECBD          INITIALIZE DECB
+*
+RWGETM   LH    R4,PDSDCB+(DCBBLKSI-IHADCB)         R4 HAS BLKSIZE
+         GETMAIN  R,LV=(R4)                        GET STORAGE
+         LTR   R15,R15                             IF NOT GOOD
+         BNZ   RWRET04                               GO TO BAD ENDING
+         LR    R11,R1                              R11 POINTS TO INAREA
+*
+         MVC   PDSBLKSI(2),PDSDCB+(DCBBLKSI-IHADCB)  SAVE PDS BLKSIZE
+         XR    R2,R2                    CLEAR R2 FOR COUNTER
+RWLOOP1A XR    R3,R3                    CLEAR R3 FOR BYTE COUNT
+*
+RWLOOP1B LA    R5,INAREA(R3)            R5 POINTS TO TARGET FOR GET
+         GET   SEQDCB,(R5)              READ INTO INAREA
+         LA    R2,1(0,R2)               R2 RECORD COUNT UP BY ONE
+         AH    R3,SEQDCB+(DCBLRECL-IHADCB)  R3 BYTE COUNT UP BY LRECL
+         CH    R3,PDSBLKSI              IF RECORD COUNT LT PDS BLKSIZE
+         BL    RWLOOP1B                   GO GET ANOTHER SEQ RECORD
+         B     RWWRITE                  ELSE GO WRITE THE RECORD
+*
+RWEOFIN  OI    SWITCH0,X'10'   EOF ===> EOF FOR INPUT FILE
+         LTR   R3,R3                    IF NO NEW LRECS BEFORE EOF
+         BZ    RWSTOW                     SKIP THE WRITE
+         B     RWWRITE                  ELSE WRITE THE REMAINING LRECS
+*
+RWWRITE  STH   R3,PDSDCB+(DCBBLKSI-IHADCB)   SET PHYSICAL RECORD LEN
+         WRITE PDSDECB,SF,PDSDCB,INAREA,'S',MF=E   WRITE THE RECORD
+         CHECK PDSDECB                       WAIT FOR OUTPUT
+         TM    SWITCH0,X'10'                 IF NOT END OF FILE
+         BZ    RWLOOP1A                        GO BACK FOR NEXT BLOCK
+*
+RWSTOW   STCM  R2,3,GU01SIZE            PUT SIZE INTO STATS
+         BAL   RBAL,TJOB                CURRENT TIME,DATE,JOBNAME
+         STOW  PDSDCB,DIRENTRY,R        ADD/UPDATE THE PDS ENTRY
+         C     R15,=F'8'                IF BAD STOW
+         BH    RWRET04                    GO TO BAD ENDING
+*
+RWFREEM  FREEMAIN R,LV=(R4),A=(R11)     FREE STORAGE
+         LTR   R15,R15                  IF BAD FREEMAIN
+         BNZ   RWRET04                    GO TO BAD ENDING
+*
+         B     RWEND
+*
+RWRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     RWEND                    BRANCH TO ENDING
+*
+RWEND    L     RBAL,RWRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+*
+         EJECT
+**********************************************************************
+***                                                                ***
+***  ADD CURRENT TIME, DATE, AND JOBNAME TO THE ISPF STATS.        ***
+***                                                                ***
+**********************************************************************
+TJOB     ST    RBAL,TJRBALSV            SAVE RETURN ADDRESS
+         XC    RETCDE,RETCDE            SET ERROR CODE TO ZERO
+*
+TJTIME   TIME  DEC                      R0=DATE MMDDHHTH
+*                                       R1=00YYDDDF
+         ST    R1,GU01DATM              SAVE DATE MODIFIED 00YYDDDF
+         STCM  R0,B'1100',GU01TIMM      SAVE TIME MODIFIED HHMM
+*
+         MVC   GU01ID(7),JOBNAME        JOBNAME CHARS 1-7 TO ID
+*
+         B     TJEND
+*
+TJRET04  LA    R15,X'04'                RETURN CODE TO R15
+         ST    R15,RETCDE               SAVE IT
+         B     TJEND                    BRANCH TO ENDING
+*
+TJEND    L     RBAL,TJRBALSV            RESTORE RETURN ADDRESS
+         BR    RBAL                     RETURN
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      FIXED DATA AREA                                            ***
+***                                                                 ***
+***********************************************************************
+F0       DC    F'0'                     CONSTANT
+BLANKS   DC    CL80' '                  LITERAL
+X00S     DC    XL40'00'                 LITERAL
+*
+PDSDDN   DC    CL8'PDS'                 DDNAME FOR PDS
+QNAME    DC    CL8'SPFEDIT'             ENQUEUE QUEUE (MAJOR) NAME
+DELETE   DC    CL12'DELETE'             LITERAL
+ALIAS    DC    CL12'ALIAS'              LITERAL
+*
+SQOPEND  OPEN  (,),MF=L
+SQCLOSD  CLOSE (),MF=L
+SEQDCBD  DCB   DDNAME=SEQ,DSORG=PS,MACRF=GM,EODAD=RWEOFIN
+*
+         WRITE PDSDECBD,SF,MF=L
+*
+ENQD     ENQ   (),MF=L
+DEQD     DEQ   (),MF=L
+*
+         LTORG
+*
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      DSECT FOR MY SAVE AREA AND VARIABLES.                      ***
+***                                                                 ***
+***********************************************************************
+WORKD    DSECT
+MYSAVE   DS    18F                      MY REGISTER SAVE AREA
+COMPCODE DS    F                        PROGRAM COMPLETION CODE
+RETCDE   DS    F                        INTERNAL RETURN CODE
+R1SAVE   DS    F                        INITIAL VALUE IN R1
+*
+SQRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+SCRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+RWRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+TJRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+JORBALSV DS    F                        RETURN ADDRESS SAVE AREA
+ENRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+DERBALSV DS    F                        RETURN ADDRESS SAVE AREA
+DLRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+ALRBALSV DS    F                        RETURN ADDRESS SAVE AREA
+*
+JOBNAME  DS    CL8                      JOBNAME FROM TIOT
+FUNCTION DS    CL12                     'UPDATE' 'DELETE' ETC.
+*
+SWITCH0  DS    B'00000000'              SWITCH AREA 0
+*                ...1....                X'10' - EOF ON SEQ FILE
+*                ......1.                X'02' - PDS DDNAME FOUND
+*                111.11.1                (UNUSED)
+*
+SEQBLKSI DS    H                        SEQUENTIAL INPUT BLKSIZE
+SEQLRECL DS    H                        SEQUENTIAL INPUT LRECL
+PDSBLKSI DS    H                        PDS OUTPUT BLKSIZE
+*
+PDSDSN   DS    CL44                     PDS DSNAME
+PDSMEMNM DS    CL8                      PDS MEMBER NAME
+RNAME    DS    CL52                     ENQUEUE RESOURCE (MINOR) NAME
+*
+SQOPENL  OPEN  (,),MF=L
+SQOPENLN EQU   *-SQOPENL
+SQCLOSL  CLOSE (),MF=L
+SQCLOSLN EQU   *-SQCLOSL
+         WRITE PDSDECB,SF,MF=L          DECB FOR PDS
+PDDECBLN EQU   *-PDSDECB
+*
+SEQDCB   DCB   DDNAME=SEQ,DSORG=PS,MACRF=GM,EODAD=RWEOFIN
+SEQDCBL  EQU    *-SEQDCB
+*
+ENQ      ENQ   (),MF=L
+ENQLN    EQU   *-ENQ
+DEQ      DEQ   (),MF=L
+DEQLN    EQU   *-DEQ
+*
+         DS    0D
+WORKDLEN EQU   *-WORKD
+*
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      MAPPING DSECTS                                             ***
+***                                                                 ***
+***********************************************************************
+*
+         IHADCB  DEVD=DA,DSORG=PS
+*
+DIRENTRY GTEUM01
+*
+         IHAPSA                         MAP OF PSA  DSECT=PSA
+         IKJTCB                         MAP OF TCB  DSECT=TCB
+TIOT     DSECT
+         IEFTIOT1                       MAP OF TIOT
+         CVT   DSECT=YES                MAP OF CVT  DSECT=CVTMAP
+JFCB     DSECT                          MAP OF JFCB
+JFCBPREF DS    CL16                       PREFIX
+         IEFJFCBN LIST=NO                 JFCB PROPER
+*
+INAREA   DSECT                          DATA INPUT AREA
+         DS    F
+*
+PDSDCB   DSECT                          OPEN DCB PASSED FROM CALLER
+         DCB   DDNAME=PDS,DSORG=PO,MACRF=(R,W)
+*
+         EJECT
+***********************************************************************
+***                                                                 ***
+***      REGISTER EQUATES                                           ***
+***                                                                 ***
+***********************************************************************
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+         END

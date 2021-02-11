@@ -1,0 +1,171 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "GENERATE"
+;
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 04/25/88 - Support for determination of superfluous initializations *
+;*            of PROG and &AUX variables to NIL.  This involves two    *
+;*            new fields in the contour that are used to detect cases  *
+;*            of a variable unconditionally being set before it is     *
+;*            ever referenced.  This is an extension of, and replaces, *
+;*            the SETQ-initialization-hacking scheme used in ZCCPROG.  *
+;*            This also requires a new P-code form, CSETNIL, and a new *
+;*            code generator module, ZCGCSNIL.                         *
+;* 06/07/88 - Support for BLOCK and TAGBODY.                           *
+;* 06/10/88 - Support for MULTIPLE-VALUE-LIST and MULTIPLE-VALUE-BIND. *
+;* 06/23/88 - Support for PROG and RETURN removed.                     *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(defun zilcogen (p)      ; P is output of "ZILCOCOM" function.
+ (prog
+  (body      ; the main body of the procedure
+   name      ; the name of the procedure currently being compiled
+   parms     ; parameters input to the program
+   special-unbounds  ; unbound special variables referenced by the pgm
+   fluid-unbounds    ; unbound lexical variables referenced by the pgm
+   atoms     ; constant atoms referenced by the program
+   lists     ; constant lists referenced by the program
+   subrs     ; external subroutines invoked by the program
+   procs     ; internal LAMBDA-procedures compiled along with the rest
+   tailrecur ; list of local variables active at tail-recursion time
+   zzzcont   ; label for normal tail recursion
+   zzzconp   ; label for tail recursion from a PROG with special vars
+   zzzstksz  ; label for maximum stack size
+   regs      ; the registers available to the code generator
+   cc        ; pair of branch mnemonics for condition code testing
+   main      ; T if program is the main procedure, NIL if internal func.
+   alone     ; T if program is a stand-alone function, NIL if executable
+   pdbas     ; offset into stack, past caller's args, of initial saves
+   stack     ; offset into stack, past initial saves, of locals & args
+   stackmax  ; maximum stack size used at any point
+   pdmax     ; push down stack of maximum stack levels
+   argbase   ; push down stack of bases for function arguments
+   special-asaved    ; stack of saved special ALIST pointers
+   fluid-asaved      ; stack of saved lexical ALIST pointers
+   lastarg   ; last argument register if applicable
+   codelist  ; list of code lines built by calls to ZCGEMIT
+   codelen   ; length of addressable portion of code
+  )
+      (setq body      (get p 'body)
+            name      (get p 'name)
+            parms     (get p 'parms)
+            special-unbounds  (get p 'special-unbounds)
+            fluid-unbounds    (get p 'fluid-unbounds)
+            atoms     (get p 'atoms)
+            lists     (get p 'lists)
+            subrs     (get p 'subrs)
+            procs     (get p 'procs)
+            tailrecur (get p 'tailrecur)
+            zzzcont   (gensym)
+            zzzstksz  (gensym)
+            regs '(\0 \1 \2 \3 \4 \5 \6 \7 \14 \15)
+            cc nil
+            codelist nil
+      )
+      ;
+      ; Note that the following registers are never available...
+      ; \8  - T
+      ; \9  - the free list pointer
+      ; \10 - NIL
+      ; \11 - the current pointer into the stack
+      ; \12 - the base register
+      ; \13 - the common area pointer
+      ;
+      ; ZZZCONP   is set by ZCGBEGIN.
+      ; MAIN      is set by ZCGBEGIN.
+      ; ALONE     is set by ZCGBEGIN.
+      ; PDBAS     is initialized by ZCGBEGIN.
+      ; STACK     is initialized by ZCGBEGIN.
+      ; STACKMAX  is initialized by ZCGBEGIN.
+      ; PDMAX     is initialized by ZCGBEGIN.
+      ; ARGBASE   is initialized by ZCGBEGIN.
+      ; SPECIAL-ASAVED  is initialized by ZCGBEGIN.
+      ; FLUID-ASAVED    is initialized by ZCGBEGIN.
+      ; CODELEN         is initialized by ZCGBEGIN.
+;
+; Set use counts for all registers to zero.
+;
+  (dolist (x regs) (putprop x 0 'usecount))
+;
+; Generate code.
+;
+ loop
+      (or body (go endup))
+      (gencode (car body) (cdr body))
+      (setq body (cdr body))
+      (go loop)
+ endup
+;
+; When finished with generation, generate code for LAMBDA procs.
+;
+      (mapc #'zilcogen (cdr procs))
+ )
+)
+
+(defun gencode (stmt restofit) ; Generate code for each thing in list.
+ (when stmt
+  (let (((verb . args) stmt))
+   (case verb
+    (begin        (zcgbegin args))
+    (end          (zcgend   args))
+    (begincall    (zcgbcall args))
+    (begininline  (zcgbcall args))
+    (begintail    (zcgbcall args))
+    (beginlam     (zcgblam  args))
+    (endlam       (zcgelam  args))
+;;;;(endcall ;;;;;(zcgecall args))
+    (call         (zcgcall  args))
+    (inline       (zcginlin args))
+    (tailrecur    (zcgrecur args))
+    (bind         (zcgbind  args))
+    (begintag     (zcgbtag  args))
+    (endtag       (zcgetag  args))
+    (beginblock   (zcgbtag  args))
+    (endblock     (zcgetag  args))
+    (beginuwp     (zcgbuwp  args))
+    (enduwp       (zcgeuwp  args))
+    (error        (zcgerror args))
+    (getvar       (zcggtvar args))
+;;;;(getparm ;;;;;(zcggetit args)) ; formerly zcggtprm
+    (getlocal     (zcggetit args)) ; formerly zcggtloc
+    (setatom      (zcggetit args)) ; formerly zcgstatm
+    (setlist      (zcggetit args)) ; formerly zcgstlst
+    (setnil       (zcggetit args)) ; formerly zcgstnil
+    (sett         (zcggetit args)) ; formerly zcgsett
+    (setsmall     (zcggetit args)) ; formerly zcgsmall
+    (label        (zcglabel args))
+    (closure      (zcgclos  args))
+    (subr         (zcgsubr  args))
+    (def          (zcgdef   args))
+    (optional     (zcgopt   args))
+    (setopt       (zcgstopt args))
+    (keys         (zcgkey   args))
+    (csetnil      (zcgcsnil args))
+    (mvinit       (zcgmvini args))
+    (t
+     (zerror "Unknown P-code statement type found by code generator"
+             verb))))))
+
+; Special declarations moved to ZILMACS.
+

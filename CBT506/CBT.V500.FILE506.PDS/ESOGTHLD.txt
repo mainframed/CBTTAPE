@@ -1,0 +1,197 @@
+/*---------------------------( rexx )---------------------------------*/
+/*                                                                    */
+/* Exec Name:  ESOGTHLD                                               */
+/*                                                                    */
+/*   Purpose:  Find and print HOLDDATA for PTFs held for a reason     */
+/*             (specified by user) by SMP/E during an APPLY CHECK.    */
+/*                                                                    */
+/*   Details:  If you have to apply huge numbers of PTFs (like an     */
+/*             ESO package), you'll probably have some number of      */
+/*             HOLD(ACTION, etc) to resolve.  This exec will eat      */
+/*             the SMPOUT output from an APPLY CHECK, then for each   */
+/*             PTF that had a HOLD of the requested type, the exec    */
+/*             finds the PTF in SMPPTS and prints out the holddata.   */
+/*             Supported HOLD types:  DOC,ACTION,DEP,EC,AO.           */
+/*                                                                    */
+/*    To Use:  1) Run an APPLY CHECK or ACCEPT CHECK for your stuff:  */
+/*                  SET BDY(target/dlib).                             */
+/*                  APPLY CHECK BYPASS(HOLDSYS(type)) ..other stuff.. */
+/*             2) Save //SMPOUT output to a file. ESOGTHLD assumes    */
+/*                'userid.SMP.OUTPUT', but you can tell it what to    */
+/*                look for (or change the default).                   */
+/*             3) Run ESOGTHLD for the type of system hold you want:  */
+/*                  %ESOGTHLD HOLD(ACTION)                            */
+/*                If you're doing something big like an ESO package,  */
+/*                you may want to run this under a batch TMP.         */
+/*                                                                    */
+/*    Syntax:  ESOGTHLD HOLD(holdtype) [ SMPRPT(dsname) ]             */
+/*     Where:  . HOLD(holdtype) is the type of HOLD to scan for       */
+/*               (ACTION, EC, DOC, ERROR, etc).  Required.            */
+/*             . SMPRPT(dsname) is the file containing //SMPOUT from  */
+/*               an APPLY CHECK.  Defaults to 'userid.SMP.OUTPUT'.    */
+/*                                                                    */
+/*     Notes:  . Yeah sure, it depends on what SMP's messages look    */
+/*               like, but you do what you gotta do :-)               */
+/*             . The exec will allocate/open/close/free each PTF      */
+/*               member in SMPPTS that it needs to look at.  If you   */
+/*               have lots and lots of held PTFs, it takes a while.   */
+/*             . Suggestions welcome.                                 */
+/*                                                                    */
+/*                                                                    */
+/*   History:  09/06/2000 jcb - New                                   */
+/*             01/02/2001 jcb - Fix for PTFs held by other PTFs that  */
+/*                              appear on ++HOLD but are not received */
+/*                              (see UR52435/UR52072 for an example). */
+/*                              See comments in the scan code below.  */
+/*             02/19/2001 jcb - Added summary of all HOLD types found */
+/*                              in smp.output.  Could be useful.      */
+/*                                                                    */
+/*--------------------------------------------------------------------*/
+/* Constants.                                                         */
+/*--------------------------------------------------------------------*/
+ptsdsn = "SMPE.OS390.V2R6M0.MVS.SMPPTS";    /* DSN of SMPPTS          */
+smprpt = " ";                               /* userid.SMP.OUTPUT      */
+holdtype = " ";                             /* Type HOLD to look for  */
+/*--------------------------------------------------------------------*/
+/* Parse the command line.                                            */
+/*--------------------------------------------------------------------*/
+arg 'HOLD(' holdtype ')' ,
+  1 'SMPRPT(' smprpt ')';
+if wordpos(holdtype, "ACTION DOC EC DEP AO") = 0 ,
+  then signal usage;
+if smprpt = " " then smprpt = "SMP.REPORT";
+/*--------------------------------------------------------------------*/
+/* Alloc and read the SMP report.                                     */
+/*--------------------------------------------------------------------*/
+"FREE FI(SMPIN SMPPTS)";
+"ALLOC FI(SMPIN) DA(" || smprpt || ")";
+if rc > 0 then signal no_smpin;
+"EXECIO * DISKR SMPIN (STEM smp. FINIS)";
+if rc > 0 then signal execio_error;
+/*--------------------------------------------------------------------*/
+/* Scan the SMP report for message GIM42001/GIM35966.                 */
+/*--------------------------------------------------------------------*/
+selected = 0;
+holdlist.0 = 0;
+do i = 1 to smp.0;
+ /*-------------------------------------------------------------------*/
+ /* OK, this is weird.  A SYSMOD's HOLD can be originated by another  */
+ /* SYSMOD.  The way this is done is by coding the second SYSMOD on   */
+ /* the ++HOLD card.  If this is the case, two different SYSMOD names */
+ /* will appear on GIM42001 'The Following ...' and GIM35966I 'System */
+ /* HOLD reason Originated By...'.  This can happen even if the second*/
+ /* SYSMOD is not in the global zone/SMPPTS.  If we aren't careful to */
+ /* go after the first SYSMOD, this can cause 013-18's for trying to  */
+ /* access a nonexistent member.                                      */
+ /*                                                                   */
+ /* This sequence depends on the order that SMP issues messages in.   */
+ /* (I don't like it either, but what are you gonna do...)            */
+ /*-------------------------------------------------------------------*/
+ parse upper var smp.i  msgid therest;
+ if msgid = 'GIM42001W' then do;   /* we'll believe this one  */
+   parse upper var smp.i,
+     msgid 'THE FOLLOWING CONDITIONS FOR SYSMOD' sysmod1 therest;
+ end;
+ else if msgid = 'GIM35966I' then do;
+   parse upper var smp.i,
+     msgid 'SYSTEM HOLD' holdtest 'ORIGINATED BY SYSMOD' ,
+        sysmod2 therest;
+   sysmod = sysmod1;
+   if holdtest = holdtype then do;
+     selected = selected + 1;
+     sysmod_list.selected = sysmod;
+     say "Selected HELD(" || holdtest || ") sysmod " || sysmod || ".";
+   end;
+   /*-----------------------------------------------------------------*/
+   /* As long as we're here, count the occurrences of each HOLD type. */
+   /*-----------------------------------------------------------------*/
+   foundhold = 0;
+   do j = 1 to holdlist.0;
+     if holdtest = holdlist.j then do;    /* if in the list  */
+       foundhold = 1;                     /*  flag it        */
+       ptr = j;
+       j = holdlist.0;                    /*  stop searching */
+     end;
+   end;
+   if foundhold = 0 then do;              /* if not flagged  */
+     j = holdlist.0 + 1;
+     holdlist.j = holdtest;
+     holdcnt.j  = 1;
+     holdlist.0 = j;
+   end;
+   else do;                               /* Else (got one): */
+     holdcnt.ptr = holdcnt.ptr + 1;      /* Count it.       */
+   end;
+ end;
+end;
+say selected "SYSMODs selected for HOLD(" || holdtype || ").";
+if holdlist.0 > 0 then do;
+  say "The following SYSTEM HOLD types were found:";
+  do i = 1 to holdlist.0;
+    type = strip(holdlist.i) || ' ---------------';
+    type = substr(type,1,15);
+    say "     " type "  " holdcnt.i;
+  end;
+end;
+sysmod_list.0 = selected;
+/*--------------------------------------------------------------------*/
+/* We got a list of PTFs to look up.  Loop thru the PTF members in    */
+/* SMPPTS and print out the HOLD(ACTION) statements.                  */
+/*--------------------------------------------------------------------*/
+do i = 1 to sysmod_list.0;
+  "ALLOC FI(SMPPTS) DA('" || ptsdsn || "(" || sysmod_list.i || ")'";
+  if rc > 0 then signal no_smppts;
+  "EXECIO * DISKR SMPPTS (STEM ptf. FINIS)";
+  if rc > 0 then signal execio_error;
+  /*------------------------------------------------------------------*/
+  /* Scan the PTF for the HOLD card we want, then print everything    */
+  /* until the next MCS (++) statement.                               */
+  /*------------------------------------------------------------------*/
+  do j = 1 to ptf.0;
+    ptfid = " "; ptfrsn = " ";
+    parse var ptf.j "++" "HOLD(" ptfid ")" "REASON(" ptfrsn ")";
+    if ptfrsn = holdtype then do;
+      say " ";
+      say "-------------------------------- (" ,
+          sysmod_list.i ,
+          ") --------------------------------";
+      say " ";
+      do k = j to ptf.0;
+        if (k > j) & substr(ptf.k,1,2) = '++' then do;
+          j = k - 1;               /* Leave print loop if we see new  */
+          leave k;                 /* ++ card, but keep scanning PTF. */
+        end;
+        say ptf.k;
+      end;                         /* this is where "leave k" goes    */
+    end;
+  end;
+  "FREE FI(SMPPTS)";
+end;
+/*--------------------------------------------------------------------*/
+/* We made it!  Reward the caller with RC zero.                       */
+/*--------------------------------------------------------------------*/
+exit 0;
+/*--------------------------------------------------------------------*/
+/* Error routines                                                     */
+/*--------------------------------------------------------------------*/
+usage:
+  say " ";
+  say "Syntax for ESOGTHLD:"
+  say " ";
+  say "  ESOGTHLD HOLD(holdtype) < SMPRPT(report.dsname) >  ";
+  say " ";
+  say "Where:  . HOLD(holdtype) is the type of HOLD to scan for";
+  say "          (ACTION, EC, DOC, ERROR, etc).  Required.";
+  say "        . SMPRPT(dsname) is the file containing //SMPOUT from";
+  say "          an APPLY CHECK.  Defaults to 'userid.SMP.OUTPUT'.";
+  say " ";
+  exit 8;
+no_smpin:
+  say "Unable to allocate to SMPPTS for input.";
+  exit 8;
+no_smppts:
+  say "Unable to allocate to SMP report file for input.";
+  exit 8;
+execio_error:
+  say "Unable to read SMP report file.";
+  exit 8;

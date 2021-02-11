@@ -1,0 +1,654 @@
+Slimming down VSE's printlog
+
+Have you ever wandered through a VSE printlog and decided
+there were more messages than necessary?  This is what
+happened in our shop.  Since I am a VM/VSE systems
+programmer, constantly looking for a more efficient way of
+doing things, I decided to write an EXEC.
+
+Before presenting the EXEC, let me describe the general flow:
+
+o      A printlog is run in VSE and routed to a VM server
+      machine.
+o      The server machine detects a reader file, determines that it
+      is a VSE printlog and invokes this EXEC with the
+      printlog's spool-id.
+
+There are several points to keep in mind when looking at this EXEC:
+
+o      A CMS file of SQL statistics is being created from SQL
+      SHOW commands recorded on the printlog.
+
+o      The printlog is filtered and condensed by eliminating such
+      messages as 1Q34I "task WAITING FOR WORK ON cuu".
+
+o      In addition, two extra pages are appended to the end -
+      these pages contain 'helpful' information that has been
+      extracted while processing the printlog.  The first page
+      contains an index of POWER jobname, time job began,
+      page number in the printlog, partition in which the job ran,
+      and a cancel flag if the job was cancelled.  The second
+      page contains a tape error summary for all the 4E10I "
+      volume-id TR = nnn TW = nnn SIO = nnnnn" messages.
+      Other 'helpful' information could be extracted and
+      formatted according to the needs of your shop.
+
+Examples of the reformatted printlog and the two extra pages
+are included as Figures 1, 2, and 3 respectively.
+
+Note that three other EXECs are called from the main EXEC.
+A listing of these EXECs is provided.
+
+One final word - our environment is VM/SP Release 4 with
+VSE/SP 2.1.3 as the guest.  We are getting ready to upgrade to
+VM Release 6 and VSE/SP 4.1.2, and I feel confident that this
+EXEC will work just as well under the new software.
+
+
+ARCH:VSC EXEC
+
+/********************************************************************/
+/**  EXEC MODE : INVOKED BY SUPRARCH EXEC IN THE ARCHIVE MACHINE   **/
+/**  FUNCTION  : FILTERS, CONDENSES, AND PRINTS THE VSE PRINTLOG.  **/
+/**              ALSO THE SQL STATS ARE EXTRACTED AND WRITTEN TO   **/
+/**              THE SQL STATS FILE.                               **/
+/**  FORMAT    : ARCH:VSC (SPOOLID)                                **/
+/**  USERS     : ARCHIVE                                           **/
+/**  FILE/TABLE: THE VSE PRINTLOG                                  **/
+/**  PARMLIST  : SPOOL-ID OF THE VSE PRINTLOG FILE                 **/
+/********************************************************************/
+/**  ERASE SOME OLD SQL STATS FILES  **/
+PARSE VALUE DATE(O) WITH YY '/' MM '/' .
+PARSE VALUE DATECALC(YY'/'MM'/01','O','70','-'),
+        WITH OLDYY '/' OLDMM '/' .
+RC = QUIET('ERASE SQL'OLDYY||OLDMM' STATS A')
+AA = TIME(R)
+/**  SET UP SOME VARIABLES                                         **/
+LINE_CNT   = '0'                 /* LINE COUNT ON A PAGE            */
+PAGE_CNT   = '1'                 /* PAGE COUNT                      */
+NEW_TIME   = '1'                 /* TIME FOR A TIME BREAK           */
+NEW_USER   = '0'                 /* TIME TO PRINT THE USERID        */
+OLD_PARTID = ''                  /* SAVE THE PREVIOUS PARTITION ID  */
+LOG_TIME   = '00:00:00'          /* SET UP THE INITIAL TIME         */
+LOG_DATE   = '00/00/00'          /* SET UP THE INITIAL DATE         */
+CHECK_PAGE = '1'                 /* CHECK FOR THE PAGE BREAK        */
+SQL_STATS  = '0'                 /* START WRITING SQL STATISTICS    */
+HEADER1    = SPREAD('VSE PRINTLOG',' ',1,' ',3)
+HEADER1    = CENTER(HEADER1,132)
+/**  ACCEPT THE SPOOLID OF THE PRINTLOG FILE                       **/
+ARG SPOOLID
+/**  PUT THE READER ON HOLD IN CASE SOMETHING GOES AWRY  **/
+PARSE VALUE DIAG(8,'SPOOL READER HOLD') WITH DATA
+/**  ORDER THE PRINTLOG ENTRY IN THE READER QUEUE  **/
+PARSE VALUE DIAG(8,'ORDER * R 'SPOOLID) WITH DATA
+/**  LOCATE THE FIRST HEADER IN THE PRINTLOG LISTING               **/
+'EXECIO * CARD (LOC /OPTIONS SPECIFIED/ STEM HEADER.'
+IF RC > '0'
+   THEN DO
+           SAY 'ERROR: COULD NOT FIND THE HEADERS IN THE VSE PRINTLOG'
+           SAY 'ERROR: RC = 'RC
+           SIGNAL EXIT
+        END
+/**  SET UP THE HEADERS FOR THE PRINT FILE  **/
+CALL HEADERS                           /* PRINT THE FIRST HEADERS   */
+/**  DEFINE THOSE MESSAGES WHICH CAN BE SUPPRESSED                 **/
+MSG_TABLE = '1Q20I 1R75I 1Q34I 1I40I 1C39I 0D16D',
+            '1T20I K002I K004I K006I K481I K001I K008I',
+            'K029I K103I K088I 1S78I'
+/**  DEFINE THE VALID PARTITION IDS  **/
+PARTID_TABLE = 'AR BG F1 F2 F3 F4 F5 F6 F7 F8 F9 FA FB'
+/**  LOOP THROUGH THE PRINTLOG FILTERING AND REFORMATTING          **/
+JOB_INDEX = ''                         /* TABLE OF JOBS AND TIMES   */
+ERRORS    = '0'                        /* COUNT OF TAPE ERROR MSGS  */
+DO FOREVER
+   CARD_REC = 'CARD_REC'               /* RESET PRINTLOG RECORD     */
+   CNTL     = 'CNTL'                   /* RESET CARRIAGE CONTROL    */
+   /**  READ THE NEXT RECORD IN THE FILE  **/
+   'EXECIO 1 CARD (VAR 'CARD_REC
+   IF RC > '0'
+      THEN LEAVE
+   /**  IS THIS THE END OF THE PRINTLOG?  **/
+   IF FIND(CARD_REC,'END OF UTILITY') > '0'
+      THEN DO
+              LOG_REC = COPIES(' ',10) /* WRITE A BLANK LINE        */
+              CALL WRITE_DETAIL
+              LOG_REC = COPIES(' ',10) /* WRITE A BLANK LINE        */
+              CALL WRITE_DETAIL
+              LOG_REC = CARD_REC       /* WRITE THE EOF MSG         */
+              CALL WRITE_DETAIL
+              CALL PRINT_INDEX         /* WRITE INDEX PAGE          */
+              CALL PRINT_TAPE_ERRORS   /* WRITE THE TAPE ERROR PAGE */
+              LEAVE                    /* GO TO THE EXIT            */
+           END
+   /**  LAYOUT THE PRINTLOG RECORD WITH DIFFERENT VIEWS  **/
+   PARSE VAR CARD_REC . 8  CON_LINE 85 .
+   PARSE VAR CARD_REC . 16 JOB_MSG 85 .
+   PARSE VAR CARD_REC . 16 DOS_CARD 23 .
+   PARSE VAR CARD_REC . 16 SUBSYS_MSG 24 SUBSYS_TEXT 85 .
+   PARSE VAR CARD_REC .  2 COUNT     7 .  8 REPLY   9 PART_ID  11 .,
+                        12 REPLY_ID 15 . 16 MSG_ID 21 MSG_TEXT 85 .
+   /**  NOW START ANALYZING THE VSE CONSOLE ENTRY  **/
+   SELECT
+     /**  IS THIS A PRINTLOG PAGE HEADER?  **/
+     WHEN FIND(CARD_REC,'OPTIONS SPECIFIED:') > '0'
+       THEN ITERATE
+     /**  IS THIS ANOTHER PRINTLOG PAGE HEADER?  **/
+     WHEN FIND(CARD_REC,'MESSAGE TEXT') > '0'
+       THEN ITERATE
+     /**  IS THIS A BLANK LINE?  **/
+     WHEN COUNT = ' ' & CON_LINE = ' '
+       THEN ITERATE
+     /**  IS THIS MESSAGE ID IN THE TABLE OF MESSAGES TO SKIP?  **/
+     WHEN FIND(MSG_TABLE,MSG_ID) > '0'
+        THEN ITERATE
+     /**   IS THIS A COMMENT? **/
+     WHEN SUBSTR(DOS_CARD,1,2) = '* '
+       THEN DO
+               LOG_REC = LOG_DATE COPIES(' ',9) PART_ID COPIES(' ',3),
+                         MSG_ID||MSG_TEXT
+               CALL WRITE_DETAIL
+               ITERATE
+            END
+     /**  IS THIS A NULL MESSAGE FROM A PARTITION?  **/
+     WHEN (SUBSTR(PART_ID,1,1) = 'F' | SUBSTR(PART_ID,1,1) = 'B') &,
+          MSG_ID = '*' & MSG_TEXT = ''
+       THEN ITERATE
+     /**  IS THIS A DITTO PROMPT?  **/
+     WHEN FIND(JOB_MSG,'DITTO FUNCTION ?') > '0'
+       THEN ITERATE
+     /**  IS CICS FINISHED INITIALIZING?  **/
+     WHEN SUBSYS_MSG = 'DFH1500' &,
+          FIND(SUBSYS_TEXT,'CONTROL IS BEING GIVEN TO CICS') = '0'
+       THEN ITERATE
+     /**  IS THIS A MESSAGE TELLING A JOB WAS RECEIVED IN READER?  **/
+     WHEN MSG_ID = '1Q47I'
+       THEN DO
+               PARSE VAR CARD_REC . '1Q47I' NEW_PARTID NEW_JOB .,
+                              'FROM LOCAL' USERID ', TIME=' LOG_TIME .
+               NEW_PARTID = STRIP(NEW_PARTID,B,' ')
+               PART_JOB.NEW_PARTID = NEW_JOB
+               USERID     = STRIP(USERID,B,' ')
+               IF USERID = ''          /* NO USERID ON MSG          */
+                  THEN USERID = 'LCL'  /* USE LOCAL AS USERID       */
+               NEW_TIME   = '1'
+               NEW_USER   = '1'
+               LOG_TIME   = RIGHT(LOG_TIME,8,'0')
+               NEW_JOB    = LEFT(NEW_JOB,8,'.')
+               JOB_INDEX  = JOB_INDEX NEW_JOB'='||LEFT(LOG_TIME,5)'.P',
+                            ||RIGHT((PAGE_CNT - 1),2,'0')'.'NEW_PARTID
+               ITERATE
+            END
+     /**  IS THIS A HIGHLIGHTED MESSAGE?  **/
+     WHEN REPLY = '*'
+       THEN DO
+               CHECK_PAGE = '1'        /* CHECK FOR PAGE OVERFLOW   */
+               LOG_REC    = COPIES(' ',18) PART_ID'     'JOB_MSG
+               CALL WRITE_DETAIL
+               CHECK_PAGE = '0'        /* DON'T CHECK               */
+               CNTL       = '+'        /* OVERLAY PREVIOUS LINE     */
+               CALL WRITE_DETAIL       /* WRITE SAME LINE AGAIN     */
+               CHECK_PAGE = '1'        /* START CHECKING AGAIN      */
+               ITERATE
+            END
+     /**  IS THIS A DATE AND TIME LINE?  **/
+     WHEN REPLY_ID = 'DAT'
+       THEN DO
+               PARSE VAR CARD_REC . 'DATE ' LOG_DATE ',CLOCK ' LOG_TIME,
+                                  ',DURATION' DURATION .
+               NEW_TIME = '1'
+               LOG_TIME = LEFT(LOG_TIME,8)
+               LOG_TIME = REPLACE(LOG_TIME,'/',':')
+               IF DURATION ¬= ''
+                  THEN DO
+                          DURATION = REPLACE(DURATION,'/',':')
+                          LOG_REC  = LOG_DATE LOG_TIME COPIES(' ',7),
+                                     'DURATION = 'DURATION
+                          CALL WRITE_DETAIL
+                          NEW_TIME = '0'
+                       END
+               ITERATE
+            END
+     /**  IS A JOB CANCELLING?  **/
+     WHEN INDEX(MSG_TEXT,'CANCELED.') > '0' &,
+          MSG_ID ¬= '0S12I'                   /* CICS CANCELLING?    */
+          THEN DO
+                 PARSE VAR MSG_TEXT . 'JOB, J_NAME 'CANCELED. ',
+                                    CANCEL_MSG
+                 IF J_NAME = 'NO NAME' /* NO JOB NAME ASSIGNED      */
+                    THEN DO
+                           LOG_REC = LOG_DATE COPIES(' ',9) PART_ID,
+                                     COPIES(' ',3) 'CAUSE =' CANCEL_MSG
+                           POINTER = CENTER('CANCEL->',10)
+                           LOG_REC = OVERLAY(POINTER,LOG_REC,10)
+                           CALL WRITE_DETAIL
+                           ITERATE
+                         END
+                 BB = LASTPOS('.'||PART_ID,JOB_INDEX)
+                 IF BB = '0'           /* NO ENTRY IN TABLE FOR JOB */
+                    THEN DO
+                           LOG_REC = LOG_DATE COPIES(' ',9) PART_ID,
+                                     COPIES(' ',3) 'CAUSE =' CANCEL_MSG
+                           POINTER = CENTER('CANCEL->',10)
+                           LOG_REC = OVERLAY(POINTER,LOG_REC,10)
+                           CALL WRITE_DETAIL
+                           ITERATE
+                         END
+                 CC = INDEX(JOB_INDEX,' ',BB)
+                 IF CC = '0'           /* ENTRY LAST IN TABLE       */
+                    THEN CC = LENGTH(JOB_INDEX) + 1
+                 DD = LASTPOS(' ',JOB_INDEX,BB) + 1
+                 /**  HAS THIS JOB CANCELLED ALREADY?  **/
+                 IF INDEX(SUBSTR(JOB_INDEX,DD,(CC - DD)),'-C') = '0'
+                    THEN JOB_INDEX = INSERT('-C',JOB_INDEX,(CC - 1))
+                 LOG_REC = LOG_DATE COPIES(' ',9) PART_ID,
+                           COPIES(' ',3) 'CAUSE =' CANCEL_MSG
+                 POINTER = CENTER('CANCEL->',10)
+                 LOG_REC = OVERLAY(POINTER,LOG_REC,10)
+                 CALL WRITE_DETAIL
+                 ITERATE
+               END
+     /**  IS THIS A VSE IPL MESSAGE?  **/
+     WHEN PART_ID = '**'
+       THEN DO
+               LOG_REC = COPIES(' ',8) CON_LINE
+               CALL WRITE_DETAIL
+               ITERATE
+            END
+     /**  IS THIS A TAPE ERROR MESSAGE?   **/
+     WHEN MSG_ID = '4E10I'
+       THEN DO
+               PARSE VAR CARD_REC . PART_ID . '4E10I' VOLSER DRIVE,
+                              'TR=' READ 'TW=' WRITE 'SIO=' SIO .
+               PART_ID = STRIP(PART_ID,B,' ')
+               ERRORS  = ERRORS + 1
+               IF DRIVE = ''           /* NO VOLSER PRESENT?       */
+                  THEN DO
+                          DRIVE  = CENTER(STRIP(VOLSER,B,' '),5)
+                          VOLSER = COPIES(' ',6)
+                       END
+                  ELSE DO
+                          DRIVE  = CENTER(STRIP(DRIVE,B,' '),5)
+                          VOLSER = STRIP(VOLSER,B,' ')
+                       END
+               READ  = STRIP(READ,L,'0')
+               WRITE = STRIP(WRITE,L,'0')
+               SIO   = STRIP(SIO,L,'0')
+               IF INDEX(PART_JOB.PART_ID,'PART_JOB') > '0' /* NO NAME*/
+                  THEN PART_JOB.PART_ID = LEFT(PART_ID,8,' ')
+               TAPE.ERRORS = PART_JOB.PART_ID'  'VOLSER'   'DRIVE' ',
+                             RIGHT(READ,6)'  'RIGHT(WRITE,6),
+                             RIGHT(SIO,5)
+            END
+     /**  IS THIS AN SQL MESSAGE?  **/
+     WHEN FIND(JOB_MSG,'COUNTERS RESET AT') > '0' |,
+          FIND(JOB_MSG,'COUNTER VALUES AT') > '0'
+       THEN DO
+               PARSE VAR CARD_REC . 'TIME=' LOG_TIME
+               NEW_TIME = '1'
+               LOG_TIME = LEFT(STRIP(LOG_TIME,B,"'"),8)
+               LOG_TIME = RIGHT(LOG_TIME,8,'0')
+            END
+     /**  IS THIS A CICS RESPONSE?  **/
+     WHEN FIND(JOB_MSG,'RESPONSE:') > '0'
+       THEN DO
+               PARSE VAR CARD_REC . 'TIME:' LOG_TIME 'DATE:' .
+               NEW_TIME = '1'
+               LOG_TIME = LEFT(STRIP(LOG_TIME,B,' '),8)
+               LOG_TIME = RIGHT(LOG_TIME,8,'0')
+               LOG_TIME = REPLACE(LOG_TIME,'.',':')
+            END
+     /**  IS THE LINE NONE OF THE ABOVE?  **/
+     OTHERWISE
+       NOP
+   END
+   /**  IS IT TIME TO WRITE SQL STATS TO THE SQL FILE?  **/
+   IF SQL_STATS
+      THEN DO
+             /**  IS THIS THE END OF SQL COMMAND RESPONSE?  **/
+             IF SUBSYS_MSG = 'ARI0065I'
+                THEN SQL_STATS = '0'   /* YES, TURN OFF FLAG        */
+                ELSE DO                /* NO, PROCESS COUNTERS      */
+                       PARSE VAR CARD_REC  . 47 LABEL 56 VALUE .
+                       VALUE   = STRIP(VALUE,B,' ')
+                       SQL_REC = ' 'LOG_DATE LOG_TIME LABEL,
+                                 RIGHT(VALUE,8,' ')
+                       'EXECIO 1 DISKW SQL'YY||MM' STATS A',
+                                  '(STRING 'SQL_REC
+                       IF RC > '0'
+                          THEN DO
+                                 SAY 'ERROR: COULD NOT WRITE TO THE',
+                                     'SQL STATS FILE.'
+                                 SAY 'ERROR: RC = 'RC
+                                 SIGNAL EXIT
+                               END
+                     END
+           END
+   /**  ARE THE SQL STATISTICS COMING UP?  **/
+   IF FIND(JOB_MSG,'COUNTER VALUES AT') > '0'
+      THEN SQL_STATS = '1'
+   /**  HAS THE USER CHANGED?  **/
+   IF NEW_USER & PART_ID = NEW_PARTID & DOS_CARD = '// JOB '
+      THEN DO
+              CON_LINE     = OVERLAY(USERID,CON_LINE,5,4)
+              USER_ON_LINE = '1'
+              NEW_USER     = '0'
+           END
+      ELSE USER_ON_LINE = '0'
+   /**  IS THE REPLY ID TO BE OVERLAID?  **/
+   IF FIND(PARTID_TABLE,PART_ID) > '0' & ¬ USER_ON_LINE
+      THEN CON_LINE = OVERLAY('    ',CON_LINE,5,4)
+   /**  HAS TIME CHANGED?  **/
+   IF NEW_TIME
+      THEN DO
+              LOG_REC  = LOG_DATE LOG_TIME CON_LINE
+              NEW_TIME = '0'
+           END
+      ELSE LOG_REC = LOG_DATE COPIES(' ',8) CON_LINE
+   /**  IS THIS A USER ENTERED COMMAND?  **/
+   IF PART_ID ¬= '' & FIND(PARTID_TABLE,PART_ID) = '0'
+      THEN DO
+              ARROW   = CENTER('===>',10)
+              LOG_REC = OVERLAY(ARROW,LOG_REC,10)
+           END
+   /**  WRITE THE DETAIL RECORD  **/
+   CALL WRITE_DETAIL
+   CHECK_PAGE = '1'                    /* RESET PAGE OVERFLOW CHECK */
+END
+/**  EXIT THIS EXEC                                               **/
+SYNTAX:
+EXIT:
+/**  CLOSE THE READER  **/
+PARSE VALUE DIAG(8,'CLOSE RDR') WITH DATA
+/**  TAKE THE READER OFF HOLD  **/
+PARSE VALUE DIAG(8,'SPOOL READER NOHOLD') WITH DATA
+/**  CLOSE THE PRINT FILE TO SEND IT ON ITS WAY  **/
+PARSE VALUE DIAG(8,'CLOSE PRT') WITH DATA
+/**  CLOSE THE SQL STATS FILE  **/
+'FINIS SQL 'YY||MM' STATS A'
+/**  PURGE THE PRINTLOG FILE  **/
+PARSE VALUE DIAG(8,'PURGE READER 'SPOOLID) WITH DATA
+BB = FORMAT(TIME(E),3,0)
+SAY 'It took 'BB' seconds to finish.'
+'DROPBUF'
+EXIT
+/**  PRINT THE DETAIL RECORD                                      **/
+WRITE_DETAIL:
+IF LINE_CNT >= '60' & CHECK_PAGE       /* TIME FOR A PAGE BREAK?    */
+   THEN CALL HEADERS
+/**  DETERMINE THE PROPER CARRIAGE CONTROL  **/
+SELECT
+  WHEN PART_ID = '  '                  /* A CONTINUATION LINE?      */
+    THEN CNTL = ' '                    /* YES, SINGLE SPACE         */
+  /**  IS THIS AN OPERATOR RESPONSE TO THE IMMEDIATE PREV PARTITION?**/
+  WHEN OLD_PARTID = 'F'||SUBSTR(PART_ID,1,1)           |, /* F1-F9  */
+       (SUBSTR(OLD_PARTID,2,1) = 'A' & PART_ID = '10') |, /* FA?    */
+       (SUBSTR(OLD_PARTID,2,1) = 'B' & PART_ID = '11') |, /* FB?    */
+       (OLD_PARTID = 'BG'            & PART_ID = '0')     /* BG?    */
+    THEN CNTL = ' '                    /* YES, SINGLE SPACE         */
+  WHEN OLD_PARTID ¬= PART_ID           /* PARTITION HAS CHANGED?    */
+    THEN DO
+            OLD_PARTID = PART_ID
+            IF CNTL = 'CNTL'           /* NO VALUE ASSIGNED YET?    */
+               THEN CNTL = '0'         /* NO, DOUBLE SPACE LINE     */
+         END
+  OTHERWISE
+    IF CNTL = 'CNTL'                   /* NO VALUE ASSIGNED YET?    */
+       THEN CNTL = ' '                 /* NO, SINGLE SPACE LINE     */
+END
+/**  WRITE THE DETAIL RECORD  **/
+'EXECIO 1 PRINT (CC DATA STRING 'CNTL||LOG_REC
+IF RC > '0'
+   THEN DO
+           SAY 'ERROR: COULD NOT ROUTE THE PRINT LINE TO FILE.'
+           SAY 'ERROR: RC = 'RC
+           SIGNAL EXIT
+        END
+/**  DETERMINE HOW MANY LINES TO INCREMENT THE LINE COUNT  **/
+SELECT
+  WHEN CNTL = ' '                      /* LINE WAS SINGLE SPACED    */
+    THEN LINE_CNT = LINE_CNT + 1
+  WHEN CNTL = '0'                      /* LINE WAS DOUBLE SPACED    */
+    THEN LINE_CNT = LINE_CNT + 2
+  WHEN CNTL = '+'                      /* LINE WAS OVERLAID         */
+    THEN NOP
+  OTHERWISE
+    LINE_CNT = LINE_CNT + 1
+END
+RETURN
+/**  PRINT THE PAGE HEADERS                                       **/
+HEADERS:
+'EXECIO 1 PRINT (CC DATA STRING 1'HEADER1
+IF RC > '0'
+   THEN DO
+           SAY 'ERROR: COULD NOT ROUTE THE FIRST HEADER TO THE FILE.'
+           SAY 'ERROR: RC = 'RC
+           SIGNAL EXIT
+        END
+'EXECIO 1 PRINT (CC DATA STRING 'COPIES(' ',120) 'PAGE = 'PAGE_CNT
+IF RC > '0'
+   THEN DO
+           SAY 'ERROR: COULD NOT ROUTE THE SECOND HEADER TO THE FILE.'
+           SAY 'ERROR: RC = 'RC
+           SIGNAL EXIT
+        END
+'EXECIO 1 PRINT (CC DATA STRING 'COPIES(' ',10)
+IF RC > '0'
+   THEN DO
+           SAY 'ERROR: COULD NOT ROUTE THE THIRD HEADER TO THE FILE.'
+           SAY 'ERROR: RC = 'RC
+           SIGNAL EXIT
+        END
+
+LINE_CNT = '3'
+PAGE_CNT = PAGE_CNT + 1
+RETURN
+/**  PRINT THE JOB NAME / START TIME / PAGE NUMBER INDEX          **/
+PRINT_INDEX:
+LINE_CNT = '1'                         /* RESET THE LINE COUNT      */
+PARSE VALUE 'FF' '00' WITH OLD_PARTID PART_ID
+LOG_REC = HEADER1                      /* WRITE THE HEADER          */
+CNTL    = '1'
+CALL WRITE_DETAIL
+LIT1 = 'JOB NAME ALPHABETICAL CROSS-REFERENCE'
+LOG_REC = CENTER(LIT1,132)
+CNTL    = ' '
+CALL WRITE_DETAIL
+LIT1 = 'JOB NAME / START TIME / PAGE NUMBER / PARTITION - CANCEL FLAG'
+LOG_REC = CENTER(LIT1,132)
+CNTL    = ' '
+CALL WRITE_DETAIL
+LOG_REC = COPIES('=',132)
+CNTL    = '0'
+CALL WRITE_DETAIL
+JOB_INDEX = REXXSORT(JOB_INDEX,'1','11','A')
+CHECK_PAGE = '0'                       /* DON'T CHECK FOR PAGE BREAK*/
+DO JI = 1 TO 55 UNTIL WORD(JOB_INDEX,JI) = ''
+   COL1 = LEFT(WORD(JOB_INDEX,JI),25,' ')
+   COL1 = REPLACE(COL1,'=',' ')
+   COL1 = REPLACE(COL1,'.',' ')
+   C2   = JI + 55                      /* POINT TO 2ND COLUMN      */
+   COL2 = LEFT(WORD(JOB_INDEX,C2),25,' ')
+   COL2 = REPLACE(COL2,'=',' ')
+   COL2 = REPLACE(COL2,'.',' ')
+   C3   = JI + 110                     /* POINT TO 3RD COLUMN      */
+   COL3 = LEFT(WORD(JOB_INDEX,C3),25,' ')
+   COL3 = REPLACE(COL3,'=',' ')
+   COL3 = REPLACE(COL3,'.',' ')
+   C4   = JI + 165                     /* POINT TO 4TH COLUMN      */
+   COL4 = LEFT(WORD(JOB_INDEX,C4),25,' ')
+   COL4 = REPLACE(COL4,'=',' ')
+   COL4 = REPLACE(COL4,'.',' ')
+   C5   = JI + 220                     /* POINT TO 5TH COLUMN      */
+   COL5 = LEFT(WORD(JOB_INDEX,C5),25,' ')
+   COL5 = REPLACE(COL5,'=',' ')
+   COL5 = REPLACE(COL5,'.',' ')
+   LOG_REC = COL1||COL2||COL3||COL4||COL5
+   CNTL    = ' '
+   CALL WRITE_DETAIL
+END
+RETURN
+/**  PRINT THE TAPE ERROR SUMMARY                                 **/
+PRINT_TAPE_ERRORS:
+LINE_CNT = '1'                         /* RESET THE LINE COUNT      */
+LOG_REC = HEADER1                      /* WRITE THE HEADER          */
+CNTL    = '1'
+CALL WRITE_DETAIL
+LOG_REC = CENTER('TAPE ERROR SUMMARY',132)
+CNTL    = ' '
+CALL WRITE_DETAIL
+LOG_REC = COPIES(' ',10)               /* WRITE A BLANK LINE        */
+CNTL    = ' '
+CALL WRITE_DETAIL
+LOG_REC = '  JOB     VOLSER  TAPE    READ   WRITE   SIO'
+CNTL    = ' '
+CALL WRITE_DETAIL
+LOG_REC = '  NAME            DRIVE  ERRORS  ERRORS  COUNT'
+CNTL    = ' '
+CALL WRITE_DETAIL
+LOG_REC = '--------  ------  -----  ------  ------  -----'
+CNTL    = ' '
+CALL WRITE_DETAIL
+/**  LOOP THROUGH TAPE ERROR MESSAGES  **/
+IF ERRORS = '0'                        /* NO TAPE ERRORS            */
+   THEN DO
+           LOG_REC = 'THERE WERE NO TAPE ERRORS DURING THIS PERIOD.'
+           CNTL    = ' '
+           CALL WRITE_DETAIL
+        END
+   ELSE DO TE = 1 TO ERRORS            /* DISPLAY THE ERRORS        */
+           LOG_REC = TAPE.TE
+           CNTL    = ' '
+           CALL WRITE_DETAIL
+        END
+
+RETURN
+
+
+QUIET EXEC
+
+/**  EXEC MODE : INVOKED AS A REXX BUILT-IN FUNCTION               **/
+/**  FUNCTION  : IT ISSUES A COMMAND WHILE SUPPRESSING ALL         **/
+/**              GENERATED MESSAGES                                **/
+/**  PARMLIST  : A COMMAND TO EXECUTE                              **/
+/**  RETURNS   : THE RETURN CODE FROM THE COMMAND                  **/
+ARG COMMAND                       /* ACCEPT THE PARAMETERS    */
+RESULT = '0'                      /* INIT THE RESULT          */
+/**  GET THE CP MSG SETTINGS  **/
+PARSE VALUE DIAG(8,'QUERY SET'),
+       WITH . 'MSG' MSG_SETTING ',' . 'EMSG' EMSG_SETTING ',' ,
+            . 'IMSG' IMSG_SETTING ',' .
+MSG_SETTING  = STRIP(MSG_SETTING,B,' ')
+EMSG_SETTING = STRIP(EMSG_SETTING,B,' ')
+IMSG_SETTING = STRIP(IMSG_SETTING,B,' ')
+/**  GET THE CMS MSG SETTING  **/
+'QUERY CMSTYPE (STACK LIFO'
+PULL . '= ' CMSTYPE_SETTING
+/**  TURN ALL MSG MODES OFF  **/
+PARSE VALUE DIAG(8,'SET MSG OFF') WITH DATA
+PARSE VALUE DIAG(8,'SET EMSG OFF') WITH DATA
+PARSE VALUE DIAG(8,'SET IMSG OFF') WITH DATA
+ADDRESS CMS 'SET CMSTYPE HT'
+/**  GET THE XEDIT MSG SETTING  **/
+/**  AND SET IT OFF             **/
+ADDRESS XEDIT 'COMMAND EXTRACT /MSGMODE'
+IF RC = '0'
+   THEN DO
+           ADDRESS XEDIT 'SET MSGMODE OFF'
+           IN_XEDIT = '1'
+        END
+    ELSE IN_XEDIT = '0'
+/**  EXECUTE THE COMMAND     **/
+IF IN_XEDIT
+   THEN ADDRESS XEDIT COMMAND
+   ELSE COMMAND
+COMMAND_RC = RC
+/**  RESET THE CP MSG SETTINGS  **/
+PARSE VALUE DIAG(8,'SET MSG 'MSG_SETTING) WITH DATA
+PARSE VALUE DIAG(8,'SET EMSG 'EMSG_SETTING) WITH DATA
+PARSE VALUE DIAG(8,'SET IMSG 'IMSG_SETTING) WITH DATA
+IF IN_XEDIT
+   THEN ADDRESS XEDIT 'SET MSGMODE 'MSGMODE.1 MSGMODE.2
+ADDRESS CMS 'SET CMSTYPE 'CMSTYPE_SETTING
+EXIT COMMAND_RC
+
+
+REPLACE EXEC
+
+/**  EXEC MODE : REXX BUILT-IN FUNCTION                            **/
+/**  FUNCTION  : REPLACE A SUBSTRING WITH ANOTHER SUBSTRING        **/
+/**              THIS IS SIMILIAR TO THE TRANSLATE FUNCTION        **/
+/**              EXCEPT THAT REPLACE WILL TRANSLATE ONE FOR MANY   **/
+/**              OR MANY FOR ONE.                                  **/
+/**  PARMLIST  : STRING TO BE EXAMINED;                            **/
+/**              SUBSTRING TO BE LOCATED ON;                       **/
+/**              SUBSTRING TO SUBSTITUTE                           **/
+/**  RETURNS   : EITHER -                                          **/
+/**               THE ORIGINAL STRING, BECAUSE THE SUBSTRING TO    **/
+/**                                    LOCATE WAS NOT FOUND        **/
+/**                OR                                              **/
+/**               THE ORIGINAL STRING WITH THE SUBSTITUTED         **/
+/**               SUBSTRING                                        **/
+/**  RECEIVE THE ARGUMENTS  **/
+PARSE ARG STRING,L_SUBSTR,S_SUBSTR
+/**  LOOP THROUGH THE STRING LOOKING FOR THE EACH OCCURRENCE  **/
+/**  OF THE FIRST SUBSTRING AND THEN REPLACE IT WITH THE      **/
+/**  SECOND SUBSTRING                                         **/
+STRING_POS = '1'        /* LOCATION OF SUBSTRING TO BE REPLACED */
+DO FOREVER
+   STRING_POS = INDEX(STRING,L_SUBSTR,STRING_POS)
+   IF STRING_POS = '0'
+      THEN LEAVE
+   STRING     = DELSTR(STRING,STRING_POS,LENGTH(L,_SUBSTR))
+   INSERT_POS = STRING_POS - 1
+   STRING     = INSERT(S_SUBSTR,STRING,INSERT_POS,LENGTH(S_SUBSTR))
+   STRING_POS = STRING_POS + LENGTH(S_SUBSTR)
+END
+EXIT:
+EXIT STRING
+
+
+REXXSORT EXEC
+
+/**  EXEC MODE : REXX BUILT-IN FUNCTION                            **/
+/**  FUNCTION  : BIF SORTS A VARIABLE PASSED.                      **/
+/**  PARMLIST  : VARIABLE NAME                                     **/
+/**              BEGINNING POSITION OF THE SORT FIELD              **/
+/**              LENGTH OF THE SORT FIELD                          **/
+/**              SORT SEQUENCE                                     **/
+/**  RETURNS   : THE SORTED VARIABLE                               **/
+/**  ACCEPT THE PARAMETERS  **/
+ARG INPUT,BEG,LEN,ORDER
+/**  SET UP THE DEFAULTS  **/
+IF BEG = ''                        /* DEFAULT BEGINNING COLUMN IS 1 */
+   THEN BEG = '1'
+IF ORDER = ''                      /* DEFAULT ORDER IS ASCENDING    */
+   THEN ORDER = 'A'
+IF LEN = ''                        /* DEFAULT ENDING COLUMN IS *    */
+   THEN END = LENGTH(WORD(INPUT,1))
+   ELSE END = BEG + LEN
+/**  CREATE A TEMPORARY XEDIT FILE WITH INPUT  **/
+DO II = 1 TO WORDS(INPUT)
+   'EXECIO 1 DISKW $$TEMP SORT A (STRING 'WORD(INPUT,II)
+END
+/**  NOW SORT THE FILE  **/
+QUEUE 'COMMAND DOWN 1'
+QUEUE 'MACRO SORT * 'ORDER BEG END
+QUEUE 'FILE'
+'XEDIT $$TEMP SORT A'
+/**  NOW READ THE FILE BACK IN  **/
+'EXECIO * DISKR $$TEMP SORT A (STEM SORT_LINE.'
+/**  REBUILD THE OUTPUT  **/
+RESULT = ''
+DO N = 1 TO SORT_LINE.0
+   RESULT = RESULT SORT_LINE.N
+END
+/**  GET RID OF THE TEMP FILE  **/
+RC = QUIET('ERASE $$TEMP SORT A')
+/**  EXIT THE EXEC  **/
+EXIT:
+EXIT RESULT
+
+Randy Epperson
+Systems Programmer
+Ray Co Inc (USA)                               c Ray Co Inc 1991
+

@@ -1,0 +1,462 @@
+Dynamic allocation by RACF user-id or group
+
+The following routine is meant to be invoked from a CLIST at
+TSO log-on to allocate a user's ISPF files.  It is meant to speed up
+log-on and simplify the maintenance of log-on procedures and
+CLISTs.  This is done by allocating the datasets users require
+according to their RACF user-id or group.  As a result we need
+only one log-on procedure and log-on CLIST for all the users at
+our site.
+
+The files to be allocated are entered into a dataset with an 120-
+byte logical record length, which will allow up to seven users or
+groups to be listed.  This could easily be altered by changing the
+count at label 'MATCH'.  The program uses 'get locate I/O'
+processing so it should cope with other record lengths without
+change.  If a file or dataset is to be allocated to all users then
+'ALL' can be specified.  Up to sixteen datasets can be
+concatenated together.
+
+Because of the way dynamic allocation works, datasets are
+concatenated by allocating the second, third, fourth datasets, and
+so on, to temporary DDNAMEs.  These are then concatenated to
+the first DDNAME which you actually want to use.  There is a
+drawback here in that if you free a concatenated DDNAME, the
+datasets will be re-allocated back to the temporary DDNAMEs
+used previously.  Subsequent attempts to free concatenated
+DDNAMEs will fail as the temporary DDNAMEs are already in
+use.  We have found the best way to bypass this problem when re-
+allocating files is to use this program as all DDNAMEs are freed
+prior to being used.
+
+This routine has been written to run on MVS/ESA.  Instead of
+setting up a register save area, saving the registers on entry, and
+restoring them prior to returning control to the caller, it uses two
+new instructions.  These are BAKR (branch and stack) on entry,
+which will automatically store all general and access registers onto
+the linkage stack, and PR (program return) on exit, which will
+automatically restore the registers from the linkage stack.  Those
+of you running on pre-ESA systems will need to add code for
+standard entry and exit.
+
+* THIS ROUTINE READS AN INPUT FILE CONTAINING DDNAMES AND FILES TO   *
+* BE ALLOCATED. DDNAME RECORDS BEGIN WITH @. DSNAME RECORDS BEGIN    *
+* WITH -. COMMENTS BEGIN WITH *. THE FIRST RECORD OF A SET IS        *
+* ALLOCATED TO THE KOSHER DDNAME AND SUBSEQUENT ONES TO TEMPORARY    *
+* DDNAMES. THESE ARE THEN CONCATENATED TO THE KOSHER DDNAME. ALL     *
+* DDNAMES ARE FREED PRIOR TO ALLOCATION. DSNAMES STARTING WITH       *
+* &SYSUID HAVE THIS CONVERTED TO THE TSO USERID LOGGED ON. ONLY FILES*
+* FOR ALL USERS OR THOSE MATCHING THE USERID OR RACF GROUP ARE       *
+* ALLOCATED.                                                         *
+* SAMPLE INPUT                                                       *
+*12                                 50      60        70        80   *
+*@SYSPROC                           ALL                              *
+*-AB002.SKIPPY.CLIST                AB002                            *
+*-SYSX.ISPF.CLIST                   ALL                              *
+*-SYS1.HRFCLST                      DPXTS   DPXOPS    DPXSYS    DPX  *
+*-SYS1.SBLSCLI0                     DPXTS                            *
+**COMMENT LINE                                                       *
+*@SMPTABL                           DPXTS   DPX                      *
+*-&SYSUID..ISPF.ISPPROF             DPXTS   DPX                      *
+*  MAP OF SVC99 REQUEST BLOCKS                                       *
+*REQBLKP->S99RBP(DSECT)                                              *
+*         S99RBPTR -> R4-> S99RB(DSECT)                              *
+*                          ||                                        *
+*                    S99ERROR                                        *
+*                    S99INFO                                         *
+*                    S99TXTPP                                        *
+*              R5 -> S99TUPL(DSECT)                                  *
+*                    S99TUPTR ------> R6 -> S99TUNIT(DSECT)          *
+*                       "     ----->  R6    S99TUKEY  |              *
+*                       "     ---->   R6    S99TUNUM  |- MAP USER    *
+*                       "     --->    R6    S99TULNG  |  SUPPLIED    *
+*                                           S99TUPAR  |  TEXT UNITS  *
+*  PROGRAM IS REENTRANT AND MUST RUN IN 24 BIT MODE
+*
+DYNALLOC CSECT
+DYNALLOC AMODE 24
+DYNALLOC RMODE 24
+         USING *,R15
+         B     UXCODE
+         DC    C'DYNALLOC START OF CODE &SYSDATE'
+UXCODE   BAKR  R14,0                    /* PUT REGS IN LINKGE STACK*/
+         BALR  R12,0
+         USING *,R12
+* GET STORAGE AND SET REGISTERS FOR THE SVC 99 RB AND WORKAREA *
+         LA    R0,2048                    /* AMOUNT OF STORAGE REQ   */
+         GETMAIN R,LV=(0)                 /*                         */
+         LR    R3,R1                      /* ADDR OF STORAGE IN R3   */
+         USING WORKAREA,R3                /* GET ADDRESSABILITY      */
+         MVC   WORKAREA(WORKL1),@PEN      /* INITIALIZE STORAGE      */
+         MVC   WORKAREA+WORKL1(WORKL3),@PEN+WORKL1
+*  GET THE USERID AND THE RACF GROUP FROM THE ACEE *
+GETUSER  L     R4,CVTPTR               GET ADDRESS TO CVT
+         USING CVT,R4                  GET ADDRESSABILITY TO CVT
+         L     R4,CVTTCBP              DOUBLEWORD OF TCB ADDRESS
+         L     R4,12(R4)               POINT TO ASCB
+         USING ASCB,R4                 GET ADDRESSABILITY
+         L     R4,ASCBASXB             POINT TO ASXB
+         USING ASXB,R4                 GET ADDRESSABILITY
+         L     R4,ASXBSENV             POINT TO ACEE
+         USING ACEE,R4                 GET ADDRESSABILITY TO ACEE
+         MVC   USERID,ACEEUSRI         GET CURRENT USERID
+         MVC   RACFGRP,ACEEGRPN        GET CURRENT RACF GROUP
+* SET UP THE POINTERS FOR THE SVC 99 REQUEST BLOCK *
+         LA    R8,1024(,R3)               /* POINT R8 AT FREE STORAGE*/
+         USING S99RBP,R8                  /* GET ADDRESSABILITY      */
+         LA    R4,S99RBPTR+4              /* POINT R4 AT RB          */
+         USING S99RB,R4                   /* GET ADDRESSABILITY TO RB*/
+         ST    R4,S99RBPTR                /* ESTABLISH POINTER       */
+         OI    S99RBPTR,S99RBPND          /* SET HIGH ORDER BIT      */
+         ST    R8,REQBLKP                 /* SAVE ADDRESS OF RB PTR  */
+         XC    S99RB(RBLEN),S99RB         /* ZERO OUT RB             */
+         MVI   S99RBLN,RBLEN              /* ESTABLISH RB LENGTH FLD */
+         LA    R5,S99RB+RBLEN             /* POINT R5 TO TUP LIST    */
+         USING S99TUPL,R5                 /* GET ADDRESSAB'TY TO TUP */
+         ST    R5,S99TXTPP                /* PUT ADDR OF TUP IN RB   */
+* OPEN INPUT FILE AND START TO LOOP THROUGH RECORDS ALLOCATING FILES *
+         MVI   OPEN,X'80'                 /* SET HIGH ORDER BIT      */
+         OPEN  (INDD,(INPUT)),MF=(E,OPEN) /* OPEN INPUT FILE         */
+         TM    INDD+48,X'10'              /* OPEN OK ?               */
+         BZ    OPENERR                    /* ERROR - OPEN FAILED     */
+         LA    R7,0                       /* COUNT OF DS TO ALLOC    */
+         XC    TRTAB,TRTAB                /* INIT TRANSLATE TABLE    */
+         MVI   TRTAB+C' ',C' '            /* SET UP TABLE FOR BLANKS */
+LOOP     BAL   R10,READ                   /* GOSUB READ RECORD       */
+         L     R5,S99TXTPP                /* POINT R5 AT START OF TUP*/
+* LOOK FOR MATCH OF USER/GROUP/ALL IN RECORD *
+MATCH    LA    R11,7                      /* SET LOOP COUNT TO 7     */
+         LA    R10,49(,R8)                /* -> R10 AT RECORD FIELD  */
+MATCH1   CLC   0(3,R10),=C'ALL'           /* ALLOCATE TO EVERYONE ?  */
+         BE    PROCESS                    /* YES - GO PROCESS RECORD */
+         CLC   0(8,R10),RACFGRP           /* MATCH ON RACF GROUP ?   */
+         BE    PROCESS                    /* YES - GO PROCESS RECORD */
+         CLC   0(8,R10),USERID            /* MATCH ON USERID ?       */
+         BE    PROCESS                    /* YES - GO PROCESS RECORD */
+         LA    R10,10(,R10)               /* -> R10 AT NEXT FIELD    */
+         BCT   R11,MATCH1                 /* LOOP TIL MATCH OR NOT   */
+         CLI   0(R8),C'@'                 /* @ MEANS A DD CARD       */
+         BNE   LOOP                       /* GOTO READ NEXT RECORD   */
+*  IF NOT MEANT TO ALLOCATE THIS DD THEN READ UP TO NEXT DD *
+MATCH2   BAL   R10,READ                   /* GOSUB READ RECORD       */
+         CLI   0(R8),C'@'                 /* @ MEANS A DD CARD       */
+         BNE   MATCH2                     /* GOTO READ NEXT RECORD   */
+         B     MATCH                      /* GOTO CHECK NEW DD RECORD*/
+PROCESS  CLI   0(R8),C'@'                 /* @ MEANS A DD CARD       */
+         BNE   PRODSN                     /* GOTO PROCESS DSNAMES    */
+* SET UP THE TEXT UNIT FOR A DDNAME FROM THE FILE *
+         LA    R10,1(R8)                  /* POINT R10 AT DDNAME     */
+         LA    R7,0                       /* SET R7 COUNT TO 0       */
+         LA    R9,CONC2                   /* POINT R9 AT DDNAMES TAB */
+         TRT   0(9,R10),TRTAB             /* TRT TO FIND FIRST BLANK */
+         SR    R1,R10                     /* R1 NOW HAS LENGTH OF DDN*/
+         STH   R1,DDNAMEL1                /* SET UP LENGTH OF DDNAME */
+         STH   R1,DDNAMEL2                /* SET UP LENGTH OF DDNAME */
+         MVC   DDNAME,0(R10)              /* SET UP DDNAME FROM REC. */
+         MVC   CONC1,0(R10)               /* SET UP DDNAME FOR CONCAT*/
+         B     LOOP                       /* RETURN FOR NEXT RECORD  */
+* CHECK IF DS STARTS WITH &SYSUID AND IF SO CONVERT IT TO THE USERID *
+PRODSN   LA    R10,1(,R8)                 /* POINT R10 AT START OF DS*/
+         CLC   1(7,R10),=C'SYSUID.'       /* IS IT &SYSUID ?         */
+         BNE   PRODSN1                    /* NO - GO PROCESS NORMALLY*/
+         LA    R11,USERID                 /* POINT R11 AT USERID     */
+         TRT   USERID,TRTAB               /* TRT TO FIND FIRST BLANK */
+         SR    R1,R11                     /* R1 NOW HAS LENGTH OF ID */
+         LR    R11,R1                     /* PUT THIS IN R11         */
+         MVC   0(8,R10),USERID            /* PUT USERID IN DSN       */
+         LA    R10,1(,R8)                 /* POINT R10 AT UID ON REC */
+         AR    R10,R11                    /* POINT R10 AT END OF UID */
+         LA    R11,9(,R8)                 /* POINT R11 AT REST OF DSN*/
+         TRT   0(48,R11),TRTAB            /* TRT TO FIND FIRST BLANK */
+         SR    R1,R11                     /* R1 NOW HAS L OF REST DSN*/
+         LR    R2,R1                      /* PUT THIS IN R2          */
+         EX    R2,MVC1                    /* PUT DSN NEXT TO USERID  */
+* SET UP THE TEXT UNIT FOR A DSN FROM THE FILE *
+PRODSN1  LA    R10,1(R8)                  /* POINT R10 AT DSN        */
+         TRT   0(45,R10),TRTAB            /* TRT TO FIND NEXT BLANK  */
+         SR    R1,R10                     /* R1 NOW HAS LENGTH OF DSN*/
+         STH   R1,DSNL                    /* SET UP LENGTH OF DSN    */
+         MVC   DSN,0(R10)                 /* SET UP DSN FROM REC.    */
+         LA    R7,1(R7)                   /* ADD 1 TO R7 COUNT       */
+         CH    R7,=X'0001'                /* SEE IF > THAN 1         */
+         BNH   PRODSN2                    /* IF COUNT > 1 USE DUMMY  */
+* SET UP THE TEXT UNIT FOR A TEMPORARY DD TO BE CONCATENATED LATER *
+         LA    R10,3                      /* SET UP LENGTH OF DUMMYDD*/
+         STH   R10,DDNAMEL1               /* SET UP LENGTH OF DUMMYDD*/
+         MVC   DDNAME(3),0(R9)            /* SET UP DUMMYDD FROM TAB.*/
+         LA    R9,5(,R9)                  /* POINT TO NEXT ENTRY     */
+* SET UP THE SVC 99 TEXT UNIT PARAMETER LIST (POINTERS TO THE TU'S) *
+PRODSN2  LA    R6,DDNTU                   /* ADDR OF USER SUPPLIED TU*/
+         ST    R6,S99TUPTR                /* STORE ADDRESS IN TUP LST*/
+         LA    R5,S99TUPL+4               /* -> R5 AT NEXT TUP ENTRY */
+* UNALLOCATE THE DS YOU ARE ABOUT TO ALLOC TO BE ON THE SAFE SIDE *
+         LA    R6,UNALTU                  /* ADDR OF USER SUPPLIED TU*/
+         ST    R6,S99TUPTR                /* STORE ADDRESS IN TUP LST*/
+         LA    R6,S99TUPL+4               /* -> R6 BEYOND TUP ENTRY  */
+         USING S99TUNIT,R6                /* GET ADDRESSABILITY TO TU*/
+         OI    S99TUPTR,S99TUPLN          /* SET HIGH ORDER BIT      */
+         MVI   S99VERB,S99VRBUN           /* SET VERB CODE TO UNALLOC*/
+         L     R1,REQBLKP                 /* PUT ADDRESS OF RB IN R1 */
+         DYNALLOC                         /* ISSUE DYNALLOC SVC      */
+* SET UP THE REST OF THE TU'S FOR THE ALLOCATE PROPER *
+         CH    R7,=X'0001'                /* IF DUMMY DD ^ PERMANENT */
+         BH    PRODSN3                    /* SO SKIP THIS TEXT UNIT  */
+         LA    R6,PALTU                   /* ADDR OF USER SUPPLIED TU*/
+         ST    R6,S99TUPTR                /* STORE ADDRESS IN TUP LST*/
+         LA    R5,S99TUPL+4               /* -> R5 AT NEXT TUP ENTRY */
+PRODSN3  LA    R6,STATUSTU                /* ADDR OF USER SUPPLIED TU*/
+         ST    R6,S99TUPTR                /* STORE ADDRESS IN TUP LST*/
+         LA    R5,S99TUPL+4               /* -> R5 AT NEXT TUP ENTRY */
+         LA    R6,DSNTU                   /* ADDR OF USER SUPPLIED TU*/
+         ST    R6,S99TUPTR                /* STORE ADDRESS IN TUP LST*/
+         LA    R6,S99TUPL+4               /* -> R6 BEYOND TUP ENTRY  */
+         USING S99TUNIT,R6                /* GET ADDRESSABILITY TO TU*/
+         OI    S99TUPTR,S99TUPLN          /* SET HIGH ORDER BIT      */
+         MVI   S99VERB,S99VRBAL           /* SET VERB CODE TO ALLOC  */
+         L     R1,REQBLKP                 /* PUT ADDRESS OF RB IN R1 */
+         DYNALLOC                         /* ISSUE DYNALLOC SVC      */
+* CHECK DYNALLOC RET CODE AND PUT OUT ERROR IF REQUIRED *
+         CH    R15,=X'0000'               /* SEE IF NON-ZERO RC      */
+         BE    LOOP                       /* ALL OK - GO ON          */
+         MVI   ERRDY,C'A'                 /* ALLOCATE IN ERRMSG      */
+         BAL   R10,ERROR                  /* GOSUB ERROR MSG ROUTINE */
+* ON END OF FILE IF COUNT > 1 THEN CONCATENATE THE LAST SET OF DS'S *
+EOF      CH    R7,=X'0001'                /* SEE IF > THAN 1         */
+         BE    CLOSE                      /* NO - JUST QUIT          */
+         BAL   R10,CONCAT                 /* GO CONCAT LAST DD       */
+CLOSE    CLOSE (INDD,),MF=(E,OPEN)        /* CLOSE INPUT FILE        */
+EXIT     PR                               /* PROGRAM RETURN          */
+* PUT OUT ERROR MESSAGE IF OPEN FILE FAILED  *
+OPENERR  LA    R11,ERROPENE-ERROPENS      /* LENGTH OF OUTPUT        */
+         TPUT  ERROPEN,(R11)              /* WRITE ERROR MESSAGE     */
+         B     EXIT                       /* END PROGRAM             */
+* PUT OUT ERROR MESSAGE IF DYNALLOC FAILED  *
+ERROR    MVC   ERR+2(2),S99ERROR          /* PUT ERROR CODE IN ERR   */
+         L     R11,ERR                    /* PUT ERROR CODE IN R10   */
+         CVD   R11,DOUBLE                 /* CONVERT TO DECIMAL      */
+         OI    DOUBLE+7,X'0F'             /* SET SIGN                */
+         UNPK  ERRRC,DOUBLE+4(4)          /* MAKE IT CHARACTER       */
+         MVC   ERR+2(2),S99INFO           /* PUT INFO CODE IN ERR    */
+         L     R11,ERR                    /* PUT INFO CODE IN R10    */
+         CVD   R11,DOUBLE                 /* CONVERT TO DECIMAL      */
+         OI    DOUBLE+7,X'0F'             /* SET SIGN                */
+         UNPK  ERRINFO,DOUBLE+4(4)        /* MAKE IT CHARACTER       */
+         MVC   ERRDD,DDNAME               /* PUT IN THE DDNAME       */
+         LA    R11,ERRMSGE-ERRMSGS        /* LENGTH OF OUTPUT        */
+         TPUT  ERRMSG,(R11)               /* WRITE ERROR MESSAGE     */
+         BR    R10                        /* RETURN                  */
+* READ NEXT REC. IF DD TYPE THEN GO CONCATENATE ALREADY ALLOCATED DS'S*
+*                READ NEXT RECORD IF COMMENT FOUND                    *
+READ     GET   INDD                       /* R1 POINTS TO RECORD AREA*/
+         LR    R8,R1                      /* POINT R8 AT RECORD AREA */
+         CLI   0(R8),C'*'                 /* * MEANS A COMMENT CARD  */
+         BE    READ                       /* RETURN FOR NEXT RECORD  */
+         CLI   0(R8),C'@'                 /* CHECK FOR A DDCARD      */
+         BNER  R10                        /* NO - RETURN             */
+         CH    R7,=X'0001'                /* CONCAT REQUIRED IF > 1  */
+         BNHR  R10                        /* NO - RETURN             */
+* CONCATENATE ALREADY ALLOCATED DATASETS USING CONC TEXT UNIT *
+CONCAT   ST    R10,SAVER10                /* SAVE R10                */
+         MVI   S99VERB,S99VRBCC           /* SET VERB CODE TO CONCAT */
+         MVC   CONCTU(6),@ONCTU           /* INIT CONCTU FIELDS      */
+         STH   R7,CONCN                   /* NUMBER OF DDS TO CONCAT */
+         L     R5,S99TXTPP                /* POINT R5 AT START OF TUP*/
+         LA    R11,CONC1                  /* POINT R11 AT DDNAME     */
+         MVC   CONCL1,DDNAMEL2            /* PUT DDNAME LENGTH IN TU */
+         LH    R10,DDNAMEL2               /* PUT DDNAME LENGTH IN R10*/
+         LA    R11,8                      /* MAX DDNAME LENGTH IN R11*/
+         SR    R11,R10                    /* CALCULATE OFFSET        */
+         LA    R10,CONCTU                 /* MOVE FROM HERE          */
+         AR    R10,R11                    /* MOVE TO HERE            */
+         MVC   SAVEDD,CONCTU              /* SAVE FIRST 14 OF CONCTU */
+         LA    R11,SAVEDD                 /* MOVE FROM HERE          */
+         LH    R6,DDNAMEL2                /* PUT DDNAME LENGTH IN R6 */
+         LA    R6,5(,R6)                  /* PUT CONCTU LENGTH IN R6 */
+         EX    R6,MVC1                    /* MOVE UP CONCTU          */
+         ST    R10,S99TUPTR               /* STORE ADDRESS IN TUP LST*/
+         OI    S99TUPTR,S99TUPLN          /* SET HIGH ORDER BIT      */
+         LA    R7,0                       /* RESET R7 COUNT TO 0     */
+         L     R10,SAVER10                /* RESTORE R10             */
+         L     R1,REQBLKP                 /* PUT ADDRESS OF RB IN R1 */
+         DYNALLOC                         /* ISSUE DYNALLOC SVC      */
+         CH    R15,=X'0000'               /* SEE IF NON-ZERO RC      */
+         BER   R10                        /* ALL OK - RETURN         */
+         MVI   ERRDY,C'C'                 /* CONCAT IN ERRMSG        */
+         BAL   R10,ERROR                  /* GOSUB ERROR MSG ROUTINE */
+         L     R10,SAVER10                /* RESTORE R10             */
+         BR    R10                        /* RETURN                  */
+* END OF EXECUTABLE CODE *
+* CONSTANTS *
+MVC1     MVC   0(0,R10),0(R11)
+RBLEN    EQU   (S99RBEND-S99RB)
+         DS    0H
+PALTU    DC    AL2(DALPERMA)
+         DC    X'0000'
+         DS    0H
+UNALTU   DC    AL2(DUNUNALC)              USER TEXT UNITS
+         DC    X'0000'
+ERROPENS EQU   *
+ERROPEN  DC    C'DYN001 - ERROR OPENING INPUT FILE'
+ERROPENE EQU   *
+* INITIALIZED FIELDS TO BE MOVED TO GETMAINED STORAGE *
+*              DCBS                         *
+WORK1    EQU   WORKL2-*
+@PEN     DC    F'0'
+@NDD     DCB   DDNAME=SVC99IN,MACRF=GL,EODAD=EOF,DSORG=PS,             X
+               EROPT=ABE
+         DS    0H
+@SNTU    DC    AL2(DALDSNAM)
+         DC    X'0001'
+@SNL     DC    X'000F'
+@SN      DC    CL44'WZ005.TSO.CLIST'
+         DS    0H
+@TATUSTU DC    AL2(DALSTATS)
+         DC    X'0001'
+         DC    X'0001'
+         DC    X'08'
+         DS    0H
+@DNTU    DC    AL2(DALDDNAM)
+         DC    X'0001'
+@DNAMEL  DC    X'0002'
+@DNAME   DC    CL8'DDNAME  '
+WORKL2   EQU   *
+WORKL3   EQU   WORKL4-*
+         DS    0H
+@ONCTU   DC    AL2(DCCDDNAM)
+@ONCN    DC    X'0001'
+@ONCL1   DC    X'0008'
+@ONC1    DC    CL8'DDNAME  '
+@ONCL2   DC    X'0003'
+@ONC2    DC    CL3'D@1'
+@ONCL3   DC    X'0003'
+@ONC3    DC    CL3'D@2'
+@ONCL4   DC    X'0003'
+@ONC4    DC    CL3'D@3'
+@ONCL5   DC    X'0003'
+@ONC5    DC    CL3'D@4'
+@ONCL6   DC    X'0003'
+@ONC6    DC    CL3'D@5'
+@ONCL7   DC    X'0003'
+@ONC7    DC    CL3'D@6'
+@ONCL8   DC    X'0003'
+@ONC8    DC    CL2'D@7'
+@ONCL9   DC    X'0003'
+@ONC9    DC    CL3'D@8'
+@ONCLA   DC    X'0003'
+@ONCA    DC    CL3'D@9'
+@ONCLB   DC    X'0003'
+@ONCB    DC    CL3'D@A'
+@ONCLC   DC    X'0003'
+@ONCC    DC    CL3'D@B'
+@ONCLD   DC    X'0003'
+@ONCD    DC    CL3'D@C'
+@ONCLE   DC    X'0003'
+@ONCE    DC    CL3'D@D'
+@ONCLF   DC    X'0003'
+@ONCF    DC    CL3'D@E'
+@ONCLG   DC    X'0003'
+@ONCG    DC    CL3'D@F'
+@RR      DS    F'00'
+@RRMSGS  EQU   *
+@RRMSG   DS    0CL1
+@RRDY    DC    C' '
+         DC    C' DYNALLOC REASON CODE = '
+@RRRC    DC    C'    '
+         DC    C' (DEC) INFO CODE = '
+@RRINFO  DC    C'    '
+         DC    C' FOR DDNAME '
+@RRDD    DC    C'        '
+@RRMSGE  EQU   *
+WORKL4   EQU   *
+         LTORG
+* DSECT FOR WORKING STORAGE - MUST MATCH "INITIALIZED FIELDS" ABOVE  *
+WORKAREA DSECT
+*              DCBS                                                  *
+OPEN     DS    F
+INDD     DCB   DDNAME=SVC99IN,MACRF=GL,EODAD=EOF,DSORG=PS,             X
+               EROPT=ABE
+         DS    0H
+DSNTU    DS    AL2(DALDSNAM)
+         DS    X'0001'
+DSNL     DS    X'000F'
+DSN      DS    CL44'WZ005.TSO.CLIST'
+         DS    0H
+STATUSTU DS    AL2(DALSTATS)
+         DS    X'0001'
+         DS    X'0001'
+         DS    X'08'
+         DS    0H
+DDNTU    DS    AL2(DALDDNAM)
+         DS    X'0001'
+DDNAMEL1 DS    X'0002'
+DDNAME   DS    CL8'DDNAME '
+         DS    0H
+CONCTU   DS    AL2(DCCDDNAM)
+CONCN    DS    X'0001'
+CONCL1   DS    X'0008'
+CONC1    DS    CL8'DDNAME '
+CONCL2   DS    X'0003'
+CONC2    DS    CL3'D@1'
+CONCL3   DS    X'0003'
+CONC3    DS    CL3'D@2'
+CONCL4   DS    X'0003'
+CONC4    DS    CL3'D@3'
+CONCL5   DS    X'0003'
+CONC5    DS    CL3'D@4'
+CONCL6   DS    X'0003'
+CONC6    DS    CL3'D@5'
+CONCL7   DS    X'0003'
+CONC7    DS    CL3'D@6'
+CONCL8   DS    X'0003'
+CONC8    DS    CL3'D@7'
+CONCL9   DS    X'0003'
+CONC9    DS    CL3'D@8'
+CONCLA   DS    X'0003'
+CONCA    DS    CL3'D@9'
+CONCLB   DS    X'0003'
+CONCB    DS    CL3'D@A'
+CONCLC   DS    X'0003'
+CONCC    DS    CL3'D@B'
+CONCLD   DS    X'0003'
+CONCD    DS    CL3'D@C'
+CONCLE   DS    X'0003'
+CONCE    DS    CL3'D@D'
+CONCLF   DS    X'0003'
+CONCF    DS    CL3'D@E'
+CONCLG   DS    X'0003'
+CONCG    DS    CL3'D@F'
+ERR      DS    F'00'
+ERRMSGS  EQU   *
+ERRMSG   DS    0CL1
+ERRDY    DS    C' '
+         DS    C' DYNALLOC REASON CODE = '
+ERRRC    DS    C'    '
+         DS    C' (DEC) INFO CODE = '
+ERRINFO  DS    C'    '
+         DS    C' FOR DDNAME '
+ERRDD    DS    C'        '
+ERRMSGE  EQU   *
+* UNINITIALIZED FIELDS IN GETMAINED STORAGE                          *
+SAVEDD   DS    CL14
+SAVER10  DS    F
+REQBLKP  DS    F
+DDNAMEL2 DS    H
+USERID   DS    CL8'         '
+RACFGRP  DS    CL8'         '
+DOUBLE   DS    D'00'
+TRTAB    DS    XL256'00'
+         DS    F
+* MACROS    *
+         IEFZB4D0                         /*                        */
+         IEFZB4D2                         /*                        */
+         IHAASCB                          /*                        */
+         IHAASXB                          /*                        */
+         CVT DSECT=YES,LIST=YES           /*                        */
+         IHAACEE
+         END
+
+
+D H Rees
+Systems Programmer (UK) © Xephon 1989
+
+

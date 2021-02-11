@@ -1,0 +1,1491 @@
+SUBMITC  TITLE 'Submit (with Class!) ISPF edit Macro'
+*======================================================================
+*
+* Name: SUBMITC
+*
+* Author: David Alcock :: dave@planetmvs.com
+*
+* Purpose: Edit macro that submits the member (or selected lines).
+*          and does inserts of passwords and translates of system
+*          symbolics.  See $README member for more info.
+*
+*   Note: SUBMITC is NOT robust.  It was designed for specific
+*         types of jobstreams, not every possibility is supported.
+*         Your mileage may vary.
+*
+*
+* Attributes: Reentrant, Reusable, Non-Authorized.
+*
+* Restrictions:
+* o Assembler: HLASM R1 or higher
+* o Program SUBMITC needs to be in the normal module search order
+* o Panel SUBMITCP needs to be in the normal panel search order
+* o Job streams of the format we support
+* o Job streams currently must be in LRECL=F datasets.
+*
+*
+* Disclaimer: This program is FREEWARE.  Use at your own risk.  It
+*             is provided for your enjoyment and neither David
+*             Alcock or his employer provides any warranty for it's
+*             use.  I'd like to hear how it works on your system.
+*
+*             This software is not in the public domain but is
+*             available free of charge and with source code provided.
+*             It is copyright 2002+ by David Alcock.
+*             All rights reserved.
+*
+*======================================================================
+
+*======================================================================
+*
+*             M o d i f i c a t i o n   H i s t o r y
+*
+* Person     Date       Ver Description
+* ---------- ---------- --- -------------------------------------------
+* DGAlcock   2002-02-15 1.1 Added System Symbol processing;
+* DGAlcock   2002-02-06 1.0 Initial program completed;
+*
+*======================================================================
+
+* IBM macros
+
+ PRINT NOGEN
+ IHAPDS PDSBLDL=NO                      PDS Directory entry (for bldl)
+ IFGRPL ,                               Request Parameter List
+ IFGACB ,                               Access Control Block
+ YREGS ,                                Equate Registers
+ IEFZB4D0 ,                             SVC 99 - RB
+ IEFZB4D2 ,                             SVC 99 - Text Equates
+ IHAPSA ,                               Prefixed Save Area
+ IHAASCB ,                              Address Space Control Block
+ IHAASSB ,                              Address Space Secondary Block
+ IAZJSAB ,                              Job Schedular Addr Spc CB
+ IHASDWA ,                              System Diagnostic Work Area
+ ASASYMBP ,                             Mapping of SYMBP area
+ PRINT GEN
+
+* Change assembly date format ccyymmdd to ccyy-mm-dd
+
+ LCLC  &ASMDATE
+&ASMDATE SETC  '&SYSDATC'(1,4).'-'.'&SYSDATC'(5,2).'-'.'&SYSDATC'(7,2)
+
+***********************************************************************
+***
+**       Module initialization
+***
+***********************************************************************
+
+SUBMITC CSECT ,
+SUBMITC AMODE 31
+SUBMITC RMODE ANY
+
+* Standard O/S eyecatcher
+
+Main_EC  b    Main_ECL(0,R15)           Bump past EyeCatcher
+         dc   AL1(Main_ECE-Main_ECV)    Length of eyecatcher
+Main_ECV dc   C'SUBMITC &ASMDATE &SYSTIME - '
+         dc   C'Submit (with Class!) ISPF edit macro'
+Main_ECE equ  *
+         ds   0h
+Main_ECL equ  *-Main_EC
+
+* Standard ESA entry housekeeping code
+
+ bakr  R14,0                    Save registers
+ lae   R12,0(R15,0)             Get base register
+ lae   R11,2048(,R12)           Set up for second base reg
+ la    R11,2048(,R11)           Locate 4096 past R12
+ lae   R10,2048(,R11)           Set up for third base reg
+ la    R10,2048(,R10)           Locate 4096 past R11
+ USING SUBMITC,R12,R11,R10      Set module base
+
+* Obtain Dynamic Save Area (so we can be reentrant)
+
+ STORAGE OBTAIN,LENGTH=WORKDSL,LOC=BELOW Obtain storage
+ lr    R13,R1                           Point to Save Area
+
+ LR    R14,R13                          To: Address
+ L     R15,=A(WORKDSL)                  To: Length
+ SLR   R1,R1                            From: Set length and pad
+ MVCL  R14,R0                           Zero out area
+
+ mvc   4(4,R13),=C'F1SA'                Indicate stack SA
+ USING WORKDS,R13                       Get addressibility to area
+ mvc   pl_jobname(8),=8c'?'             Jobname not found yet...
+ mvc   FLAG_LIT(4),=c'FLGS'             Initialize eyecatcher
+
+***********************************************************************
+***
+** Establish our ESTAE routine.  The last thing we want to do is
+** to have someone lose work because of a programming problem here.
+***
+***********************************************************************
+
+ MVC   PARMLIST(c_ESTAEl),c_ESTAE       Initlialize parameter list
+ MVC   EWA_ID(4),=CL4'EWA'              Eyecatcher
+ STM   R10,R13,EWA_Regs                 Save important registers
+ LA    R1,E$Retry                       Locate retry recovery routine
+ ST    R1,EWA_RetryA                    Save it
+ L     R7,=V(SUBMITCE)                  Locate ESTAE routine
+ LA    R8,EWA                           Locate EWA
+ ESTAE (7),CT,                          Create ESTAE environment       @
+               PARAM=((8)),             ..Parameter passed to ESTAE    @
+               MF=(E,PARMLIST)
+ oi    flag1,$f1_ESTAE                  We be set
+
+***********************************************************************
+***
+**       Ensure we are in a proper ISPF environment
+***
+***********************************************************************
+
+* Are ISPF services available?
+
+ LINK  EP=ISPQRY,ERRET=E$IQRYE          Query ISPF environment
+ ltr   r15,r15                          ISPF environment okay?
+ bnz   E$NISPF                          Nope...
+
+* Obtain the ISPF interface module
+
+ la    r1,=CL8'ISPLINK'                 Locate module name
+ bas   r14,Find_LPA_Module              See if in the JPA/LPA
+ ltr   r15,r15                          Found?
+ bnz   I$ILINKB                         No, need BLDL
+ oi    flag1,$f1_isplinkl               Yes, set "Found in LPA" flag
+ b     I$ILINKS                         Continue with EPA in R0
+I$ILINKB ds 0h
+ la    r1,=CL8'ISPLINK'                 Locate module name
+ bas   r14,ISSUE_BLDL                   Issue the BLDL
+ ltr   r15,r15                          Is it available
+ bnz   E$ILINKB                         No, gripe about it
+ LOAD  DE=BLDLA_ENTRY,ERRET=E$ILINKL    Load into storage
+I$ILINKS DS    0H
+ st    r0,EP_ISPLINK                    Save entry point
+
+***********************************************************************
+***
+**       Start off the edit macro
+***
+***********************************************************************
+
+* Define the fields to get the edit macro parms
+
+ mvi   eparm,c' '
+ mvc   eparm+1(l'eparm-1),eparm
+
+ LA    R14,L'EPARM
+ ST    R14,DOUBLE2
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',                                            @
+               =C'(EPARM)',                                            @
+               EPARM,                                                  @
+               =CL8'CHAR',                                             @
+               DOUBLE2),                                               @
+               VL,MF=(E,PARMLIST)
+
+* Let ISPF know we are an Edit Macro
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',                                            @
+               =F'0',                                                  @
+               =C'% MACRO (EPARM) NOPROCESS %'),                       @
+               VL,MF=(E,PARMLIST)
+ ltr   r15,r15
+ bz    I$MACX
+ lr    r3,r15                     Save return code
+
+ bas   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ mvc   0(MSG4SL,R14),MSG4S
+ mvc   0(MSG4LL,R15),MSG4L
+ la    R15,MSG4LL(R15)
+ lr    R1,R3
+ bas   R9,EDITFWF
+ la    R8,MSG4SL                        Short message length
+ bas   R9,Set_ISPF_Message              Set the message up
+ b     Exit
+I$MACX ds 0h
+
+* Here we could do something with EPARM
+
+ mvi   lineval,c' '
+ mvc   lineval+1(l'eparm-1),lineval
+ oc    eparm(l'eparm),lineval           Fold to uppercase
+ CLC   EPARM(3),=C'SYM'
+ BNE   I$PARMX
+ oi    flag2,$f2_Symbols                turn on symbols
+I$PARMX ds 0h
+
+* Tell ISPF to return errors to us
+
+ l     r15,EP_ISPLINK                   -> EPA ISPLINK
+ CALL  (15),(=CL8'CONTROL',               Service: CONTROL             @
+               =CL8'ERRORS',              ..errors                     @
+               =CL8'RETURN'),             ..return to us               @
+               VL,MF=(E,PARMLIST)         ..Execute from here
+
+***********************************************************************
+***
+**       Get the line start and end range
+***
+***********************************************************************
+
+
+* Define the line current, start, end and value variables
+
+ LA    R1,L'LINEC
+ ST    R1,DOUBLE
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',=C'(LINEC)',                                @
+               LINEC,=CL8'FIXED',DOUBLE),VL,MF=(E,PARMLIST)
+*
+ LA    R1,L'LINES
+ ST    R1,DOUBLE
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',=C'(LINES)',                                @
+               LINES,=CL8'FIXED',DOUBLE),VL,MF=(E,PARMLIST)
+*
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',=C'(LINEE)',                                @
+               LINEE,=CL8'FIXED',DOUBLE),VL,MF=(E,PARMLIST)
+*
+ LA    R1,L'LINEVAL
+ ST    R1,DOUBLE
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',=C'(LINEVAL)',                              @
+               LINEVAL,=CL8'CHAR',DOUBLE),VL,MF=(E,PARMLIST)
+ MVI   LINEVAL,C' '
+ MVC   LINEVAL+1(L'LINEVAL-1),LINEVAL
+
+* Save current line location
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% (LINEC) = LINENUM .ZCSR %'),                       @
+               VL,MF=(E,PARMLIST)
+
+* Process range S
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% PROCESS RANGE S %'),                               @
+               VL,MF=(E,PARMLIST)
+ LTR   R15,R15
+ BZ    I$LINESS
+ CH    R15,=H'4'                        RC Higher than 4?
+ BH    EXIT                             Yes, let ISPF issue err msg
+
+* SS-SS range was not given - use whole edit file (.ZFIRST - .ZLAST)
+
+*-> OI    flag1,$f1_wholefile      May need this later...
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% (LINES) = LINENUM .ZFIRST %'),                     @
+               VL,MF=(E,PARMLIST)
+*
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% (LINEE) = LINENUM .ZLAST %'),                      @
+               VL,MF=(E,PARMLIST)
+*
+ LM    R0,R1,LINES                      Get line start and end
+ AR    R0,R1                            Add 'em together
+ BNZ   I$LINEX                          Okay: not zero
+ BAS   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ MVC   0(MSG5LL,R15),MSG5L
+ LA    R15,MSG5LL(R15)                  Locate to end of long message
+ LA    R8,0                             Short message length
+ BAS   R9,Set_ISPF_Message              Set the message up
+ B     EXIT                             Give up
+
+* Grab the starting and ending lines of the ones selected
+
+I$LINESS DS    0H
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% (LINES) = LINENUM .ZFRANGE %'),                    @
+               VL,MF=(E,PARMLIST)
+*
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',=F'0',                                      @
+               =C'% (LINEE) = LINENUM .ZLRANGE %'),                    @
+               VL,MF=(E,PARMLIST)
+I$LINEX  DS    0H
+
+***********************************************************************
+***
+**  Dynamically allocate the INTRDR
+***
+***********************************************************************
+
+* Format the SVC 99 Request Block
+
+         LA    R4,da_s99rb                Get address of work area
+         xc    0(l'da_s99rb,r4),0(r4)     initialize to binary zeros
+         ST    R4,DOUBLE                  Save address
+         OI    DOUBLE,S99RBPND            Indicate last one
+*        XC    0(S99RBEND-S99RB,R4),0(R4) Clear Request Block area
+         MVI   S99RBLN-S99RB(R4),S99RBEND-S99RB Length of REQUEST BLK
+         LA    R5,S99RBEND-S99RB(R4)      Locate Text Units Pointers
+         ST    R5,S99TXTPP-S99RB(R4)      STORE ADDR OF Text Unit PTRs
+         LA    R6,20(R5)    5*4=20        Bump past Text pointers
+         MVI   S99VERB-S99RB(R4),S99VRBAL    Verb = ALLOCATE
+
+* The address of each of the text Units will be stored in the
+* request block text PTR area as they are being defined,
+* Active registers are: R5 - Address in text unit pointers
+*                       R6 - Address in text unit define area
+
+***-(1)---------------------------------- DDNAME=
+         ST    R6,0(R5)                     Save Address of Text Unit
+         LA    R5,L'S99TUPTR(R5)            Bump to next entry
+*
+         LA    R14,DALRTDDN                 Generate Key Value
+         STH   R14,S99TUKEY-S99TUNIT(R6)    Store Key
+         LA    R14,1                        Number of entries
+         STH   R14,S99TUNUM-S99TUNIT(R6)    Store Number
+         LA    R14,8                        Length of First Entry
+         STH   R14,S99TULNG-S99TUNIT(R6)    Store Length
+         LA    R1,S99TUPAR-S99TUNIT(R6)     Locate DDNAME
+         ST    R1,da_ddname                 Save Addr: Returned DDNAME
+*
+         LA    R6,S99TUPAR-S99TUNIT+8(R6)   Bump past this Text Unit
+***-(2)---------------------------------- SYSOUT=A
+         ST    R6,0(R5)                     Save Address of Text Unit
+         LA    R5,L'S99TUPTR(R5)            Bump to next entry
+*
+         LA    R14,DALSYSOU                 Generate Key Value
+         STH   R14,S99TUKEY-S99TUNIT(R6)    Store Key
+         LA    R14,1                        Number of entries
+         STH   R14,S99TUNUM-S99TUNIT(R6)    Store Number
+         LA    R14,1                        Length of First Entry
+         STH   R14,S99TULNG-S99TUNIT(R6)    Store Length
+         MVI   S99TUPAR-S99TUNIT(R6),C'A'   SYSOUT=A
+*
+         LA    R6,S99TUPAR-S99TUNIT+2(R6)   Bump past this Text Unit
+***-(3)---------------------------------- Program name
+         ST    R6,0(R5)                     Save Address of Text Unit
+         LA    R5,L'S99TUPTR(R5)            Bump to next entry
+*
+         LA    R14,DALSPGNM                 Generate Key Value
+         STH   R14,S99TUKEY-S99TUNIT(R6)    Store Key
+         LA    R14,1                        Number of entries
+         STH   R14,S99TUNUM-S99TUNIT(R6)    Store Number
+         LA    R14,6                        Length of First Entry
+         STH   R14,S99TULNG-S99TUNIT(R6)    Store Length
+         MVC   S99TUPAR-S99TUNIT(8,R6),=C'INTRDR  '
+*
+         LA    R6,S99TUPAR-S99TUNIT+8(R6)   Bump past this Text Unit
+***-(4,LAST) ---------------------------- Free=close
+         ST    R6,0(R5)                     Save Address of Text Unit
+         OI    S99TUPTR-S99TUPL(R5),S99TUPLN End of parm indication
+         LA    R5,L'S99TUPTR(R5)            Bump to next entry
+*
+         LA    R14,DALCLOSE                 Generate Key Value
+         STH   R14,S99TUKEY-S99TUNIT(R6)    Store Key
+         LA    R14,0                        Number of entries
+         STH   R14,S99TUNUM-S99TUNIT(R6)    Store Number
+         LA    R14,0                        Length of First Entry
+         STH   R14,S99TULNG-S99TUNIT(R6)    Store Length
+*
+         LA    R6,S99TUPAR-S99TUNIT+2(R6)   Bump past this Text Unit
+***-------------------------------------- Complete and make request
+ LA    R1,DOUBLE                        Get address of Request BLK
+ DYNALLOC ,                             Invoke SVC 99
+ LTR   R15,R15
+ BZ    DA$X
+
+ LR    R4,R15                           Save DYNALLOC RC
+ bas   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ mvc   0(MSG11LL,R15),MSG11L
+ la    R15,MSG11LL(R15)
+ lr    R1,R4
+ bas   R9,EDITFWF
+ MVC   0(11,R15),=C', S99ERROR='
+ LA    R15,11(R15)
+ LA    R14,da_s99rb                     Get address of work area
+ UNPK  0(5,R15),S99ERROR-S99RB(3,R14)
+ MVZ   0(4,R15),=8X'00'
+ TR    0(4,R15),=C'0123456789ABCDEF'
+ LA    R15,4(R15)
+ MVC   0(10,R15),=C', S99INFO='
+ LA    R15,10(R15)
+ UNPK  0(5,R15),S99INFO-S99RB(3,R14)
+ MVZ   0(4,R15),=8X'00'
+ TR    0(4,R15),=C'0123456789ABCDEF'
+ LA    R15,4(R15)
+ la    R8,0                             Short message length = 0
+ bas   R9,Set_ISPF_Message              Set the message up
+ b     exit
+
+DA$X DS 0h
+
+*la r15,parmlist                               BOZO
+*mvc 0(23,r15),=c'INTRDR allocated to dd='     BOZO
+*l  r1,da_ddname                               BOZO
+*mvc 23(8,r15),0(r1)                           BOZO
+*TPUT parmlist,23+8                            BOZO
+
+***********************************************************************
+***
+**       Open the ACB and ready the RPL
+***
+***********************************************************************
+
+Open_ACB ds 0h
+
+ la    R3,rr_ACB                        Locate ACB in Dynamic Save Area
+ mvc   0(c_acbl,R3),c_acb               Initialize ACB
+ l     r1,da_ddname                     Locate ddname from dynalloc
+ mvc   acbddnm-ifgacb(8,r3),0(r1)       Get ddname from dynamic alloc
+
+ mvc   PARMLIST(c_openol),c_openo       Get open parameter list
+ OPEN  ((3),(OUTPUT)),MF=(E,PARMLIST)   Open the ACB
+ ltr   R15,R15                          Okay?
+ bz    oa$openx                         Yep, continue
+ lr    r4,r15                           Save open return code
+
+ bas   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ mvc   0(MSG10SL,R14),MSG10S
+ mvc   0(MSG10LL,R15),MSG10L
+ la    R15,MSG10LL(R15)
+ lr    R1,R4
+ bas   R9,EDITFWF
+ la    R8,MSG4SL                        Short message length
+ bas   R9,Set_ISPF_Message              Set the message up
+ b     exit
+
+oa$openx ds    0h
+
+ LA    R4,rr_RPL                        Locate RPL in Dynamic Save Area
+ MVC   0(c_rpll,r4),c_rpl               Initialize RPL
+ st    r3,RPLDACB-IFGRPL(R4)            Save address of ACB
+ la    R1,LINEVAL                       Locate record area
+ st    r1,RPLAREA-IFGRPL(R4)            Save address of record
+
+***********************************************************************
+***
+**  Read all lines selected via " (LINEVAL) = LINE # " ISREDIT calls
+***
+***********************************************************************
+
+Read_Records ds 0h
+
+ MVC   ISREDITC(19),=C'% (LINEVAL) = LINE ' Initialize line
+ L     R4,LINES                         Get starting line to process
+ LA    R5,1                             On relative line 1 to start
+
+RR$L ds 0h
+
+ lr    r1,r4                            Get line number into good reg
+ LA    R15,ISREDITC+19                  Locate place in string for num
+ BAS   R9,EDITNCF                       Edit number without commas
+ MVC   0(2,R15),=C' %'                  Set trailing stuff
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ISREDIT',                                            @
+               =F'0',                                                  @
+               ISREDITC),               "(LINEVAL) = LINE #"           @
+               VL,MF=(E,PARMLIST)
+ ltr   R15,R15
+ bz    RR$glx
+ lr    r8,r15
+ LA    R15,ZEDLMSG
+ mvi   0(r15),c' '
+ mvc   1(l'zedlmsg-1,r15),0(r15)
+ mvc   0(27,r15),=c'Line obtain failed with RC='
+ la    r15,27(r15)
+ lr    r1,r8
+ bas   r9,editfwf
+ mvc   0(23,r15),=c', Hit enter to continue'
+ TPUT  zedlmsg,79
+ TGET  double,1
+ b     RR$LX
+rr$glx ds 0h
+
+ CLC   LINEVAL(71),=CL71'// '           End of the line
+ BE    RR$LX
+
+ BAS   R14,Process_Line                 Process the line
+
+ PUT   RPL=RR_RPL                       Write the record
+ LTR   R15,R15                          Any errors?
+ BZ    RR$LB                            Yes, goto error routine
+
+ lr    r8,r15
+ LA    R15,ZEDLMSG
+ mvi   0(r15),c' '
+ mvc   1(l'zedlmsg-1,r15),0(r15)
+ mvc   0(20,r15),=c'PUT RPL suffered RC='
+ la    r15,20(r15)
+ lr    r1,r8
+ bas   r9,editfwf
+ mvc   0(11,r15),=c', feedback='
+ la    r15,11(r15)
+ unpk  0(9,r15),rr_RPL+(RPLFDBWD-IFGRPL)(5)
+ mvz   0(8,r15),=8x'00'
+ tr    0(8,r15),=c'0123456789ABCDEF'
+ la    r15,8(r15)
+ la    r1,zedlmsg
+ lr    r15,r1
+ lr    r0,r15
+ TPUT  (1),(0)
+ mvc   parmlist(21),=c'Hit Enter to continue'
+ TPUT  PARMLIST,21
+ TGET  double,1
+ b     RR$LX
+
+RR$LB ds 0h
+ la    r5,1(r5)                         Increment the relative line
+ la    r4,1(r4)                         Increment the selected line
+ c     r4,LINEE                         Still in line range?
+ BNH   RR$L                             Yeppers!
+
+* Read of lines is complete
+
+RR$LX  DS 0h
+
+***********************************************************************
+***
+**   All good things must come to an end
+***
+***********************************************************************
+
+Bring_It_On_Home ds 0h
+
+* Ensure that we wrote at least one record out
+
+ c     r5,=f'1'                         Did we write one record out
+ bh    bioh$ok                          Yep, continue
+
+ bas   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ mvc   0(MSG13LL,R15),MSG13L
+ la    R15,MSG13LL(R15)
+ la    R8,0                             Short message length = 0
+ bas   R9,Set_ISPF_Message              Set the message up
+ b     bioh$x
+bioh$ok ds 0h
+
+* Write out the traditional End Of File statement
+
+ mvc   LINEVAL(80),=CL80'/*EOF'
+ PUT   RPL=RR_RPL
+
+* Try to obtain the JOB ID (will go to RPLRBAR if successful)
+
+ ENDREQ RPL=RR_RPL                      Try to get the job number
+ ltr   r15,r15                          Well?
+ bz    bioh$erx                         no, just continue
+ MVC   RR_RPL+(RPLRBAR-IFGRPL)(8),=8c'?' Things got out of hand
+bioh$erx ds 0h
+
+* Boast of our success
+
+ bas   R9,Initialize_ISPF_Message       Init msgs R14=short R15=long
+ mvc   0(MSG12LL,R15),MSG12L
+ mvc   MSG12ln-msg12l(l'msg12ln,r15),pl_jobname Insert jobname
+ MVC   msg12li-msg12l(l'msg12li,r15),RR_RPL+(RPLRBAR-IFGRPL) Jobid
+ l     r1,PSAAOLD-PSA                   -> ASCB
+ l     r1,ASCBASSB-ASCB(,r1)            -> ASSB
+ icm   r14,b'1111',ASSBJSAB-ASSB(r1)    -> JSAB
+ bz    bioh$jesx                        I'll be a monkey's uncle
+ mvc   msg12lj-msg12l(l'msg12lj,r15),JSABSCID-JSAB(R14) JES2/JES3
+bioh$jesx ds 0h
+ la    R15,MSG12LL+1(R15)               Bump past the fixed msg area
+ l     r1,pfp_updated                   Get updated line count
+ bas   r9,editfwf                       Edit it
+ clc   pfp_updated(4),=f'1'             Let's use gooder english...
+ be    bioh$l1
+ mvc   1(5,r15),=c'lines'               Complete the message
+ la    r15,6(r15)                       Bump past it
+ b     bioh$l1x
+bioh$l1 ds 0h
+ mvc   1(4,r15),=c'lines'               Complete the message
+ la    r15,5(r15)                       Bump past it
+bioh$l1x ds 0h
+ la    R8,0                             Short message length = 0
+ bas   R9,Set_ISPF_Message              Set the message up
+
+bioh$x ds 0h
+
+***********************************************************************
+***
+**       Termination
+***
+***********************************************************************
+         SPACE 2
+Exit ds 0h
+
+* Turn off ESTAE if on
+
+ tm    flag1,$f1_ESTAE                  Estae on?
+ bno   x$ESTAEx                         Nope...
+ ESTAE 0                                Turn off ESTAE processing
+x$ESTAEx ds 0h
+
+* Delete ASASYMBM from storage if loaded
+
+ icm   r0,b'1111',ep_ASASYMBM
+ bz    x$DSx
+ DELETE EPLOC==CL8'ASASYMBM'
+x$DSx ds 0h
+
+* Close file (if open)
+
+ la    r3,rr_ACB                        Locate the ACB
+ tm    ACBOFLGS-IFGACB(R3),ACBOPEN      ACB is open?
+ bno   x$CLOSEx
+ mvc   PARMLIST(c_closel),c_close       Initialize parameter list
+ CLOSE ((3)),MODE=31,MF=(E,PARMLIST)    Close the file
+x$CLOSEx ds 0h
+
+* Delete module ISPLINK from storage if loaded
+
+ tm    flag1,$f1_isplinkl               Found in LPA?
+ bo    x$ILINKx                         Yes, no DELETE needed
+ DELETE EPLOC==CL8'ISPLINK'             No, delete it
+x$ILINKx ds 0h
+
+* Free resources and terminate
+
+ lr    R2,R13                           Get storage address
+ slr   R3,R3                            Get ready for IC
+ ic    R3,MaxCC                         Save return code
+ STORAGE RELEASE,LENGTH=WORKDSL,ADDR=(R2) Release storage
+ lr    R15,R3                           Set return code
+ PR    ,                                Return to caller
+
+* Error routines for ISPF enviornmental issues
+
+E$IQRYE ds 0h
+ MVC   ZEDLMSG(L'MSG0),MSG0
+ TPUT  ZEDLMSG,L'MSG0
+ B     Exit
+E$NISPF ds 0h
+ MVC   ZEDLMSG(L'MSG1),MSG1
+ TPUT  ZEDLMSG,L'MSG1
+ B     Exit
+E$ILINKB ds 0h
+ MVC   ZEDLMSG(L'MSG2),MSG2
+ TPUT  ZEDLMSG,L'MSG2
+ B     Exit
+E$ILINKL ds 0h
+ MVC   ZEDLMSG(L'MSG3),MSG3
+ TPUT  ZEDLMSG,L'MSG3
+ B     Exit
+
+* Error routine if we ABEND
+
+E$Retry ds 0h
+ xc    EWA_RetryA(4),EWA_RetryA         No more Mr. Nice guy
+ la    r15,zedlmsg  ....+....1....+....2....+....3..
+ mvc   0(32,R15),=c'Oops, SUBMITC suffered an ABEND.'
+ TPUT  zedlmsg,32
+ la    r15,zedlmsg  ....+....1....+....2....+....3....+....4
+ mvc   0(40,R15),=c'You will have to use edit/submit method.'
+ TPUT  zedlmsg,40
+ b     Exit
+
+***********************************************************************
+***
+**   Process the lines (in field LINEVAL) as they drift by
+**
+**   Hint: Here's where we try to detect passwords.
+***
+***********************************************************************
+
+Process_Line ds 0h
+ st    r14,pl_ra
+
+* The first line of a valid job should contain a jobname (duh!)
+* so save it...
+
+ c     r5,=F'1'                         First time through?
+ bne   pl$job1x                         Nope continue
+ la    r8,LINEVAL+2                     Locate jobname in "//jobname"
+ trt   0(71-2,r8),c_space               look for first space
+ bz    pl$x                             Doesn't look valid...
+ st    r1,double                        Save address of first space
+ bctr  r1,0                             Back to last character of job
+ sr    r1,r8                            Get length
+ ltr   r1,r1                            Have a length?
+ bz    pl$x                             Nope, ???
+ mvc   pl_jobname(8),=8c' '             Yes, pad spaces
+ ex    r1,pl$job1m                      Get jobname
+
+ l     r1,double                        Retreive addr of first space
+ la    r14,lineval+65                   Max to consider
+ sr    r14,r1
+ ex    r14,pl$job1j
+ bz    pl$x
+ clc   0(3,R1),=c'JOB'                  Found the job card
+ bne   pl$x
+ oi    flag1,$f1_IN_JOBCARD             In Job card
+ b     pl$x
+pl$job1j trt 0(*-*,r1),c_job            Look for a J
+pl$job1m mvc pl_jobname(*-*),0(r8)      Get jobname
+pl$job1x ds 0h
+
+ tm    flag2,$f2_Symbols
+ bno   pl$symbolx
+ bas   r14,Invoke_Symbol_Routine        Call IBM routine for LINEVAL
+pl$symbolx ds 0h
+
+ tm    flag1,$f1_IN_JOBCARD             In Job card?
+ bo    pl$jobcard
+ tm    flag1,$f1_IN_NETRCDD             In //NETRC?
+ bo    pl$netrc
+ tm    flag1,$f1_IN_INPUTDD             In //INPUT?
+ bo    pl$input
+
+* We are now processing until we see a new thing to worry about
+
+pl$jcl ds 0h
+
+ clc   LINEVAL(8),=C'//NETRC '
+ be    pl$set_netrc
+ clc   LINEVAL(8),=C'//INPUT '
+ be    pl$set_input
+ clc   LINEVAL(12),=C'//*SUBMITC::'
+ be    pl$our_ccjcl
+ clc   LINEVAL(13),=C' /* SUBMITC::'
+ be    pl$our_ccin1
+ clc   LINEVAL(10),=C'*SUBMITC::'
+ be    pl$our_ccin2
+ b     pl$x
+
+* Set NETRC for next record.  If we wanted to be robust, we would
+* ensure that this is a DD statement and not a EXEC or OUTPUT.
+
+pl$set_netrc ds 0h
+ oi    flag1,$f1_IN_NETRCDD             Turn on flag
+ b     pl$x
+
+* Set INPUT for next record.  If we wanted to be robust, we would
+* ensure that this is a DD statement and not a EXEC or OUTPUT.
+
+pl$set_input ds 0h
+ oi    flag1,$f1_IN_INPUTDD             Turn on flag
+ b     pl$x
+
+* Now process JOB card lines until we hit something that doesn't look
+* like a job card.  Comment cards in the job card are not supported
+* currently by my simple parsing.
+
+pl$jobcard ds 0h
+ clc   lineval(2),=c'/*'
+ be    pl$jobcarde
+ clc   lineval(3),=c'// '
+ bne   pl$jobcarde
+ trt   lineval(71),c_user                Look for start of "USER="
+ bz    pl$x
+ clc   0(5,r1),=C'USER='                 Found it?
+ bne   pl$x
+ la    r14,LINEVAL+70                    Locate to end of line
+ sr    r14,r1                            Length to consider
+ ex    r14,pl$jobcardq                   Found question mark?
+ bz    pl$x                              Nope...
+ cli   1(r1),c','                        Followed by a comma?
+ bne   pl$jobcardc
+ oi    flag1,$f1_appendc                 Need to append comma
+pl$jobcardc ds 0h
+ oi    flag1,$f1_pupper                  Ensure password is uppercase
+ mvc   submitcu(l'submitcu),lineval      Yes, grab line
+ bas   r14,Prompt_For_Password                and run with it
+ b     pl$x
+pl$jobcardq trt 0(*-*,r1),c_question
+pl$jobcarde ds 0h
+ ni    flag1,255-$f1_IN_JOBCARD
+ b     pl$x
+
+* Process //NETRC instream statements
+
+pl$netrc ds 0h
+ clc   lineval(2),=c'/*'                Found end?
+ be    pl$netrce
+ clc   lineval(2),=c'//'                Found end?
+ be    pl$netrce
+ mvc   submitcu(l'submitcu),lineval     Save for panel
+ bas   r14,Prompt_For_Password          Prompt for password
+ b     pl$x
+pl$netrce ds 0h
+ ni    flag1,255-$f1_IN_NETRCDD
+ b     pl$jcl
+
+* Process //INPUT instream statements
+
+pl$input ds 0h
+ clc   lineval(2),=c'/*'                Found end?
+ be    pl$inpute
+ clc   lineval(2),=c'//'                Found end?
+ be    pl$inpute
+ tm    flag1,$f1_nextpswd               Password on this line?
+ bo    pl$inputp                        Yep
+
+ mvc   double(5),lineval                get first 8 chars
+ oc    double(5),=8c' '                 Ensure uppercase
+ clc   double(5),=c'USER '              User?
+ bne   pl$x
+ mvc   submitcu(l'submitcu),lineval     Save for next record
+ oi    flag1,$f1_nextpswd               Consider next line for pswd
+ b     pl$x
+pl$inputp ds 0h
+ cli   lineval,c'?'                     Question mark on first byte?
+ be    pl$inputpp                       Yes, Cool we found one
+ ni    flag1,255-$f1_nextpswd           No, Well skip it
+ b     pl$x
+pl$inputpp ds 0h
+ bas   r14,Prompt_For_Password          Prompt for password
+ ni    flag1,255-$f1_nextpswd
+ b     pl$x
+pl$inpute ds 0h
+ ni    flag1,255-$f1_IN_INPUTDD
+ ni    flag1,255-$f1_nextpswd
+ b     pl$jcl
+
+* We found some type of special SUBMITC:: card
+
+pl$our_ccjcl ds 0h                      "//*SUBMITC::"
+ la    r3,LINEVAL+12                    Locate start of parameter
+ b     pl$ourcc
+pl$our_ccin1 ds 0h                      " /* SUBMITC::"
+ la    r3,LINEVAL+13                    Locate start of parameter
+ b     pl$ourcc
+pl$our_ccin2 ds 0h                      "*SUBMITC::"
+ la    r3,LINEVAL+10                    Locate start of parameter
+pl$ourcc ds 0h
+ clc   0(3,r3),=c'SYM'
+ be    pl$ourcc_SymbolsOn
+ clc   0(5,r3),=c'NOSYM'
+ be    pl$ourcc_SymbolsOff
+ clc   0(5,r3),=c'HELLO'
+ be    pl$ourcc_Hello
+*Here we could gripe about a parm we don't recognize
+ b     pl$x
+pl$ourcc_SymbolsOn ds 0h
+ oi    flag2,$f2_Symbols
+ b     pl$x
+pl$ourcc_SymbolsOff ds 0h
+ ni    flag2,255-$f2_Symbols
+ b     pl$x
+pl$ourcc_Hello ds 0h
+ mvc   zedlmsg(12),=c'Hello World!'
+ TPUT  zedlmsg,12
+ b     pl$x
+
+* Common exit from Process_Lines processing
+
+pl$X ds 0h
+ l     r14,pl_ra
+ bsm   0,r14
+
+***********************************************************************
+***
+**   Prompt the user for the password
+***
+***********************************************************************
+
+Prompt_For_Password ds 0h
+ st    r14,pfp_ra                         Save return address
+
+ mvi   submitci,c' '
+ mvc   submitci+1(l'submitci+1),submitci
+
+* Define the panel's output variable (userid)
+
+ la    r0,l'submitcu
+ st    r0,double
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',                                            @
+               =C'(SUBMITCU)',                                         @
+               SUBMITCU,                                               @
+               =CL8'CHAR',                                             @
+               DOUBLE),                                                @
+               VL,MF=(E,PARMLIST)
+
+* Define the panel's input variable (password)
+
+ la    r0,l'submitci
+ st    r0,double
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',                                            @
+               =C'(SUBMITCI)',                                         @
+               SUBMITCI,                                               @
+               =CL8'CHAR',                                             @
+               DOUBLE),                                                @
+               VL,MF=(E,PARMLIST)
+
+* Output the variable so the panel has it
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VPUT',                                               @
+               =C'(SUBMITCU)',                                         @
+               =CL8'SHARED'),                                          @
+               VL,MF=(E,PARMLIST)
+
+* Display the panel to get the password
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'ADDPOP'),                                            @
+               VL,MF=(E,PARMLIST)
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'DISPLAY',                                            @
+               =CL8'SUBMITCP'),                                        @
+               VL,MF=(E,PARMLIST)
+ lr    r2,r15
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'REMPOP'),                                            @
+               VL,MF=(E,PARMLIST)
+
+ ltr   r2,r2
+ bnz   pfp$rubout
+
+* Retrieve the password from the panel
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VGET',                                               @
+               =C'(SUBMITCI)',                                         @
+               =CL8'SHARED'),                                          @
+               VL,MF=(E,PARMLIST)
+ ltr   r15,r15
+ bnz   pfp$rubout
+ cli   submitci,c' '
+ be    pfp$rubout
+
+*mvc   parmlist(9),=c'Password:'    BOZO
+*tput  parmlist,9                   BOZO
+*tput  submitci,l'submitci          BOZO
+
+* Okay, it looks like we got a password, copy to LINEVAL
+
+ trt   lineval(71),c_question             Look for question mark
+ bz    pfp$rubout                         Oops, not found
+
+ l     r15,pfp_updated                    Get updated count
+ la    r15,1(r15)                         Increment by one
+ st    r15,pfp_updated                    Save updated count
+
+ tm    flag1,$f1_pupper                   Ensure password uppercase?
+ bno   pfp$ux                             No, continue
+ mvi   parmlist,c' '                      Yes, get space
+ mvc   parmlist+1(l'submitci-1),parmlist       get bunchs more
+ la    r14,lineval+70                          Maximum byte
+ sr    r14,r1                                  Len = end - start
+ ch    r14,=al2(l'submitci-1)                  In range?
+ bnh   pfp$us                                  Yes, use it
+ la    r14,l'submitci-1                        No, set to good length
+pfp$us ds 0h
+ ex    r14,pfp$uo                              Fold to uppercase
+ b     pfp$ux
+pfp$uo oc submitci(*-*),parmlist          Make uppercase
+pfp$ux ds 0h
+
+ la    r14,lineval+70                     Look for maximum last byte
+ sr    r14,r1                             Max length = end - start
+ la    r15,submitci                       Locate start of password
+pfp$l ds 0h
+ mvc   0(1,r1),0(r15)                     Move byte in of password
+ la    r15,1(r15)                         Bump to next password byte
+ la    r1,1(r1)                           Bump to next output byte
+ cli   0(r15),c' '                        Found space in password?
+ be    pfp$lx                             Yes, leave
+ bct   r14,pfp$l                          No, get next byte
+pfp$lx ds 0h
+
+ tm    flag1,$f1_appendc                  Need to append comma?
+ bno   pfp$cx
+ mvi   0(r1),c','                         Oh how thoughtful!
+pfp$cx ds 0h
+
+* "Only the paranoid survive" -- Andy Grove
+
+pfp$rubout ds 0h
+ xc    submitci(l'submitci),submitci      Set password to binary zeros
+
+ l     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VERASE',                                             @
+               =C'(SUBMITCI)',                                         @
+               =CL8'SHARED'),                                          @
+               VL,MF=(E,PARMLIST)
+
+* Common exit from Prompt_For_Password processing
+
+pfp$x  ds 0h
+ ni    flag1,255-$f1_appendc             Ensure flag is now off
+ ni    flag1,255-$f1_pupper              Ensure flag is now off
+
+ l     r14,pfp_ra                        Get return address
+ bsm   0,r14
+
+***********************************************************************
+***
+**       Misc subroutines
+***
+***********************************************************************
+
+Invoke_Symbol_Routine ds 0h
+ st    r14,isr_ra                        Save return address
+
+*  Load in the routine if first time
+
+ icm  r0,b'1111',EP_ASASYMBM             Get entry point
+ LOAD EPLOC==CL8'ASASYMBM',ERRET=ISR$Error Load routine
+ st   r0,EP_ASASYMBM                     Save entry point
+ISR$LX   DS   0h
+
+* Setup parameter list and call ASASYMBM
+
+ la    R1,parmlist                       Locate data area
+ USING SYMBP,R1
+ xc    SYMBP(SYMBP_LEN),SYMBP            Initialize to zero
+ la    r14,LINEVAL                       Address of pattern
+ st    r14,SYMBPPATTERN@                 Save in SYMBP area
+ la    r14,L'LINEVAL                     Length of pattern
+ st    r14,SYMBPPATTERNLENGTH            Save in SYMBP area
+ la    r14,isr_target                    Address of target
+ st    r14,SYMBPTARGET@                  Save in SYMBP area
+ la    r14,double                        Address of target length
+ mvc   0(4,r14),=al4(L'isr_target)       Set length of target
+ st    r14,SYMBPTARGETLENGTH@            Save in SYMBP area
+ la    r14,double+4                      Address of return code
+ xc    0(4,r14),0(r14)
+ st    r14,SYMBPRETURNCODE@              Save in SYMBP area
+ DROP  R1
+ l     R15,EP_ASASYMBM                   Get EPA of routine
+ basr  R14,R15                           Call it
+
+ icm   r1,B'1111',double+4               Get ASASYMBM return code
+ bnz   ISR$X                             No good, continue
+ clc   LINEVAL(80),isr_target            Same as it ever was?
+ be    isr$x                             Yes...
+ mvc   LINEVAL(80),isr_target            No, get updated line
+ l     r15,pfp_updated                   Get updated count
+ la    r15,1(r15)                        Increment by one
+ st    r15,pfp_updated                   Save updated count
+ b     isr$x
+
+* Error: ASASYMBM module could not be loaded
+
+ISR$Error ds 0h
+ ni    flag2,255-$f2_Symbols             Turn off symbol processing
+
+* Common exit from Invoke_Symbol_Routine processing
+
+ISR$X  ds 0h
+ l     r14,isr_ra                        Get return address
+ bsm   0,r14
+
+***********************************************************************
+***
+**       Misc subroutines
+***
+***********************************************************************
+
+* Search JPALPA for module
+*
+* Input: R1 has address of 8 byte module to look for
+* Output: R15 has return code from CSVQUERY
+
+Find_LPA_Module DS 0H
+ ST    R14,DOUBLE                         Save return address
+ ST    R2,DOUBLE+4                        Save work register
+ LR    R2,R1
+ CSVQUERY INEPNAME=(2),                   Search for module            @
+               OUTEPA=DOUBLE2,            ..Output of EPA              @
+               OUTVALID=DOUBLE2+4,        ..Output of validation byte  @
+               MF=(E,W_CSVQRY)            ..Execution
+ SLR   R0,R0                              No module...
+ LTR   R15,R15                            Found?
+ BNZ   FLM$X                              No, Leave
+ L     R0,DOUBLE2                         Get EPA of module
+ TM    DOUBLE2+4,X'40'                    Was OUTEPA valid?
+ BO    FLM$X                              Yes, continue
+ LA    R15,8                              No, can't vouch for EPA
+FLM$X ds 0h
+ L     R2,DOUBLE+4                        Restore work register
+ L     R14,DOUBLE                         Restore return address
+ BSM   0,R14                              Return to caller
+
+* Issue BLDL (no DCB)
+*
+* Input: R1 has address of 8 byte module to look for
+* Output: R15 has return code from BLDL
+
+Issue_BLDL ds 0h
+ st    r14,DOUBLE                       Save return address
+ xc    BLDLA(BLDLAL),BLDLA              Clear to zeros
+ mvc   BLDLA_FF(2),=AL2(1)              Set number of members
+ mvc   BLDLA_LL(2),=AL2(BLDLA_ENTRYL)   Move in entry length
+ mvc   BLDLA_ENTRY+(PDS2NAME-PDS2)(8),0(R1)
+ BLDL  0,BLDLA                          Perform BLDL
+ l     r14,DOUBLE                       Get return address
+ bsm   0,R14                            Return to caller
+
+* Edit R1 flush
+* R1 ... Value to edit
+* R15 ... Output address
+
+EDITFWF ds 0h
+ LTR   R1,R1                            CHECK FOR 0
+ BZ    EDITFWF0                         YES, PUT ZERO
+ CVD   R1,DOUBLE                        NO, CONVERT TO PACKEC
+ LA    R1,DOUBLE2+14                    LOCATE SIG DIGIT
+ MVC   DOUBLE2(15),EDITFWF15
+ EDMK  DOUBLE2(15),DOUBLE+2             EDIT AND SAVE PLACE
+ LA    R14,DOUBLE2+16                   LOCATE LAST POSSIBLE BYTE + 1
+ SR    R14,R1                           LENGTH = END - START
+ BCTR  R14,0                            DECREMENT FOR EX
+ EX    R14,EDITFWFM                     MOVE EDIT NUMBER TO OUTPUT
+ LA    R15,0(R14,R15)                   BUMP POINTER PAST NUMBER
+ MVI   0(R15),C' '
+ BSM   0,R9                             RETURN TO CALLER
+EDITFWFM  MVC 0(0,R15),0(R1)
+EDITFWF15 DC  X'40,20,20,6B,20,20,20,6B,20,20,20,6B,20,20,20'
+EDITFWF0 ds 0h
+ MVI   0(R15),C'0'                      PUT IN ZERO
+ LA    R15,1(R15)                       BUMP POINTER PAST ZERO
+ BSM   0,R9                             RETURN TO CALLER
+
+* Edit full word in Register 1 flush at location in Register 15
+* with no commas
+*
+* INPUT: R1 - Register to print
+*        R15 - Address to put number
+
+EDITNCF ds 0h
+ LTR   R1,R1                            CHECK FOR 0
+ BZ    EDITNCF0                         YES, PUT ZERO
+ CVD   R1,DOUBLE                        NO, CONVERT TO PACKEC
+ LA    R1,DOUBLE2+7                     LOCATE SIG DIGIT
+ MVC   DOUBLE2(8),EDITNCFP
+ EDMK  DOUBLE2(8),DOUBLE+4              EDIT AND SAVE PLACE
+ LA    R14,DOUBLE2+9                    LOCATE LAST POSSIBLE BYTE + 1
+ SR    R14,R1                           LENGTH = END - START
+ BCTR  R14,0                            DECREMENT FOR EX
+ EX    R14,EDITNCFM                     MOVE EDIT NUMBER TO OUTPUT
+ LA    R15,0(R14,R15)                   BUMP POINTER PAST NUMBER
+ MVI   0(R15),C' '
+ BSM   0,R9                             RETURN TO CALLER
+EDITNCFM MVC   0(0,R15),0(R1)
+EDITNCFP DC    X'40,20,20,20,20,20,20,20,20,20,20,20,20,20,20'
+EDITNCF0 DS    0H
+ MVI   0(R15),C'0'                      PUT IN ZERO
+ LA    R15,1(R15)                       BUMP POINTER PAST ZERO
+ BSM   0,R9                             RETURN TO CALLER
+
+* POINT REGISTER 15 TO FIRST BLANK IN STRING
+* INPUT:  R0  - MAXIMUM LENGTH OF STRING
+*         R15 - STRING
+* OUTPUT: R15 - FIRST SPACE IN STRING
+
+Locate_First_Space EQU *
+ CLI   0(R15),C' '
+ BE    LFS$X
+ LA    R15,1(R15)
+ BCT   R0,Locate_First_Space
+LFS$X ds 0h
+ BSM   0,R14
+
+* Blank out the ISPF messages
+
+Initialize_ISPF_Message ds 0h
+ LA    R14,ZEDSMSG
+ MVI   0(R14),C' '
+ MVC   1(L'ZEDSMSG-1,R14),0(R14)
+
+ LA    R15,ZEDLMSG
+ MVI   0(R15),C' '
+ MVC   1(L'ZEDLMSG-1,R15),0(R15)
+ BSM   0,R9
+
+* Set message ISRZ001 which uses ZEDSMSG and ZEDLMSG
+
+Set_ISPF_Message ds 0h
+ ST    R8,ZEDSMSGL                Set short message length
+
+ LA    R1,ZEDLMSG                 Get start of long message
+ SR    R15,R1                     Length = end - start
+ ST    R15,ZEDLMSGL               Save length
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',                                            @
+               =C'(ZEDSMSG)',                                          @
+               ZEDSMSG,                                                @
+               =CL8'CHAR',                                             @
+               ZEDSMSGL),                                              @
+               VL,MF=(E,PARMLIST)
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'VDEFINE',                                            @
+               =C'(ZEDLMSG)',                                          @
+               ZEDLMSG,                                                @
+               =CL8'CHAR',                                             @
+               ZEDLMSGL),                                              @
+               VL,MF=(E,PARMLIST)
+
+ L     R15,EP_ISPLINK
+ CALL  (15),(=CL8'SETMSG',                                             @
+               =CL8'ISRZ001'),                                         @
+               VL,MF=(E,PARMLIST)
+
+ BSM   0,R9
+
+***********************************************************************
+***
+**       Constants and literals
+***
+***********************************************************************
+
+MSG0     DC    C'Link to ISPQRY module failed'
+MSG1     DC    C'ISPF services are not available'
+MSG2     DC    C'BLDL to ISPLINK module failed'
+MSG3     DC    C'LOAD of ISPLINK module failed'
+MSG4S    DC    C'Initialization error'
+MSG4SL   EQU   *-MSG4S
+MSG4L    DC    C'MACRO call for ISREDIT RC='
+MSG4LL   EQU   *-MSG4L
+MSG5L    DC    C'Empty dataset/member, terminating'
+MSG5LL   EQU   *-MSG5L
+MSG10S   DC    C'Open failed'
+MSG10SL  EQU   *-MSG10S
+MSG10L   DC    C'Open to INTRDR ACB failed, RC='
+MSG10LL  EQU   *-MSG10L
+MSG11L   DC    C'Dynamic allocation to INTRDR failed, RC='
+MSG11LL  EQU   *-MSG11L
+
+MSG12L   dc    c'JOB '
+MSG12LN  dc    c'xxxxxxxx'
+         dc    c' ('
+MSG12LI  dc    c'xxxxxxxx'
+         dc    c') submitted to '
+MSG12LJ  dc    c'JES '
+         dc    c'. Updated'
+MSG12LL  EQU   *-MSG12L
+
+MSG13L   DC    C'Submit failed: didn''t write out any records'
+MSG13LL  EQU   *-MSG13L
+
+c_close  CLOSE (*-*),MODE=31,MF=L
+c_closel equ   *-c_close
+
+c_openo  OPEN  (*-*,(OUTPUT)),MODE=31,MF=L
+c_openol equ   *-c_openo
+
+c_acb    ACB   DDNAME=C_ACB,MACRF=(ADR,SEQ,OUT)
+c_acbl   equ   *-c_acb
+
+c_rpl    RPL   ACB=C_ACB,AREALEN=80,RECLEN=80,                         @
+               OPTCD=(ADR,SYN,SEQ,NUP,MVE)
+c_rpll   equ   *-c_rpl
+
+c_ESTAE  ESTAE *-*,CT,TERM=NO,MF=L
+c_ESTAEl EQU   *-c_ESTAE
+
+
+c_space  dc    256x'00'
+         org   c_space+c' '
+         dc    c' '
+         org   ,
+
+c_question dc  256x'00'
+         org   c_question+c'?'
+         dc    c'?'
+         org   ,
+
+c_job    dc  256x'00'
+         org   c_job+c'J'
+         dc    c'J'
+         org   ,
+
+c_user   dc  256x'00'
+         org   c_user+c'U'
+         dc    c'U'
+         org   ,
+
+* Literals
+
+         LTORG ,
+
+* Trivia: Length of main csect and bytes left addressible
+
+                    ds  0d
+SUBMITC_Length      equ *-SUBMITC                Length of program
+SUBMITC_Bytes_Left  equ (3*4096)-SUBMITC_Length  Bytes left addressable
+ DROP  R12,R11,R10
+
+***********************************************************************
+***
+**     E S T A E   E X I T  - Gets control for ABENDs
+**
+**     \\//////      ________________
+**     \\    |      /                \
+**     \(_  x|     /  Bloooeeahhh!!! |
+**     \    __)  _/__________________/
+**   __/   _\ ,. .
+**  /     /  .%:. * .
+** |  |   |   . ;>, $  '                 "Castles made of sand,
+** |  |   |    .=.~@ .  &                fall into the sea,
+** UUUU---|   :?. ;. .¬#  .   ¬          eventually" -- Jimi Hendrix
+** |      |    < * '   .   ,  *
+**
+***
+***********************************************************************
+
+SUBMITCE CSECT ,
+SUBMITCE AMODE 31
+SUBMITCE RMODE ANY
+
+* Standard O/S eyecatcher
+
+ER_EC    B     ER_ECL(0,R15)            Bump past EyeCatcher
+         DC    AL1(ER_ECE-ER_ECV)       Length of Eyecatcher
+ER_ECV   DC    C'SUBMITCE - ESTAE error routine'
+ER_ECE   EQU   *
+         DS    0H
+ER_ECL   EQU   *-ER_EC
+
+* Standard ESA entry housekeeping
+
+ bakr  r14,0                            Save regs
+ lae   r12,0(r15,0)                     Get base register
+ USING SUBMITCE,R12                     Get addressibility
+ SAC   0
+ SYSSTATE ASCENV=P
+
+* Register input parameters
+* R0 - Code:
+*      - 0  ... Active I/O has be Quiesced and is restorable
+*      - 4  ... Active I/O has been halted and is not restorable
+*      - 8  ... No active I/O at ABEND Time
+*      - 12 ... an SDWA was not obtained
+*      - 16 ... No I/O processing was performed
+* R1 - IF R0 <> 12 THEN it has SDWA ELSE ABEND code
+
+ ch    r0,=H'12'                        SDWA present?
+ be    er$x                             No, just leave
+ lr    r2,r1                            Save SDWA address
+ USING SDWA,r2
+ l     r4,SDWAPARM                      Locate EWA
+
+* Get set for return address
+
+ ICM   R3,B'1111',EWA_RetryA-EWA(R4)    Get retry addr
+ BZ    ER$X                             Not there, give up
+ MVC   SDWASR13(4),EWA_R13-EWA(R4)
+ MVC   SDWASR12(4),EWA_R12-EWA(R4)
+ MVC   SDWASR11(4),EWA_R11-EWA(R4)
+ MVC   SDWASR10(4),EWA_R10-EWA(R4)
+
+         SETRP WKAREA=(2),              Set Return Parameters          @
+               RETADDR=(3),             ..Return Address               @
+               RETREGS=YES,             ..Reset regs using SDWASRSV    @
+               DUMP=YES,                ..Take the dump, pleeze        @
+               RC=4                     ..Retry using RETADDR
+         DROP  R2
+
+* Return with no attempt to retry
+
+er$x ds 0h
+ pr    ,                                Return to caller
+
+* constants
+
+ LTORG ,                                Literals
+ ds    0d                               End on doubleword boundry
+SUBMITCEL equ   *-SUBMITCE
+ drop  R12
+
+***********************************************************************
+***
+**       Dynamic Save Area
+***
+***********************************************************************
+
+WORKDS         DSECT ,
+               DS    18F               Register Save Area
+               DS    0D
+DOUBLE         DS    D
+DOUBLE2        DS    2D
+PARMLIST       DS    20F
+
+EP_ISPLINK     ds    xl4                Entry point of ISPLINK
+
+pfp_updated    ds    xl4                Number of updated lines
+pfp_ra         ds    xl4                Return address for routine
+
+
+LINEC          ds    xl4                .ZCSR
+LINES          ds    xl4                Starting Line or .ZFIRST
+LINEE          ds    xl4                Ending line or .ZLAST
+LINEVAL        ds    cl80               Line value
+ISREDITC       DS    cl64'% (LINEVAL) = LINE xxxxxxxxxx %'
+
+FLAG_LIT       DS    C'FLGS'            Flag literal for dumps
+flag1          DS    B'00000000'        Flag 1:
+$f1_isplinkl   EQU   B'10000000'        ..ISPLINK in LPA?
+$f1_IN_NETRCDD EQU   B'01000000'        ..In //NETRC?
+$f1_IN_INPUTDD EQU   B'00100000'        ..In //INPUT?
+$f1_IN_JOBCARD EQU   B'00010000'        ..In job card?
+$f1_NextPswd   EQU   B'00001000'        ..Next line has password?
+$f1_appendc    EQU   B'00000100'        ..Need to append comma?
+$f1_pupper     EQU   B'00000010'        ..Ensure password is uppercase?
+$f1_ESTAE      EQU   B'00000001'        ..ESTAE active?
+flag2          DS    B'00000000'        Flag 1:
+$f2_Symbols    EQU   B'10000000'        ..Call IBM routine for Symbols?
+MaxCC          DS    X                  Exit condition code
+
+BLDLA          DS    0F                 BLDL area
+BLDLA_FF       DS    X'00,00'           ..Total number of entries
+BLDLA_LL       DS    X'00,00'           ..Length of the area
+BLDLA_ENTRY    DS    XL(PDS2USRD-PDS2)  ..Start of user data
+BLDLA_USERD    DS    CL62               ..User data (enough for ISPF)
+BLDLA_ENTRYL   EQU   *-BLDLA_ENTRY      ..Length of PDS entry
+BLDLAL         EQU   *-BLDLA            ..Length of PDS area
+
+               ds    0d                 Read_Records:
+rr_ACB         ds    xl(c_acbl)         ..Access Control Block
+rr_RPL         ds    xl(c_rpll)         ..Request Parameter List
+
+EWA            ds    0f                 ESTAE Work Area
+EWA_ID         ds    cl4'EWA'           ..ID for dumps
+EWA_RetryA     ds    xl4                ..Retry address
+EWA_Regs       equ   *                  ..Important registers
+EWA_R10        ds    f
+EWA_R11        ds    f
+EWA_R12        ds    f
+EWA_R13        ds    f
+EWAL           equ   *-EWA
+
+* Symbol processing areas
+
+EP_ASASYMBM    ds    xl4                Entry point of ASASYMBM module
+isr_ra         ds    xl4                Return address for routine
+isr_target     ds    CL80               Target area to modify
+
+               ds    0f                 Dynamic_Allocation:
+da_ddname      ds    xl4                ..Address of returned DDNAME
+da_s99rb       ds    xl256              ..SVC 99 RB area and text units
+
+               ds    0f                 Process_Line:
+pl_ra          ds    xl4                ..Return Address
+pl_jobname     ds    cl8                ..Jobname found
+
+               CSVQUERY MF=(L,W_CSVQRY),PLISTVER=2
+
+* Misc ISPF variables
+
+               DS    0F
+ZEDSMSGL       DS    F                  Short error message length
+ZEDLMSGL       DS    F                  Long error message length
+ZEDSMSG        DS    CL24               Short error message
+ZEDLMSG        DS    CL128              Long error message
+
+submitcu       ds    cl70               Shown on password prompt panel
+submitci       ds    cl32               Password is returned here
+EPARM          DS    CL50               Edit macro parm
+               DS    0D
+WORKDSL        EQU   *-WORKDS
+
+* End of SUBMITC source ...............................................
+ END ,

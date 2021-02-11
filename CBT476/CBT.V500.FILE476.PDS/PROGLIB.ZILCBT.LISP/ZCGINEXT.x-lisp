@@ -1,0 +1,373 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "ZCGINEXT"
+;
+; This compiles "extended inline code" P-code requests.  These look
+; similar to inline code requests passed to ZCGINLIN, except that
+; the function name is a list.
+;
+; The register "R" to be used as return register is returned as the
+; value of this function.
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/22/88 - Support for fast inline ASSQ and MEMQ.                   *
+;*                                                                     *
+;***********************************************************************
+;
+; The following are currently supported:
+;
+; (INLINE (ARG n) 0 v s)    - compiles (ARG n) where n is a fixnum.
+; (INLINE (SETARG n) 1 v s) - compiles (SETARG n arg1) , n fixnum.
+; (INLINE (VREF n) 1 v s)   - compiles (VREF arg1 n), n fixnum.
+; (INLINE (VSET n) 2 v s)   - compiles (VSET arg1 n arg2), n fixnum.
+; (INLINE (EQ n) 1 v s)     - compiles (EQ arg1 n), n constant.
+; (INLINE (EQL n) 1 v s)    - compiles (EQL arg1 n), n a number.
+; (INLINE (CONS n) 1 v s)   - compiles (CONS arg1 n), n simple.
+; (INLINE (RPLACA n) 1 v s) - compiles (RPLACA arg1 n), n simple.
+; (INLINE (RPLACD n) 1 v s) - compiles (RPLACD arg1 n), n simple.
+; (INLINE (ASSQ n) 1 v s)   - compiles (ASSQ arg1 n), n simple.
+; (INLINE (MEMQ n) 1 v s)   - compiles (MEMQ arg1 n), n simple.
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(defun zcginext (b n v s c)
+
+ ;      b   ; the list (function qualifier) telling what to compile
+ ;      n   ; the number of other arguments passed to the function
+ ;      v   ; an item to receive the value if SETQ is involved
+ ;      s   ; the target of the value to be set
+ ;      c   ; comment identifying inline code
+
+ (prog (
+        f   ; the name of the function to be coded inline
+        q   ; a qualifier object used when inline-compiling the function
+       )
+       (desetq (f q) b)
+       (if (and (not (zerop n))
+                (null lastarg))
+           (return nil)) ; Let ZCGINLIN handle null LASTARG problem.
+       (return
+        (case f
+         (eq     (or (eql n 1) (go wna-error)) (zcgineq     q v s c))
+         (eql    (or (eql n 1) (go wna-error)) (zcgineql    q v s c))
+         (cons   (or (eql n 1) (go wna-error)) (zcgincons   q v s c))
+         (rplaca (or (eql n 1) (go wna-error)) (zcginrplaca q v s c))
+         (rplacd (or (eql n 1) (go wna-error)) (zcginrplacd q v s c))
+         (assq   (or (eql n 1) (go wna-error)) (zcginassq   q v s c))
+         (memq   (or (eql n 1) (go wna-error)) (zcginmemq   q v s c))
+         (arg    (or (eql n 0) (go wna-error)) (zcginarg    q v s c))
+         (setarg (or (eql n 1) (go wna-error)) (zcginsetarg q v s c))
+         (vref   (or (eql n 1) (go wna-error)) (zcginvref   q v s c))
+         (vset   (or (eql n 2) (go wna-error)) (zcginvset   q v s c))
+         (t      (zerror "No inline code generator for" b))
+        ))
+wna-error
+  (when lastarg (zcgrels lastarg))
+  (cterpri 'code)
+  (princ "*** Wrong number of inline args" 'code) ; Force bad assembly
+  (terpri 'code)
+  (return nil) ; Return some random dumb register
+))
+
+;======================================================================
+
+;
+; Inline code generator for (EQ arg1 n)
+;
+; Possible forms of (f q) are:
+;
+; (EQ NIL)           - quick compare to NIL
+; (EQ T)             - quick compare to T
+; (EQ UNBOUND)       - quick compare to (ZILUNBND)
+; (EQ (xxx . yyy)    - quick compare to constant object represented
+;                      by the dotted pair (xxx . yyy)
+;
+
+(defun zcgineq (q v s c
+                &aux
+                (opcode    (case q
+                                ((nil t) "CR")
+                                (t       "C")))
+                (ilen      (case q
+                                ((nil t) 2   )
+                                (t       4  )))
+                (comparand (case q
+                                ((nil)     "10")
+                                ((t)       "8")
+                                ((unbound) "ZLCUNBND")
+                                (t         (where-it-is q))))
+                (onam      (cond
+                            ((eq q 'unbound)        "#<UNBOUND>")
+                            ((atom q)               q)
+                            ((< (flatc (car q)) 16) (car q))
+                            (t                      (cdr q))))
+               )
+
+ (zcgemit ilen () opcode `(,lastarg "," ,comparand)
+                                                  `("Inline EQ " ,onam))
+ (zcgipred '(be bne) v s "Inline code for EQ")
+)
+
+;======================================================================
+
+;
+; Inline code generator for (EQL arg1 n)
+;
+; Possible forms of (f q) are:
+;
+; (EQL n)             - quick compare to small fixnum n
+; (EQL (xxx . yyy)    - quick compare to constant fixnum or flonum
+;                       represented by the dotted pair (xxx . yyy)
+;
+; Sample code sequences:
+;
+; (EQL X 1)     --> L   R1,X
+;                   CLC 0(8,R1),#SFT+8
+;
+; (EQL X 10.0)  --> L   R1,X
+;                   L   R14,G12345
+;                   CLC 0(8,R1),0(R14)
+;
+
+(defun zcgineql (q v s c)
+
+ (cond
+  ((fixnump q)
+   (zcgemit 6 () "CLC" `("0(8,"     ; )
+                         ,lastarg   ; ((
+                         ,(if (minusp q) "),#SFT" "),#SFT+") ,(* q 8))
+                                                    `("Inline EQL " ,q))
+  )
+  (t
+   (zcgemit 4 () "L"   `("14," ,(where-it-is q))
+                                              `("Get number " ,(car q)))
+   (zcgemit 6 () "CLC" `("0(8," ,lastarg "),0(14)")
+                                                  "Inline code for EQL")
+  )
+ )
+ (zcgipred '(be bne) v s "Inline code for EQL")
+)
+
+;======================================================================
+
+;
+; Inline code generator for (CONS arg1 n)
+;
+;
+; Sample code sequences:
+;
+; (CONS X NIL)  --> L    R1,X
+;                   LR   R2,R10
+;                   L    R15,ZLCCONS
+;                   BALR R14,R15
+;
+; (CONS X Y)    --> L    R1,X
+;                   L    R2,G12345 (address of Y)
+;                   L    R15,ZLCCONS
+;                   BALR R14,R15
+;
+
+(defun zcgincons (q v s c &aux r)
+ (zcgrels lastarg)
+ (unless (zcgavail '\1)
+     (zcgemit 0 () "!" "Register 1 not available for CONS" "ZCGINEXT")
+     (warn "Register 1 not available to code generator for CONS")
+ )
+ (unless (zcgavail '\2)
+     (zcgemit 0 () "!" "Register 2 not available for CONS" "ZCGINEXT")
+     (warn "Register 2 not available to code generator for CONS")
+ )
+ (unless (eq lastarg (zcgresv '\1))
+         (zcgemit 2 () "LR" `("1," ,lastarg) "Inline code for CONS"))
+ (zcgemit 4 () "L" "15,ZLCCONS" "Get address of ZILCONS.")
+ (zcgload (zcgresv '\2) q)           ; Done here for pipelining opt.
+ (zcgemit 2 () "BALR" "14,15"   "Call ZILCONS.")
+ (setq r (zcgresv '\15))
+ (zcgrels '\1)
+ (zcgrels '\2)
+ r
+)
+
+;======================================================================
+
+;
+; Inline code generator for (RPLACA arg1 n) and (RPLACD arg1 n)
+;
+;
+; Sample code sequences:
+;
+; (RPLACA X NIL)  --> L    R1,X
+;                     ST   R10,##CAR(,R1)
+;
+; (RPLACD X Y)    --> L    R1,X
+;                     L    R2,Y
+;                     ST   R2,##CDR(,R1)
+;
+
+(defmacro zcginrplaca (q v s c)
+ `(zcginrplacx ,q ,v ,s ,c t))
+
+(defmacro zcginrplacd (q v s c)
+ `(zcginrplacx ,q ,v ,s ,c nil))
+
+(defun zcginrplacx (q v s c carp &aux r)
+ (case q
+  ((nil)
+   (setq r '\10))      ; If NIL, store reg 10
+  ((t)
+   (setq r '\8))       ; If T, store reg 8
+  (t
+   (setq r (zcggtreg)) ; Otherwise, get any register
+   (zcgload r q)))     ; Get arg2 into register
+ (zcgemit 4 ()
+           "ST"
+           `(,r ,(if carp ",##CAR(," #|)|# ",##CDR(,") ,lastarg ")")
+           `("Inline code for " ,(if carp "RPLACA" "RPLACD")))
+ (zcgrels r)
+ lastarg
+)
+
+;======================================================================
+
+;
+; Inline code generator for (ASSQ arg1 n)
+;
+; Possible forms of (f q) are:
+;
+; (ASSQ SALIST)      - quick compare to (SALIST)
+; (ASSQ (xxx . yyy)) - quick compare to constant object represented
+;                      by the dotted pair (xxx . yyy)
+;
+; See ZCGIASSQ module for details of code generation.
+;
+; LASTARG contains arg 1 to ASSQ.
+;
+
+(defun zcginassq (q v s c &aux r2)
+ (zcgresv '\0)          ; Can't use register 0 for arg 2.
+ (setq r2 (zcggtbst t)) ; Set arg2 register (try to get register 15).
+ (zcgrels '\0)
+ (cond
+  ((consp q)
+   (zcgload r2 q))        ; Load fast arg2.
+  ((eq q 'salist)
+   (zcgemit 4 () "L" `(,r2 ",ZLCSALST") "Load special ALIST."))
+  (t
+   (zerror "Bad thing passed to ASSQ as fast arg2" q)))
+ (zcgiassq lastarg r2 v s "Inline code for ASSQ") ; Returns return reg.
+)
+
+;======================================================================
+
+;
+; Inline code generator for (MEMQ arg1 n)
+;
+; See ZCGIMEMQ module for details of code generation.
+;
+; LASTARG contains arg 1 to MEMQ.
+;
+
+(defun zcginmemq (q v s c &aux r2)
+ (unless (consp q) (zerror "Bad thing passed to MEMQ as fast arg2" q))
+ (zcgresv '\0)
+ (setq r2 (zcggtbst s)) ; Set arg2/return reg (can't use register 0).
+ (zcgrels '\0)
+ (zcgload r2 q)         ; Load fast arg2.
+ (zcgimemq lastarg r2 v s "Inline code for MEMQ") ; Returns return reg.
+)
+
+;======================================================================
+
+;
+; Inline code generator for (ARG n)
+;
+
+(defun zcginarg (q v s c &aux r)
+ (if (null q)
+  then
+   (setq r (zcgresv '\15))
+   (zcgresv '\1)
+   (zcgresv '\2)
+   (zcgresv '\14)
+   (zcgemit 2 () "LR"    "2,11"                            c)
+   (zcgemit 4 () "S"     "2,0(,2)"                         c)
+   (zcgemit 4 () "SRA"   "2,2"                             c)
+   (zcgemit 2 () "BCTR"  "2,0"                             c)
+   (zcgemit 4 () "L"     "15,ZLCCONS Cons"                 c)
+   (zcgemit 4 () "L"     "1,#SFT     up a"                 c)
+   (zcgemit 2 () "BALR"  "14,15    fixnum"                 c)
+   (zcgrels '\1)
+   (zcgrels '\2)
+   (zcgrels '\14)
+  else
+  if (fixnump q)
+  then
+   (setq r (zcggtbst s))
+   (zcgemit 4 () "L"    "14,0(,11)"                        c)
+   (zcgemit 4 () "L"    `(,r "," ,(* q 4) "(,14)")         c)
+  else
+   (zerror "Bad inline form" (list 'arg q))
+  endif
+ )
+ r
+)
+
+;======================================================================
+
+;
+; Inline code generator for SETARG
+;
+
+(defun zcginsetarg (q v s c &aux r)
+ (setq r lastarg)
+ (zcgemit 4 () "L"    "14,0(,11)"                        c)
+ (zcgemit 4 () "ST"   `(,r "," ,(* q 4) "(,14)")         c)
+ r
+)
+
+;======================================================================
+
+;
+; Inline code generator for VREF
+;
+
+(defun zcginvref (q v s c &aux r)
+ (zcgrels lastarg)
+ (setq r (zcggtbst s))
+ (zcgemit 4 () "L"    `(,r ",##VECDAT+" ,(* q 4) "(," ,lastarg ")") c)
+ r
+)
+
+;======================================================================
+
+;
+; Inline code generator for VSET
+;
+
+(defun zcginvset (q v s c &aux r r1)
+ (setq r lastarg)
+ (zcgresv '\0)
+ (setq r1 (zcggtbst s))
+ (zcgrels '\0)
+ (zcggtarg r1 1)
+ (zcgrels r1)
+ (zcgemit 4 () "ST"   `(,r ",##VECDAT+" ,(* q 4) "(," ,r1 ")") c)
+ r
+)
+

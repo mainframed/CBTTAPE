@@ -1,0 +1,369 @@
+//IBMUSERW JOB (ACCT#),SHUTDOWN,
+// NOTIFY=&SYSUID,REGION=5M,
+// CLASS=A,MSGCLASS=X,COND=(0,NE)
+//ASMH EXEC PGM=ASMA90,PARM=(NODECK,OBJECT,NOESD,NORLD,NOXREF)
+***********************************************************************
+*                                                                     *
+* MODULE NAME = SHUTDOWN                                              *
+*                                                                     *
+* DESCRIPTIVE NAME = Automate MVS shutdown procedure on the P390      *
+*                                                                     *
+* STATUS = R103                                                       *
+*                                                                     *
+* FUNCTION = The SHUTDOWN program stops all active jobs, started      *
+*            tasks and TSO address spaces, then issues $PJES2, Z EOD  *
+*            and QUIESCE.  To ensure the system comes down properly,  *
+*            SHUTDOWN installs itself as a WTO exit and monitors      *
+*            termination messages of critical sub-systems.            *
+*            SHUTDOWN executes as a sub-task of the CONSOLE address   *
+*            space.  It is ATTACHed by the P390IPL MPF exit when the  *
+*            SHUTDOWN command has been entered by the operator.       *
+*                                                                     *
+* AUTHOR = Gilbert Saint-flour                                        *
+*                                                                     *
+* ENVIRONMENT = SEE BELOW                                             *
+*                                                                     *
+*    DEPENDENCIES: MVS/ESA V5 or OS/390                               *
+*                  P390IPL utility                                    *
+*                  STRING macro                                       *
+*                                                                     *
+* MODULE TYPE = PROCEDURE, (CSECT TYPE)                               *
+*                                                                     *
+*    PROCESSOR = IBM HIGH LEVEL ASSEMBLER/MVS                         *
+*                                                                     *
+*    MODULE SIZE = 2K                                                 *
+*                                                                     *
+*    ATTRIBUTES = RMODE ANY, AMODE 31,                                *
+*                 Supervisor State, Key 0                             *
+*                                                                     *
+* OPERATION = See comments in source code.                            *
+*                                                                     *
+* INSTALLATION = SHUTDOWN must be link-edited in an APF-authorized    *
+*                link-list library.                                   *
+*                                                                     *
+*                NOTE: you must have a module called IEAVMXIT in your *
+*                system libraries.  If you don't, you can make one up *
+*                by copying IEFBR14 under the name IEAVMXIT into any  *
+*                library concatenated to the LINKLIB or the LPALIB.   *
+*                                                                     *
+* PARAMETERS = R1 on entry contains the console ID on                 *
+*              which the SHUTDOWN command was entered.                *
+*                                                                     *
+* RETURN-CODES = NONE                                                 *
+*                                                                     *
+* CHANGE ACTIVITY                                                     *
+*                                                                     *
+*  $101 Shut Down RACF (OW16573/UW24421)                              *
+*  $102 Shut Down BPXOINIT                                            *
+*  $103 Cancel remaining Jobs and STCs                                *
+*                                                                     *
+***********************************************************************
+SHUTDOWN CSECT
+SHUTDOWN RMODE ANY
+         BAKR  R14,0                   save registers
+         LR    R10,R15
+         USING SHUTDOWN,R10
+         LR    R11,R1                  CONSOLE ID
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Move IEAVMXIT code to ECSA                                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+         STORAGE OBTAIN,SP=241,KEY=0,LENGTH=DYNAML
+         LR    R12,R1                  A(DYNAM)
+         USING IEAVMXIT,R12
+         L     R14,=A(IEAVMXIT)        FROM
+         LA    R15,DYNAML
+         LA    R0,IEAVMXIT             TO
+         LA    R1,DYNAML
+         MVCL  R0,R14                  MOVE IEAVMXIT
+         MVC   ASCB099,PSAAOLD-PSA     OWN ASCB
+*---------------------------------------------------------------------*
+*                                                                     *
+*        SET-UP IEAVMXIT                                              *
+*                                                                     *
+*---------------------------------------------------------------------*
+         L     R3,CVTPTR
+         USING CVTMAP,R3
+         L     R4,CVTCUCB              UNIT CONTROL MODULE (UCM)
+         USING UCM,R4
+         L     R5,UCMBFEXT             ADDR OF FIXED EXTENSION BASE
+         USING UCMFEXTA,R5
+         ICM   R6,B'1111',UCMGENXP     GENERAL WTO EXIT TABLE
+         BNZ   GOTGENX                 OK, JUMP
+         STRING 'K M,UEXIT=Y',INTO=WTO1TXT
+         LR    R0,R11                  CN(0)
+         MGCR  WTO1L                   ACTIVATE IEAVMXIT
+         STIMER WAIT,BINTVL==F'100'    WAIT FOR 1 SECOND
+         ICM   R6,B'1111',UCMGENXP     GENERAL WTO EXIT TABLE
+GOTGENX  EQU   *
+         USING GENX,R6
+         BSM   R12,0                   SET AMODE
+         ST    R12,GENXENTY            STORE A(IEAVMXIT)
+         MVI   GENXFLGS,GENXACTV       IEAVMXIT IS ACTIVE
+*---------------------------------------------------------------------*
+*                                                                     *
+*        STOP JES INITIATORS AND VTAM                                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+         STRING '$PI',INTO=WTO1TXT     STOP INITIATORS
+         BAL   R14,MGCR                ISSUE COMMAND
+         STRING 'Z NET,QUICK',INTO=WTO1TXT STOP VTAM
+         BAL   R14,MGCR                ISSUE COMMAND
+*---------------------------------------------------------------------*
+*                                                                     *
+*        STOP ALL ACTIVE JOBS, STCS, TSUS                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+         LA    R4,2                    FIRST ASID
+         L     R5,CVTASVT              POINT TO ASVT
+         L     R5,ASVTMAXU-ASVT(,R5)   MAX ASID
+*LOOP
+LOOP1    LOCASCB ASID=(R4)
+         LTR   R15,R15                 ASCB active?
+         BNZ   LOOP1NXT                no, ignore
+         LR    R7,R1
+         USING ASCB,R7
+         L     R1,ASCBJBNS             JOB NAME
+         MVC   JOBNAME,0(R1)           move job name
+         CLC   =C'BPXOINIT',JOBNAME    OMVS INITIATOR?
+         BE    LOOP1BPX                YES, STOP BPXAS
+         IAZXJSAB READ,ASCB=(R7),JOBNAME=JOBNAME
+         LTR   R15,R15
+         BNZ   LOOP1NXT
+         CLC   =C'INIT ',JOBNAME       JES2 INITIATOR?
+         BE    LOOP1NXT                YES, IGNORE
+         CLC   =C'ASCHINT ',JOBNAME    APPC INITIATOR?
+         BE    LOOP1ASC                YES, CANCEL ASCH
+         CLC   =C'RACF ',JOBNAME       RACF address space?
+         BE    LOOP1RAC                YES, STOP RACF
+         STRING 'P ',JOBNAME,INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+         B     LOOP1NXT                YES, IGNORE
+LOOP1BPX STRING 'F BPXOINIT,SHUTDOWN=FORKINIT',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+         B     LOOP1NXT
+LOOP1ASC NOP   LOOP1NXT                ONCE ONLY
+         OI    *-3,X'F0'               ONCE ONLY
+         STRING 'C APPC',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+         STRING 'C ASCH',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+         B     LOOP1NXT
+*        RACF doesn't have to be stopped if OW16573/UW24421 is applied
+LOOP1RAC STRING '#STOP',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+LOOP1NXT LA    R4,1(,R4)               NEXT ASID
+         BCT   R5,LOOP1                NEXT ASID
+*ENDLOOP
+         BAL   R14,WAITASEC            WAIT FOR A WHILE
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Display active JOBs/STCs/TSUs                                *
+*                                                                     *
+*---------------------------------------------------------------------*
+         LA    R4,2                    FIRST ASID
+         L     R5,CVTASVT              POINT TO ASVT
+         L     R5,ASVTMAXU-ASVT(,R5)   MAX ASID
+*LOOP
+LOOP2    LOCASCB ASID=(R4)
+         LTR   R15,R15                 ASCB active?
+         BNZ   LOOP2NXT                no, ignore
+         LR    R7,R1
+         USING ASCB,R7
+         IAZXJSAB READ,ASCB=(R7),                                      X
+               USERID=USERID,JOBNAME=JOBNAME,JOBID=JOBID
+         LTR   R15,R15
+         BNZ   LOOP2NXT
+         STRING 'JOB=',JOBNAME,' USER=',USERID,' JOBID=',JOBID,        X
+               ' ASID=',(ASCBASID,,X),                                 X
+               INTO=WTO1TXT
+         WTO   MF=(E,WTO1L)
+LOOP2NXT LA    R4,1(,R4)               NEXT ASID
+         BCT   R5,LOOP2                NEXT ASID
+*ENDLOOP
+         BAL   R14,WAITASEC            WAIT FOR A WHILE
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Cancel remaining JOBs/STCs                                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+         LA    R4,2                    FIRST ASID
+         L     R5,CVTASVT              POINT TO ASVT
+         L     R5,ASVTMAXU-ASVT(,R5)   MAX ASID
+*LOOP
+LOOP3    LOCASCB ASID=(R4)
+         LTR   R15,R15                 ASCB active?
+         BNZ   LOOP3NXT                no, ignore
+         LR    R7,R1
+         USING ASCB,R7
+         IAZXJSAB READ,ASCB=(R7),                                      X
+               USERID=USERID,JOBNAME=JOBNAME,JOBID=JOBID
+         LTR   R15,R15
+         BNZ   LOOP3NXT
+         CLI   JOBID,C'T'              TSU ?
+         BE    LOOP3NXT                yes, skip it
+         STRING 'CANCEL ',(JOBNAME,,T),                                X
+               ',A=',(ASCBASID,,X),                                    X
+               INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+LOOP3NXT LA    R4,1(,R4)               NEXT ASID
+         BCT   R5,LOOP3                NEXT ASID
+*ENDLOOP
+*---------------------------------------------------------------------*
+*                                                                     *
+*        STOP JES2                                                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+PJES2    LA    R1,=CL10'$HASP099'      "ALL AVAILABLE FUNCTIONS COMPL"
+         BAL   R14,WAIT4MSG            WAIT FOR MESSAGE
+*
+         STRING '$PJES2',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+*
+         LA    R1,=CL10'$HASP085'      "JES2 TERMINATION COMPLETE"
+         BAL   R14,WAIT4MSG            WAIT FOR MESSAGE
+*---------------------------------------------------------------------*
+*                                                                     *
+*        HALT EOD                                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+ZEOD     STRING 'Z EOD',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+*
+         LA    R1,=CL10'IEE334I'       "HALT EOD SUCCESSFUL"
+         BAL   R14,WAIT4MSG            WAIT FOR MESSAGE
+*
+UEXITN   STRING 'K M,UEXIT=N',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+*
+         BAL   R14,WAITASEC            WAIT FOR A WHILE
+*
+QUIESCE  STRING 'QUIESCE',INTO=WTO1TXT
+         BAL   R14,MGCR                ISSUE COMMAND
+         PR                            EXIT
+*---------------------------------------------------------------------*
+*        ISSUE A COMMAND                                              *
+*---------------------------------------------------------------------*
+MGCR     BAKR  R14,0
+         LR    R0,R11                  CONSOLE ID
+         MGCR  WTO1L                   SEND COMMAND
+*ORG *-2 MGCR->WTO
+*SVC 35  MGCR->WTO
+         PR
+*---------------------------------------------------------------------*
+*        WAIT FOR A MESSAGE                                           *
+*---------------------------------------------------------------------*
+WAIT4MSG BAKR  R14,0
+         STRING '>>> Waiting for ',((R1),10,T),' message <<<',         X
+               INTO=(WTO4L+4,40)
+         MVI   ECB099,0
+         WTO   MF=(E,WTO4L)            ISSUE MESSAGE
+         LR    R2,R1                   SAVE MSG ID
+         WAIT  ECB=ECB099              ECB IS POSTED BY IEAVMXIT
+         DOM   MSG=(R2)                DELETE MESSAGE
+         PR
+WTO4L    WTO   '                                                     ',X
+               DESC=2,ROUTCDE=1,MF=L
+*---------------------------------------------------------------------*
+*        WAIT FOR A FEW SECONDS                                       *
+*---------------------------------------------------------------------*
+WAITASEC BAKR  R14,0
+         STIMER WAIT,BINTVL=AWHILE
+         PR
+*
+AWHILE   DC    AL4(10*100)             WAIT A FEW SECONDS
+         LTORG
+         DROP
+***********************************************************************
+*                                                                     *
+*        IEAVMXIT                                                     *
+*                                                                     *
+*        This code executes from the ECSA and must be                 *
+*        self-relocatable.  It replies to TCAS WTORs and              *
+*        monitors selected messages to notify the mainline            *
+*        of termination messages from critical sub-systems.           *
+*                                                                     *
+*        Unlike the mainline which executes in the CONSOLE            *
+*        address space, IEAVMXIT executes in the address              *
+*        space of the issuer of the WTO.                              *
+*                                                                     *
+***********************************************************************
+IEAVMXIT CSECT
+IEAVMXIT RMODE ANY
+         BAKR  R14,0
+         LR    R12,R15
+         USING IEAVMXIT,R12
+         L     R10,0(,R1)              A(CTXT)
+         USING CTXT,R10
+         L     R11,CTXTTXPJ            TEXT MAJOR POINTER
+         USING CTXTATTR,R11
+         CLC   =C'IKT010D ',CTXTTMSG   "TSO USERS ACTIVE"
+         BE    IKT010D
+         CLC   =C'IKT012D ',CTXTTMSG   "TCAS TERMINATION IN PROGRESS"
+         BE    IKT012D
+         CLC   =C'$HASP099 ',CTXTTMSG  "ALL AVAILABLE FUNCTIONS COMPLT"
+*CLC =C'IEE136I ',CTXTTMSG   "D T"
+         BE    HASP099
+         CLC   =C'$HASP085 ',CTXTTMSG  "JES2 TERMINATION COMPLETE"
+         BE    HASP099
+         CLC   =C'IEE334I ',CTXTTMSG   "HALT EOD SUCCESSFUL"
+         BE    HASP099
+         PR                            IGNORE ALL OTHER MESSAGES
+*
+*        REPLY TO TCAS MESSAGES
+*
+IKT010D  MVC   IKTREPLY+9(3),=C'SIC'
+IKT012D  L     R0,CTXTRPYB             REPLY ID
+         CVD   R0,DWD                  MAKE IT DECIMAL
+         OI    DWD+7,15                NO SIGN
+         UNPK  IKTREPLY+6(2),DWD       REPLY ID
+         SLR   R0,R0                   CN(0)
+         MGCR  IKTREPLY
+         PR
+IKTREPLY WTO   'R XX,U  ',MF=L
+*
+*        XPOST MAIN-LINE
+*
+HASP099  L     R2,ASCB099              GET ASCB ADDRESS
+         POST  ECB099,0,                                               X
+               ASCB=(R2),ECBKEY=0,ERRET=HASP099X,                      X
+               LINKAGE=SYSTEM
+HASP099X PR
+         LTORG
+DWD      DS    D
+WTO1L    DC    Y(116,0)                CMD PREFIX
+WTO1TXT  DS    CL112                   COMMAND
+USERID   DS    CL8                     XJSAB
+JOBNAME  DS    CL8                     XJSAB
+JOBID    DS    CL8                     XJSAB
+ECB099   DS    F                       MSG WAIT
+ASCB099  DS    A(ASCB)                 ASCB OF CONSOLE ADDRESS SPACE
+DYNAML   EQU   *-IEAVMXIT
+*
+         PRINT NOGEN
+PRINT    OPSYN ANOP
+         YREGS
+         STRING GENERATE
+         CVT   DSECT=YES
+         IHAPSA
+         IHAASCB
+         IHAASSB
+         IHAASVT
+         IAZJSAB
+         IEECUCM DSECT=YES             UNIT CONTROL MODULE
+GENX     IEEZB816                      GENERAL WTO USER EXIT TABLE
+         IEZVX100                      CTXT
+         END
+//SYSLIB   DD DISP=SHR,DSN=IBMUSER.TRIMMAC               (optional)
+//         DD DISP=SHR,DSN=SYS1.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MODGEN
+//         DD DISP=SHR,DSN=IBMUSER.P390IPL.PDS           (IEEZB816)
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//*
+//LINKLLA EXEC PGM=LINKLLA,PARM=NOREUS
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//SYSLMOD  DD DISP=SHR,DSN=SYS1.P390.LINKLIB(SHUTDOWN)
+//SYSPRINT DD SYSOUT=*

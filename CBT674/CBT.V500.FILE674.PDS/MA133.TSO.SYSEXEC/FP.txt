@@ -1,0 +1,345 @@
+/* rexx */
+Arg Proc Func .
+
+Signal On Failure
+Signal On Syntax
+Signal On Novalue
+
+ReturnCode = 0
+Call Main_Routine
+
+Return ReturnCode
+/*-------------------------------------------------------------------*/
+/*- handle any problems encountered                                 -*/
+/*-------------------------------------------------------------------*/
+Failure: Say "Failure occured on line" Sigl; Call Cleanup; Exit(12);
+Syntax:  Say "Syntax error on line"    Sigl; Call Cleanup; Exit(12);
+Novalue: Say "Novalue used on line"    Sigl; Call Cleanup; Exit(12);
+Cleanup:
+Parse Source . . Exec .
+Say 'In exec' Exec
+Return
+/*-------------------------------------------------------------------*/
+/*- This exec will find a proc to view. If invoked as an edit       -*/
+/*- macro, it will search any jcllib/proclib statements. if invoked -*/
+/*- outside edit, it will search only the system libs.              -*/
+/*- to communicate programatically these ispf vars are used:        -*/
+/*-   FPDSN the dataset that the proc was found in.                 -*/
+/*-   FPNEST set to 'Y' to use the proc list built previously.      -*/
+/*-   FPNEST0 the number of procs in FPNESTn.                       -*/
+/*-   FPNEST1-n the procs that were previously found.               -*/
+/*- this will allow a previously resolved jcllib concat sequence to -*/
+/*- be used to resolve nested procs and include members.            -*/
+/*-------------------------------------------------------------------*/
+Main_Routine:
+
+Parmlib = "MA133.TSO.PARMLIB(FP)"
+
+Address ISPEXEC
+Edit = 'Y'                               /* see if we are editing   */
+"ISREDIT MACRO (PROC,FUNC)"
+If RC = 20 Then Edit = 'N'
+
+If Length(Proc) = 1 Then Do              /* if we passed a one char */
+  Func = Proc                            /* dsn, assume it's really */
+  Proc = ''                              /* the function.           */
+End
+
+Proclib.0 = 0
+/* so what's the user pointing to anyway?? */
+Upper Proc
+If Proc = '' Then Do                     /* was the proc passed?     */
+  If Edit = 'Y' Then Call Get_From_Edit
+  Else Call Get_From_Screen
+End
+
+If Proc = '' Then Do                     /* still don't have a proc? */
+  Say 'Enter the proc name you want to find...'
+  Pull Proc
+End
+If Proc = '' Then Do                     /* may as well give up.     */
+  ReturnCode = 4
+  Say 'Proc name is missing.'
+  Return
+End
+
+Call Create_Proclib_List
+
+Do iProclib = 1 To Proclib.0             /* now find the first in the*/
+  Dsn = "'"Proclib.iProclib"("Proc")'"   /* search sequence          */
+  If Sysdsn(Dsn) = 'OK' Then Do
+    FPDSN = Dsn                          /* save it for calling guy  */
+    "VPUT FPDSN SHARED"
+    Call FDSN Dsn Func                   /* go func it               */
+    ReturnCode = RC
+    Return
+  End
+End
+
+ReturnCode = 4
+Say 'Proc' Proc 'not found.'
+
+Return
+/*-------------------------------------------------------------------*/
+/*- create the list of proclibs to be used.                         -*/
+/*-------------------------------------------------------------------*/
+Create_Proclib_List:
+
+UseNestedProcs = 'N'                     /* create list of proclibs  */
+"VGET FPNEST SHARED"
+If RC = 0 & FPNEST = 'Y' Then Do         /* load from nested FP cmd  */
+  "VGET FPNEST0 SHARED"                  /* if this if the first time*/
+  If RC = 0 Then Do                      /* fpnest won't be inited   */
+    UseNestedProcs = 'Y'
+    Do iProclib = 0 To FPNEST0
+      "VGET FPNEST"iProclib "SHARED"
+      Proclib.iProclib = Value('FPNEST'iProclib)
+    End
+    Proclib.0 = FPNEST0
+  End
+End
+
+If UseNestedProcs = 'N' Then Do          /* if we're not nested      */
+  If Edit = 'Y' Then Call Load_Proclibs  /* go find jcllib stuff     */
+  Call Add_Sys_Proclibs                  /* add the system proclibs  */
+  "VGET FPNEST SHARED"                   /* load to ispfvars         */
+  If RC = 0 & FPNEST = 'Y' Then Do
+    Do iProclib = 0 To Proclib.0
+      Interpret "FPNEST"iProclib "=" Proclib.iProclib
+      "VPUT FPNEST"iProclib "SHARED"
+    End
+    FPNEST0 = Proclib.0
+    "VPUT FPNEST0 SHARED"
+  End
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- We don't have a proc passed, and we aren't in edit. try to find -*/
+/*- the proc from the line the cursor is on the screen.             -*/
+/*-------------------------------------------------------------------*/
+Get_From_Screen:
+
+GETLINE = ''
+"VPUT GETLINE SHARED"
+"SELECT CMD(%GETLINE)"
+"VGET (CSR CSRP LINE SCRW PANEL) SHARED"
+Upper LINE
+
+CmdPos = Pos('COMMAND',LINE)               /* is cursor on cmd line? */
+If CmdPos = 0 | CmdPos > 3 Then Call Parse_Out_Proc
+
+Return
+/*-------------------------------------------------------------------*/
+/*- We're in edit, so it's easier to get the line from edit cmds.   -*/
+/*-------------------------------------------------------------------*/
+Get_From_Edit:
+
+Address ISREDIT
+"(ROW,CSRP) = CURSOR"
+If ROW > 0 Then Do
+  "(LINE) = LINE" ROW
+  Call Parse_Out_Proc
+End
+Address ISPEXEC
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Find the proc name from the line on the screen.                 -*/
+/*-------------------------------------------------------------------*/
+Parse_Out_Proc:
+
+Select
+  When Word(LINE,2) = 'EXEC' Then Do   /* do we have an exec?    */
+    Parse Var LINE ' EXEC ' Proc .
+    Parse Var Proc Proc ','
+    If Left(Proc,5) = 'PROC=' Then Parse Var Proc 'PROC=' Proc
+  End
+  When Word(LINE,2) = 'INCLUDE' & ,
+    Left(Word(LINE,3),7) = 'MEMBER=' Then Do
+    Parse Var LINE 'MEMBER=' Proc .
+  End
+  When Pos('WAS EXPANDED USING',LINE) > 0 Then Do
+    Parse Var LINE Proc 'WAS EXPANDED USING' ,
+      . 'LIBRARY' Proclib .
+    Proc = Word(Proc,Words(Proc))
+    Proc = Strip(Proc)
+    Call Add_Proclib Proclib
+  End
+  Otherwise Do
+    Do While CSRP > 1
+      If Substr(LINE,CSRP-1,1) = ' ' Then Leave
+      CSRP = CSRP - 1
+    End
+    Proc = Word(Substr(LINE,CSRP),1)
+    Proc = Strip(Proc,'L','/')
+
+    Valid = "ABCDEFGHIJKLMNOPQRSTUVWXYZ@#$0123456789"
+    Len = Length(LINE)
+    Beg = Verify(Reverse(LINE),Valid,"N",(Len - CSRP + 1))
+    If Beg = 0 Then Beg = 1; Else Beg = Len - Beg + 2
+    End = Verify(LINE,Valid,"N",CSRP); If End = 0 Then End = Len + 1
+    Proc = Substr(LINE,Beg,Abs(End-Beg))
+  End
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Put any user proclibs in the search order.                      -*/
+/*-------------------------------------------------------------------*/
+Load_Proclibs:
+
+Address ISREDIT
+"(LAST) = LINENUM .ZLAST"
+Do iLine = 1 To LAST
+  "(JCL) = LINE" iLine
+  JCL = Left(JCL,72)
+  Select
+    /* if it's a comment                 */
+    When Left(JCL,3) = '//*' Then Nop
+
+    /* see if there's a jcllib statement */
+    When Pos(' JCLLIB ',JCL) > 0 Then Call Process_Jcllib
+
+    /* see if there's a proclib statement */
+    When Word(JCL,1) = '//PROCLIB' Then Call Process_Easyproc
+
+    /* end if there's proc call statement */
+    When Word(JCL,2) = 'EXEC' Then Leave iLine
+
+    Otherwise Nop
+  End
+End
+Address ISPEXEC
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Found a JCLLIB statement. Parse it out.                         -*/
+/*-------------------------------------------------------------------*/
+Process_Jcllib:
+
+Parse Var Jcl 'ORDER=' Proclibs .
+Proclibs = Word(Proclibs,1)
+Proclibs = Strip(Proclibs,'L','(')
+Proclibs = Strip(Proclibs,'T',')')            /* strip last ) */
+
+Do While Pos(',',Proclibs) > 0
+  Parse Var Proclibs Proclib ',' Proclibs
+  Do While Proclib <> ''
+    Call Add_Proclib Proclib
+    Parse Var Proclibs Proclib ',' Proclibs
+  End
+  iLine = iLine + 1
+  "(JCL) = LINE" iLine
+  Parse Var JCL . Proclibs ')'                /* strip last ) */
+  Proclibs = Word(Proclibs,1)
+End
+
+Call Add_Proclib Proclibs    /* there should only be one here */
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Found a PROCLIB statement. Parse it out.                        -*/
+/*-------------------------------------------------------------------*/
+Process_Easyproc:                          /* does not support  */
+                                           /* split lines!!!    */
+Parse Var JCL 'DSN=' Proclib ','           /* get the first one */
+If Proclib = '' Then Parse Var JCL 'DSNAME=' Proclib ','
+If Proclib = '' Then Do
+  Say 'Unable to pull proclib from:'
+  Say JCL
+  Signal Failure
+End
+
+Proclib = Word(Proclib,1)
+Call Add_Proclib Proclib
+Do iLine = iLine + 1 To LAST
+  "(JCL) = LINE" iLine
+  If Substr(JCL,1,3) = '//*' Then Iterate  /* skip comment*/
+  If Substr(JCL,1,3) <> '// ' Then Do      /* no others */
+    iLine = iLine - 1
+    Leave
+  End
+  Parse Var JCL 'DSN=' Proclib ',' .
+  If Proclib = '' Then Parse Var JCL 'DSNAME=' Proclib ','
+  Proclib = Word(Proclib,1)
+  Call Add_Proclib Proclib
+End
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Add a proclib to the search list.                               -*/
+/*-------------------------------------------------------------------*/
+Add_Proclib:
+Arg Proclib .
+Proclib = Strip(Proclib)
+
+/* if this is a symbolic, resolve it before adding it. this is used */
+/* when the proclib/jcllib has a symbolic set using the SET jcl stmt*/
+/* this won't work if you have a set statement that sets the same   */
+/* symbol twice. this will pick up the first one, but the jcl will  */
+/* use the last one.                                                */
+If Edit = 'Y' Then Do
+  Address ISREDIT
+  "(STATE) = USER_STATE"            /* save what the user was doing */
+  "RESET EXCLUDED"                  /* reset the environ for me     */
+  Do While Pos('&',Proclib) > 0
+    Parse Var Proclib Prefix '&' Symbol '.' Suffix
+    "EXCLUDE ALL"
+    "FIND '"Symbol"=' ALL"          /* find any lines with symbol=  */
+    "EXCLUDE '//*' 1 ALL"           /* get rid of any comment lines */
+    "CURSOR = 1 1"
+    Do Forever
+      "FIND '"Symbol"=' NEXT NX"    /* look for //x set symbol=yyy  */
+      If RC > 0 Then Do
+        Say 'Unable to resolve symbolic variable' Symbol ,
+          'in proclib' Proclib
+        Proclib = ''
+        Leave
+      End
+      "(SET) = LINE .ZCSR"
+      Parse Var SET . 'SET' Operand .    /* make sure we have set   */
+      Parse Var Operand (Symbol) '=' Value
+      If Value = '' Then Iterate
+      Proclib = Prefix || Value || Suffix
+      Leave
+    End
+    "RESET EXCLUDED FIND"
+  End
+  "USER_STATE = (STATE)"
+End
+If Proclib = '' Then Return
+
+Do x = 1 To Proclib.0
+  If Proclib = Proclib.x Then Return
+End
+iProclib = Proclib.0
+iProclib = iProclib + 1
+Proclib.iProclib = Proclib
+Proclib.0 = iProclib
+
+Return
+/*-------------------------------------------------------------------*/
+/*- Add system proclibs to the search list.                         -*/
+/*-------------------------------------------------------------------*/
+Add_Sys_Proclibs:
+
+Address TSO
+"ALLOC F(IN) DA('"Parmlib"') SHR REUSE"
+"EXECIO * DISKR IN (STEM Dsn. FINIS"
+"FREE F(IN)"
+Address ISPEXEC
+
+Sysname = Mvsvar('SYSNAME')
+Edit.0 = 0                                  /* add doc libs to search*/
+Do iDsn = 1 To Dsn.0
+  Dsn.iDsn = Strip(Dsn.iDsn)
+  Upper Dsn.iDsn
+  If Left(Dsn.iDsn,1) = '*' Then Iterate
+  Parse Var Dsn.iDsn Sys Dsn .
+  If Sys <> Sysname & Sys /= 'ALL' Then Iterate
+  Dsn = Strip(Dsn,"B","'")
+  Call Add_Proclib Dsn
+End
+
+Return

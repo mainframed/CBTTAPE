@@ -1,0 +1,464 @@
+/**************/
+/* subrupdt.c */
+/*******************************************************************/
+/* This program runs daily to apply the daily subscriber update    */
+/* file from the mainframe to the current subscriber file. The     */
+/* update file contains an A, C, or D code to identify the record  */
+/* as an add, change, or delete. All records contain the subscriber*/
+/* number and gate (pilot) number. Update file records are sorted  */
+/* in ascending order by subscriber number. Add records are merged */
+/* into the new subscriber file at the correct point. Change       */
+/* records replace the former record for the subscriber, and delete*/
+/* records drop the former subscriber record.                      */
+/*                                                                 */
+/* Author R Thornton September 1993                                */
+/*******************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void initiate(int argc, char *argv[]); /* initialization function */
+void mainline(void);              /* mainline function */
+void terminat(void);              /* termination function */
+void readold(void);               /* read old subscriber file */
+void updtequl(void);              /* process update = old subscriber */
+void updatlow(void);              /* process update < old subscriber */
+void updthigh(void);              /* process update > old subscriber */
+void readupd(void);               /* read update file */
+void writenew(void);              /* write new subscriber file */
+void printlin(void);              /* print a line to prn */
+int edit(char output[], char pattern[], char number[]); /* edit nbr */
+
+typedef struct {                      /* subscriber file record */
+  char subr_id[9];                      /* subscriber id */
+  char gate_no[4];                      /* gate number */
+  char nl_byte;                         /* newline character */
+  char null_byte;                       /* null for fgets()-fputs() */
+} subrecd;
+
+typedef struct {                      /* update file record */
+  char upd_subr_id[9];                  /* subscriber id */
+  char upd_filler[6];                   /* unused */
+  char upd_gate_no[4];                  /* date number */
+  char upd_type;                        /* type: A, C, D */
+  char upd_nl;                          /* newline character */
+  char upd_null;                        /* null for fgets() */
+} updrecd;
+
+FILE *oldfile, *updfile, *newfile, *prtfile; /* file handle pointers */
+char oldnam[81];                      /* old subscriber file name */
+char updnam[81];                      /* update file name */
+char newnam[81];                      /* new subscriber file name */
+char prtnam[81];                      /* print file name */
+
+char prtline[132];                    /* print line buffer */
+subrecd oldrec;                       /* old subscriber record */
+updrecd updrec;                       /* update record */
+subrecd newrec;                       /* new subscriber record */
+
+int more_subrs = -1;                  /* old subscriber file eof sw */
+int more_updates = -1;                /* update file eof switch */
+int read_old_subr = -1;               /* read old subscriber switch */
+int read_updt_file = -1;              /* read update file switch */
+int compare;                          /* <0:low, =:equal, >0:high */
+long old_subr_count = 0;              /* old subscriber records read */
+long upd_count = 0;                   /* update records read */
+long new_subr_count = 0;             /* new subscriber recds written */
+long error_updates = 0;               /* update records in error */
+long added_subr_count = 0;            /* subscriber records added */
+long deleted_subr_count = 0;          /* deleted subscriber records */
+long changed_subr_count = 0;          /* changed subscriber records */
+char number[32];                      /* ascii number field */
+
+int subr_size;                  /* size of subscriber file records */
+int updt_size;                  /* size of update file records */
+int prnt_size;                  /* size of print records */
+
+void main(int argc, char *argv[]) {
+  initiate(argc, argv);               /* open files */
+  while(more_subrs || more_updates)   /* perform mainline until */
+    mainline();                         /* no more records */
+  terminat();                         /* close files */
+  exit(0);                            /* quit */
+}
+/********************************************************************/
+/* mainline function: process the update file against the old       */
+/* subscriber master file until there are no more records in either */
+/* file.
+/********************************************************************/
+void mainline(void) {
+  if(read_old_subr)          /* if needed, read old subscriber file */
+    readold();
+  if(read_updt_file)         /* if needed, read update file */
+    readupd();
+  while(more_subrs || more_updates) {
+    compare = memcmp(updrec.upd_subr_id, oldrec.subr_id, 9);
+    if(compare == 0)
+      updtequl();            /* update = old subscriber */
+    else
+      if(compare < 0)
+        updatlow();          /* update < old subscriber */
+      else
+        updthigh();          /* update > old subscriber */
+  }
+}
+/*******************************************************************/
+/* initialization: open files, read first input record.            */
+/*******************************************************************/
+void initiate(int argc, char *argv[]) {
+  if(argc == 5) {
+    strcpy(oldnam,argv[1]);        /* copy file names */
+    strcpy(updnam,argv[2]);
+    strcpy(newnam,argv[3]);
+    strcpy(prtnam,argv[4]);
+  }
+  else {
+    printf("\nsubrupdt syntax: subrupdt oldsubr updtfile \
+              newsubr, prntfil\n");
+    exit(1);
+  }
+  if((oldfile=fopen(oldnam,"rb")) == NULL) {  /* open old subr */
+    printf("\nCan't open old subscriber file %s.\n",oldnam);
+    exit(1);
+  }
+  if((updfile=fopen(updnam,"rb")) == NULL) { /* open update file */
+    printf("\nCan't open update file %s.\n",updnam);
+    exit(1);
+  }
+  if((newfile=fopen(newnam,"wb")) == NULL) { /* open new subr */
+    printf("\nCan't open new subscriber file %s.\n",newnam);
+    exit(1);
+  }
+  if((prtfile=fopen(prtnam,"w"))==NULL) { /* open printer file */
+    printf("\nCan't open the printer file %s.\n",prtnam);
+    exit(1);
+  }
+  subr_size = sizeof(subrecd);
+  updt_size = sizeof(updrecd);
+  prnt_size = sizeof(prtline);
+  readold();                             /* read first record    */
+  newrec.null_byte = '\0';               /* insure end of string */
+  oldrec.null_byte = '\0';
+  updrec.upd_null = '\0';
+}
+/********************************************************************/
+/* subscriber id in the update record is equal to that in the old   */
+/* subscriber file: o.k. if the update is a delete or change, but   */
+/* an error otherwise. For a delete, set up to read another old     */
+/* subscriber file record. For a change, copy the update record to  */
+/* the new subscriber file and set up to read both files.           */
+/********************************************************************/
+void updtequl(void) {
+  if(updrec.upd_type == 'D') {          /* if delete record */
+    read_old_subr = -1;                 /* set up to read old subr */
+    deleted_subr_count++;               /* add 1 to deleted subrs */
+  }
+  else
+    if(updrec.upd_type == 'C') {        /* if change record */
+      memcpy(newrec.subr_id, updrec.upd_subr_id, 9);
+      memcpy(newrec.gate_no, updrec.upd_gate_no, 4);
+      writenew();                       /* write new subr record */
+      read_old_subr = read_updt_file = -1; /* set up to read both */
+      changed_subr_count++;             /* add 1 to changed subrs */
+    }
+    else {                    /* neither delete nor change */
+      strcpy(prtline,"Invalid update record, subscriber on file: ");
+      printlin();                 /* print reason */
+      strcpy(prtline,(char *)&updrec);
+      printlin();                 /* print error update */
+      error_updates++;            /* add 1 to error update records */
+    }
+}
+/********************************************************************/
+/* subscriber id in the update record is lower than that in the old */
+/* subscriber file: o.k. if the update is an add, bute an error.    */
+/* if o.k., add the update record to the new subscriber file and set*/
+/* up to read another update file record.
+/********************************************************************/
+void updatlow(void) {
+  if(updrec.upd_type == 'A') {
+    memcpy(newrec.subr_id, updrec.upd_subr_id, 9); /* moce subr id */
+    memcpy(newrec.gate_no, updrec.upd_gate_no, 4); /* move gate nbr */
+    writenew();                     /* write new subr record */
+    read_updt_file = -1;            /* set to read update record */
+    added_subr_count++;             /* add 1 to added subrs */
+  }
+  else {
+    strcpy(prtline,"Invalid update record: subscriber not on file: ");
+    printlin();                     /* print error reason */
+    strcpy(prtline,(char *)&updrec);
+    printlin();                     /* print the error update recd */
+    error_updates++;                /* add 1 to error update records */
+  }
+}
+/********************************************************************/
+/* subscriber id in the update record is higher than that in the old*/
+/* subscriber file: copy the current subscriber record to the new   */
+/* subscriber file and read another old subscriber record.          */
+/********************************************************************/
+void updthigh(void) {
+  memcpy(&newrec, &oldrec, subr_size); /* copy old record to new */
+  writenew();                          /* write to new subr file */
+  read_old_subr = -1;                  /* set up to read old subr */
+}
+/********************************************************************/
+/* read next old subscriber file record into the oldrec area. at    */
+/* end of file, set the more_subs switch to false.                  */
+/********************************************************************/
+void readold() {
+  if(fgets((char *)&oldrec,subr_size-1,oldfile) == NULL) /* readold  */
+    more_subrs = 0;                    /* set switch at end of file */
+  read_old_subr = 0;                   /* reset read subr switch */
+  if(more_subrs)
+    old_subr_count++;                  /* add 1 to old subrs read */
+}
+/********************************************************************/
+/* read update file record into the updrec area. at end of file set */
+/* the more_updates switch to false.                                */
+/********************************************************************/
+void readupd() {
+  if(fgets((char *)&updrec,updt_size-1,updfile) == NULL) /* read updt*/
+    more_updates = 0;                 /* set switch at end of file */
+  read_updt_file = 0;                 /* reset read updt switch */
+  if(more_updates)
+    upd_count++;                     /* add 1 to update record count */
+}
+/********************************************************************/
+/* write a record to the new subscriber file.                       */
+/********************************************************************/
+void writenew() {
+  fputs((char *)&newrec,newfile);        /* write output record */
+  new_subr_count++;              /* add 1 to new subrs written */
+}
+/********************************************************************/
+/* write a line to the report file                                  */
+/********************************************************************/
+void printlin() {
+  fputs(prtline,prtfile);        /* write print line */
+}
+/********************************************************************/
+/* The edit function provides numeric report editing, including     */
+/* leading zero suppression, check protection, floating $, leading  */
+/* or trailing minus sign, insertion of commas, decimal points and  */
+/* other non-numeric fields. The first parameter is the address of  */
+/* the edited output, whose size will be the same as the pattern.   */
+/* The second parameter is the editing pattern, which must be a true*/
+/* null-terminated string containing the edit pattern. The third    */
+/* is the number to be edited, a null-terminated string containing  */
+/* only digits 0-9 except the first position, which is a -, if the  */
+/* number is negative. The pattern may be up to 64 characters, and  */
+/* the number to be edited may contain up to 32 characters. The     */
+/* number may not contain more significant digits than there are    */
+/* digit select characters in the pattern. If there are more digits */
+/* selected by the pattern than there are in the number, leading    */
+/* zeros will be assumed. In the pattern, the first character may   */
+/* be:      $ (floating dollar sign)                                */
+/*          * (check protection)                                    */
+/*          - (floating minus sign)                                 */
+/* The body of the edit pattern will be composed of digit select    */
+/* characters (z and 9) and other characters, handled as follows:   */
+/*          z (zero suppression output is a blank in this position  */
+/*             until significance is set by receipt of a significant*/
+/*             digit or a 9 in the pattern. After significance is   */
+/*             set, output is a digit from the number.)             */
+/*          9 (output is a digit from the number and significance   */
+/*             is set, even if the digit is a leading zero.)        */
+/*        other characters in the pattern will be output as-is after*/
+/*             significance is set, but will be output as blanks    */
+/*             before significance is set.                          */
+/* Characters in the pattern following the last digit select will   */
+/* be output as-is if the number is negative, otherwise output will */
+/* be blanks for these pattern positions.                           */
+/*                                                                  */
+/* When * check protection is selected, output will be *, rather    */
+/* than blanks as mentioned above.                                  */
+/*                                                                  */
+/* An integer is returned to indicate success or errors:            */
+/*                 0 = successful edit                              */
+/*                 1 = pattern too long (over 64 characters)        */
+/*                 2 = too many digits selected (over 32)           */
+/*                 3 = no output digits selected in pattern         */
+/*                 4 = number contains non-numeric data             */
+/*                 5 = number has more digits than the pattern      */
+/*                                                                  */
+/* Examples:                            nbr=             outf=      */
+/*    err=edit(outf,"zz,zz9.99-",nbr);  0                     0.00  */
+/*                                      123                   1.23  */
+/*                                      562983            5,629.83  */
+/*                                      -4675                46.75- */
+/*    err=edit(outf,"$,$$$.$$",nbr);    0                           */
+/*                                      123                  $1.23  */
+/*                                      562983           $5,629.83  */
+/*                                      -4675               $46.75  */
+/*    err=edit(outf,"***.**",nbr);      0                           */
+/*                                      123                 **1.23  */
+/*                                      562983   err = 5            */
+/*                                      -4675               *46.75  */
+/*    err=edit(outf,"--,--9.99",nbr);   0                     0.00  */
+/*                                      123                   1.23  */
+/*                                      562983            5,629.83  */
+/*                                      -46.75              -46.75  */
+/*                                                                  */
+/* Author R Thornton April 1989                                     */
+/********************************************************************/
+/**/
+int edit(char output[], char pattern[], char number[]) {
+  char float_val = ' ';
+  char fill_val = ' ';
+  char sign_val = ' ';
+  int signif = 0;
+  int psize = 0;
+  int pdig = 0;
+  int plast = 0;
+  int ndig = 0;
+  char nbr[33];
+  char ch= ' ';
+  int po=0;
+  int n=0;
+
+/****************************************************************/
+/* examine pattern: set up float and fill, count size and digits*/
+/****************************************************************/
+  if(((ch=pattern[0]) == '$') || (ch == '*') || (ch == '-'))
+    float_val = ch;
+  if(ch == '*')
+    fill_val = '*';
+  while((ch=pattern[po]) != '\0') {
+    if((ch == 'z') || (ch == '9')) {
+      pdig++;
+      plast = po;
+    }
+    psize++;
+    po++;
+  }
+  if(psize > 63)
+    return(1);
+  if(pdig > 32)
+    return(2);
+  if(!pdig)
+    return(3);
+/****************************************************************/
+/* examine number: set up sign, count digits, check numeric.    */
+/* set error if more digits than pattern, move right justified  */
+/****************************************************************/
+  if(number[0] == '-') {
+    sign_val = '-';
+    n = 1;
+  }
+  while((ch=number[n]) != '\0') {
+    if((ch < '0') || (ch > '9'))
+      return(4);
+    ndig++;
+    n++;
+  }
+  if(ndig > pdig)
+    return(5);
+  for(po=0;po<(pdig-ndig);po++)
+    nbr[po] = '0';
+  if(sign_val == ' ')
+    n = 0;
+  else
+    n=1;
+  for(;po<pdig;po++,n++)
+    nbr[po] = number[n];
+/****************************************************************/
+/* scan across the pattern, setting the corresponding output    */
+/* byte from pattern, fill, or amt depending on the pattern     */
+/* character and state of significance.                         */
+/****************************************************************/
+  if(float_val != ' ') {
+    output[0] = ' ';
+    po = 1;
+  }
+  else
+    po = 0;
+  n = 0;
+  while((po <= plast)) {
+    ch = pattern[po];
+    if(ch == 'z') {
+      if(signif) {
+        output[po] = nbr[n];
+        n++;
+      }
+      else {
+        if(nbr[n] == '0') {
+          output[po] = fill_val;
+          n++;
+        }
+        else {
+          output[po] = nbr[n];
+          signif = -1;
+          n++;
+          if(float_val == ' ')
+            ;
+          else
+            if((float_val == '$') || (sign_val == '-'))
+              output[po-1] = float_val;
+        }
+      }
+    }
+    else if(ch == '9') {
+      output[po] = nbr[n];
+      if(!signif) {
+        signif = -1;
+        if(float_val == ' ')
+          ;
+        else
+          if((float_val == '$') || (sign_val == '-'))
+            output[po-1] = float_val;
+      }
+      n++;
+    }
+    else {
+      if(signif)
+        output[po] = pattern[po];
+      else
+        output[po] = fill_val;
+    }
+    po++;
+  }
+  while((ch=pattern[po]) != '\0') {
+    if(sign_val == ' ')
+      output[po++] = fill_val;
+    else
+      output[po++] = pattern[po];
+  }
+  return(0);
+}
+/********************************************************************/
+/* termination: write total counts, close files.                    */
+/********************************************************************/
+void terminat() {
+  sscanf(number, "%D", &old_subr_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," old subscriber records read");
+  printlin();                   /* write old subscriber count */
+  sscanf(number, "%D", &upd_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," update records read");
+  printlin();                   /* write update record count */
+  sscanf(number, "%D", &new_subr_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," new subscriber records written");
+  printlin();                   /* write new subscriber count */
+  sscanf(number, "%D", &error_updates);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," error update records dropped");
+  printlin();                   /* write error update count */
+  sscanf(number, "%D", &added_subr_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," new subscriber records added");
+  printlin();                   /* write old added subscriber count */
+  sscanf(number, "%D", &deleted_subr_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," old subscriber records deleted");
+  printlin();                   /* write deleted subscriber count */
+  sscanf(number, "%D", &changed_subr_count);
+  edit(prtline,"zz,zzz,zz9", number);
+  strcpy(prtline+11," old subscriber records changed");
+  printlin();                   /* write changed subscriber count */
+  fclose(prtfile);
+  fclose(oldfile);
+  fclose(updfile);
+  fclose(newfile);
+}

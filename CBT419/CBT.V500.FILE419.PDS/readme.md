@@ -1,0 +1,78 @@
+
+## $$DOC.txt
+```
+
+This PDS contains two programs that are typically available
+on UNIX systems,  the `what' program and the `grep' program.
+
+You should find the following:
+
+        grep@c   -    The C source code for a grep clone,
+                      originally taken from the DECUS tape.  Modified
+                      for running under OS/390.
+
+        grep@a   -    The assembly source generated with the Systems/C
+                      compiler.
+
+        what@c   -    The C source code for the `what' program, from the
+                      Berkely distribution.  Modified for running under
+                      OS/390
+
+        what@a   -    The assembly source generated with the Systems/C
+                      compiler.
+
+We have included the assembly source for these programs in case
+someone wants to "pull out" one of the routines (particularly, the
+regular expression routines in grep) for inclusion in other programs.
+You should be able to extract the function, adjust the prologue/epilogue
+correctly and include these in your own programs.   The code is non-rent,
+and uses R12 as the base register and R13 as the frame base register.
+You should replace DCCPRLG and DCCEPIL with the appropriate function
+entry/exit macros.  The FRAMESIZE parameter on DCCPRLG indicates how
+much dynamic storage the routine will need.
+
+However, you should be able to compile the C source with other C compiler
+implementations for the mainframe.
+
+Also, if you want to download the executables, we have them on our
+web site - http://www.dignus.com
+
+Just what are these?
+
+  GREP:
+        General Regular Expression Processor.
+
+                Read a file, looking for lines that match a specified
+                pattern.
+
+  WHAT:
+        show what versions of object modules were used to construct a file
+
+                On some source management systems, it's possible to embed
+                embed an ID string in the source which will then appear
+                in the object deck or load module for a program.   This
+                ID usually contains the file name, revisision number,
+                check-in date, etc...
+
+                Thus, using WHAT, you can scan an object deck, or load
+                module, and be able to determine just which version of the
+                source was used to build that object.
+
+                From the Berkely manual page:
+                        The what utility searches each specified
+                        file for sequences of the form "@(#)" as
+                        inserted by the source code control system.
+                        It prints the remainder of the string following
+                        this marker, up to a NUL character, newline,
+                        double quote, ``>'' character, or backslash.
+
+                        The following option is available:
+
+                        -s      Stop searching each file after the
+                                first match.
+
+                        Exit status is 0 if any matches were found,
+                        otherwise 1.
+
+```
+

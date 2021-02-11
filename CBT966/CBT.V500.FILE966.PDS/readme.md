@@ -1,0 +1,421 @@
+
+## $DOC.txt
+```
+Member   Purpose
+$DOC     This member
+HLASM    Help member for SYS1.HELP
+INSTALL  Install HLASM to a "permanent" library using the object
+         "deck" in member OBJECT.  Follow the instructions in the
+         member.
+INSTALLA Install HLASM to a permanent library by assembling and
+         linking the source module in the SOURCE member.  Follow the
+         instructions in the member.
+INSTALLB Inatall HLASM to a permanent library entirely in batch by
+         assembling the source module in the SOURCE member and
+         linking the object preoduced by the assembly.  Except
+         for date and time information assembled into the object
+         this object is byte to byte identical to the object in
+         the OBJECT member.
+LINCLUDE Binder control statements used with the INSTALLA job.
+OBJECT   The object "deck" of the HLASM program.
+ODT      User document in Open Document format.  This member
+         requires additional processing to prepare it for use on a
+         work station.  See the discussion later in this member.
+SOURCE   The source code of the program.
+USING    A brief discussion about using the HLASM command.
+
+The HLASM program is a TSO command processor to run the High
+Level Assembler in a TSO session.
+
+This HLASM command is a complete, but incompatible, replacement
+of the HLASM command in the CBTTAPE "file" 300 collection.  It
+uses the IKJPARS TSO service to examine the contents of the
+command line, uses MVS dynamic allocation to allocate all the
+data sets required for the assembly, and uses the TSO PUTLINE
+service to communicate with the terminal operator or the SYSTSPRT
+DD statement if run in TSO in batch.  It will run directly from
+the TSO READY prompt; it does not require a CLIST or Rexx exec to
+pre allocate the data sets required for the assembly unless the
+LIBDD or LIBFILE parameters are used to specify a preallocated DD
+statement (FILE in TSO usage).
+
+The command syntax is
+
+HLASM  data set  NOADATA/ADATA(data set)  NOALIGN/ALIGN  NOASMAOPTS/
+       ASMAOPT(data set)  NOBATCH/BATCH  NODBCS/DBCS  NODXREF/
+       DXREF  NOESD/ESD  NOFOLD/FOLD  NOGOFF/GOFF(NOADATA.ADATA)
+       NOLIBMAC/LIBMAC  NOLIST/LIST(121/133)
+       NOMXREF/MXREF(FULL/ SOURCE/XREF)  NOOBJECT/OBJECT(data set)
+       NOPRINT/PRINT(data set)  NORC/RC  NORLD/RLD  NORXREF/RXREF
+       NOTERM/TERM(data set)  NOTEST/TEST  NOTHREAD/THREAD  VERSION
+       NOXOBJ/XOBJ(NOADATA/ADATA)  NOXREF/XREF(FULL/SHORT UNREFS)
+       LIB(data set ... data set)/LIBDD(dd name)/LIBFILE(dd name)
+ Required - data set
+ Default - OBJECT TERM(*) LIB('SYS1.MODGEN' 'SYS1.MACLIB') PRINT TEST
+           If the source data set is not fully qualified, the full
+           data set name is formed by using the data set prefix
+           appended to the start of the name and .ASM appended to
+           the data set name.
+
+           If the TERM data set name is not specified, and the
+           source data data set name is not fully qualified, HLASM
+           forms the data set name as prefix.dsn.TERMLIST.
+
+           If the OBJECT data set name is not specified, and the
+           source data data set name is not fully qualified, HLASM
+           forms the dasta set name as prefix.dsn.OBJ.
+
+           If the PRINT data set name is not specified, and the
+           source data data set name is not fully qualified, HLASM
+           forms the data set name as prefix.dsn.ASMLIST.
+
+           If the ADATA data set name is not specified, and the
+           source data data set name is not fully qualified, HLASM
+           forms name as prefix.dsn.ADATA.
+
+           If the source data set is fully qualified or it is
+           specified with a member, the command will prompt the
+           terminal operator for the remainder of the data sets.
+
+           HLASM will allocate the OBJ, TERMLIST, ASMLIST and ADATA
+           data sets if they are not already allocated.
+
+           If TSO "file" ASMAOPTS is allocated and no ASMAOPTS
+           data set is specified in the command line, the High
+           Level Assembler will use the TSO "file."
+
+Messages -
+
+The High Level Assembler will issue a number of messages if the
+command line specifies TERM(*).  In addition, the IKJPARS TSO service
+will display messages as required.  These messages are not documented
+here.
+
+HLA001I RUNNING HIGH LEVEL ASSEMBLER
+
+Reason: HLASM has completed preparing the environment for the High
+Level Assembler.
+Action: HLASM runs the High Level Assembler.
+Programmer Response: None required.
+
+HLA002I ASM90 RC = nn
+
+Reason: The High Level Assembler completed with return code nn.
+Action: HLASM releases the data sets it allocated to run the High Level
+Assembler and terminates.
+Programmer Response: Examine the TERMLIST data set if was directed to a
+data set if the return code is not 0, correct any errors, and rerun
+HLASM.
+
+HLA003I HLASM V2L3 12/01/17 07.25
+
+Reason: The VERSION option was specified in the HLASM command line.
+HLASM displays the version and the date and time the source data set
+was assembled.
+Action: HLASM completes preparing the environment to run the High
+Level Assembler and runs it.
+Programmer Response: None reqired.
+
+HLA004E dsname IS TOO LONG TO ADD STANDARD QUALIFIERS
+
+Reason: HLASM determined the data set name specified as an "ordinary"
+  data set rather than a fully qualified data set name is too long to
+  apply standard data set qualifiers.
+Action: HLASM directs the IKJPARS service routine to prompt the
+  TSO terminal operator to enter a more appropriate data set name.
+  If the TSO terminal operator is unable tp enter a proper data set
+  name, the command terminates.
+Programmer response: See the discussion in the action paragraph.
+
+HLA005E mmm IS NOT IN ddd
+
+Reason: HLASM determined that member mmm is not in data set ddd.
+  This message may appear if data set ddd is not a Partitioned
+  data set.
+Action: If ddd is the data set specified for the source statement
+  data set, HLASM may prompt the terminal operator to reenter
+  the data set.  If ddd is the data set specified for High Level
+  Assembler options data set, HLASM terminates.
+Programmer response: If HLASM prompts you to reenter the source
+  data set, reenter the source data set.  Otherwise, reenter
+  the entire HLASM command.
+
+HLA006E TOO MANY DATA SETS SPECIFIED IN THE LIB PARAMETER
+
+Reason: HLASM determined the LIB parameter in the command line
+  specified more than 22 data sets.  The maximum number of data sets
+  HLASM can concatenate is 22.
+Action: HLASM frees the data sets it allocated and terminates.
+  If HLASM was entered from a CLIST or Rexx exec, it is terminsted.
+Programmer response: Specify fewer libraries in the LIB parameter.
+  If this is not possible run the assembly in batch.
+
+HLA007A UNABLE TO USE dddd: THE DATA SET IS NOT SEQUENTIAL OR
+PARTITIONED
+
+Reason: HLASM determined that data set dddd is not sequential or
+  partitioned.
+Action: HLASM prompts the terminal operator for a valid data set.
+Programmer response: Enter a valid data set.
+
+HLA008A UNABLE TO USE dddd: THE DATA SET IS SEQUENTIAL BUT THE COMMAND
+LINE SPECIFIES A MEMBER
+
+Reaaon: The command line specifies a data set name in the form
+  dddd(member), but HLASM determined the data set is sequential.
+Action: HLASM prompts the terminal operator for a valid data set.
+Programmer response: Enter a valid data set.
+
+HLA009A UNABLE TO USE dddd: THE DATA SET IS PARTITIONED BUT THE
+  COMMAND LINE DOES NOT SPECIFY A MEMBER
+
+Reason: HLASM determined that the command line specified a partitioned
+  data set, but it did not specify a member name.
+Action: HLASM prompts the terminal operator for a valid data set.
+Programmer response: Enter a valid data set.
+
+HLA010E UNABLE TO USE dddd: THE DATA SET IS NOT PARTITIONED.
+
+Reason: HLASM determined that data set dddd specified in the LIB
+  parameter is not a partitioned data set.
+Action: HLASM termninates.
+Programmer response: Reenter the HLASM command specifying a
+  partitioned data set for the LIB parameter.
+
+HLA011A LIBRARY DD IS NOT ALLOCATED
+
+Reason: HLASM determined the file name specified in the LIBDD or
+  LIBFILE keyword is not allocated to the TSO session.
+Action: HLASM directs IKJPARS to prompt the terminal operator to
+  enter a valid DD name or file name.
+Programmer response: Enter a valid file name and press your Enter
+  key.
+
+******************* Specified Operating Environment *******************
+
+HLASM requires the same operating environment as the High Level
+Assembler.
+
+**************************** Testing HLASM ****************************
+
+More testing can be accomplished by various mechanisms from the
+READY prompt in a TSO session.  For example -
+
+ READY
+test 'xxxxxx.hlasm.cbt.v2l4.pds(object)' object cp
+ IEW2278I B352 INVOCATION PARAMETERS -
+          TERM,NOPRINT,NCAL,NOMAP,NORES,LET,NAME=TEMPNAME
+
+ IEW2008I 0F03 PROCESSING COMPLETED.  RETURN CODE =  0.
+ IKJ57090A ENTER COMMAND FOR CP
+hlasm 'xxxxxx.hlasm.v2l4.cbt.pds(source)'
+ TEST
+go
+ IKJ56700A ENTER NAME OF DATA SET TO CONTAIN THE ASSEMBLER LISTING -
+tsthlasm
+ IKJ56700A ENTER NAME OF DATA SET TO CONTAIN THE ASSEMBLER OBJECT OUTPUT
+tsthlasm
+ HLA001I RUNNING HIGH LEVEL ASSEMBLER
+ Assembler Done HLASM No Statements Flagged
+ HLA002I ASMA90 RC = 0
+ IKJ57023I PROGRAM UNDER TEST HAS TERMINATED NORMALLY+
+ TEST
+end
+ READY
+
+In the example, the TSO TEST command used the linking loader to
+load the HLASM command object module from
+xxxxxx.hlasm.cbt.pds(object), where xxxxxx is your userid.  The
+TEST command prompted the terminal operator to enter a command to
+execute -
+
+hlasm 'xxxxxx.hlasm.cbt.pds(source)'
+
+The go command directs TEST to run the command it loaded.
+
+The IKJ56700A ENTER NAME OF DATA SET TO CONTAIN THE ASSEMBLER
+LISTING message was issued by TSO to request the terminal
+operator to enter the data set name of the data set to contain
+the listing.  HLASM actually creates data set
+XXXXXX.TSTHLASM.ASMLIST.  Then TSO requests a data set to contain
+the object module from the assembly.
+
+HLASM then runs the High Level Assembler to create data in the
+ASMLIST and OBJ data sets.
+
+************************* Load Module Location ************************
+
+For testing purposes, store the HLASM command in a library that
+can be used by the TSOLIB facility or an equivalent facility as
+specified by the INSTALL member.  For a permanent installation,
+store it in a linklist library.  It can also be stored in LPALIB.
+The module requires about 8K above the line.
+
+**************************** Link Pack Area ***************************
+
+HLASM is a reasonable candidate for the link pack area.  It is small
+(less than 12K), RMODE ANY and it is reenterable.
+
+************************** Customizing HLASM **************************
+
+Specialized macro library specifications can be added by altering
+the IKJPARS statements.  For example, add these statements after
+
+HLLIB    IKJKEYWD ...
+
+         IKJNAME PRODMAC,INSERT='LIB(''production macro library'' ''SYSX
+               1.MODGEN'' ''SYS1.MACLIB'')
+
+and before
+
+HLRC     IKJKEYWD ...
+
+After making this change, assemble and reinstall HLASM.
+
+To use this macro library, run HLASM like normal and add PRODMAC as a
+keyword:
+
+HLASM program prodmac
+
+Two examples are present in the source as comment lines.
+
+************************* Preparing ODT Member ************************
+
+The ODT member contains a user document in Open Document format
+for use by the Writer component of the Apache OpenOffice or Libre
+Office products.  I understand the more recent versions of
+Microsoft Office or Word Perfect can also read these files.
+
+You must use the contents of the ODT member to prepare a data set
+that can be sent to a work station.  Execute this command.
+
+RECEIVE INDATASET('thisdataset(ODT)')
+
+The RECEIVE command will prompt you to enter the data set name of
+the data set to receive the data.
+
+Dataset XXXXXX.HLASM.V2L4.ODT from XXXXXX on NODENAME
+Enter restore parameters or 'DELETE' or 'END' +
+
+Enter the data set name you want as DATASET(xxxx) or just press
+your Enter key to use the default userid.HLASM.V2L4.ODT.  After
+you have prepared this data set you can download it to your work
+station as a binary data set.  Once you have received the data
+set you can open the file with Apache Open Office or Libre Office,
+or with Micosoft Word or WordPerfect if it supports opening data in
+Open Document format.
+
+*************************** Sequence Numbers ***************************
+
+Correction material may be sent as source updates in IEBUPDTE format,
+though not in a form acceptable as a ++SRCUPD to SMP, so DO NOT ALTER
+THE SEQUENCE NUMBERS.
+
+***************************** CHANGE LOG *******************************
+
+** Changes From V2L0 (the version in CBT "file" 966 as of January 2018 *
+
+- When TERM(*) is specified and HLASM is run in TSO in batch, the High
+  Level Assembler messages directed to the data set normally
+  specified by the DD statement with DD name SYSTERM are sent to the
+  TSO data set specified by the DD statement with DD name SYSTSPRT.
+- When TERM(*) specified and HLASM is run by a CLIST or Rexx exec, the
+  High Level Assembler messages directed to the data set normally
+  specified by the DD statement with DD name SYSTERM can be "trapped"
+  by the CLIST or Rexx exec.
+- Data sets specified as just a member name are allocated to a data
+  set with data set name prefix.suffix(member), where prefix is the
+  value specified by the PROFILE PREFIX(prefix) TSO command.  This
+  prefix is normally your TSO userid.
+
+** Changes From V2L2 (the version in CBT "file" 966 as of March 2018) **
+
+- Interpret data set name entered as only (member) as
+  userid.suffix(member), where suffix depends on the context.
+- Added messages HLA007A, HLA008A, HLA009A, HLA010A and HLA011E.
+- Internal changes to add addressability.
+- Added LIBDD/LIBFILE keywords to the command line.
+- Corrected multiple problems encoountered when entering a member
+  name in the input data set name.
+- Refreshed the user documentation in ODT.
+- Updated member HLASM (the SYS1.HELP member) to support
+  LIBDD/LIBFILE.
+
+***************************** Restrictions ****************************
+
+HLASM allocates new data sets, including the data set specified
+by the OBJECT parameter, to use System Determined BLKSIZE.  The
+actual BLKSIZE, usually 27920 on 3390 or pseudo 3390 devices, is
+too large for the OS/VS Linkage Editor (program HEWLKED) which
+IBM has retained for compatibility reasons.  If it is necessary
+to use the object output with HEWLKED, pre allocate the object
+data set with a BLKSIZE that HEWLKED will accept, such as
+BLKSIZE=3200.  In all other respects the normal object output,
+unless modified by the XOBJ or GOFF parameters, is acceptable to
+HEWLKED.  More information is available in the "z/OS Program
+Management User's Guide and Reference," "z/OS Program Management
+Advanced Facilities" and "HLASM V1R6 Programmer's Guide."  The
+HLASM in the last manual title refers to the High Level
+Assembler, not the TSO HLASM command in this document.
+
+*************************** Version Summary ***************************
+
+V1L0 - Initial release, no support for fully qualified data set names.
+       Not released to CBT.
+V2L0 - Support for fully quaalifed data set names.  Released to CBT.
+V2L1 - High Level Assembler SYSTERM data "trapped" and sent to TSO
+       session via PUTLINE.  Not released to CBT.
+V2L2 - Support for member only data set names.  Released to CBT.
+V2L3 - Improved support for XREF(UNREFS).  This is documented as
+       corrective maintenance, not a feature.  Not released to CBT.
+V2L4 - Corrected error when member specified for the Assembler
+       input data set.  Added LIBDD/LIBFILE to specify preallocated
+       SYSLIB data sets.  No futher enhancements expected.
+
+Additional details are in the change log in the source.
+
+***************  No further feature changes are expected ***************
+
+While there is no influence from the ASMAHL command used by the
+z/VM version of the High Level Assembler, the generic goal is
+similar.  The LINECOU option provided by ASMAHL is provided by
+HLASM as a standard keyword abbreviation provided by TSO, not as
+a separate option.
+
+******************************* Support *******************************
+
+Contact the author at mvsprog@yahoo.com
+
+************************** Author's Comments **************************
+
+There are several problems with material in the CBT distribution
+method.
+
+ - Support
+
+   Obviously paid support through a large company like IBM is better.
+   Another issue is authors move on and can no longer support their
+   product for one reason or another.
+
+ - Release dependencies
+
+   HLASM was developed for use with High Level Assembler Verson 1
+   Release 6.  For the most part it was assembled and tested with
+   Version 1 Release 5.  It is unknown if future High Level Assembler
+   releases will have a significant impact on HLASM.  Certainly no
+   issues were detected going from Release 5 to Release 6.
+
+   In addition, z/OS 2.3 inserted significant potential issues for
+   HLASM.  To the maximum extent possible these issues have been
+   mitigated by using IKJPARS to insert the data set prefix for
+   user data sets.  While HLASM has not been tested on z/OS 2.3, or
+   higher releases, it is hopeful the previously discussed
+   mitigation issues will be sufficent to avoid problems,
+
+ - Author prefrences
+
+   The command is used in an environment where relatively small
+   programs are being written and tested.  The default space
+   allocations, particularly for PDS data sets, reflect this reality.
+```
+

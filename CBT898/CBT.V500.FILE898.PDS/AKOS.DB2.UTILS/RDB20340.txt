@@ -1,0 +1,371 @@
+/******************************** REXX ********************************/
+/*--------------------------ooo000OOOO000ooo--------------------------*/
+/*                                                                    */
+/* Program - RDB20340                                                 */
+/* Alias   - DB2UTIL                                                  */
+/* Purpose - To generate DB2 utility parms & jcl for given databases  */
+/*         - Special for jobs submitted via CONTROL/M                 */
+/*                                                                    */
+/* The following files have to be pre-allocated prior to invocation:  */
+/*         UTILPARM     - Input options                               */
+/*         LISTDEF      - Output from the DB2 LISTDEF command         */
+/*         OUTLIST      - List of tablespaces to be copied            */
+/*                                                                    */
+/* Input options:                                                     */
+/*         SYSTEM       - DB2 subsystem ( mandatory )                 */
+/*         UTILITY      - Opretion being performed. Default is spaces */
+/*                        which will cause the bypass of last_copy    */
+/*                        checking ("Ignore" eyecatcher inserted in   */
+/*                        AUDIT report.                               */
+/*         MIGRATED     - Set to 'PROCESS' to force processing of     */
+/*                        migrated datasets. Default is NO-PROCESS.   */
+/*         LAST_COPY    - Number of hours since the last imagecopy    */
+/*                        NOTE - Only used for "COPY" process.        */
+/*                      - (Default = 23.)                             */
+/*         DEBUG        - DEBUG=YES/AUDIT or blank. YES gives full    */
+/*                        REXX trace. Audit gicves a display of data  */
+/*                        processed and results.                      */
+/*         ERROR_RC     - Return code to exit with in case of error.  */
+/*                      - (Default = 1.)                              */
+/*                                                                    */
+/*--------------------------------------------------------------------*/
+    Parse Upper Arg array 'DEBUG=' debug  .
+
+    system    =
+    last_copy = 23                          /* Last copy - hours since*/
+    error_rc  = 1
+    debug     =
+    utility   = 'MISSING'
+    mig_proc  = 'NO-PROCESS'
+
+/*
+Address TSO
+"alloc F(UTILPARM) DA('TPCICS.C838704.$DB2.PARM') SHR REU"
+"alloc F(LISTDEF)  DA('TPCICS.C838704.$DB2.LIST') SHR REU"
+"alloc F(OUTLIST)  DA('TPCICS.C838704.$DB2.OUTLIST') SHR REU"
+*/
+
+
+    Call read_parm
+    Call print_parm
+    If debug = 'YES' Then Do
+        Trace r
+        x = Msg('On')
+    End
+    Else x = Msg('Off')
+    Call read_listdef
+
+/*--------------------------------------------------------------------*/
+/*  Activate the REXX SQL interface routine                           */
+/*--------------------------------------------------------------------*/
+    'SUBCOM DSNREXX'                /* Host cmd mode available?  */
+    If rc Then,                     /* if not, make it available */
+        s_rc = RXSUBCOM('ADD','DSNREXX','DSNREXX')
+    Address DSNREXX
+    "CONNECT" system
+
+/*--------------------------------------------------------------------*/
+/*  Build the DSN commands statements                                 */
+/*--------------------------------------------------------------------*/
+    Address TSO
+    "NEWSTACK"
+    Queue '    'ldef_list
+    Do i=ld_p To listdef.0
+        If Word(listdef.i,1) /= 'INCLUDE' Then Iterate
+        Parse VAR listdef.i . tty database '.' tspace . '(' partno ')' .
+        If Datatype(partno) = 'NUM' Then Do
+            partno = partno+0
+            xtra = 'PART('partno')'
+        End
+        Else Do
+            partno = 0
+            xtra   =
+        End
+        If #database /= database Then Do
+            "NEWSTACK"
+            Queue '-DISPLAY DB('database') SPACE(*) RESTRICT'
+            Queue 'END'
+            restrict = Get_db_restrict()
+            If debug = 'AUDIT' Then,
+                Say restrict '-DISPLAY DB('database') SPACE(*) RESTRICT'
+            "DELSTACK"
+            #database = database
+        End
+        If restrict Then Do
+            "NEWSTACK"
+            Queue '-DISPLAY DB('database') SPACE('tspace') LIMIT(*)' xtra
+            Queue 'END'
+            dbsum = Get_db_summary()
+            If debug = 'AUDIT' Then Say dbsum,
+                '-DISPLAY DB('database') SPACE('tspace') LIMIT(*)' xtra
+            "DELSTACK"
+        End
+        Else Do
+            dbsum  = 0
+            status = "'OK2COPY'"
+        End
+        r_count = '?'
+        If dbsum = 0 Then Do
+            adr@ = Address()
+            Address DSNREXX
+
+            If mig_proc /= 'NO-PROCESS' Then li = 0
+            Else li = Check_if_migrated()
+            If li = 0 & utility = 'COPY' Then,
+                 li = Check_last_imagecopy()
+
+            Address(adr@)
+            If li = 0 Then Queue '            'Strip(listdef.i)
+        End
+        If debug = 'AUDIT' Then Do
+            If utility /= 'COPY' & Datatype(li) = 'NUM' Then li = 'Ignored'
+            Say '  ' dbsum 'space =' Substr(tspace,1,8) 'part('partno')',
+                'status =' Substr(status,1,10) 'Last-copy =' li
+        End
+    End
+
+    If Queued() = 1 Then Do
+        "DELSTACK"
+        Say ' '
+        Say '******************** Error ****************************'
+        Say ' '
+        Say 'No tablespaces availalbe for COPY.'
+        Say 'Processing halted with RC='error_rc'.'
+        Say ' '
+        Say '*******************************************************'
+        zispfrc = error_rc;Address ISPEXEC "VPUT (zispfrc)"
+        Exit error_rc
+    End
+
+    Queue ''
+    Address TSO "EXECIO * DISKW OUTLIST ( FINIS"
+
+    If debug = 'AUDIT' Then Do
+        Address TSO "EXECIO * DISKR OUTLIST (STEM line. FINIS"
+        Do i=1 To line.0;Say Right(i,3)')' Strip(line.i,'t');end
+    End
+    If Queued() > 0 Then "DELSTACK"
+
+    Address DSNREXX "DISCONNECT"
+
+/*
+Address TSO "FREE F(UTILPARM,LISTDEF,OUTLIST)"
+*/
+
+    Exit 0
+
+/*--------------------------------------------------------------------*/
+/*  Obtain the tablespaces for given database from the -DISPLAY       */
+/*  command.                                                          */
+/*  Parse the data for '------' to identify the start of the          */
+/*  tablespace names and '*******' for the end.                       */
+/*--------------------------------------------------------------------*/
+Get_db_restrict:
+    msg = Msg('On');x = Outtrap('list.')
+    "DSN SYSTEM("system")"
+    x = Outtrap('Off');msg = Msg(msg)
+
+    Do j=1 To list.0
+        If Word(list.j,1) = '--------' Then Leave
+    End
+    j = j+1
+    If Strip(list.j) = '******** NO SPACES FOUND' Then Return 0
+    Else                                               Return 1
+
+/*--------------------------------------------------------------------*/
+/*  Obtain the tablespaces for given database from the -DISPLAY       */
+/*  command.                                                          */
+/*  Parse the data for '------' to identify the start of the          */
+/*  tablespace names and '*******' for the end.                       */
+/*--------------------------------------------------------------------*/
+Get_db_summary:
+    msg = Msg('On');x = Outtrap('list.')
+    "DSN SYSTEM("system")"
+    x = Outtrap('Off');msg = Msg(msg)
+
+    Do j=1 To list.0
+        If Word(list.j,1) = '--------' Then Leave
+        If Word(list.j,1) = 'DSNT362I' Then Do
+            Parse VAR list.j . 'STATUS =' status .
+            If status = 'STOP' Then Return 1
+        End
+    End
+    j = j+1
+    Parse VAR list.j . type p_n status .
+    If Datatype(p_n) = 'CHAR' Then status = p_n
+    Select
+        When status   = 'RW'       Then NOP
+        When status   = 'RO'       Then NOP
+        When status   = 'RW,COPY'  Then NOP
+        When status   = 'RO,COPY'  Then NOP
+        When status   = 'RW,ICOPY' Then NOP
+        When status   = 'RO,ICOPY' Then NOP
+        Otherwise Return 1
+    End
+
+    Return 0
+
+/*--------------------------------------------------------------------*/
+/*       Purpose - To read input parms and validate the input parms   */
+/*--------------------------------------------------------------------*/
+Read_parm:
+    "EXECIO * DISKR UTILPARM ( STEM list. FINIS"
+
+    Do i=1 To list.0
+        Parse Upper VAR list.i keyword '=' key_value .
+        Select
+            When keyword = 'LAST_COPY'  Then last_copy = key_value
+            When keyword = 'SYSTEM'     Then system    = key_value
+            When keyword = 'UTILITY'    Then utility   = key_value
+            When keyword = 'ERROR_RC'   Then error_rc  = key_value
+            When keyword = 'DEBUG'      Then debug     = key_value
+            When keyword = 'MIGRATED'   Then mig_proc  = key_value
+            Otherwise NOP
+        End
+    End
+
+    If system = '' Then Do
+        Call print_parm
+        Say ' '
+        Say '******************** Error ****************************'
+        Say ' '
+        Say 'Please provide the DB2 subsystem name.'
+        Say 'Processing halted with RC='error_rc'.'
+        Say ' '
+        Say '*******************************************************'
+        zispfrc = error_rc;Address ISPEXEC "VPUT (zispfrc)"
+        Exit error_rc
+    End
+
+    Return
+
+/*--------------------------------------------------------------------*/
+/*       Purpose - To read input parms and validate the input parms   */
+/*--------------------------------------------------------------------*/
+print_parm:
+    Say 'Runtime parameters:'
+    Say '-------------------'
+    Say 'DB2 subsystem SYSTEM      =' system
+    Say '              UTILITY     =' utility
+    Say '              LAST_COPY   =' last_copy '(hours)'
+    Say '              MIGRATED    =' mig_proc
+    Say '              ERROR_RC    =' error_rc
+    Say '              DEBUG       =' debug
+    Say ' '
+
+    If debug = 'AUDIT' Then Do
+        Say Copies('-',65)
+        Say 'With AUDIT on, the following displays will be presented:'
+        Say '1. 1(restricted) 0(non-restricted) followed by the "display"'
+        Say '   command used.'
+        Say '2. If there are restrictions:'
+        Say '   "Display" command used for the table/index space with the'
+        Say '   return code.'
+        Say '3. If NO-PROCESS is active for migrated datasets (default):'
+        Say '   The "sysreason" followed by the dataset name. Where the'
+        Say '   common reasons are:'
+        Say '     5 - Not catalogued.'
+        Say '     9 - Migrated dataset.'
+        Say '    12 - VSAM dataset (OK reason).'
+        Say '    25 - Migrated to non-DASD.'
+        Say '4. The name of the space (table/index) partlevel, status and'
+        Say '   last-copy value (actually the number of copies since the'
+        Say '   number of hours on the last-copy parameter. The staus will'
+        Say '   be set to "OK2COPY" if' restrictions are off.'
+        Say '   This last-copy value may be altered to "migrated/not-cat"'
+        Say '   depending on the dataset status returned from the migration'
+        Say '   determination processing.'
+        Say '   For non "COPY" functions the last-copy will be changed to'
+        Say '   "Ignored" if the space is not migrated or not catalogued.'
+        Say Copies('-',65)
+        Say ' '
+    End
+
+    Return
+
+/*--------------------------------------------------------------------*/
+/*  Read OBJECTS  output from the LISTDEF command.                    */
+/*--------------------------------------------------------------------*/
+read_listdef:
+    "EXECIO * DISKR LISTDEF ( STEM listdef. FINIS"
+
+    Do i=1 to listdef.0
+        If ( Index(listdef.i,'DSNU1010I') > 0  &,
+             Index(listdef.i,'DSNUGPVV')  > 0 )  Then Leave
+    End
+
+    If i = listdef.0 Then Do
+        Say '******************** Error ****************************'
+        Say ' '
+        Say 'Unable to find the start of the list expansion'
+        Say 'Processing halted with RC='error_rc'.'
+        Say ' '
+        Say '*******************************************************'
+        zispfrc = error_rc;Address ISPEXEC "VPUT (zispfrc)"
+        Exit error_rc
+    End
+
+    ld_p = i+1
+    Parse VAR listdef.ld_p v1 v2 .
+    ldef_list = v1 v2
+    ld_p = ld_p +1
+
+    Return 0
+
+/*--------------------------------------------------------------------*/
+/*  To check for existance of image copy within the last "x" hours.   */
+/*--------------------------------------------------------------------*/
+Check_last_imagecopy:
+    sqlstmt = "SELECT COUNT(*)",
+             "FROM SYSIBM.SYSCOPY",
+             "WHERE DBNAME = '"database"'",
+             "AND   TSNAME = '"tspace"'",
+             "AND   DSNUM  IN (0,"partno")",
+             "AND   ICTYPE = 'F'",
+             "AND   TIMESTAMP > CURRENT TIMESTAMP -",
+             last_copy "HOURS"
+    "EXECSQL PREPARE S1 FROM :sqlstmt"
+    "EXECSQL DECLARE C1 CURSOR FOR S1"
+    "EXECSQL OPEN C1"
+    If sqlcode = 0 Then Do
+        EXECSQL "FETCH C1 INTO :r_count"
+        EXECSQL "CLOSE C1"
+    End
+
+    Return r_count
+
+/*--------------------------------------------------------------------*/
+/*  To check for existance of image copy within the last "x" hours.   */
+/*--------------------------------------------------------------------*/
+Check_if_migrated:
+    If tty = 'TABLESPACE' Then,
+        sqlstmt = "SELECT VCATNAME,IPREFIX",
+                 "FROM SYSIBM.SYSTABLEPART",
+                 "WHERE DBNAME = '"database"'",
+                 "AND   TSNAME = '"tspace"'"
+    Else
+        sqlstmt = "SELECT A.VCATNAME,A.IPREFIX",
+                 "FROM SYSIBM.SYSINDEXPART A,",
+                 "     SYSIBM.SYSINDEXES   B",
+                 "WHERE  A.IXNAME     = B.NAME",
+                 "AND    A.IXCREATOR  = B.CREATOR",
+                 "AND    B.DBNAME     = '"database"'",
+                 "AND    B.INDEXSPACE = '"tspace"'"
+    "EXECSQL PREPARE S1 FROM :sqlstmt"
+    "EXECSQL DECLARE C1 CURSOR FOR S1"
+    "EXECSQL OPEN C1"
+    If sqlcode = 0 Then Do
+        EXECSQL "FETCH C1 INTO :vcatname,:ipref"
+        EXECSQL "CLOSE C1"
+    End
+
+    hlq = Strip(vcatname)'.DSNDBD.'database'.'tspace
+    If partno = 0 Then partno = 1
+    dsn = hlq"."ipref"0001.A"Right(partno,3,'0')
+    x = LISTDSI("'"dsn"'" volume "DIRECTORY NORECALL")
+    If debug = 'AUDIT' Then Say '  ' Sysreason+0 'DSN   =' dsn
+    If sysreason = 9 | sysreason = 25 Then Return 'Migrated'
+    If sysreason = 5 Then Return 'Not-catalogued'
+
+    Return 0
+

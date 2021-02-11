@@ -1,0 +1,136 @@
+
+## $DOC.txt
+```
+-----------------------------------------------------------------------
+|  DISCLAIMER:                                                        |
+-----------------------------------------------------------------------
+
+This software is provided for your use without any warranty or recourse
+should it not perform or cause problems.  The author and others who
+have contributed are not responsible for issues that arise, nor are
+their employers. Use this software at your own risk. Test and test
+again before using in any productive capacity.
+
+The complete source is provided and it is my hope that you will not
+find any issues.  However if you do have issues please let me know
+(nicklight031@gmail.com) and if you do make changes/enhancements,
+please let me know as well.
+
+-----------------------------------------------------------------------
+|  REQUIREMENTS:                                                      |
+-----------------------------------------------------------------------
+
+STEMEDIT, on CBT file 895, is required to be installed if you wish
+to use the GDGP panel for online processing.
+
+-----------------------------------------------------------------------
+|  INSTALLATION INSTRUCTIONS:                                         |
+-----------------------------------------------------------------------
+
+- Copy GDGP to your SYSEXEC library.
+- Copy GDGPH and GDGPP to your ISPF panel library.
+- Copy GDGP00 to your ISPF message library.
+- Install STEMEDIT from CBT file 895.
+- Update the following statement in the GDGP exec to specify the
+  SYSEXEC library where you copied GDGP:
+
+     "//SYSEXEC   DD DISP=SHR,DSN=dsn.where.GDGP.exists"
+
+-----------------------------------------------------------------------
+|  HOW IT WORKS:                                                      |
+-----------------------------------------------------------------------
+
+This REXX EXEC allows the user to do a couple of things:
+
+1.  Create a new GDG if the one specified by the user does not exist;
+    or,
+
+2.  If the GDG does exist, modify the base with the properties
+    specified by the user.
+
+To modify an existing GDG, the EXEC processes as follows:
+
+1.  If the new limit specified is 255 or less, or the GDG is already
+    defined as NONEXTENDED, then the ALTER command is used to update
+    the GDG.
+
+2.  If the GDG is defined as NONEXTENDED and a limit of greater than
+    255 is requested, the following process is executed:
+
+    a.  Uncatalog each GDS, disassociating it with the base.
+    b.  Delete the GDG base and redefine it with the requested
+        specifications.
+    c.  Re-catalog each GDS, re-associating it with the base.
+
+NOTE:  This process will work with generations on either DASD or tape.
+       However, if the ALTER command cannot be used for the updates
+       (item 2 above is required for processing), this exec will not
+       work with one or more generations that have been archived.
+
+This REXX EXEC can be run any of 4 ways:
+
+1.  Online displaying a panel.  The panel is displayed when TSO GDGP
+    is invoked without both the GDG base and limit specified.  If
+    either are specified, they will be displayed initially on the
+    panel.
+
+2.  Online without a panel.  If TSO GDGP is invoked with at least the
+    GDG base and limit specified, the panel will not be displayed and
+    and processing will occur with exactly the parameters specified
+    when GDGP was invoked.
+
+3.  In batch from the panel.  On the GDGP panel, specify B (for Batch),
+    and JCL will be displayed which can be submitted to execute the
+    process as a batch job.
+
+4.  As a batch job.  Simply submit the job from your JCL library.
+    Following is sample JCL:
+
+    //GDGP     EXEC PGM=IKJEFT01
+    //SYSEXEC   DD DISP=SHR,DSN=rexx.dsn
+    //SYSTSPRT  DD SYSOUT=*
+    //SYSTSIN   DD *
+    GDGP gdg.base.name limit nscr emp fifo purge
+
+-----------------------------------------------------------------------
+|  PARAMETERS:                                                        |
+-----------------------------------------------------------------------
+
+Parameters passed to this program are as follows:
+
+The following two parameters are required and positional:
+
+Base    1st parameter.  An existing GDG base to be converted or the
+        name of a GDG base to be created.
+Limit   2nd parameter.  The GDG limit for the converted/new GDG base.
+
+        On the panel only, if left blank and the specified GDG base
+        already exists, the current attributes are displayed on the
+        panel.
+
+The following parameters are all optional and can be entered in any
+order (after the first two required parameters).  See DFSMS Access
+Method Services Commands for detailed descriptions of each parameter.
+
+SCRATCH/NOSCRATCH  NOSCRATCH is the default.
+EMPTY/NOEMPTY      NOEMPTY is the default.
+FIFO/LIFO          LIFO is the default.
+PURGE/NOPURGE      NOPURGE is the default.  When NOSCRATCH is
+                   specified, NOPURGE is automatically set.
+
+For new GDGs, the above defaults are taken when nothing is specified.
+For existing GDGs, the value is not changed if not specified/
+overridden by the user.
+
+-----------------------------------------------------------------------
+|  MEMBERS OF THIS PDS:                                               |
+-----------------------------------------------------------------------
+
+$DOC   - You're reading it!
+GDGP   - The REXX exec
+GDGPH  - Help panel
+GDGPP  - Main panel
+GDGP00 - Messages
+
+```
+

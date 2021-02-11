@@ -1,0 +1,941 @@
+/* REXX ******************************************************* EASE *
+ * Copyright 1990, 1999, 2001, 2006, 2011 Hewlett-Packard            *
+ * Development Company, L.P.  All rights reserved.                   *
+ *********************************************************************
+ *                                                                   *
+ * REVIVE:    ISPF edit macro                                        *
+ *                                                                   *
+ * Function:  Restores deleted member using PDS RESTORE command.     *
+ *            Provides selection list in LIFO order from which       *
+ *            deleted members may be browsed or selected.            *
+ *            Selection list shows date/time range for each mbr.     *
+ *                                                                   *
+ * Requires:  ISPF 3.1                                               *
+ *            PDS  8.6.4                                             *
+ *            Panels    @SEURCOV - Recovery parameters               *
+ *                      @SEURCOL - Recovery member list              *
+ *                      @SEHRCOV - Help                              *
+ *                                                                   *
+ * Author:    Jay Dunning, EDS Property and Casualty, Plano, TX      *
+ *                                                                   *
+ * Created:   08/29/90                                               *
+ *                                                                   *
+ * Modified:                                                         *
+ *                                                                   *
+ * 10/29/1999 Michael Schmitt, EDS Insurance, Plano TX               *
+ *            Y2K changes.                                           *
+ *                                                                   *
+ * 07/24/2001 Michael Schmitt, EDS Insurance Solutions, Plano TX     *
+ *            The logic for determining whether to report SSI or     *
+ *            ISPF Statistics was getting fooled by libraries with a *
+ *            lot of old members without stats.                      *
+ *                                                                   *
+ * 06/19/2006 Michael Schmitt, EDS Financial Services ADU, Plano, TX *
+ *            PDS version 8.6 provides a TEST parameter on RESTORE,  *
+ *            so that it is not necessary to queue NO & END commands.*
+ *                                                                   *
+ * 10/04/2011 Michael Schmitt, HP ES Application Services, Plano, TX *
+ *            PDS RESTORE has a limit of 32 characters on the FIND   *
+ *            string. Truncate the string to fit by removing         *
+ *            trailing and leading spaces, then other characters.    *
+ *                                                                   *
+ * 10/20/2011 John Kalinich, CSC, St Louis, MO                       *
+ *            Add XISPMODE operand to PDS commands.                  *
+ *            Add SLEEP command after pop-up messages.               *
+ *                                                                   *
+ * 01/14/2019 John Kalinich, CBT, St Louis, MO                       *
+ *            Add LoadISPF/DropISPF logic for in-line panels.        *
+ *            Add SLEEP switch.                                      *
+ *            Check for PDS format.                                  *
+ *            Reformat with REXXFORM.                                *
+ *                                                                   *
+ * 01/14/2019 Lionel Dyck                                            *
+ *            Change SLEEP to use syscall sleep.                     *
+ *********************************************************************/
+   sleep = 1                /* sleep = 0 to bypass     DRK JAN19 */
+   find_str_len = 32        /* Maximum length of FIND string */
+   rename   = ''
+   renameid = ''
+   string   = ''
+   last_restored_ttr = ''
+   ADDRESS ISPEXEC "CONTROL ERRORS RETURN"
+/* get member information  *******************************************/
+   ADDRESS ISREDIT
+   "MACRO (help)"
+   If help = '?' then do
+      Address ISPEXEC "DISPLAY PANEL(@SEHRCOV)"
+      Exit 4
+   End
+   if rc ¬= 0 then
+      call error_msg 'Revive must be executed within edit'
+   "(MEMBER) = MEMBER"
+   if member = '' then
+      call error_msg 'Cannot REVIVE: not a PDS member'
+   "(DSN)    = DATASET"
+   Address ISPExec
+   "dsinfo dataset('"dsn"')"
+   if zdsdsnt <> 'PDS' then
+      call error_msg 'Cannot REVIVE: not a PDS'
+   load_info = loadispf()
+/* look for signature string  ****************************************/
+   Address ISREdit
+   "(NUMSW,NUMMODE)   = NUMBER"
+   numcob = substr(nummode,9,7)
+   if numcob = COBOL then do
+      col7  = 1
+      col8  = 2
+      col11 = 5
+      col12 = 6
+      col72 = 66
+   end
+   else do
+      col7  = 7
+      col8  = 8
+      col11 = 11
+      col12 = 12
+      col72 = 72
+   end
+   "(LASTLNBR) = LINENUM .ZLAST"
+   if lastlnbr > 0 then do
+      "FIND PROGRAM-ID FIRST"          /* cobol program      */
+      if rc = 0 then do
+         "FIND P' @'"                  /* in case next line  */
+         "(LINE) = LINE .ZCSR"
+         string = substr(line,col8,64)
+      end
+      else do
+         "FIND ' PIC ' FIRST"          /* cobol data copy mbr*/
+         if rc = 0 then do
+            "(LINE) = LINE .ZCSR"
+            string = substr(line,col8,64)
+         end
+         else do
+            "FIND 'WAAMENTR' FIRST"    /* ALC                */
+            if rc = 0 then do
+               "(LINE) = LINE .ZCSR"
+               string = substr(line,1,72)
+            end
+            else do
+               "FIND 'CSECT' FIRST"    /* ALC                */
+               if rc = 0 then do
+                  "(LINE) = LINE .ZCSR"
+                  string = substr(line,1,72)
+               end
+               else do
+                  "FIND ':' FIRST"     /* PLI, CLIST, REXX   */
+                  if rc = 0 then do
+                     "(LINE) = LINE .ZCSR"
+                     string = substr(line,1,72)
+                  end
+                  else do               /* unknown            */
+                     do linenbr = 1 to 999,
+                          until pos('*',line) = 0
+                        "(LINE) = LINE .ZCSR"
+                     end
+                     string = substr(line,1,72)
+                  end
+               end
+            end
+         end
+      end
+   end
+   string = shorten(string, find_str_len)  /* shorten to fit */
+/* get member recovery details  **************************************/
+   ADDRESS ISPEXEC
+display:
+   "DISPLAY PANEL(@SEURCOV)"
+   if rc > 0 then signal exit
+   presence = SYSDSN(''''dsn'('@seurcon')''')
+   if presence = 'OK' then do
+      zedsmsg = ''
+      zedlmsg = 'Member' @seurcon 'already exists -- please',
+        'choose a different name'
+      "SETMSG MSG(ISRZ001)"
+      signal display
+   end
+/* build table representing directory  *******************************/
+   if @seurcod = 'Y' then
+   call build_directory_table
+   call in_progress_msg 'Preparing control information...'
+   if sleep = 1 then                                /* DRK OCT11 */
+       address 'SYSCALL' 'SLEEP (1)'                /* LBD JAN19 */
+/* calculate max number of members ***********************************/
+/* rule of thumb:  each track can hold about 30 1-line members max
+                   so assume 10 deleted members per track.  If too low
+                   -> hangs, if too high then QUEUEs take too long   */
+
+/*-- following commented out 6/19/2006 MS -----------------------------
+          thumb = 10
+          x = listdsi(''''dsn'''')
+          select
+             when sysunits = 'CYLINDER' then
+                maxmbrs = systrkscyl * sysused * thumb
+             when sysunits = 'TRACK'    then
+                maxmbrs = sysused * thumb
+             when sysunits = 'BLOCK'    then
+                maxmbrs = trunc((sysused / sysblkstrk) * thumb)
+             otherwise do
+                call error_msg,'LISTDSI error: rc =' rc,
+                               ', SYSUNITS =' sysunits
+                signal clean_up
+                end
+             end
+---------------------------------------------------------------------*/
+
+   ADDRESS TSO
+   "PROFILE PROMPT"
+   x = PROMPT('ON')
+   "NEWSTACK"
+   if string = '' then
+   queue 'RESTORE' @seurcon 'NODISPLAY TEST'
+   else
+   queue 'RESTORE' @seurcon 'NODISPLAY FIND('''string''')',
+     'ASIS TEST'
+       /* do maxmbrs           *** removed 6/19/2006 MS ***
+             queue N
+             queue END
+             end */
+   queue 'END'
+   queue ''
+/* get list of deleted member ttrs from PDS  *************************/
+   call in_progress_msg 'Obtaining deleted member information...'
+   if sleep = 1 then
+     address 'SYSCALL' 'SLEEP (1)'                  /* LBD JAN19 */
+   X = OUTTRAP("PDS.",'*',NOCONCAT)
+   "PDS '"dsn"' xispmode"                           /* DRK OCT11 */
+   X = OUTTRAP('OFF')
+   "DELSTACK"
+/* create table of members  ******************************************/
+   ADDRESS ISPEXEC
+   "CONTROL DISPLAY REFRESH"
+   call in_progress_msg 'Tabling deleted member information...'
+   if sleep = 1 then
+     address 'SYSCALL' 'SLEEP (1)'                  /* LBD JAN19 */
+   Address ISPEXEC                                  /* DRK OCT11 */
+   rcvtable = 'R'||TIME(seconds)
+   version = 0
+   "TBCREATE" rcvtable "NAMES(TTR ACTION RENAME INFO)",
+     "NOWRITE REPLACE"
+   do i = PDS.0 to 1 by -1
+      parse var PDS.i 'FOUND AT TTR: ' ttr
+      if ttr ¬= '' then do
+         version = version - 1
+         if @seurcod = 'Y' then do
+            call estimate_date ttr
+            info = right(version,4)||'             '||result
+         end
+         else
+         info = right(version,4)
+         "TBADD" rcvtable
+      end
+   end
+/* display selection list  *******************************************/
+   if sleep = 1 then
+     address 'SYSCALL' 'SLEEP (1)'                  /* LBD JAN19 */
+   Address ISPEXEC                                  /* DRK OCT11 */
+   "TBTOP"  rcvtable
+   "TBDISPL" rcvtable "PANEL(@SEURCOL) POSITION(CRP)"
+   do forever
+      if rc >= 8          then signal clean_up
+      if abbrev(zcmd,CAN) then signal clean_up
+      do while ztdsels > 0
+         select
+            when selcmd = 'B' then do
+               if ttr ¬= last_restored_ttr then
+               call restore_member @seurcon,ttr
+               "BROWSE DATASET('&DSN(&@SEURCON)')"
+               action = '*Browsed'
+               "TBPUT" rcvtable
+            end
+            when selcmd = 'S' then do
+               if ttr ¬= last_restored_ttr then
+               call restore_member @seurcon,ttr
+               ADDRESS ISREDIT "DELETE ALL .ZFIRST .ZLAST"
+               ADDRESS ISREDIT "COPY &@SEURCON AFTER .ZFIRST"
+               signal clean_up
+            end
+            when selcmd = 'R' then do
+               if sysdsn(''''||dsn'('rename')'||'''') = OK then
+               action  = '*Already exists'
+               else do
+                  if ttr = last_restored_ttr then
+                  call rename_member  rename,@seurcon
+                  else
+                  call restore_member rename,ttr,'STATS(Y)'
+                  action = '*Restored to'
+               end
+               "TBPUT" rcvtable
+            end
+            otherwise
+            action = '*Invalid'
+         end
+         selcmd = ''
+         if ztdsels > 1 then
+         "TBDISPL" rcvtable
+         else
+         ztdsels = 0
+      end
+      "TBDISPL" rcvtable "PANEL(@SEURCOL)"
+   end
+clean_up:
+   if last_restored_ttr ¬= '' then do
+      X = OUTTRAP("PDS.",'*',NOCONCAT)
+      ADDRESS TSO "PDS '"dsn"' DELETE" @seurcon
+      X = OUTTRAP('OFF')
+   end
+   "TBEND" rcvtable
+exit:
+   x = dropispf(load_info)
+   exit
+/* restore member *****************************************************/
+restore_member:
+   ADDRESS TSO
+   arg newname,newttr,stats
+   "NEWSTACK"
+   queue 'DELETE'  newname
+   queue 'RESTORE' newname 'TTR('newttr') NOPROMPT COUNT(0)'
+   if stats = 'STATS(Y)' then
+   queue 'ATTRIB' newname 'ADDSTATS'
+   queue 'END'
+   queue ''
+   X = OUTTRAP("PDSR.",'*',NOCONCAT)
+   "PDS '"dsn"' xispmode"                           /* DRK OCT11 */
+   X = OUTTRAP('OFF')
+   "DELSTACK"
+   last_restored_ttr = newttr
+   ADDRESS ISPEXEC "CONTROL DISPLAY REFRESH"
+   return
+/* rename  member *****************************************************/
+rename_member:
+   ADDRESS TSO
+   arg newname,oldname
+   "NEWSTACK"
+   queue 'RENAME'  oldname newname
+   queue 'ATTRIB' newname 'ADDSTATS'
+   queue 'END'
+   queue ''
+   X = OUTTRAP("PDSR.",'*',NOCONCAT)
+   "PDS '"dsn"' xispmode"                           /* DRK OCT11 */
+   X = OUTTRAP('OFF')
+   "DELSTACK"
+   last_restored_ttr = ''
+   ADDRESS ISPEXEC "CONTROL DISPLAY REFRESH"
+   return
+/*********************************************************************/
+/* build table representing directory  *******************************/
+build_directory_table:
+   call in_progress_msg 'Building date/time estimate data...'
+   if sleep = 1 then
+     address 'SYSCALL' 'SLEEP (1)'                  /* LBD JAN19 */
+   ADDRESS ISPEXEC
+   ispfct   = 0
+   ssict    = 0
+   ispfdate = ''
+   ispftime = ''
+   ssidate  = ''
+   dirtable = 'T'||TIME(seconds)
+/* read pds directory  ***********************************************/
+   ADDRESS TSO "ALLOC DD(@SENRCOV) DSN('"dsn"') SHR REUSE",
+     "LRECL(256) BLKSIZE(256) DSORG(PS) RECFM(F B)"
+   ADDRESS MVS "EXECIO * DISKR @SENRCOV (STEM LINE. FINIS"
+   ADDRESS TSO "FREE DD(@SENRCOV)"
+/* create table containing member, ttr, date/time  *******************/
+   ADDRESS ISPEXEC
+   "TBCREATE" dirtable "NOWRITE REPLACE",
+     "NAMES(TTRMBR TTR ISPFDATE ISPFTIME SSIDATE)"
+   do i = 1 to line.0
+      blocklen = c2d(substr(line.i,1,2))
+      if blocklen = 0 then leave
+      pos = 3
+      do while pos < blocklen
+         if substr(line.i,pos,1) = 'ff'x then leave i
+         ttrmbr     = substr(line.i,pos,8)
+         ttr        = right(c2d(substr(line.i,pos+8,3)),8,'0')
+         lenchar    = substr(line.i,pos+11,1)
+         userlen    = c2d(bitand(lenchar,'0f'x)) * 2
+         if c2x(bitand(lenchar,'f0'x)) = '00' then do
+            if userlen = 30 then do
+               ispfdate = ,
+                 left(c2x(substr(line.i,pos+20,4)),7) + 1900000
+               ispftime = c2x(substr(line.i,pos+24,2))
+               ssidate  = ''
+               "TBADD" dirtable
+               ispfct = ispfct + 1
+            end
+            else
+            if userlen > 0 then do
+               ispfdate = ''
+               ispftime = ''
+               ssidate = c2x(substr(line.i,pos+12,4))
+               "TBADD" dirtable
+               ssict = ssict + 1
+            end
+         end
+         else do
+            ispfdate = ''
+            ispftime = ''
+            ssidate = c2x(substr(line.i,pos+34,4))
+            "TBADD" dirtable
+            ssict = ssict + 1
+         end
+         pos = pos + userlen + 12
+      end
+   end
+   if ispfct > 0 then expect = 'ISPF'
+   else               expect = 'SSI'
+   "TBSORT" dirtable "FIELDS(TTR,N,D)"
+   return
+/* estimate date/time of member based on ttr **************************/
+estimate_date:
+   ADDRESS ISPEXEC
+   savettr = ttr
+   ttr = right(x2d(ttr),8,'0')
+   if expect = 'ISPF' then do
+      ispfdate = ''
+      "TBSCAN" dirtable "ARGLIST(TTR,ISPFDATE) CONDLIST(LT,NE)"
+   end
+   else do
+      ssidate = ''
+      "TBSCAN" dirtable "ARGLIST(TTR,SSIDATE) CONDLIST(LT,NE)"
+   end
+   select
+      when rc = 8 then
+      lowval = 'ORIGINAL      '
+      when ispfdate ¬= '' then
+      lowval = jul_to_mmddyy(ispfdate) insert(':',ispftime,2)
+      otherwise
+      lowval = ssidate||'      '
+   end
+   if expect = 'ISPF' then do
+      ispfdate = ''
+      "TBSCAN" dirtable "ARGLIST(TTR,ISPFDATE) CONDLIST(GT,NE)",
+        "PREVIOUS"
+   end
+   else do
+      ssidate = ''
+      "TBSCAN" dirtable "ARGLIST(TTR,SSIDATE) CONDLIST(GT,NE)",
+        "PREVIOUS"
+   end
+   select
+      when rc = 8 then
+      highval = 'NOW'
+      when ispfdate ¬= '' then
+      highval = jul_to_mmddyy(ispfdate) insert(':',ispftime,2)
+      otherwise
+      highval = ssidate
+   end
+   ttr = savettr
+   return lowval||'   '||highval
+
+/* shorten string to fit maximum length *******************************/
+shorten:  procedure
+   parse arg string, len
+   if length(string) <= len then return string
+
+          /* Remove trailing spaces, but only up to the desired length */
+   string = left(string,len) || strip(substr(string,len + 1),'T')
+   if length(string) <= len then return string
+
+          /* Remove leading spaces, but only up to the desired length */
+   string = strip(left(string,length(string)-len),'L')||right(string,len)
+   if length(string) <= len then return string
+
+          /* If still too long, truncate on the right */
+   string = left(string,len)
+
+   return string
+
+/* convert julian yyyyddd to mm/dd/yy  ********************************/
+jul_to_mmddyy: procedure
+   juldate = arg(1)
+   parse value '31 28  31  30  31  30  31  31  30  31   30   31',
+     with  d.1 d.2 d.3 d.4 d.5 d.6 d.7 d.8 d.9 d.10 d.11 d.12
+/* check for leap year (divisible by 4 or 400, but not by 100)        */
+   year = substr(juldate,1,4)
+   if trunc(year/4) * 4 = year then do
+      if trunc(year/400) * 400  = year then d.2 = 29
+      else
+      if trunc(year/100) * 100  = year then nop
+      else                                  d.2 = 29
+   end
+/* find month                                                         */
+   julday = substr(juldate,5)
+   daytot = 0
+   days   = 0
+   m = 0
+   do while daytot < julday
+      m = m + 1
+      if m > 12 then signal julerror
+      days = d.m
+      daytot = daytot + days
+   end
+   if m < 10 then month = 0||m
+   else           month = m
+/* find day                                                           */
+   daytot = daytot - days
+   day = julday - daytot
+   if day < 10 then day = 0||day
+/* build date                                                         */
+   normdate = month||'/'||day||'/'||right(year,2)
+julexit:  return normdate
+julerror: return arg(1)
+/* display in-progress message ***************************************/
+in_progress_msg:
+   ADDRESS ISPEXEC
+   parse arg zedlmsg
+   "SETMSG MSG(ISRZ000)"
+   "CONTROL DISPLAY LOCK"
+   "DISPLAY PANEL(@SEURCOV)"
+   return
+/* return error messages *********************************************/
+error_msg:
+   parse arg zedlmsg
+   ADDRESS ISPEXEC "SETMSG MSG(ISRZ001)"
+   exit
+/* --------------------  rexx procedure  -------------------- *
+ * Name:      DropISPF                                        *
+ *                                                            *
+ * Function:  Remove ISPF LIBDEF's and deactivate ALTLIB's    *
+ *            that were created by the LoadISPF function.     *
+ *                                                            *
+ * Syntax:    rc = dropispf(load_info)                        *
+ *                                                            *
+ * Author:    Janko                                           *
+ *                                                            *
+ * History:                                                   *
+ *            12/05/18 - Creation                             *
+ * ---------------------------------------------------------- */
+ DropISPF: Procedure
+ arg load_info
+ Address ISPEXEC
+ do until length(load_info) = 0
+    parse value load_info with dd libd load_info
+    if left(libd,6) = "ALTLIB" then do
+       if libd = "ALTLIBC" then lib = "CLIST"
+                           else lib = "EXEC"
+       Address TSO,
+         "Altlib Deact Application("lib")"
+       end
+    else "libdef" libd
+    address tso "free f("dd")"
+    end
+ return 0
+/* --------------------  rexx procedure  -------------------- *
+ * Name:      LoadISPF                                        *
+ *                                                            *
+ * Function:  Load ISPF elements that are inline in the       *
+ *            REXX source code.                               *
+ *                                                            *
+ * Syntax:    rc = loadispf()                                 *
+ *                                                            *
+ *            The inline ISPF resources are limited to        *
+ *            ISPF Messages, Panels, and Skeletons,           *
+ *                 CLISTs and EXECs are also supported.       *
+ *                                                            *
+ *            The inline resources must start in column 1     *
+ *            and use the following syntax:                   *
+ *                                                            *
+ *            >START    used to indicate the start of the     *
+ *                      inline data                           *
+ *                                                            *
+ *            >END    - used to indicate the end of the       *
+ *                      inline data                           *
+ *                                                            *
+ *            Each resource begins with a type record:        *
+ *            >type name                                      *
+ *               where type is CLIST, EXEC, MSG, PANEL, SKEL  *
+ *                     name is the name of the element        *
+ *                                                            *
+ * Sample usage:                                              *
+ *          -* rexx *-                                        *
+ *          load_info = loadispf()                            *
+ *          ... magic code happens here (your code) ...       *
+ *          Address ISPEXEC                                   *
+ *          do until length(load_info) = 0                    *
+ *             parse value load_info with dd libd load_info   *
+ *             if left(libd,6) = "ALTLIB" then do             *
+ *                if libd = "ALTLIBC" then lib = "CLIST"      *
+ *                                    else lib = "EXEC"       *
+ *                Address TSO,                                *
+ *                  "Altlib Deact Application("lib")"         *
+ *                end                                         *
+ *             else "libdef" libd                             *
+ *             address tso "free f("dd")"                     *
+ *             end                                            *
+ *          exit                                              *
+ *          >Start inline elements                            *
+ *          >Panel panel1                                     *
+ *          ...                                               *
+ *          >Msg msg1                                         *
+ *          ...                                               *
+ *          >End of inline elements                           *
+ *                                                            *
+ * Returns:   the list of ddnames allocated for use along     *
+ *            with the libdef's performed or altlib           *
+ *                                                            *
+ *            format is ddname libdef ddname libdef ...       *
+ *                   libdef may be altlibc or altlibe         *
+ *                   for altlib clist or altlib exec          *
+ *                                                            *
+ * Notes:     Entire routine must be included with REXX       *
+ *            exec - inline with the code.                    *
+ *                                                            *
+ * Comments:  The entire rexx program is processed from the   *
+ *            last record to the first to find the >START     *
+ *            record at which point all records from that     *
+ *            point on are processed until the >END           *
+ *            statement or the end of the program is found.   *
+ *                                                            *
+ *            It is *strongly* suggested that the inline      *
+ *            elements be at the very end of your code so     *
+ *            that the search for them is faster.             *
+ *                                                            *
+ *            Inline ISPTLIB or ISPLLIB were not supported    *
+ *            because the values for these would have to be   *
+ *            in hex.                                         *
+ *                                                            *
+ * Author:    Lionel B. Dyck                                  *
+ *                                                            *
+ * History:                                                   *
+ *            05/10/16 - correction for clist and exec        *
+ *            04/19/16 - bug correction                       *
+ *            06/04/04 - Enhancements for speed               *
+ *            08/05/02 - Creation                             *
+ *                                                            *
+ * ---------------------------------------------------------- *
+ * Disclaimer: There is no warranty, either explicit or       *
+ * implied with this code. Use it at your own risk as there   *
+ * is no recourse from either the author or his employeer.    *
+ * ---------------------------------------------------------- */
+ LoadISPF: Procedure
+
+ parse value "" with null kmsg kpanel kskel first returns ,
+                     kclist kexec
+/* ------------------------------------------------------- *
+ * Find the InLine ISPF Elements and load them into a stem *
+ * variable.                                               *
+ *                                                         *
+ * Elements keyword syntax:                                *
+ * >START - start of inline data                           *
+ * >CLIST name                                             *
+ * >EXEC name                                              *
+ * >MSG name                                               *
+ * >PANEL name                                             *
+ * >SKEL name                                              *
+ * >END   - end of all inline data (optional if last)      *
+ * ------------------------------------------------------- */
+ last_line = sourceline()
+ do i = last_line to 1 by -1
+    line = sourceline(i)
+    if translate(left(line,6)) = ">START " then leave
+    end
+ rec = 0
+/* --------------------------------------------------- *
+ * Flag types of ISPF resources by testing each record *
+ * then add each record to the data. stem variable.    *
+ * --------------------------------------------------- */
+ do j = i+1 to last_line
+    line = sourceline(j)
+    if translate(left(line,5)) = ">END "   then leave
+    if translate(left(line,7)) = ">CLIST " then kclist = 1
+    if translate(left(line,6)) = ">EXEC "  then kexec  = 1
+    if translate(left(line,5)) = ">MSG "   then kmsg   = 1
+    if translate(left(line,7)) = ">PANEL " then kpanel = 1
+    if translate(left(line,6)) = ">SKEL "  then kskel  = 1
+    rec  = rec + 1
+    data.rec = line
+    end
+
+/* ----------------------------------------------------- *
+ * Now create the Library and Load the Member(s)         *
+ * ----------------------------------------------------- */
+ Address ISPExec
+/* ----------------------------- *
+ * Assign dynamic random ddnames *
+ * ----------------------------- */
+ clistdd = "lc"random(999)
+ execdd  = "le"random(999)
+ msgdd   = "lm"random(999)
+ paneldd = "lp"random(999)
+ skeldd  = "ls"random(999)
+
+/* ---------------------------------------- *
+ *  LmInit and LmOpen each resource library *
+ * ---------------------------------------- */
+ if kclist <> null then do
+    call alloc_dd clistdd
+    "Lminit dataid(clist) ddname("clistdd")"
+    "LmOpen dataid("clist") Option(Output)"
+    returns = strip(returns clistdd ALTLIBC)
+    end
+ if kexec <> null then do
+    call alloc_dd execdd
+    "Lminit dataid(exec) ddname("execdd")"
+    "LmOpen dataid("exec") Option(Output)"
+    returns = strip(returns execdd ALTLIBE)
+    end
+ if kmsg <> null then do
+    call alloc_dd msgdd
+    "Lminit dataid(msg) ddname("msgdd")"
+    "LmOpen dataid("msg") Option(Output)"
+    returns = strip(returns msgdd ISPMLIB)
+    end
+ if kpanel <> null then do
+    call alloc_dd paneldd
+    "Lminit dataid(panel) ddname("paneldd")"
+    "LmOpen dataid("panel") Option(Output)"
+    returns = strip(returns paneldd ISPPLIB)
+    end
+ if kskel <> null then do
+    call alloc_dd skeldd
+    "Lminit dataid(skel) ddname("skeldd")"
+    "LmOpen dataid("skel") Option(Output)"
+    returns = strip(returns skeldd ISPSLIB)
+    end
+
+/* ----------------------------------------------- *
+ * Process all records in the data. stem variable. *
+ * ----------------------------------------------- */
+ do i = 1 to rec
+    record = data.i
+    recordu = translate(record)
+    if left(recordu,5) = ">END " then leave
+    if left(recordu,7) = ">CLIST " then do
+       if first = 1 then call add_it
+       type = "Clist"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">EXEC " then do
+       if first = 1 then call add_it
+       type = "Exec"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,5) = ">MSG " then do
+       if first = 1 then call add_it
+       type = "Msg"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,7) = ">PANEL " then do
+       if first = 1 then call add_it
+       type = "Panel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+    if left(recordu,6) = ">SKEL " then do
+       if first = 1 then call add_it
+       type = "Skel"
+       first = 1
+       parse value record with x name
+       iterate
+       end
+   /* --------------------------------------------*
+    * Put the record into the appropriate library *
+    * based on the record type.                   *
+    * ------------------------------------------- */
+    Select
+      When type = "Clist" then
+           "LmPut dataid("clist") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Exec" then
+           "LmPut dataid("exec") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(255)"
+      When type = "Msg" then
+           "LmPut dataid("msg") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Panel" then
+           "LmPut dataid("panel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      When type = "Skel" then
+           "LmPut dataid("skel") MODE(INVAR)" ,
+                 "DataLoc(record) DataLen(80)"
+      Otherwise nop
+      end
+    end
+ if type <> null then call add_it
+/* ---------------------------------------------------- *
+ * Processing completed - now lmfree the allocation and *
+ * Libdef the library.                                  *
+ * ---------------------------------------------------- */
+ if kclist <> null then do
+    Address TSO,
+    "Altlib Act Application(Clist) File("clistdd")"
+    "LmFree dataid("clist")"
+    end
+ if kexec <> null then do
+    Address TSO,
+    "Altlib Act Application(Exec) File("execdd")"
+    "LmFree dataid("exec")"
+    end
+ if kmsg <> null then do
+    "LmFree dataid("msg")"
+    "Libdef ISPMlib Library ID("msgdd") Stack"
+    end
+ if kpanel <> null then do
+    "Libdef ISPPlib Library ID("paneldd") Stack"
+    "LmFree dataid("panel")"
+    end
+ if kskel <> null then do
+    "Libdef ISPSlib Library ID("skeldd") Stack"
+    "LmFree dataid("skel")"
+    end
+ return returns
+
+/* --------------------------- *
+ * Add the Member using LmmAdd *
+ * based upon type of resource *
+ * --------------------------- */
+ Add_It:
+ Select
+    When type = "Clist" then
+         "LmmAdd dataid("clist") Member("name")"
+    When type = "Exec" then
+         "LmmAdd dataid("exec") Member("name")"
+    When type = "Msg" then
+         "LmmAdd dataid("msg") Member("name")"
+    When type = "Panel" then
+         "LmmAdd dataid("panel") Member("name")"
+    When type = "Skel" then
+         "LmmAdd dataid("skel") Member("name")"
+    Otherwise nop
+    end
+ type = null
+ return
+
+/* ------------------------------ *
+ * ALlocate the temp ispf library *
+ * ------------------------------ */
+ Alloc_DD:
+ arg dd
+ Address TSO
+ if pos(left(dd,2),"lc le") > 0 then
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(1)",
+    "recfm(v b) lrecl(255) blksize(32760)"
+ else
+ "Alloc f("dd") unit(sysda) spa(5,5) dir(1)",
+    "recfm(f b) lrecl(80) blksize(23440)"
+ return
+>START
+/*
+>Panel @SEURCOV
+)ATTR DEFAULT(%+_)
+  $ TYPE(INPUT) INTENS(LOW)
+  ! TYPE(INPUT) INTENS(HIGH) PAD(' ') CAPS(OFF) SKIP(OFF)
+  # TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) SKIP(ON)
+  ~ TYPE(OUTPUT) INTENS(LOW)  CAPS(OFF) SKIP(ON)
+  ` TYPE(&FIXIN) INTENS(HIGH)
+)BODY WIDTH(80) EXPAND(\\)
+%-\-\-  Member Recovery Options  -\-\-+
+%COMMAND ===>_ZCMD                                                             +
+
++This function recovers previously saved members of a           %ENTER+Continue+
++library.  ALL members that have been changed or deleted          %END+Cancel  +
++since the library was last compressed or rebuilt will be
++available.  This function should only be used if a backup
++is not available.
++
++Recover to#MEMBER  +in#DSN                                                    +
++
++
++Restrict to members containing the following string: (scan is case-sensitive)
+      ----.----1----.----2----.----3--
+%===>!STRING                          %<===+PDS RESTORE FIND('string')         +
++
++Estimate member dates/times%===>_Z+(Y|N)
++   (may not be accurate if members have been copied into the library)
++
++Work member name%===>_@SEURCON+ (must not exist: used as temporary member name)
+)INIT
+ .ZVARS = '(@SEURCOD)'
+ .HELP  = @SEHRCOV
+ IF (&@SEURCOD = &ZNULL)
+    &@SEURCOD = Y
+ IF (&@SEURCON = &ZNULL)
+    &@SEURCON = '@&ZUSER'
+)PROC
+ VER (&@SEURCOD,NB,LIST,Y,N)
+ VER (&@SEURCON,NB,NAME)
+ VPUT (@SEURCOD @SEURCON) PROFILE
+)END
+>Panel @SEURCOL
+)ATTR DEFAULT(%+_)
+  $ TYPE(INPUT) INTENS(LOW)
+  ! TYPE(INPUT) INTENS(HIGH) CAPS(ON) PAD(_)
+  _ TYPE(INPUT) INTENS(HIGH) CAPS(ON)
+  # TYPE(OUTPUT) INTENS(HIGH) CAPS(OFF) SKIP(OFF)
+  ~ TYPE(OUTPUT) INTENS(LOW)  CAPS(OFF) SKIP(ON)
+  ` TYPE(&FIXIN) INTENS(HIGH)
+)BODY WIDTH(80) EXPAND(\\)
+%-\-\-  Member Recovery Selection List  -\-\-+
+%COMMAND ===>_ZCMD                                            +Scroll%===>_Z   +
+
++Recover to#MEMBER  +in#DSN                                     %ENTER+Continue+
+ ----.----1----.----2----.----3--                                 %END+Cancel  +
+~STRING                          %<===+PDS RESTORE FIND('string')
+
+%S+Recover this member to current member  %R+Recover to new name %B+Browse
+
++sel                new       +sequence        ~DATEMSG                        +
++                   name    (newest first)
+)MODEL
+!Z+#ACTION         _RENAME  + ~INFO                                            +
+)INIT
+ .HELP  = @SEHRCOV
+ .ZVARS = '(ZSCED,SELCMD)'
+ IF (&@SEURCOD = Y)
+    &DATEMSG = 'saved after      saved before'
+ ELSE
+    &DATEMSG = &ZNULL
+)PROC
+ IF (&ZTDSELS ¬= 0)
+    VER (&SELCMD,LIST,S,R,B)
+    IF (&ACTION = '*Recovered to')
+       IF (&SELCMD ¬= &ZNULL)
+          &ZEDLMSG = 'Already recovered: no longer accessible through REVIVE'
+          .CURSOR = SELCMD
+          .MSG = ISRZ001
+    IF (&SELCMD = R)
+       VER (&RENAME,NB,NAME)
+    IF (&SELCMD = S)
+       IF (&RENAME ¬= &ZNULL)
+          &ZERRSM = &ZNULL
+          &ZERRLM = 'Rename must be blank with selection S'
+          &ZERRHM = '@SEHRECO'
+          &ZERRALRM = 'NO'
+          .MSG = ISRZ002
+)END
+>Panel @SEHRCOV
+)ATTR DEFAULT(%+_)
+    $ TYPE(TEXT) INTENS(HIGH) COLOR(BLUE) HILITE(REVERSE)
+)BODY width(80) expand(\\)
+%TUTORIAL -\-\- EDIT - 'REVIVE' MACRO -\-\- TUTORIAL
+%SELECTION ===>_ZCMD                                                           +
++
+  The%REVIVE+macro provides a way to restore deleted versions of PDS members.
+ %REVIVE+should only be used if a backup is not available.
+
+ %REVIVE+reads through the entire PDS to find deleted members.  Although no
+  directory information is available, it can attempt to estimate the date/time
+  window in which the member may have been saved.  This may not be accurate if
+  the member was copied from another library or is placed between members copied
+  from other libraries.
+
+ %REVIVE+finds$ALL+deleted members.  A scan string can be specified to restrict
+  the members found to members containing the string.
+
+  After%REVIVE+has completed its scan, a list of all members found is displayed.
+  The list is sorted by date last saved, with the most recently saved member
+  first.  Each member may be browsed, restored to a different name, or selected
+  for recovery to the current member.  When a member is browsed or selected, it
+  is given the name of the Work Member (entered on the options panel).  If it is
+  selected, it is copied to the member being recovered.  If it is restored to
+  a new name, it is given current ISPF statistics with the user's userid.
+)PROC
+)END
+>END */

@@ -1,0 +1,849 @@
+NIMAGENT TITLE 'NimBUS SNMP Sub-Agent - Main rtn   BY M.SCHMUTZOK'
+*PROCESS USING(WARN(15))
+         ACONTROL CPAT(NOSYSL,NOCASE)
+**********************************************************************
+*  (C)   Copyright Shands HealthCare, 2009                           *
+*  Program was written by:                                           *
+*    Michael Schmutzok                                               *
+*    Sr. Systems Programmer                                          *
+*    Shands HealthCare                                               *
+*    Information Services                                            *
+*    1329 SW 16th St, Room 3150                                      *
+*    Gainesville, FL  32608-1128                                     *
+*    mailto:schmum@shands.ufl.edu                                    *
+*    352.265.7982          (fax)                                     *
+*    352.265.8317  x85465  (voice)                                   *
+**********************************************************************
+*                                                                    *
+*  MODULE NAME:  NIMAGNT                                             *
+*                                                                    *
+*                                                                    *
+*  DESCRIPTIVE NAME:  SNMP subagent for NimBUS                       *
+*                                                                    *
+*  FUNCTION: THIS MAIN ROUTINE IS RESPONSIBLE FOR ATTACHING ALL      *
+*            OF THE SUBTASKS, HANDLING ALL SNMP REQUESTS,            *
+*            TERMINATION/CLEANUP, OPERATOR MODIFY COMMANDS AND       *
+*            ESTABLISHING A CONNECTION TO SNMP.                      *
+*                                                                    *
+*  OPERATION: THE FOLLOWING ACTIONS ARE TAKEN BY THIS MODULE:        *
+*      1) INITIALIZE THE SUB-AGENT AND SUB-TASK CONTROL BLOCKS       *
+*      2) ESTABLISH THE ESTAE ENVIRONMENT                            *
+*      3) ATTACH ALL OF THE SUB-TASKS                                *
+*      4) INITIALIZE THE CONSOLE COMMUNICATION INTERFACE             *
+*      5) REGISTER THE SUB-AGENT WITH SNMP                           *
+*      6) WAIT FOR AND PROCESS OPERATOR COMMANDS, SUB-TASK REQUESTS, *
+*         AND SNMP REQUESTS                                          *
+*                                                                    *
+*  DEPENDENCIES: IF USING THE SNAP FUNCTION FOR DEBUGGING, MAKE      *
+*                SURE THE PCCSSNAP MODULE IS IN THE STEPLIB OR       *
+*                LINKLIST TO PREVENT S806 ABEND                      *
+*                                                                    *
+*  RESTRICTIONS: NONE                                                *
+*                                                                    *
+*  REGISTER CONVENTIONS:                                             *
+*                                                                    *
+*          STANDARD ENTRY LINKAGE                                    *
+*                                                                    *
+*          R0 AND R1 USED FOR SYSTEM SERVICE INVOCATION              *
+*          R2 THROUGH R4 ARE WORK REGISTERS                          *
+*          R5 DPIPDU ADDRESSING                                      *
+*          R6 WORK REGISTER                                          *
+*          R7 CIB MAPPING                                            *
+*          R8 WORK REGISTER                                          *
+*          R9 COM AREA ADDRESSING                                    *
+*          R10 AGCB ADDRESSING                                       *
+*          R11 CONTAINS THE ADDRESS OF THE DYNAMIC AREA              *
+*          R12 IS THE BASE REGISTER                                  *
+*                                                                    *
+*                                                                    *
+*  INPUT:  OPERATOR MODIFY COMMANDS:                                 *
+*            PLACING AN OBJECT IN AND OUT OF 'MAINTENANCE MODE'      *
+*              F NIMAGENT,MAINT,ON|OFF,XXXXXXXX                      *
+*            SHUTTING DOWN NIMAGENT                                  *
+*              F NIMAGENT,STOP                                       *
+*            CHANGING THE CHECK INTERVAL TIME                        *
+*              F NIMAGENT,INTERVAL,XXXX,MMMM (FUTURE ADDITION)       *
+*                                                                    *
+*  OUTPUT: SYSTEM INFORMATION AND STATUS OF VARIOUS MONITORED        *
+*          OBJECTS, ETC WHICH ARE ACCESSIBLE USING SNMP GET          *
+*          REQUESTS FOR THE CORRESPONDING OID.                       *
+*                                                                    *
+*  RETURN CODES = 0  NORMAL TERMINATION                              *
+*                                                                    *
+**********************************************************************
+         PRINT ON,GEN,NODATA
+NIMAGNT  CSECT ,                   Establish the csect
+         USING *,R15
+NIMAGNT  MODID                     Est. module identification
+         STM   R14,R12,12(R13)     Save caller's registers
+         LR    R11,R15             Setup local base register
+         DROP  R15
+         LA    R12,2048(R11)       Addressability
+         LA    R12,2048(R12)       Addressability
+         USING NIMAGNT,R11,R12     Est. code addressability
+         LA    R15,NIMA000         Prepare to force the AMODE
+         O     R15,=X'80000000'    Indicate AMODE=31
+         BSM   R0,R15              Set the AMODE, continue on
+NIMA000  DS    0H
+         MODESET KEY=NZERO,MODE=SUP Get into supervisor state
+         SLR   R1,R1               Ensure SYSEVENT does not POST ECB
+         SYSEVENT TRANSWAP         Force SWAP out, then in for good
+         GETMAIN RC,LV=AGCBLEN,SP=230,LOC=ANY      Allocate the AGCB
+         LTR   R15,R15             Successful GETMAIN ...
+         BZ    NIMA010              Yes, skip ABEND and continue
+         ABEND 888,,STEP,USER      ABEND the Agent
+*----------------------------------------------------------------------
+*        INITIALIZATION
+*----------------------------------------------------------------------
+NIMA010  DS    0H
+         LR    R10,R1              Set AGCB addressability
+         USING AGCB,R10            Establish global addr. for the AGCB
+         LR    R2,R10              Zero the
+         LA    R3,AGCBLEN           new Agent
+         MVCL  R2,R14                control block
+         MVC   AGCBID,=C'AGCB'     Set the eye catcher
+         LA    R15,AGCBSAVE        Perform
+         ST    R13,4(,R15)           save
+         ST    R15,8(,R13)             area
+         LR    R13,R15                   linkage
+         MVC   AGCBXINT(8),DFLTXTME initial existence subtask timer
+         MVC   AGCBJINT(8),DFLTJTME initial JES subtask timer
+         MVC   AGCBHINT(8),DFLTHTME initial HSM subtask timer
+         MVC   AGCBDINT(8),DFLTDTME initial DASD subtask timer
+         MVC   AGCBSINT(8),DFLTSTME initial SYS subtask timer
+         MVC   FAMILY(2),=AL2(2)   Socket name structure
+         LA    R7,SECB             Selectex ecb
+         ST    R7,SECBA            Save address
+*----------------------------------------------------------------------
+*        ESTAE INITIALIZATION
+*----------------------------------------------------------------------
+         MVC   AGCBMPL(AGCBEPLL),NIMAEPL  Copy list form ESTAE
+         L     R2,=V(NIMESTA)      Get the ESTAE routine address
+         ESTAE (2),                Establish the ESTAE exit            C
+               MF=(E,AGCBMPL),                                         C
+               PARAM=(10)
+*----------------------------------------------------------------------
+*        TIOT/COMM EXTRACTION
+*----------------------------------------------------------------------
+NIMA020  DS    0H
+         LA    R9,AGCBEXTA         Point to area for EXTRACT info
+         MVC   AGCBMPL(AGCBXPLL),NIMAXPL  Copy list form EXTRACT
+         EXTRACT (R9),             Get CIB info, TIOT addr             C
+               MF=(E,AGCBMPL)
+         L     R9,AGCBTIOT         Pick up the TIOT address
+         MVC   AGCBMN(8),TIOCSTEP-TIOT(R9) Save the agent name
+*----------------------------------------------------------------------
+*        SUBTASK ATTACH ROUTINE
+*----------------------------------------------------------------------
+         LA    R3,NIMEXSTN         Name of subtasks
+         LA    R4,AGCBXECB         Subtask ECB table
+         LA    R5,AGCBXTCB         Subtask TCB table
+         LA    R6,VNIMEXST         Point to module addresses
+         LA    R7,5                Number of subtasks
+NIMA800  DS    0H
+         L     R1,0(R6)            Load module address
+         IDENTIFY EPLOC=(R3),      Identify the entry point            C
+               ENTRY=(1)
+         MVC   AGCBMPL(MSG243EL),MSG243E Assume bad IDENTIFY
+         LR    R0,R15              Pick up IDENTIFY code for msg
+         CL    R15,=F'4'           Was IDENTIFY successful?
+         BH    NIMA810               No, go return the error
+         MVC   AGCBMPL(AGCBAPLL),NIMAAPL   Copy ATTACH parm list
+         LR    R1,R10              Load the AGCB for the subtask
+         ATTACH EPLOC=(R3),        Attach the subtask                  C
+               ECB=(R4),                                               C
+               DPMOD=+2,                                               C
+               SF=(E,AGCBMPL)
+         LTR   R0,R15              Test ATTACH return code
+         BZ    NIMA820             ATTACH ok, move on
+         MVC   AGCBMPL(MSG244EL),MSG244E Bad attach
+         LA    R2,AGCBMPL          Point to message area
+         ST    R0,AGCBDWD          Save RC
+         UNPK  MSG24XRC(9,R2),AGCBDWD(5) Unpack it
+         TR    MSG24XRC(8,R2),HEXTAB Make all of it viewable
+         MVI   MSG24XRC+8(R2),C' ' Get rid of bad byte
+         MVC   MSG24XNM(8,R2),0(R3) Move in module name
+         B     NIMA815             Issue error message
+NIMA810  DS    0H
+         LA    R2,AGCBMPL          Point to message area
+         ST    R0,AGCBDWD          Save RC
+         UNPK  MSG243RC(9,R2),AGCBDWD(5) Unpack it
+         TR    MSG243RC(8,R2),HEXTAB Make all of it viewable
+         MVI   MSG243RC+8(R2),C' ' Get rid of bad byte
+         MVC   MSG243NM(8,R2),0(R3) Move in module name
+NIMA815  DS    0H
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         B     SHUTDOWN            End the agent
+NIMA820  DS    0H
+         ST    R1,0(R5)            Save the address from ATTACH
+         MVC   AGCBMPL(MSG141IL),MSG141I Attach successful
+         LA    R2,AGCBMPL          Point to message area
+         MVC   MSG14XNM(8,R2),0(R3) Move in module name
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         LA    R3,8(R3)            Point to next name
+         LA    R4,12(R4)           Subtask ECB table
+         LA    R5,12(R5)           Subtask TCB table
+         LA    R6,4(R6)            Point to next module address
+         BCT   R7,NIMA800          Go attach the next sub-task
+NIMA1000 DS    0H
+*----------------------------------------------------------------------
+*        INITIALIZE CONSOLE COMMUNICATION INTERFACE
+*----------------------------------------------------------------------
+         L     R9,AGCBCOM          Get addr of the COMM area
+         USING COM,R9              Establish COMM area addressability
+         L     R1,COMECBPT         Get address of the communication ECB
+         O     R1,=X'80000000'     Set high bit - last ECB in list
+         ST    R1,CECBA            Put addr of modify ECB in list
+         MVC   AGCBMPL(MSG202EL),MSG202E Set up for no CIB msg
+         ICM   R7,15,COMCIBPT      Pick up first CIB off CSCB
+         BNZ   GOTCIB              Go process start CIB
+         BAL   R8,EMSGRTN          No start CIB, must be batch (ERR!)
+         B     SHUTDOWN            Leave
+GOTCIB   DS    0H
+         BAL   R8,DELCIB           Go delete the start CIB
+         QEDIT ORIGIN=COMCIBPT,    Limit CIBS to one                   C
+               CIBCTR=1
+*----------------------------------------------------------------------
+*        SNMP SUBAGENT REGISTRATION
+*----------------------------------------------------------------------
+         MVC   FUNC(8),=CL8'INITAPI' Function name for error message
+         EZASMI TYPE=INITAPI,      Issue INITAPI macro                 C
+               MAXSOC=MAXSOC,      Max number of sockets               C
+               MAXSNO=MAXSNO,      Max number of sockets returned      C
+               APITYPE=APITYPE,    API type field                      C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Zero return code?
+         BNM   SOCKET1               yes, continue
+         BAL   R8,EMSGRTN            no, issue results message
+         B     SHUTDOWN            Exit
+SOCKET1  DS    0H
+         MVC   FUNC(8),=CL8'SOCKET1' Function name for error message
+         LA    R5,DATAGRAM         Point to pdu
+         BAL   R8,SOCKET           Go open socket
+         STH   R6,SOCKDESC         Save retcode (=socket descriptor)
+         LTR   R6,R6               Check it
+         BM    TERMAPI             --> We are done!
+         MVC   FUNC(8),=CL8'GETHOSTI' Function name for error message
+         EZASMI TYPE=GETHOSTID,    GETHOSTID type                      C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO         Field for returned error number
+         L     R6,RETCODE          Load return code
+         C     R6,=F'-1'           RC=-1?
+         BNE   CONNECT1              no, continue
+         BAL   R8,EMSGRTN            yes, issue results message
+         B     TERMAPI             Exit
+CONNECT1 DS    0H
+         ST    R6,ADDRESS          Save host address
+         MVC   PORT(2),SNMPPORT    Load snmp port #
+         MVC   FUNC(8),=CL8'CONNECT1' Function name for error message
+         BAL   R8,CONNECT          Connect to snmp socket
+         MVC   FUNC(8),=CL8'SWRITE1' Function name for error message
+         LA    R4,PDU1LEN          Point to pdu length
+         LA    R5,PDU1             Point to Get dpiPortForTCP.0 pdu
+         BAL   R8,WRITE            Issue GET DPI_port
+         MVC   FUNC(8),=CL8'SREAD1' Function name for error message
+         BAL   R8,READ             SNMP response PDU for GET DPI_port
+         MVC   PORT(2),BUF+45      Save port number
+         BAL   R8,CLOSE            Close SNMP socket
+         MVC   FUNC(8),=CL8'SOCKET2' Function name for error message
+         LA    R5,STREAM           Indicate stream
+         BAL   R8,SOCKET           Open DPI socket
+         STH   R6,SOCKDESC         Save retcode (=socket descriptor)
+         LTR   R6,R6               CHECK IT
+         BM    TERMAPI             --> We are done!
+         MVC   FUNC(8),=CL8'CONNECT2' Function name for error message
+         BAL   R8,CONNECT          Go connect
+         MVC   FUNC(8),=CL8'DWRITE1' Function name for error message
+         LA    R4,PDU2LEN          Point to pdu length
+         LA    R5,PDU2             Point to pdu
+         BAL   R8,WRITE            Go open DPI
+         MVC   FUNC(8),=CL8'DREAD1' Function name for error message
+         BAL   R8,READ             Get result
+         MVC   FUNC(8),=CL8'DWRITE2' Function name for error message
+         LA    R4,PDU3LEN          Point to pdu length
+         LA    R5,PDU3             Point to DPI_resgister pdu
+         BAL   R8,WRITE            Go register with SNMP
+         MVC   FUNC(8),=CL8'DREAD2' Function name for error message
+         BAL   R8,READ             Go get results
+         TPIMASK SET,              Set mask                            C
+               MASK=RSNDMASK,                                          C
+               SD=SOCKDESC
+         MVC   AGCBMPL(MSG100IL),MSG100I Copy the WPL for message 1
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+*----------------------------------------------------------------------
+*        SET UP WAIT
+*----------------------------------------------------------------------
+LOOP     DS    0H
+         MVC   FUNC(8),=CL8'SELECTEX' Function name for error message
+         EZASMI TYPE=SELECTEX,     SELECTX function                    C
+               MAXSOC=MAXSOC,      Max number of sockets               C
+               RSNDMSK=RSNDMASK,   Read mask                           C
+               RRETMSK=RRETMASK,   Returned read mask                  C
+               SELECB=(AGCBECBL,'LIST'), Post these ECBs if activity   C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BNM   TPIMASK2              Yes, return
+         BAL   R8,EMSGRTN            No, go issue error message
+         BAL   R8,CLOSE            Close the connection
+         B     TERMAPI             Terminate the subagent
+TPIMASK2 DS    0H
+         TPIMASK TEST,MASK=RRETMASK,SD=SOCKDESC   SNMP interrupt?
+         BE    DPIRD3              Yes, go process SNMP request
+         ICM   R7,15,COMCIBPT      No, check for operator interrupt
+         USING CIB,R7              Base CIB mapping
+         CLI   CIBVERB,CIBSTOP     Was it a STOP command?
+         BNE   NOTSTOP             No, keep checking
+         BAL   R8,CLOSE            Close
+         B     TERMAPI             Exit
+NOTSTOP  DS    0H
+         CLI   CIBVERB,CIBMODFY    Was it a modify command?
+         BNE   NOTMDFY             No, go free CIB
+         BAL   R8,DELCIB           Free CIB
+         B     CIBRTN              It was a MODIFY, go process command
+         B     LOOP                Go wait for next interrupt
+NOTMDFY  DS    0H
+         WTO   'UNKNOWN INTERRUPT RECEIVED. BYPASSING'
+         BAL   R8,DELCIB           Free CIB
+         B     LOOP                Don't know what interrupted us
+*----------------------------------------------------------------------
+*        PROCESS CIB ROUTINES
+*----------------------------------------------------------------------
+DELCIB   DS    0H
+         QEDIT ORIGIN=COMCIBPT,    Free the CIB                        C
+               BLOCK=(R7)
+         BR    R8                  Return
+CIBRTN   DS    0H
+         MVI   AGCBCOMM,C' '       Clear print line
+         MVC   AGCBCOMM+1(255),AGCBCOMM  Clear print line
+         IC    R15,CIBDATLN        Get size of modify data
+         BCTR  R15,R0              Decrement for EXECUTE
+         EX    R15,MVC060          Move to COMMDATA
+         B     PMF01000            Go process operator command
+MVC060   MVC   AGCBCOMM(0),CIBDATA Move data to work area
+         DROP  R7,R9
+*----------------------------------------------------------------------
+*     PROCESS SNMP REQUESTS
+*----------------------------------------------------------------------
+DPIRD3   DS    0H
+         USING DPIPDU,R5           Get addressability
+         MVC   FUNC(8),=CL8'DREAD3' Function name for error message
+         BAL   R8,READ             Go get request
+         XC    RESPPDU(75),RESPPDU Clear response pdu
+         MVC   RESPPDU(7),BUF      Copy HDR
+         LA    R5,BUF              Point to buffer
+         CLI   DPIPTYPE,DPIGET     Get request?
+         BE    GETRTN                yes, go process
+         CLI   DPIPTYPE,DPIGETN    Getnext request?
+         BE    GETRTN                yes, go process
+BADREQ   DS    0H
+         MVI   DPIPERRC,genErr     General error
+         B     BADRESP             Go issue error PDU
+GETRTN   DS    0H
+         MVC   FUNC(8),=CL8'DWRITE3' Function name for error message
+         LA    R3,DPIGCN           Point to community name
+         AH    R3,DPIGCNL          Add community name length (if any)
+         LA    R5,RESPPDU          Point to PDU request
+         MVI   DPIPTYPE,DPIRESP    Indicate DPI response PDU
+         LA    R4,DPIPVAR          Point to variable section
+GIDLOOP  DS    0H
+         MVC   0(1,R4),0(R3)       Move a byte from buffer to resppdu
+         LA    R4,1(R4)            Point to next byte - resppdu
+         LA    R3,1(R3)            point to next byte - buffer
+         CLI   0(R3),X'00'         End of variable?
+         BNE   GIDLOOP               No, keep going
+         MVC   0(1,R4),0(R3)         Yes, move in null
+         LA    R4,1(R4)            Point to next byte - resppdu
+         LA    R3,1(R3)            Point to next byte - buffer
+         ST    R3,INSTANCS         Save start of instance
+INSTLOOP DS    0H
+         MVC   0(1,R4),0(R3)       Move a byte from buffer to resppdu
+         LA    R4,1(R4)            Point to next byte - resppdu
+         LA    R3,1(R3)            Point to next byte - buffer
+         CLI   0(R3),X'00'         End of variable?
+         BNE   INSTLOOP              No, keep going
+         ST    R3,INSTANCE         Save end of instance
+         MVC   0(1,R4),0(R3)         Yes, move in null
+         LA    R4,1(R4)            Point to next byte - resppdu
+VALUE    DS    0H
+         L     R3,INSTANCE         Point to end of instance
+         SH    R3,=H'2'            Subtract 1
+         CLC   0(2,R3),=C'.0'      Zero instance?
+         BE    ZEROINST              yes, continue
+         L     R3,INSTANCE         Point to end of instance
+ZEROINST DS    0H
+         SH    R3,=H'2'            Subtract 1
+         CLI   0(R3),C'.'          1 digit instance?
+         BNE   DIGIT2                No, go get 2 digit instance
+DIGIT1   DS    0H
+         PACK  AGCBDWD(8),1(1,R3)  Convert instance to dec nbr
+         B     GOTINST             Go process instance
+DIGIT2   DS    0H
+         PACK  AGCBDWD(8),0(2,R3)  Convert instance to dec nbr
+GOTINST  DS    0H
+         CVB   R2,AGCBDWD          Make usable
+         STC   R2,AGCBINST         Save it
+         L     R3,INSTANCS         Point to start of instance
+         CLI   0(R3),C'1'          System metrics?
+         BE    SYSM                  Yes, go process
+         CLI   0(R3),C'2'          Dasd metrics?
+         BE    DASDM                 Yes, go process
+         CLI   0(R3),C'3'          Application metrics?
+         BE    APPLM                 Yes, go process
+         B     BADREQ                No, go issue bad response
+SYSM     DS    0H
+         CLI   AGCBINST,SYSVNUM    Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),2(1,R3)  Convert instance to dec nbr
+         LA    R6,SYSMET           Point to system metrics vars
+         B     GETVAR              Go get variable
+DASDM    DS    0H
+         CLI   AGCBINST,DASDVNUM   Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),2(1,R3)  Convert instance to dec nbr
+         LA    R6,DASDMET          Point to dasd metrics vars
+         B     GETVAR              Go get variable
+APPLM    DS    0H
+         CLI   2(R3),C'1'          CICS metrics?
+         BE    CICSM                 Yes, go process
+         CLI   2(R3),C'2'          DB2 metrics?
+         BE    DB2M                  Yes, go process
+         CLI   2(R3),C'3'          STC metrics?
+         BE    STCM                  Yes, go process
+         CLI   2(R3),C'4'          HSM metrics?
+         BE    HSMM                  Yes, go process
+         B     BADREQ                No, go issue bad response
+CICSM    DS    0H
+         CLI   AGCBINST,CICSVNUM   Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),4(1,R3)  Convert instance to dec nbr
+         LA    R6,CICSMET          Point to CICS metrics vars
+         B     GETVAR              Go get variable
+DB2M     DS    0H
+         CLI   AGCBINST,DB2VNUM    Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),4(1,R3)  Convert instance to dec nbr
+         LA    R6,DB2MET           Point to db2 metrics vars
+         B     GETVAR              Go get variable
+STCM     DS    0H
+         CLI   AGCBINST,STCVNUM    Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),4(1,R3)  Convert instance to dec nbr
+         LA    R6,STCMET           Point to stc metrics vars
+         B     GETVAR              Go get variable
+HSMM     DS    0H
+         CLI   AGCBINST,HSMVNUM2   Valid variable number?
+         BH    BADREQ                No, go issue bad response
+         PACK  AGCBDWD(8),4(1,R3)  Convert instance to dec nbr
+         LA    R6,HSMMET1          Point to hsm metrics vars
+         B     GETVAR              Go get variable
+GETVAR   DS    0H
+         XR    R3,R3               Clear loop counter
+         IC    R3,AGCBINST         Load instance number
+         SH    R3,=H'1'            Subtract 1
+         LTR   R3,R3               First entry?
+         BZ    LOOPBYP               Yes, bypass loop
+VALLOOP  DS    0H
+         MVC   AGCBFWD+2(2),1(R6)  Extract variable length
+         L     R2,AGCBFWD          Load variable length
+         LA    R2,3(R2)            Add length of length field
+         AR    R6,R2               Point to next value
+         BCT   R3,VALLOOP          Loop until right value
+LOOPBYP  DS    0H
+         MVC   0(3,R4),0(R6)       Move in the type, length
+         LA    R4,3(R4)            Move resppdu pointer
+         MVC   AGCBFWD+2(2),1(R6)  Extract variable length
+         L     R3,AGCBFWD          Load variable length
+         STM   R4,R7,REGSAVE       Save registers
+         LR    R5,R3               To length
+         LR    R7,R3               From length
+         LA    R6,3(R6)            From address
+         MVCL  R4,R6               Move value to resppdu
+         LM    R4,R7,REGSAVE       Save registers
+         AR    R4,R3               Move resppdu pointer
+         LA    R5,RESPPDU          Load start of response pdu buffer
+         SR    R4,R5               End - start = pdu length
+         ST    R4,REGSAVE          Save pdu length
+         SH    R4,=H'2'            Length - 2 = packet length
+         STH   R4,DPIPLEN          Move in packet length
+         LA    R4,REGSAVE          Restore pdu length for write
+         BAL   R8,WRITE            Go write it out
+*        BAL   R8,SNAPRTN          Go snap storage for debugging
+         B     LOOP                Wait for another request
+         DROP  R5
+*----------------------------------------------------------------------
+*        SOCKET OPEN
+*          R5 - SOCKET TYPE
+*----------------------------------------------------------------------
+SOCKET   DS    0H
+         EZASMI TYPE=SOCKET,       Issue SOCKET Macro                  C
+               AF=INET,            INET or IUCV                        C
+               SOCTYPE=(R5),         STREAM(TCP) DATAGRAM(UDP) OR RAW  C
+               ECB=SECB,           For exits and ECBs                  C
+               RETCODE=RETCODE,    Specify RETCODE field               C
+               ERRNO=ERRNO,        Specify ERRNO field                 C
+               ERROR=ERROR         Abend if Macro error
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BNMR  R8                    Yes, return
+         BAL   R8,EMSGRTN            No, go issue error message
+         B     TERMAPI             Exit
+*----------------------------------------------------------------------
+*        SOCKET CLOSE
+*----------------------------------------------------------------------
+CLOSE    DS    0H
+         MVC   FUNC(8),=CL8'CLOSE'
+         EZASMI TYPE=CLOSE,        Issue Macro                         C
+               S=SOCKDESC,         Socket descriptor                   C
+               ECB=SECB,           For exits and ECBs                  C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BZR   R8                    Yes, return
+         BAL   R8,EMSGRTN            No, go issue error message
+*----------------------------------------------------------------------
+*        TERMAPI
+*----------------------------------------------------------------------
+TERMAPI  DS    0H
+         EZASMI TYPE=TERMAPI       Terminate the API
+         B     SHUTDOWN            End it all
+*----------------------------------------------------------------------
+*        SOCKET CONNECT
+*----------------------------------------------------------------------
+CONNECT  DS    0H
+         EZASMI TYPE=CONNECT,      Issue Macro                         C
+               S=SOCKDESC,         Socket descriptor                   C
+               NAME=NAME,          Socket name structure               C
+               ECB=SECB,           For exits and ECBs                  C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BNMR  R8                    Yes, return
+         BAL   R8,EMSGRTN            No, go issue error message
+         B     TERMAPI             Exit
+*----------------------------------------------------------------------
+*        SOCKET READ
+*          R4 - SIZE OF BUFFER
+*          R5 - BUFFER
+*----------------------------------------------------------------------
+READ     DS    0H
+         EZASMI TYPE=READ,         Issue Macro                         C
+               S=SOCKDESC,         Socket descriptor                   C
+               NBYTE=NBYTE,        Size of buffer                      C
+               BUF=BUF,            Buffer                              C
+               ECB=SECB,           For exits and ECBs                  C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BNMR  R8                    Yes, return
+         BAL   R8,EMSGRTN            No, go issue error message
+         BAL   R8,CLOSE            Go close connection
+         B     TERMAPI             Terminate the API
+*----------------------------------------------------------------------
+*        SOCKET WRITE
+*          R4 - SIZE OF BUFFER
+*          R5 - BUFFER
+*----------------------------------------------------------------------
+WRITE    DS    0H
+         EZASMI TYPE=WRITE,        Issue Macro                         C
+               S=SOCKDESC,         Stream socket                       C
+               NBYTE=(R4),         Size of buffer                      C
+               BUF=(R5),           Buffer                              C
+               ECB=SECB,           For exits and ECBs                  C
+               RETCODE=RETCODE,    Field for return code               C
+               ERRNO=ERRNO,        Field for returned error number     C
+               ERROR=ERROR         Address to branch to if error occurs
+         L     R6,RETCODE          Load return code
+         LTR   R6,R6               Good return code?
+         BNMR  R8                    Yes, returnue
+         ST    R8,REGSAVE            Save return address
+         BAL   R8,EMSGRTN            No, issue results message
+         L     R8,REGSAVE          Load original return
+         BR    R8                  Return
+*----------------------------------------------------------------------
+*        PROCESS OPERATOR MODIFY COMMAND
+*----------------------------------------------------------------------
+PMF01000 DS    0H
+         CLC   AGCBCOMM(4),=CL4'STOP' Stop command entered?
+         BE    SHUTDOWN            Go terminate sub-agent
+         CLC   AGCBCOMM(5),=CL5'MAINT' Maint command entered?
+         BE    MAINTCMD                 Yes, go process
+         MVC   AGCBMPL(MSG151EL),MSG151E COPY LIST FORM
+         LA    R2,AGCBMPL          Point to message area
+         MVC   MSG151CM(8,R2),AGCBCOMM  Load message
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         B     LOOP                Go await next command
+MAINTCMD DS    0H
+         OI    MODFLAG,MAINTBIT    Set maint command flag
+         LA    R7,AGCBXTCB         Point to subtask TCB/ECB table
+         POST  8(R7)               Post the subtask communication ECB
+         B     LOOP                Go await next command
+*****************************
+*****   EXIT ROUTINES   *****
+*****************************
+SHUTDOWN DS    0H
+*        CHAP  -2
+*        STIMER WAIT,DINTVL=INTV
+         BAL   R8,DELCIB           Done with CIB
+         LA    R7,AGCBXTCB         Point to subtask TCB/ECB table
+         LA    R8,5                Number of TCBs
+TCBLOOP  DS    0H
+         ICM   R6,B'1111',0(R7)    TCB?
+         BZ    NEXTTCB              No, go check next
+         BAL   R14,GOTTCB           Yes, go detach
+         XC    0(4,R7),0(R7)       Clear the TCB entry
+NEXTTCB  DS    0H
+         LA    R7,12(R7)           Point to next table entry
+         BCT   R8,TCBLOOP          Do until end of table
+         B     EXIT                Go shutdown agent
+GOTTCB   DS    0H
+         TM    4(R7),X'80'         Sub task ECB still waiting?
+         BNZ   NOPOST                No, must have abended
+         OI    MODFLAG,SHUTBIT     Set shutdown bit
+         POST  8(R7)               Post the subtask communication ECB
+         WAIT  ECB=4(R7)           Wait for subtask to terminate
+NOPOST   DS    0H
+         DETACH 0(R7),STAE=YES     Detach the subtask
+         LTR   R0,R15              Test DETACH return code
+         BZR   R14                 DETACH good, go finish TCB list
+         ST    R0,AGCBDWD          Save RC
+         MVC   AGCBMPL(MSG245EL),MSG245E Bad detach
+         LA    R2,AGCBMPL          Point to message area
+         LA    R3,NIMJES2N         Start of module name table
+         UNPK  MSG24XRC(9,R2),AGCBDWD(5) Unpack it
+         TR    MSG24XRC(8,R2),HEXTAB Make all of it viewable
+         MVI   MSG24XRC+8(R2),C' ' Get rid of bad byte
+         MVC   MSG24XNM(8,R2),0(R3) Move in module name
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         BR    R14                 Go finish TCB list
+EXIT     DS    0H
+         MVC   AGCBMPL(MSG199IL),MSG199I Copy the WPL for message 2
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         L     R9,4(,R13)          Get high save (last SACB reference)
+         FREEMAIN RU,              Free the AGCB                       C
+               LV=AGCBLEN,                                             C
+               A=(10),                                                 C
+               SP=230
+         LR    R13,R9              Get high save area address
+         RETURN (14,12),RC=0       Return to MVS, terminate sub task
+******************************
+*****   ERROR ROUTINES   *****
+******************************
+ERROR    ABEND 1,DUMP
+         CNOP  2,4
+EMSGRTN  DS    0H
+         MVC   AGCBMPL(MSG150EL),MSG150E  Copy list form
+         LA    R2,AGCBMPL          Point to message area
+         MVC   MSG150FN(8,R2),FUNC Move function name to msg
+         MVI   MSG150SN(R2),C'-'   Move sign
+         CVD   R6,AGCBDWD          Convert it to decimal
+         UNPK  MSG150RC(8,R2),AGCBDWD+4(4) Unpack it
+         OI    MSG150RC+7(R2),X'F0' Correct the sign
+         L     R6,ERRNO            Get ERRNO value
+         CVD   R6,AGCBDWD          Convert it to decimal
+         UNPK  MSG150EN(8,R2),AGCBDWD+4(4) Unpack it
+         OI    MSG150EN+7(R2),X'F0' Correct the sign
+         SR    R6,R6               Clear out...
+         ST    R6,RETCODE          RETCODE and...
+         ST    R6,ERRNO               ERRNO
+         WTO   MF=(E,AGCBMPL)      Issue message to operator
+         BR    R8                  Return
+*SNAPRTN  DS    0H
+*         STM   R2,R3,REGSAVE
+*         LA    R2,AGCBID
+*         LA    R3,REGSAVE+12
+*         MVC   AGCBMPL(NIMLPLL),NIMLPL  COPY LIST FORM LINK
+*         LINK  EP=PCCSSNAP,PARAM=((R2),(R3)),VL=1,MF=(E,AGCBMPL)
+*         LM    R2,R3,REGSAVE
+*         BR    R8
+         USING DPIPDU,R5           Get addressability
+OIDERR   DS    0H
+         MVI   DPIPERRC,noSuchNm   Load no such name error
+BADRESP  DS    0H
+         LA    R5,RESPPDU          Point to response PDU
+         MVI   DPIPTYPE,DPIRESP    Indicate DPI response PDU
+         MVI   DPIPERRI+3,X'01'    Error code index
+         LA    R4,11               Set length of packet
+         IC    R4,DPIPLEN+1        Add to pdu
+         LA    R4,2(R4)            Set length of pdu
+         ST    R4,REGSAVE          Save it
+         LA    R4,REGSAVE          Point to it
+         MVC   FUNC(8),=CL8'DWRITE3' Indicate write function
+         BAL   R8,WRITE            Go write the response PDU
+         B     LOOP                Go await next command
+         DROP  R5
+         EJECT
+**************************************************
+***   S T O R A G E    D E F I N I T I O N S   ***
+**************************************************
+         EJECT
+R0       EQU   0                   Register
+R1       EQU   1                     equates
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8                   BAL return
+R9       EQU   9
+R10      EQU   10                  Program addressability
+R11      EQU   11                  AGCB addressability
+R12      EQU   12                  Program addressability
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         DS    0F
+DFLTXTME DC    CL8'00010000'       Default wait between checks nimexst
+DFLTJTME DC    CL8'00050000'       Default wait between checks nimjes2
+DFLTHTME DC    CL8'00010000'       Default wait between checks nimhsm
+DFLTDTME DC    CL8'00010000'       Default wait between checks nimdasd
+DFLTSTME DC    CL8'00003000'       Default wait between checks nimsys
+NIMEXSTN DC    CL8'NIMEXST'        Existence monitor
+NIMJES2N DC    CL8'NIMJES2'        JES2 monitor
+NIMHSMN  DC    CL8'NIMHSM'         HSM monitor
+NIMDASDN DC    CL8'NIMDASD'        V2X monitor
+NIMSYSN  DC    CL8'NIMSYS'         SYS monitor
+VNIMEXST DC    V(NIMEXST)          module address
+VNIMJES2 DC    V(NIMJES2)          module address
+VNIMHSM  DC    V(NIMHSM)           module address
+VNIMDASD DC    V(NIMDASD)          module address
+VNIMSYS  DC    V(NIMSYS)           module address
+SNMPPORT DC    H'161'              SNMP listening prot
+NBYTE    DC    F'75'               SIZE OF BUFFER
+INET     DC    F'2'
+STREAM   DC    F'1'
+DATAGRAM DC    F'2'
+MAXSOC   DC    F'50'
+MAXSNO   DC    F'49'
+APITYPE  DC    H'2'
+PDU1     EQU   * Get dpiPortForTCP.0
+         DC    X'30'
+         DC    AL1(PDU1L-2)
+         DC    X'02010004'
+         DC    X'08',C'shandtss'
+         DC    X'A01C'
+         DC    X'020101'
+         DC    X'020100'
+         DC    X'020100'
+         DC    X'3011'
+         DC    X'300F'
+         DC    X'060B'
+         DC    X'2B06010401020201010100'
+         DC    X'0500'
+PDU1L    EQU   *-PDU1
+PDU1LEN  DC    A(PDU1L)
+*
+PDU2     EQU   * SNMP_DPI_OPEN
+PDULEN   DC    AL2(PDU2L-2)
+HDR      DC    X'02020000'
+REQID    DC    X'00'
+PDUTYPE  DC    X'08'
+TIMEOUT  DC    X'0078'
+MAXVBIND DC    X'00'
+CHARSET  DC    X'00'
+SAID     DC    X'00',C'1.3.6.1.4.1.15037'    subagent ID
+DESC     DC    X'00',C'NimBUS SNMP Subagent'
+         DC    X'000000'
+PDU2L    EQU   *-PDU2
+PDU2LEN  DC    A(PDU2L)
+*
+PDU3     EQU   * SNMP_DPI_REGISTER
+         DC    AL2(PDU3L-2)
+         DC    X'02020000'
+         DC    X'00'
+         DC    X'06'
+         DC    X'FFFFFFFF'
+         DC    X'00000000'
+OID      DC    C'1.3.6.1.4.1.15037.',X'00'
+PDU3L    EQU   *-PDU3
+PDU3LEN  DC    A(PDU3L)
+*
+PDU4     EQU   * DPI_RESPONSE
+         DC    AL2(PDU4L-2)
+         DC    X'020200'
+         DC    X'0000'                       request id
+         DC    X'05'                         DPI_Response
+         DC    X'05'                         Error code
+         DC    X'00000000'                   Error Index
+PDU4L    EQU   *-PDU4
+PDU4LEN  DC    A(PDU4L)
+NIMAXPL  EXTRACT *-*,'S',FIELDS=(COMM,TIOT),MF=L
+NIMAAPL  ATTACH EPLOC=*-*,ECB=*-*,SM=SUPV,DISP=YES,SZERO=NO,SF=L
+NIMAEPL  ESTAE *-*,TERM=YES,       LIST FORM ESTAE PARMLIST            C
+               RECORD=YES,PARAM=*-*,MF=L
+NIMLPL   LINK  SF=L
+NIMLPLL  EQU   *-NIMLPL
+MSG100I  WTO   'NMAG100I NIMBUS AGENT INITIALIZATION COMPLETE.',ROUTCDEC
+               =(1,10),MF=L
+MSG100IL EQU   *-MSG100I
+MSG199I  WTO   'NMAG199I NIMBUS AGENT TERMINATION COMPLETE.   ',ROUTCDEC
+               =(1,10),MF=L
+MSG199IL EQU   *-MSG199I
+MSG141I  WTO   'NMAG141I XXXXXXXX PROBE SUCCESSFULLY ATTACHED',ROUTCDE=C
+               (1,10),MF=L
+MSG141IL EQU   *-MSG141I
+MSG14XNM EQU   WPLTXT-WPL+9,8
+MSG142I  WTO   'NMAG142I XXXXXXXX PROBE SUCCESSFULLY DETACHED',ROUTCDE=C
+               (1,10),MF=L
+MSG142IL EQU   *-MSG142I
+MSG150E  WTO   'NMAG150E xxxxxxxx RETCODE= sxxxxxxxx ERRNO=xxxxxxxx',ROC
+               UTCDE=(1,10),MF=L
+MSG150EL EQU   *-MSG150E
+MSG150FN EQU   WPLTXT-WPL+9,8
+MSG150SN EQU   WPLTXT-WPL+27,1
+MSG150RC EQU   WPLTXT-WPL+28,8
+MSG150EN EQU   WPLTXT-WPL+43,8
+MSG151E  WTO   'NMAG151E UNKNOWN COMMAND ENTERED:           ',ROUTCDE=(C
+               1,10),MF=L
+MSG151EL EQU   *-MSG151E
+MSG151CM EQU   WPLTXT-WPL+34,8
+MSG202E  WTO   'NMAG202E START ERROR, NO START CIB FOUND',ROUTCDE=(1,10C
+               ),MF=L
+MSG202EL EQU   *-MSG202E
+MSG243E  WTO   'NMAG243E SUBTASK EP IDENTIFY FAILED FOR XXXXXXX, R15=XXC
+               XXXXXX',ROUTCDE=(1,10),MF=L
+MSG243EL EQU   *-MSG243E
+MSG243NM EQU   WPLTXT-WPL+40,8
+MSG243RC EQU   WPLTXT-WPL+53,8
+MSG244E  WTO   'NMAG244E SUBTASK ATTACH FAILED FOR XXXXXXX, R15=XXXXXXXC
+                X',ROUTCDE=(1,10),MF=L
+MSG244EL EQU   *-MSG244E
+MSG24XNM EQU   WPLTXT-WPL+35,8
+MSG24XRC EQU   WPLTXT-WPL+48,8
+MSG245E  WTO   'NMAG245E SUBTASK DETACH FAILED FOR XXXXXXX, R15=XXXXXXXC
+                X',ROUTCDE=(1,10),MF=L
+MSG245EL EQU   *-MSG245E
+HEXTAB   EQU   *-240
+         DC    C'01234567'
+         DC    C'89ABCDEF'
+         LTORG
+         EJECT
+*************************
+*** DYNAMIC WORK AREA ***
+*************************
+         TITLE 'SUB TASK APPLICATION CONTROL BLOCK'
+         NIMSTCB ,                 GENERATE STCB DSECT
+         TITLE 'AGENT CONTROL BLOCK (AGCB)'
+         NIMAGCB ,                 GENERATE AGCB DSECT
+TIOT     DSECT ,                   Generate MVS
+         IEFTIOT1 ,                  TIOT dsect
+         IEZWPL ,                  Generate MVS WPL dsect
+CIB      DSECT ,                   Generate MVS
+         IEZCIB ,                    CIB dsect
+COM      DSECT ,                   Generate MVS
+         IEZCOM  ,                   COMLIST (CSCB) dsect
+         DPIPDU  ,                 Generate DPI PDU layouts
+NIMAGNTL EQU   *-NIMAGNT           Length of this module
+         END NIMAGNT

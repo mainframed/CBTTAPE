@@ -1,0 +1,547 @@
+GUPI     TITLE 'Generic Update Program for IBM 370'
+*
+* (c) 1987, J. F. Chandler
+*
+* Permission is granted to any individual or institution to copy or
+* use this program, except for explicitly commercial purposes.
+*
+* This program consists of two parts: generic (the present file
+* IK0GUP.ASM plus some macros shared with Kermit-370) and system-
+* specific (the file IKxGUP.ASM plus some more shared macros).  Here,
+* "x" represents the target system code, such as "T" for TSO.  IKxGUP
+* is composed of "COPY" elements (designed to be fetched from a macro
+* library) plus, perhaps, some specialized GUPI macros.  The simplest
+* method of assembling this program is to make a macro library out of
+* IKxGUP or to include its members in the Kermit-370 library, if any.
+* Like the corresponding Kermit files IKxMAC.ASM, the specific part of
+* GUPI is divided into members by lines beginning  "*COPY" and
+* containing the member name in columns 55-62.  If the Kermit-370
+* macros are not kept in a library, the ones needed by GUPI can be
+* inserted by hand before the first EJECT.
+*
+* Kermit macros used in the generic code:
+*  ADCON, CLOSF, DSMFREE, DMSFRET, ENTER, EXIT, FDBD, FDBPAT, KCALL,
+*  LOCALS, LREG, OPENF, PTEXT, READF, RET, WRITF, WTEXT        @SC88111
+*
+* 1. System-specific code is responsible for the interface between the
+*    program on the one hand and the user and operating system on the
+*    other.  The user interface consists of supplying the following
+*    information:
+*        SRCNAM - file spec of the base source
+*        CTLNAM - file spec of the update controls
+*        OUTNAM - file spec of the output new source
+*        MRKD   - 3-character sequence label to be placed in columns
+*                 73-75 of inserted or renumbered records in 5-column
+*                 updating mode.
+*        FLG    - byte of flags governing the options of in-core vs.
+*                 disk-to-disk updates and 5- vs. 8-column mode.
+*    The system-specific code must also include subroutine DISKIO and
+*    any other system-interface routines for error message, memory
+*    management, and the like.
+*
+* 2. Generic code carries out the update function, reading the source
+*    and control files and writing the updated output.  In disk-to-disk
+*    mode, GUPI makes a single pass (reading and writing in parallel
+*    with minimal buffering), and the control commands must form a
+*    non-overlapping monotonic sequence, but in-core update mode allows
+*    any number of sub-sequences to be applied cumulatively by making
+*    three passes: (1) read the entire source, (2) apply updates, and
+*    (3) write out the new source.
+*
+*    The update control file consists of control cards and data cards.
+*    All control cards begin with './' in columns 1-2 followed by
+*    free-form fields in columns 4-50, and all other cards are
+*    considered data cards.  In the following, parentheses denote
+*    optional items, upper-case items are verbatim, and lower-case
+*    items are 'variables' to be filled in.
+*
+*    Comment:  ./ *   remarks
+*        Annotates the update file.  No other function.
+*
+*    Sequence: ./ S   seq1 inc (mark)
+*        Resequences the entire source file.  The output starts with
+*        number 'seq1' and steps by 'inc'.  If a 'mark' is supplied, it
+*        replaces the default contents of columns 73-75.
+*
+*    Delete:   ./ D   line1 (line2)
+*        Removes source line 'line1' or lines 'line1' through 'line2'
+*        inclusive.  The starting and ending line numbers must exist
+*        in the source file.
+*
+*    Insert:   ./ I   line1  ($ seq1 inc)
+*        Inserts the immediately following data cards after line
+*        'line1' (which must exist) in the source.  The inserted cards
+*        are resequenced from 'seq1' by 'inc' and must fit strictly
+*        between line 'line1' and its successor.
+*
+*    Replace:  ./ R   line1  (line2)  ($ seq1 inc)
+*        Deletes source lines as in the Delete command and then inserts
+*        as in the Insert command except that the new cards are added
+*        in place of the deleted range.
+*
+         SPACE 4                                               @SC88111
+*  Update history:                                             @SC88111
+* Version 1.1 - 88/8/31 - Implement system-specific epilog,    @SC88111
+*                         allow RECFM=V control file, use new  @SC88111
+*                         FDBPAT macro                         @SC88111
+         EJECT
+         PRINT NOGEN
+*          Generic preliminaries
+         FDBD
+*
+         USING STORAG,11
+         USING COMMON,10
+*
+         COPY  GUPSPC
+*
+GUPI     ENTER MAIN
+         COPY  GUPNIT
+         TITLE 'Update: process control cards'
+OPN      DS    0H
+         MVC   MRK,MRKD      Default label field
+         LA    3,CTLBUF
+         ST    3,INSBP       Set up control buffer
+         MVC   VARS(LVARS),IVARS
+         OPENF I,SRCNAM,FDBP,SRC,E=OPNERR
+         OPENF I,CTLNAM,FDBP,CTL,E=OPNERR
+         OPENF O,OUTNAM,FDBP,OUT,E=OPNERR
+         OI    FLG,XXTOP     Start at top of file
+         ZAP   LSTNO,=P'0'   Clear sequence numbers
+         ZAP   OUTNO,=P'0'
+         SR    6,6
+         TM    FLG,XXCOR     In-core?
+         BZ    CTLP          No, just start reading
+*
+*          Read entire file into core
+         BAL   9,GBLK
+         LA    3,4(1)
+         ST    3,INSBP       Set up control buffer
+         LA    6,SPTR
+RLP      BAL   9,GBLK        Get buffer
+         LA    3,4(1)        Start of card
+         LR    4,1           Save ptr
+         READF SRC,BUFFER=(3),E=RLPZ
+         ST    4,0(6)        Add to chain
+         LR    6,4
+         B     RLP
+RLPZ     C     15,=F'12'     Eof?
+         BNE   DSKERR        No, quit
+*
+*          Main loop - read a control card
+CTLP     L     3,INSBP       Ptr to control buffer
+         READF CTL,BUFFER=(3),E=CTLZ
+         CLC   =C'./ ',0(3)  Control card?
+         BNE   ERR0          No, too bad
+CTLQ     CH    0,*+10        R0 has length read                @SC88244
+         BNH   *+8                                             @SC88244
+          LA   0,50          Ignore anything after col 50      @SC88244
+         AR    0,3                                             @SC88244
+         LA    1,80(,3)      End of card buffer                @SC88244
+         SR    1,0           Length to blank                   @SC88244
+         SR    15,15                                           @SC88244
+         ICM   15,8,=C' '                                      @SC88244
+         MVCL  0,14                                            @SC88244
+         LA    0,2(3)
+         ST    0,COL         Set up scan
+         BAL   14,SCANN      Find command
+          NOP  0
+         MVC   CMD,0(3)
+         CLI   1(3),C' '     Should be 1 char
+         BNE   ERR1          No, bad syntax
+         CLI   CMD,C'*'      Comment?
+         BE    CTLP          Yes, ignore it
+         LA    1,4
+CMDLP    IC    0,CMDTB-1(1)  Get next command
+         CLM   0,1,CMD       Match?
+         BE    CMDF          Ok
+         BCT   1,CMDLP
+         B     ERR1          Bad command
+CMDTB    DC    C'SDIR'
+CMDF     BCT   1,PROC        Go if not sequence
+*          Resequence source deck
+         ZAP   INCNO,=P'10'  Default increment
+         TM    FLG,XX8       5-column?
+         BZ    *+10          Yes
+         ZAP   INCNO,=P'1000' 8-column default
+         MVC   NXTNO,INCNO
+         MVC   MRK,MRKD      Default label field
+         BAL   14,SCANN      Get start value
+          B    SEQ1          Use defaults
+         MVC   NXTNO,ARGNO
+         BAL   14,SCANN      Get increment value
+          B    SEQ1          Use default
+         MVC   INCNO,ARGNO
+         BAL   14,SCANN      Check for label field
+          NOP  0
+         CLI   0(3),C' '
+         BE    SEQ1
+         MVC   MRK,0(3)      Use it
+SEQ1     ZAP   ARGNO,=P'0'   At start of file?
+         BAL   14,SEQCHK
+         BAL   14,NEXT       Get a card
+         LTR   3,3           End?
+         BZ    CTLP          Yes, back to control stream
+         BAL   14,SNUM       Renumber it
+         MVC   LSTNO,INSNO   Output card number
+         B     SEQ1
+*
+*          Process an editing card
+PROC     BAL   14,SCANN      Get seqno 1
+          B    ERR1          Missing
+         MVC   NXTNO,ARGNO   Default start
+         LM    0,1,NXTNO
+         SRL   1,24          Remove garbage
+         LA    2,X'10'       Default increment =P'1'
+         LA    3,5           Max for checking
+PROCDL   SRDL  0,4           Check next digit
+         LTR   1,1           Found non-zero?
+         BNZ   PROCDF        Yes, got it
+         SLL   2,4           No, try * 10
+         BCT   3,PROCDL
+PROCDF   ST    2,TMPDW+4
+         OI    TMPDW+7,15    Fix sign
+         ZAP   INCNO,TMPDW+4(4)
+         AP    NXTNO,INCNO   Default start
+         BAL   14,SEQCHK     Check order
+         BAL   14,FIND       Get proper source card
+         ST    6,SAV6        Save current card ptr
+         CLI   CMD,C'I'
+         BE    *+8           No deletion
+         OI    FLG,XXKIL     Delete
+         BAL   14,SCANN      Get end of range
+          B    PRC2          Just one card
+         BAL   14,FIND       Find end of range
+         BAL   14,SCANN      Should be followed by '$'
+          B    PRC2          Ok
+         B     ERR1          Oops, extra number there
+PRC2     BAL   14,NEXT       Skip over this card
+         BAL   14,KILL       Delete, if necessary
+         CLI   CMD,C'D'
+         BE    CTLP          Done if delete
+         BAL   14,SCANN      Insert starting number?
+          B    INSRT         No, use defaults
+         MVC   NXTNO,ARGNO   Yes
+         CLC   OUTNO,NXTNO   Is it ok?
+         BNL   ERR3          Out of sequence
+         BAL   14,SCANN      Increment?
+          B    INSRT         No, use default
+         MVC   INCNO,ARGNO
+INSRT    L     3,INSBP       Ptr to buffer
+INS3     READF CTL,BUFFER=(3),E=CTLZ
+         CLC   =C'./ ',0(3)
+         BE    CTLQ          End of insertion
+         AR    0,3                                             @SC88244
+         LA    1,72(,3)      Must fill to col 72               @SC88244
+         SR    1,0           Length to blank, if any           @SC88244
+         BNP   INS3A         No need to fill                   @SC88244
+         SR    15,15                                           @SC88244
+         ICM   15,8,=C' '                                      @SC88244
+         MVCL  0,14          Fill with blanks                  @SC88244
+INS3A    DS    0H                                              @SC88244
+         BAL   14,SNUM       Sequence new card
+         OI    FLG,XXINS     Now inserting
+         MVC   OUTNO,INSNO   Write it
+         TM    FLG,XXCOR     In-core?
+         BZ    INS4          No, write it out
+         SH    3,EH4         Get chain ptr for buffer
+         MVC   0(4,3),0(6)   Insert into file
+         ST    3,0(6)
+         LR    6,3           New card is before 'current' one
+         BAL   9,GBLK        Get buffer
+EH4      EQU   *+2           Offset to card
+         LA    3,4(1)
+         ST    3,INSBP
+         B     INS3
+INS4     WRITF OUT,BUFFER=(3),E=DSKERR
+         B     INS3
+*
+*          END OF CONTROL FILE INPUT
+CTLZ     CLOSF CTL
+         TM    FLG,XXCOR     In-core?
+         BZ    RDMP          No, copy rest of source to output
+*          Write out file and release storage
+         LA    6,SPTR        Start of file
+DMPLP    ICM   6,15,0(6)     Get next card
+         BZ    DMPZ          Done
+         LA    3,4(6)
+         WRITF OUT,BUFFER=(3),E=DSKERR
+         B     DMPLP
+DMPZ     L     6,BPTR        Start of blocks
+FRELP    LTR   1,6           Reached end of chain?
+         BZ    FREZ          Yes, all released
+         ICM   6,15,0(6)     Ptr to next
+         LA    0,(99*84+4)/8
+         DMSFRET DWORDS=(0),LOC=(1)
+         B     FRELP
+*
+RDMP     BAL   14,NEXT       Get a card
+         LTR   3,3
+         BNZ   RDMP          Keep copying
+*        B     FREZ
+FREZ     CLOSF OUT           Close files
+         CLOSF SRC
+         SR    15,15         Ok
+QUIT     DS    0H                                              @SC88111
+         COPY  GUPFIN                                          @SC88111
+         RET   MAIN                                            @SC88111
+         TITLE 'Update: various subroutines'
+*          Renumber a source or inserted record
+SNUM     UNPK  72(8,3),NXTNO Replace sequence field
+         OI    79(3),C'0'    Fix zone
+         TM    FLG,XX8       Is it 8-col?
+         BO    *+10          Yes
+         MVC   72(3,3),MRK   Just 5
+         MVC   INSNO,NXTNO   Note current number (inserted)
+         AP    NXTNO,INCNO
+         BR    14
+*
+*          Check sequence numbers.  if out of order, assume new batch
+SEQCHK   CP    LSTNO,ARGNO   Sequence ok?
+         BNHR  14            Ok
+         TM    FLG,XXCOR     In-core?
+         BZ    ERR2          No, can't back up
+         OI    FLG,XXTOP     Yes, start at top
+         ZAP   LSTNO,=P'0'
+         BR    14
+*
+*          Remove deleted cards (if in-core)
+KILL     TM    FLG,XXKIL
+         BZR   14            Not deleting
+         NI    FLG,255-XXKIL Now turn it off
+         TM    FLG,XXCOR     In-core?
+         BZR   14            No, cards were flushed already
+         L     1,SAV6        -> start of range
+         L     2,0(1)        Start
+         MVC   0(4,1),0(6)   Unchain card(s)
+         MVC   0(4,6),FPTR   Put on free chain
+         ST    2,FPTR
+         LR    6,1           Fix current ptr
+         BR    14
+*
+*          Find desired sequence number
+FIND     CP    LSTNO,ARGNO   Match?
+         BER   14            Ok
+         BH    ERR6          Went too far
+         ST    14,FNDSV                                        @SC88111
+         BAL   9,NEXTA       Get next
+         L     14,FNDSV                                        @SC88111
+         LTR   3,3
+         BZ    ERR6          Not found
+         B     FIND
+*
+*          Get next card
+NEXT     LR    9,14          Direct return
+NEXTA    TM    FLG,XXKIL+XXTOP
+         BNZ   NEXTB         Nothing for output
+         TM    FLG,XXINS     Insertion?
+         BZ    NEXTOK        No, don't insist
+         CLC   OUTNO,LSTNO   Are we in order?
+         BNL   ERR5          No, give up
+NEXTOK   MVC   OUTNO,LSTNO   Save output sequence
+NEXTB    TM    FLG,XXCOR     In-core?
+         BZ    RNEXT         No, read it
+         TM    FLG,XXTOP
+         BZ    NEXTN
+         LA    6,SPTR        Start at top
+         B     NEXTS         Rejoin with predecessor of new
+NEXTN    ICM   3,15,0(6)     Get ptr to current card, if any
+         BZR   9             At eof
+         LR    6,3           Move to next
+NEXTS    ICM   3,15,0(6)     Get ptr to new card, if any
+         BZR   9             At eof
+         LA    3,4(3)        Ptr to card itself
+NEXTP    NI    FLG,255-XXINS-XXTOP Started down file
+         MVC   TMPDW,72(3)   Copy sequence field
+         TM    FLG,XX8
+         BO    *+10
+         MVC   TMPDW(3),=C'000'  Only 5 digits used
+         TRT   TMPDW,NUMB    Valid?
+         BNZR  9
+         PACK  LSTNO,TMPDW   Save value
+         BR    9             Return
+*
+RNEXT    TM    FLG,XXEOF     Already hit end?
+         BO    RNXZ          Yes, don't read again
+         LA    3,SRCBUF
+         TM    FLG,XXKIL+XXTOP
+         BNZ   RNXA          No current card, or killing anyway
+         WRITF OUT,BUFFER=(3),E=DSKERR
+RNXA     READF SRC,BUFFER=(3),E=RNXE
+         B     NEXTP
+RNXE     C     15,=F'12'     Eof?
+         BNE   DSKERR        No, quit
+RNXZ     SR    3,3           Indicate eof
+         OI    FLG,XXEOF     Remember it
+         BR    9             Return
+*
+*          Add a block of buffers to free chain, then get one
+GMORE    LA    0,(99*84+4)/8 Get 99 at once
+         DMSFREE DWORDS=(0),ERR=ERR4
+         MVC   0(4,1),BPTR   Add to block chain
+         ST    1,BPTR
+         LA    1,4(1)        First new buffer
+         LA    0,99          Counter
+GCHN     MVC   0(4,1),FPTR   Add to chain
+         ST    1,FPTR
+         LA    1,84(1)
+         BCT   0,GCHN
+*          Get a free buffer (GBLK) ptr in R1
+GBLK     ICM   1,15,FPTR
+         BZ    GMORE         Need to get some more
+         MVC   FPTR,0(1)
+         XC    0(4,1),0(1)   Clear chain ptr
+         BR    9             AND RETURN
+*
+*          Find next numeric field in card, skip if ok
+SCANN    SR    1,1
+         L     3,COL         Current position
+         TRT   0(30,3),NBLNK Next non-blank
+         BZR   14            Nothing
+         LR    3,1           Ptr to field
+         TRT   0(10,3),BLNK  End of field
+         BZR   14            Too long
+         ST    1,COL         New position
+         CLI   0(3),C'0'     Numeric?
+         BLR   14            No, skip it
+         BCTR  1,0           Last char
+         SR    1,3           Count - 1
+         EX    1,TRTN        Check valid digits
+         BNZ   ERR1          Oops
+         EX    1,PCKA
+         OI    ARGNO+4,15    Fix sign, just in case
+         B     4(14)         Got it
+PCKA     PACK  ARGNO,0(,3)
+TRTN     TRT   0(,3),NUMB
+         TITLE 'Update: error messages'
+ERR0     PTEXT 'MISSING CONTROL CARD'
+         B     ERPNC
+ERR1     PTEXT 'INVALID CONTROL CARD'
+         B     ERPRT
+ERR2     PTEXT 'CONTROL CARD OUT OF ORDER, DISK-TO-DISK MODE'
+         B     ERPNC
+ERR3     MVC   LSTNO,NXTNO   Get bad number
+         B     ERR5
+ERR4     PTEXT 'FREE STORAGE EXHAUSTED, TRY DISK-TO-DISK UPDATE'
+ERRMSG   WTEXT (3),(4)       Type it
+         B     ERREX
+ERR5     UNPK  MSGS2,LSTNO   Set up message
+         OI    MSGS2+7,C'0'
+         UNPK  MSGS1,OUTNO
+         OI    MSGS1+7,C'0'
+         PTEXT MSGSQ,LMSGSQ
+         B     ERPNC
+ERR6     PTEXT 'SEQUENCE NUMBER NOT FOUND'
+         B     ERPRT
+ERPNC    XC    COL,COL       No column indicator
+ERPRT    WTEXT (3),(4)
+         L     5,INSBP
+         WTEXT (5),80
+         ICM   3,15,COL      Any column to mark
+         BZ    ERREX         No
+         MVI   0(5),C' '     Blank out buffer
+         MVC   1(79,5),0(5)
+         MVI   0(3),C'*'
+         WTEXT (5),80
+ERREX    LA    15,20
+         B     QUIT
+         LOCALS
+QUPDT    EXIT
+         TITLE 'Update: Common code, constants, and variables'
+COMMON   CSECT
+*
+* Utility routine to set up linkage
+SUBENT   LR    12,15         CSECT addressibility              @SC86295
+         L     15,STKPTR     Current end of stack              @SC86295
+         AR    0,15          Our needs                         @SC86295
+         C     0,STKLIM      Does it fit?                      @SC86295
+         BH    SUBDIE        No, (that's incredible)           @SC86295
+         ST    0,STKPTR      New end                           @SC86295
+         ST    13,4(15)      Link subroutines                  @SC86295
+         ST    15,8(13)                                        @SC86295
+         L     0,20(13)      Restore R0                        @SC86295
+         LR    13,15                                           @SC86295
+         BR    14            Go                                @SC86295
+SUBDIE   LM    14,12,12(13)                                    @SC86295
+         SR    15,15                                           @SC86295
+         BCTR  15,0          Set return code = -1              @SC86295
+         BR    14            Go                                @SC86295
+*
+RTRN2    LA    15,2          Indicate error                    @SC86295
+         B     RTRN                                            @SC86295
+RTRN0    SR    15,15         No errors                         @SC86295
+         B     RTRN                                            @SC86295
+RTRN1    LA    15,1          Indicate error                    @SC86295
+RTRN     ST    13,STKPTR     Free the storage                  @SC86295
+         L     13,4(13)      Unlink                            @SC86295
+         L     14,12(13)     Restore registers                 @SC86295
+         LM    0,12,20(13)                                     @SC86295
+         LTR   15,15         Test return code                  @SC86295
+         BR    14                                              @SC86295
+*
+*          Constants
+NBLNK    DC    64X'1',X'0',191X'1'   Find non-blank, if any
+BLNK     DC    64X'0',X'1',191X'0'   Find blank, if any
+NUMB     DC    240X'1',10X'0',6X'1'  Find non-digit, if any
+TRHEX    EQU   *-240
+         DC    C'0123456789ABCDEF'   Convert to characters
+F4       DC    F'4'
+F8       DC    F'8'
+         ADCON DISKIO
+FDBP     DS    0F            Pattern for file FDB
+         DC    A(0,80)       Buffer ptr, length
+         FDBPAT ,F,80        F/80 file                         @SC88111
+IVARS    DS    0D
+IMSGSQ   DC    C'SEQUENCE ERROR: '
+         DC    CL8' ',C' TO '
+         DC    CL8' '
+*          Variables
+STORAG   DSECT
+TMPDW    DS    D             For conversions
+STKPTR   DS    A             Save area stack
+STKLIM   DS    A             ditto
+SPTR     DS    A             Ptr to start of file
+FPTR     DS    A             Ptr to free list
+BPTR     DS    A             Allocation block list
+INSBP    DS    A             Ptr to control buffer
+COL      DS    A             Current scan column ptr
+SAV6     DS    A             Saved card ptr
+FNDSV    DS    F             Return address for FIND           @SC88111
+         DS    0F
+NXTNO    DS    PL5           Next sequence number for insert/reseq
+INCNO    DS    PL5           Sequencing increment
+LSTNO    DS    PL5           Current sequence number
+OUTNO    DS    PL5           Last card written
+ARGNO    DS    PL5           Number read from control card
+INSNO    DS    PL5           Last card resequenced
+CTL      DS    F             Ticket to control input
+SRC      DS    F             Ticket to input source
+OUT      DS    F             Ticket to output file
+CTLBUF   DS    CL80          Buffers
+SRCBUF   DS    CL80
+CMD      DS    C             Control command
+MRK      DS    CL3           Sequence label field
+         COPY  GUPVAR        System-specific variables
+VARS     DS    0D
+MSGSQ    DC    C'SEQUENCE ERROR: '
+MSGS1    DC    CL8' ',C' TO '
+MSGS2    DC    CL8' '
+LMSGSQ   EQU   *-MSGSQ
+LVARS    EQU   *-VARS
+*
+*          User interface information
+SRCNAM   DS    CL(LFID)      Input file name
+CTLNAM   DS    CL(LFID)      Control file name
+OUTNAM   DS    CL(LFID)      Output file name
+MRKD     DS    CL3           Default sequence label field
+FLG      DS    X             Flags
+XXKIL    EQU   X'80'         Deleting source records
+XXTOP    EQU   X'40'         At top of file
+XXINS    EQU   X'20'         Latest card is inserted
+XXEOF    EQU   X'10'         Reached end of source
+XX8      EQU   X'02'         8-column sequence field
+XXCOR    EQU   X'01'         Perform update in-core
+         DS    0D
+STODWDS  EQU   (*-STORAG)/8  Length of storage
+         COPY  GUPSUB
+*
+         END   GUPI

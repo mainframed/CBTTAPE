@@ -1,0 +1,377 @@
+CHECKVOL TITLE 'CHECKVOL - DISPLAY OFFLINE VOLUME SERIAL NUMBER'
+***********************************************************************
+*                     *                                               *
+*   C H E C K V O L   *     DISPLAY OFFLINE VOLUMES SERIAL NUMBER     *
+*                     *                                               *
+***********************                                               *
+*                                                                     *
+*   FUNCTION :        DISPLAY OFFLINE VOLUME'S VOLUME SERIAL NUMBER   *
+*                                                                     *
+*   PARMS:            "DEVICE ADDRESS" / OPTIONAL ",WAIT"             *
+*                                              OR ",WAIT=Y"           *
+*                                                                     *
+*   EXIT CODE:         0  -  UCB/VOLSER SUCCESSFULLY DISPLAYED        *
+*                      8  -  INVALID PARAMETER SPECIFIED              *
+*                     12  -  NO PARAMERTER SPECIFIED                  *
+*                     16  -  OPERATOR REPLIED "NO" OR "N.."           *
+*                     20  -  SPECIFIED UCB DOES NOT EXIST             *
+*                     24  -  UCB IS NOT OFFLINE OR A DASD DEVICE      *
+*                     28  -  UCB IS NOT ACCESSABLE (BOXED)            *
+*                     32  -  I/O ERROR OR TIMEOUT READING LABEL       *
+*                                                                     *
+*   REGISTER USAGE :   R0 - WORK REGISTER                             *
+*                      R1 - WORK REGISTER                             *
+*                      R2 - WORK REGISTER                             *
+*                      R3 - INPUT PARAMETER ADDRESS                   *
+*                      R4 - WORK REGISTER                             *
+*                      R5 - WORK REGISTER                             *
+*                      R6 - VOLUME LABEL ADDRESS                      *
+*                      R7 - NOT USED                                  *
+*                      R8 - NOT USED                                  *
+*                      R9 - NOT USED                                  *
+*                     R10 - NOT USED                                  *
+*                     R11 - NOT USED                                  *
+*                     R12 - BASE REGISTER                             *
+*                     R13 - SAVE AREA BASE REGISTER                   *
+*                     R14 - RETURN ADDRESS                            *
+*                     R15 - RETURN CODE                               *
+*                                                                     *
+*   MACROS : #DSECTS  #SETRC   #START   #STARTWA #STOP    #STOPWA     *
+*            DOM      IECDSECT LINK     STIMER   WAIT     WTO         *
+*            WTOR                                                     *
+*                                                                     *
+*   ROUTINES CALLED : READVOL1                                        *
+*                                                                     *
+***********************************************************************
+
+         ACONTROL OPTABLE(ZS3)     Assembly OPTCDE Table
+         SPLEVEL  SET=6            Specify OS/390 R2 macro format
+         SYSSTATE ARCHLVL=2        Assembly requires z/Architecture
+         SYSSTATE OSREL=ZOSV1R13   Assembly requires z/OS 1.13 & higher
+
+CHECKVOL #START ,                  Start Routine                       *
+               AMODE=31,           Indicate 31 Bit Addressing Mode     *
+               BASE=(R12),         Define Base Register(s)             *
+               COPY=YES,                                               *
+               LOC=BELOW,          Indicate 24 Bit work Area           *
+               REG1=(R3),          Copy Input Parameter Address        *
+               RMODE=24,           Indicate 24 Bit Residency Mode      *
+               WKDSECT=CHKVWORK,   Define WorkArea Name                *
+               LEVEL=**TOOL**      Maintenance Level
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Parse The Parameter List                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         L     R3,0(,R3)           A(Parameter List)
+         SLR   R4,R4
+         ICM   R4,3,0(R3)          L(Parameter Text)
+         BZ    CHKER001            B. If No Parameter Specified
+         LA    R3,2(,R3)           A(Parameter Text)
+         LA    R1,0(R4,R3)         A(End Of Parameter Text)
+         #EXEC -R4,TRT,0(*-*,R3),TRTAB1
+         AHI   R4,1                Restore Length
+         SR    R1,R3               Calculate Operand Length
+         BNP   CHKER001            B. If No Device Specified
+         CHI   R1,4                Check For Maximum Length
+         BH    CHKER002            B. If Too Long
+         MVC   DEVNAME,=C'0000'    Initialize Device Name Field
+         LA    R5,DEVNAME+4        A(End Of Device Name Field)
+         SR    R5,R1               Back Up To Right Justify
+         #EXEC -R1,MVC,0(*-*,R5),0(R3)
+         AHI   R1,1                Restore Device Number Length
+         LA    R3,0(R1,R3)         Advance Past Device Name
+         SR    R4,R1               Calculate Remaining Length
+
+         TRT   DEVNAME,HEXTAB      Verify Device Address Is Valid
+         BNZ   CHKER002            B. If Not
+
+         MVC   WRKDBL2(4),DEVNAME  Copy Device Address
+         TR    WRKDBL2(4),TRTAB2   Convert To Hex Values
+         OI    WRKDBL2+3,X'F0'     Ensure Positive Sign
+         PACK  WRKDBL1(4),WRKDBL2(4)
+         L     R1,WRKDBL1          Load Converted Hex Value
+         SRL   R1,4                Shift Off Sign
+         STCM  R1,3,UCBSDEVN       Save Converted Value
+
+         CHI   R4,5                Check If ",WAIT" Possible
+         BL    CHK00100            B. If Not
+         OC    0(5,R3),BLANKS      Ensure Upper Case
+         CLC   0(5,R3),=C',WAIT'   Check If "WAIT" Requested
+         BNE   CHK00100            B. If Not
+         OI    FLAGBYTE,$WAIT      Remember "Wait" Specified
+
+         LA    R3,5(,R3)           Advance Past ",WAIT"
+         SHI   R4,5                Subtract length of ",WAIT"
+         CHI   R4,2                Check If Any PARM Data Remaining
+         BL    CHK00100            B. If Not
+         CLI   0(R3),C'='          Check For ",WAIT="
+         BNE   CHK00100            B. If Not (Ignore Invalid Extras)
+         CLI   1(R3),C'Y'          Check For ",WAIT=Y"
+         BE    CHK00100            B. If Yes
+         NI    FLAGBYTE,255-$WAIT  Assume ",Wait=N" Specified
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Locate UCB For Specified DASD Device                         *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+CHK00100 DS    0H
+         XC    UCBSWORK,UCBSWORK
+         MODESET KEY=ZERO,MODE=SUP
+         UCBSCAN ADDRESS,          Call "ADDRESS" Service              *
+               DEVN=UCBSDEVN,      . Device Number                     *
+               DEVCLASS=DASD,      . Device Class                      *
+               DYNAMIC=YES,        . Include Dynamic UCBs              *
+               RANGE=ALL,          . Include 4-Digit Device Numbers    *
+               LOC=ANY,            . Include Above 16 Meg UCBs         *
+               NOPIN,              . Do Not Pin The UCB                *
+               UCBPTR=UCBSPTR,     . Address Of UCB Common Segment     *
+               WORKAREA=UCBSWORK,  . Required WorkArea                 *
+               MF=(E,UCBSLIST)
+         STM   R15,R0,RETREAS      Save Return/Reason Codes
+         MODESET KEY=NZERO,MODE=PROB
+         LM    R15,R0,RETREAS      Restore Return/Reason Codes
+         LTR   R15,R15             Check If UCBSCAN Was Successful
+         BNZ   CHKER003            B. If Not
+
+         L     R4,UCBSPTR          A(UCB)
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Call "READVOL1" To Read The Offline Volume's Label           *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         ST    R4,RVOLPARM+4       Save UCB Address
+         LA    R0,RVOLBUFF
+         ST    R0,RVOLPARM+8       Save Buffer Address
+         OI    RVOLPARM+8,X'80'    Indicate End Of Parameter List
+         LA    R1,RVOLPARM         A("READVOL1" Parameter List)
+         L     R15,=V(READVOL1)
+         BALR  R14,R15             Call "READVOL1" To Read Label
+         LHI   R0,X'99'            Identify "After" READVOL1
+         STM   R15,R0,RETREAS      Save Return/Reason Codes
+         CL    R15,=F'20'          Check For Valid Return Code
+         BH    CHKER004            B. If Not
+
+         B     *+4(R15)            Branch According To Return Code
+         B     CHK00200            - 00 Successful
+         B     CHKER003            - 04 UCB Not Valid
+         EX    0,*                 - 08
+         EX    0,*                 - 12
+         B     CHKER006            - 16 Device Not Accessible
+         B     CHKER007            - 20 Can't Read Device
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Process Returned Label Information                           *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+CHK00200 DS    0H
+         LA    R6,RVOLBUFF         A(DASD Label Information)
+         USING DXLBL,R6
+         MVC   MSG001I1,DEVNAME    Insert Device Address
+         MVC   MSG001I2,VOLSERNO   Insert Volume Serial
+         DROP  R6
+         WTO   MF=(E,MSG001)
+         ST    R1,DOMID1           Save WTO Message Identifier
+
+         TM    FLAGBYTE,$WAIT      Check If "WAIT" Requested
+         BNO   CHK00600            B. If Not
+
+CHK00300 DS    0H
+         MVC   RESPONSE,BLANKS     Initialize Response Area
+         XC    ECB,ECB             Initialize ECB
+         LA    R2,MSG001A
+         WTOR  MF=(E,(R2))         Issue Message With Reply
+
+         WAIT  ECB=ECB             Wait For Operator To Reply
+         ICM   R1,15,DOMID2        Load Previous Error Message Id
+         BZ    CHK00400            B. If None
+         DOM   MSG=(1)             Delete Operator Message
+         XC    DOMID2,DOMID2
+
+CHK00400 DS    0H
+         OC    RESPONSE,BLANKS     Convert Reply To Upper Case
+         CLI   RESPONSE,C'Y'       Check If Operator Replied "Y.."
+         BE    CHK00700            B. If Yes
+         CLI   RESPONSE,C'N'       Check If Operator Replied "N.."
+         BE    CHK00500            B. If Yes
+         MVC   MSG001B1,RESPONSE   Insert Response Into Message
+         LA    R2,MSG001B          A(Error Message)
+         WTO   MF=(E,(R2))         Issue Error Message
+         ST    R1,DOMID2           Save Message Identifier
+         B     CHK00300            Re-Prompt Operator
+
+CHK00500 DS    0H
+         #SETRC 16                 Set Return Code
+         B     CHK00700
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Wait For 30 Seconds Before Terminating                       *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+CHK00600 DS    0H
+         STIMER WAIT,DINTVL=SECONDS
+
+CHK00700 DS    0H
+         DOM   MSG=DOMID1          Delete Operator Message
+         B     TERMINAT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Process Error Conditions                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+CHKER001 DS    0H
+         WTO   TEXT=ERR001,ROUTCDE=(1)
+         #SETRC 12                 Set Return Code
+         B     TERMINAT
+
+CHKER002 DS    0H
+         WTO   TEXT=ERR002,ROUTCDE=(1)
+         #SETRC 8                  Set Return Code
+         B     TERMINAT
+
+CHKER003 DS    0H
+         MVC   ERR003I,DEVNAME     Insert Device Number
+         WTO   TEXT=ERR003,ROUTCDE=(1)
+         #SETRC 20                 Set Return Code
+         B     TERMINAT
+         UNPK  ERR004I1(5),RETREAS(3)
+         UNPK  ERR004I1+4(5),RETREAS+2(3)
+         MVI   ERR004I1+8,C' '
+         TR    ERR004I1,=C'0123456789ABCDEF'-C'0'
+         UNPK  ERR004I2(5),RETREAS+4(3)
+         UNPK  ERR004I2+4(5),RETREAS+6(3)
+         MVI   ERR004I2+8,C' '
+         TR    ERR004I2,=C'0123456789ABCDEF'-C'0'
+         WTO   TEXT=ERR004,ROUTCDE=(1)
+         B     TERMINAT
+
+CHKER004 DS    0H
+         EX    0,*                 Abend S0C3
+
+CHKER006 DS    0H
+         MVC   ERR006I,DEVNAME     Insert Device Number
+         WTO   TEXT=ERR006,ROUTCDE=(1)
+         #SETRC 28                 Set Return Code
+         B     TERMINAT
+
+CHKER007 DS    0H
+         MVC   ERR007I,DEVNAME     Insert Device Number
+         WTO   TEXT=ERR007,ROUTCDE=(1)
+         #SETRC 32                 Set Return Code
+         B     TERMINAT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        TERMINATE                                                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+TERMINAT #STOP ,                   TERMINATE
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        MESSAGE AREA                                                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+MSG001   WTO   ('*-------------------------------------------*',D),    *
+               ('*    UNIT ____ HAS VOLUME SERIAL ______     *',D),    *
+               ('*-------------------------------------------*',DE),   *
+               ROUTCDE=1,DESC=(2),MF=L
+MSG001I1 EQU   MSG001+4+67,4       Insert Address/Length
+MSG001I2 EQU   MSG001+4+90,6       Insert Address/Length
+MSG001A  WTOR  'CKV001A REPLY "YES" TO CONTINUE, OR "NO" TO ABORT',    *
+               RESPONSE,3,ECB,DESC=(2),ROUTCDE=(1),MF=L
+MSG001B  WTO   'CKV001I REPLY ___ IS INVALID - REPLY "YES" OR "NO"',   *
+               DESC=(2),ROUTCDE=(1),MF=L
+MSG001B1 EQU   MSG001B+4+14,3      Insert Address/Length
+
+ERR001   DC    AL2(L'ERR001T)
+ERR001T  DC    C'CKV001E NO PARM= SPECIFIED'
+
+ERR002   DC    AL2(L'ERR002T)
+ERR002T  DC    C'CKV002E INVALID PARM= SPECIFIED'
+
+ERR003   DC    AL2(L'ERR003T)
+ERR003T  DC    C'CKV003E UNIT ____ IS NOT AN OFFLINE DASD DEVICE'
+ERR003I  EQU   ERR003T+13,4        Insert Address/Length
+
+ERR004   DC    AL2(L'ERR004T)
+ERR004T  DC    C'        RETURN CODE:________ Reason Code:________ '
+ERR004I1 EQU   ERR004T+20,8        Insert Address/Length
+ERR004I2 EQU   ERR004T+41,8        Insert Address/Length
+
+ERR006   DC    AL2(L'ERR006T)
+ERR006T  DC    C'CKV006E UNIT ____ IS NOT ACCESSIBLE'
+ERR006I  EQU   ERR006T+13,4        Insert Address/Length
+
+ERR007   DC    AL2(L'ERR007T)
+ERR007T  DC    C'CKV007E CAN NOT READ LABEL ON UNIT ____ '
+ERR007I  EQU   ERR007T+35,4        Insert Address/Length
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        CONSTANTS & WORK AREA                                        *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+BLANKS   DC    256C' '             Lots Of Blanks
+ECB      DC    F'0'                WTOR ECB
+RESPONSE DC    CL3' '              WTOR Reply Area
+SECONDS  DC    C'00003000'         "WAIT" For 30 Seconds
+TRTAB1   DC    256X'00'            Find Delimeter
+         ORG   TRTAB1+C','
+         DC    C','
+         ORG   ,
+TRTAB2   DC    256X'00'            Convert Bytes from Char to Hex
+         ORG   TRTAB2+C'A'
+         DC    X'0A0B0C0D0E0F'
+         ORG   TRTAB2+C'0'
+         DC    X'00010203040506070809'
+         ORG   ,
+HEXTAB   DC    256X'FF'            Find Invalid HEX Characters
+         ORG   HEXTAB+C'A'
+         DC    6X'00'              A-F
+         ORG   HEXTAB+C'0'
+         DC    10X'00'             0-9
+         ORG   ,
+
+         #STARTWA ,
+         UCBSCAN MF=(L,UCBSLIST)   UCBSCAN Parameter List
+WRKDBL1  DS    D
+WRKDBL2  DS    D
+
+RETREAS  DS    2F                  Return/Reason Codes
+
+DEVNAME  DS    CL4,C
+DOMID1   DS    F
+DOMID2   DS    F
+FLAGBYTE DS    X                   Flag Byte
+$WAIT    EQU   BIT0                "WAIT" Requested
+UCBSDEVN DS    XL2                 UCBSCAN Device Number
+UCBSWORK DS    XL100               UCBSCAN WorkArea
+UCBSPTR  DS    A                   UCBSCAN UCB Address
+UCBSPTKN DS    CL8                 UCBSCAN Pin Token
+RVOLBUFF DS    CL80                "READVOL1" Output Buffer
+RVOLPARM DS    0F                  "READVOL1" Parameter List
+         DS    A                   - Unused
+         DS    A                   - UCB Address
+         DS    A                   - 80 Byte Label Buffer Address
+         #STOPWA ,
+
+         IECDSECT ,                O/C/EOV WorkArea (Volume Label Map)
+
+         #DSECTS CVT,UCB
+         END   ,

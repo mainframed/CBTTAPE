@@ -1,0 +1,372 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; This function compiles function calls.
+;;;
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 04/25/88 - Support for determination of superfluous initializations *
+;*            of PROG and &AUX variables to NIL.  This involves two    *
+;*            new fields in the contour that are used to detect cases  *
+;*            of a variable unconditionally being set before it is     *
+;*            ever referenced.  This is an extension of, and replaces, *
+;*            the SETQ-initialization-hacking scheme used in ZCCPROG.  *
+;*            This also requires a new P-code form, CSETNIL, and a new *
+;*            code generator module, ZCGCSNIL.                         *
+;*                                                                     *
+;***********************************************************************
+;
+
+;
+; Set up so that the compiler knows what's really inline even though
+; the user may have declared something inline or notinline.  E.G.
+;
+; (defload floating-point-p floatp)
+; (declare (notinline floating-point-p))
+;
+; means that floatp has the BUILTIN property
+; but floating-point-p has the NOTINLINE property.
+;
+; (declare (notinline floatp))
+;
+; has no effect on floating-point-p.
+;
+; Note:  The above isn't implemented yet....
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun zcceval (func args v s e)
+ (prog (a c n tail-recursive inline minargs maxargs restarg lexprarg)
+  (cond
+   ((symbolp func)
+          (setq a args
+                c (let ((x (get func 'cautoload)))
+                        (if (symbolp x) x nil))
+                n (length args)
+                ;
+                ; Eventually, the setting of "inline-ness" will be done
+                ; by retrieving it from the current contour.  Then,
+                ; (declare (notinline ...)) will work.
+                ;
+                inline (and (get (or c func) 'builtin)
+                            (get func 'inline))
+                tail-recursive (and (eq func (car name))
+                                    (null v)
+                                    (eq (ultimate-target s e) t)))
+
+;
+; If the function has a CAUTOLOAD property (via DEFLOAD), then
+; use the CAUTOLOAD name's defaults.  If these aren't defined,
+; or if there's no CAUTOLOAD property, then use the function's
+; own defaults.  If these don't exist, then punt.
+;
+          (setq minargs  (or (if c (get c 'minargs))
+                             (get func 'minargs)))
+          (setq maxargs  (or (if c (get c 'maxargs))
+                             (get func 'maxargs)))
+          (setq restarg  (or (if c (get c 'restarg))
+                             (get func 'restarg)))
+          (setq lexprarg (or (if c (get c 'lexprarg))
+                             (get func 'lexprarg)))
+
+          (if lexprarg (setq tail-recursive nil)) ; Can't optimize it!
+
+          (if minargs
+           then
+            (if (< n minargs)
+             then
+              (modq body
+                  `(error "Too few arguments passed to function" ,func))
+             else
+             if (and (null restarg) (null lexprarg) (> n maxargs))
+             then
+              (modq body
+                 `(error "Too many arguments passed to function" ,func))
+             endif
+            )
+           else
+           if (get '*zilco* 'autofuncall)
+           then
+             (unless (get func 'funcalled)
+              (princ " Function \"")
+              (prin1 func)
+              (princ "\" unknown.  Will be invoked via FUNCALL.")
+              (terpri)
+              (putprop func t 'funcalled))
+             (return (zccevcom `(funcall ',func . ,args) v s e))
+           else
+             (princ " Undeclared function name \"")
+             (prin1 func)
+             (princ "\". Assumed to be a SUBR with ")
+             (princ n)
+             (princ (if (eql n 1) " argument." " arguments."))
+             (terpri)
+             (setq maxargs n)
+             (putprop func n 'minargs)  ; Set minimum number of args.
+             (putprop func n 'maxargs)  ; Set maximum number of args.
+             (remprop func 'restarg)    ; Set no &REST arg.
+           endif
+          )
+
+;
+; If this is an inline call because the CAUTOLOAD property is an
+; inline function, then set the function name to the inline name.
+;
+          (and inline c (setq func c))
+
+          (modq body `(,(cond
+                         (tail-recursive 'begintail)
+                         (inline         'begininline)
+                         (t              'begincall)) ,func ,n ,v ,s))
+
+;
+; Generate code to evaluate the arguments to the function.
+;
+          (zcceval-pass-args a nil minargs maxargs restarg lexprarg e)
+;
+; Generate code to invoke the function.
+;
+          (modq body
+           (cond
+            (tail-recursive (compile-tailrecur)); See macro definition.
+            (inline         `(inline ,func ,n ,v ,s))
+            (t              (zcccall func n v s e)))))
+
+  ((atom func) ; If function is not a symbol...
+   (modq body `(error "Function name not a symbol" ,func)))
+
+  ((eq (car func) 'lambda)
+
+  ;--- do lambda stuff - get attributes of lambda expression ---
+
+   (if (null (cdr func))
+    then
+       (modq body `(error "Missing arglist in LAMBDA expression"
+                          (,func . ,args)))
+    else
+    if (not (listp (cadr func)))  ; If the arg list is non-NIL atom
+    then                          ; it's a LEXPR-style LAMBDA expr.
+                                  ; in which case we have no choice
+                                  ; but to compile it like a
+                                  ; separate function
+       (zcceval (zcclamb func t e) args v s e)
+    else
+       (zcceval-call-lambda func args v s e)
+   endif
+  ))
+
+  (t
+   (modq body `(error "Function name not a symbol" ,func)))
+   )))
+
+;
+; This generates code to perform tail recursion.
+; The local variables known at the time of the tail recursion must
+; be saved in pseudoglobal TAILRECUR so that the code generator can
+; determine if special variable bindings are to be maintained over
+; the tail-recursive branch-back.
+;
+; This subroutine has been implemented as a macro to save stack usage
+; in the compiler.
+;
+
+(defmacro compile-tailrecur ()
+ '(loop for p in (zilcec-bindings (car e)) ; Add local vars to list
+    do (push p tailrecur)              ; of tail-recursive variables.
+    finally                            ; Update list, then emit P-code.
+      (return `(tailrecur ,func ,n ,v ,s))))
+
+(defun zcceval-call-lambda (func args v s e)
+ (let* (
+        (n (length args))
+        ((lambda-args . lambda-body) (cdr func))
+        (temp-lambda-name     (gensym))
+        (temp-lambda-valid-p  (zilcoarg temp-lambda-name lambda-args))
+        (temp-lambda-parms    (get temp-lambda-name 'parms))
+        (temp-lambda-minargs  (get temp-lambda-name 'minargs))
+        (temp-lambda-maxargs  (get temp-lambda-name 'maxargs))
+        (temp-lambda-restarg  (get temp-lambda-name 'restarg))
+        (temp-lambda-lexprarg (get temp-lambda-name 'lexprarg))
+        (lambda-exitlabel     (gensym))
+        (e                    (cons (zccmkcec 'lambda e) e))
+       )
+
+       (putprop lambda-exitlabel v 'vartarg)
+       (putprop lambda-exitlabel s 'rettarg)
+
+       (if temp-lambda-valid-p
+        then
+         ; ... do stuff for a valid lambda-expression ...
+         (if (< n temp-lambda-minargs)
+          then
+             (modq body
+               `(error "Too few arguments passed to LAMBDA-expression"
+                       ((lambda ,lambda-args etc.) . ,args)))
+          else
+          if (and (null temp-lambda-restarg)
+                  (null temp-lambda-lexprarg)
+                  (> n temp-lambda-maxargs))
+          then
+             (modq body
+              `(error "Too many arguments passed to LAMBDA-expression"
+                       ((lambda ,lambda-args etc.) . ,args)))
+          endif
+         )
+
+;
+; Start up a call sequence.
+;
+        (modq body `(begincall ,func ,n ,v ,s))
+;
+; Generate code to evaluate the arguments to the function.
+; Note that the environment is the one outside the lambda's env.
+;
+        (zcceval-pass-args args
+                           temp-lambda-parms
+                           temp-lambda-minargs
+                           temp-lambda-maxargs
+                           temp-lambda-restarg
+                           temp-lambda-lexprarg
+                           (cdr e))
+;
+; Generate code to invoke the LAMBDA code inline.
+;
+
+;;;;
+;;;; We are not suppressing GO/RETURN stuff any more, because now the
+;;;; compiler can handle it.
+;;;;
+
+         (modq body `(beginlam ,temp-lambda-name
+                               ,temp-lambda-parms ,v ,s))
+
+;
+; Identify args as belonging to the current function.
+;
+
+         (dolist (x temp-lambda-parms)
+                 (putprop (cdr x) name 'owner))
+
+;
+; Generate code to initialize and bind all args, including
+; &optional, &aux, and supplied-p arguments.
+;
+
+         (setq lambda-body
+          (zcclama temp-lambda-name lambda-exitlabel lambda-body e))
+
+         ; Evaluate the body of the lambda.
+
+         (zccprogn lambda-body nil `(goto ,lambda-exitlabel) e)
+
+         (modq body `(endlam ,lambda-exitlabel
+                             ,temp-lambda-parms ,v ,s))
+
+         (modq body `(label    ,lambda-exitlabel ,v ,s))
+
+        else
+
+         (princ "Warning: Uncompilable LAMBDA-expression arglist: ")
+         (print lambda-args)
+         (princ "Converting to FUNCALL of interpretive LAMBDA list.")
+         (terpri)
+         ;
+         ; Note use of outer environment...
+         ;
+         (zccevcom `(funcall ',func . ,args) v s (cdr e))
+
+        endif
+
+       ) ; end if temp-lambda-valid-p
+
+ ) ; end LET*
+)
+
+(defun zcceval-pass-args (a lparms minargs maxargs restarg lexprarg e)
+
+ ;
+ ; Generate code to evaluate the arguments to the function.
+ ;
+ ; If the function we're calling has &OPTIONAL arguments
+ ; (i.e. MAXARGS > MINARGS), pass in the arguments until
+ ; we run out of arguments, and then pass in the "not-supplied"
+ ; indicator for each omitted argument.
+ ;
+ ; If the function we're calling has a &REST argument,
+ ; take the remaining arguments, CONS up a list out of
+ ; them, and pass the list as the final argument.
+ ;
+ ; If the function we're calling is a LEXPR,
+ ; make a fixnum out of the one arg, making it arg 1,
+ ; and pass the other args on the stack following it.
+ ;
+
+ (if   lexprarg
+  then
+       (zccatom (length a) nil '(arg 1) e)
+       (loop for i from 2
+             for x in a
+             do (zccevcom x nil `(arg ,i) e)
+       )
+  else
+       (loop for i from 1 to maxargs
+             do
+               (cond
+                ((null a)
+                 (modq body `(setopt nil nil (arg ,i))))
+                (t
+                 (cond
+                  ((and lparms (null (car a)))
+                   (let ((pair (car lparms)))
+                        (remprop (cdr pair) 'set)
+                        (remprop (cdr pair) 'used)
+                        (remprop (cdr pair) 'mustinit)
+                        (modq body `(csetnil ,pair nil (arg ,i)))))
+                  (t
+                   (zccevcom (car a) nil `(arg ,i) e)))
+                 (setq lparms (cdr lparms))
+                 (setq a (cdr a))))
+             finally
+               (if restarg
+                   (zccevcom (zilcotrn `(list . ,a) debug)
+                             nil `(arg ,i) e))
+       )
+  endif
+ )
+)
+
+;
+; This determines whether the ultimate target of a form to be compiled
+; is the final return value (or some other thing).  Used to determine
+; if tail recursion is valid.
+;
+
+; Somehow, contours will be interrogated eventually here.
+
+(defun ultimate-target (s e) ; The ultimate value target of a target
+ (if (and (eq (car s) 'goto)               ; If unconditional GOTO
+          (null (get (cadr s) 'vartarg))   ; and there's no SETQ or
+          (null (get (cadr s) 'popsalist)) ; special-alist restor'n or
+          (null (get (cadr s) 'popfalist)) ; fluid-alist restoration or
+          (null (get (cadr s) 'catch))     ; catch frame to worry about
+       )                                   ; then you can go right thru
+  then
+       (ultimate-target (get (cadr s) 'rettarg) e)
+  else s
+ endif))
+

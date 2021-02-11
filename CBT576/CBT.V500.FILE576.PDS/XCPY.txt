@@ -1,0 +1,558 @@
+/*                               rexx                                        */
+/*****************************************************************************/
+/* NAME         : XCPY                                                       */
+/* DESCRIPTION  : Extended Copy Facility allowing copies without allocations */
+/* AUTHOR       : Mick Sheehy                                                */
+/* DATE WRITTEN : February 4, 2002                                           */
+/*                                                                           */
+/* MODIFICATIONS                                                             */
+/* 05/06/02 : SHEMIC : Modify to allow uncataloged original datasets.        */
+/*                   :  This includes a change to the panel.                 */
+/* 23/05/02 : SHEMIC : Modify xcpy to invoke IEBGENER via a TSOEXEC "call"   */
+/*                   :  rather than using LINKMVS.                           */
+/*                   : Improve logic ensuring datasets are fully qualified.  */
+/* 10/05/02 : SHEMIC : Modify TSO ALLOCATE command to use keyword "REUSE"    */
+/*                   :  instead of looping logic to reallocate a dataset if  */
+/*                   :  it is in use.                                        */
+/*                   : Ensure both the original and destination datasets are */
+/*                   :  fully qualified - before and after the panel is      */
+/*                   :  displayed.                                           */
+/* 06/05/02 : SHEMIC : Modify TSO CALL to IEBCOPY to invoke TSOEXEC and      */
+/*                   :  explicitly state which library IEBCOPY resides in.   */
+/*                   :  (ie. SYS1.LINKLIB)                                   */
+/* 02/05/02 : SHEMIC : Modify to change the PDS copy procedure to use        */
+/*                   :  IEBCOPY instead of ISPF service LMCOPY.              */
+/*                   : Add more meaningful error messages.                   */
+/* 01/05/02 : SHEMIC : Modify to convert allocations to bytes before         */
+/*                   :  comparing against the primary allocation.            */
+/* 23/04/02 : SHEMIC : Modify to protect against copying a dataset to a      */
+/*                   :  destination which is too small (ie. Primary alloc)   */
+/* 28/03/02 : SHEMIC : Modify to correct bug which disallowed a secondary    */
+/*                   :  allocation of space.                                 */
+/*                   : Improve logic controlling allocation of SYSIN.        */
+/*                   : Added the ability to PF3 out without performing the   */
+/*                   :  copy.                                                */
+/*****************************************************************************/
+/*                                                                           */
+/* If you don't want to put the panel into an ISPPLIB panel library,         */
+/* then uncomment the LIBDEF statement, and point it to a valid              */
+/* library containing the panel, at your installation.                       */
+/*                                                                           */
+/* Use a LIBDEF to point to the panel - prevents overcrowding in the SYSEXEC */
+/*                                                                           */
+/* Address ISPEXEC
+        "LIBDEF ISPPLIB DATASET ID('SHEMIC.WORK.JCLLIB') STACK"              */
+FailCount = 0
+ovolume = ' '
+volume   = ''
+unit     = ''
+dsorg    = ''
+recfm    = ''
+lrecl    = ''
+blksize  = ''
+alloc    = ''
+upages   = ''
+primary  = ''
+OrigPrim = ''
+second   = ''
+OrigSec  = ''
+units    = ''
+Origunit = ''
+adirblk  = ''
+udirblk  = ''
+volentered = ''
+dssms    = ''
+racfprot = ''
+/*                                                                           */
+/* Set up rudimentary space constants                                        */
+/*                                                                           */
+trackbytes = 58778
+cyltracks  = 15
+/*                                                                           */
+/* Get the existing and new dataset names                                    */
+/*                                                                           */
+parse arg dsn dsn2
+if dsn = '' then
+do
+   say "Please enter the fully qualified FROM dsname."
+   parse pull DSFROM
+   if DSFROM /= ""
+   then do
+       dsn = ''''||STRIP(TRANSLATE(DSFROM,' ',''''))||''''
+   end
+   else do
+       say "You must enter a fully qualified dsname to copy from"
+       exit 0
+   end
+end
+/*                                                                           */
+/* Strip out a specified volume if specified.                                */
+/* Ensure original dataset is fully qualified.                               */
+/*                                                                           */
+    if INDEX(dsn,':') > 0
+    then do
+        ovolume = SUBSTR(dsn,1,INDEX(dsn,':')-1)
+        dsn = SUBSTR(dsn,INDEX(dsn,':')+1)
+    end
+    dsn = ''''||STRIP(TRANSLATE(dsn,' ',''''))||''''
+/*                                                                           */
+/* Strip out a specified volume if specified.                                */
+/* Ensure destination dataset is fully qualified.                            */
+/*                                                                           */
+    IF WORDS(STRIP(TRANSLATE(dsn2,' ',''''))) = 0
+    THEN DO
+        dsn2 = ''
+    END
+    ELSE DO
+        if INDEX(dsn2,':') > 0
+        then do
+            volentered = SUBSTR(dsn2,1,INDEX(dsn2,':')-1)
+            dsn2 = SUBSTR(dsn2,INDEX(dsn2,':')+1)
+        end
+        dsn2 = ''''||STRIP(TRANSLATE(dsn2,' ',''''))||''''
+    END
+/*                                                                           */
+/* Get dataset information for the existing dataset                          */
+/* Use LISTDSI with a volume only if a volume was specified.                 */
+/*                                                                           */
+/* If an uncataloged dataset is the source dataset, display the panel        */
+/* allowing the volume it resides on to be entered.  After the volume is     */
+/* entered, use LISTDSI to populate the remaining panel fields.              */
+/*                                                                           */
+if WORDS(STRIP(ovolume)) = 0
+then do
+    x = listdsi(dsn directory prealloc)
+end
+else do
+    OrigDsetVolume = 'volume('||ovolume||')'
+    x = listdsi(dsn OrigDsetVolume directory prealloc)
+end
+do while (FailCount < 2)
+    FailCount = FailCount + 1
+    if x > 0
+    then do
+        if (STRIP(TRANSLATE(sysreason,' ','0')) = "2") & (FailCount <= 1)
+        then do
+            Address ISPEXEC
+                "display panel(xcpypnl0) "
+/*                                                                           */
+/* End / Return on receipt of PF3                                            */
+/*                                                                           */
+            if rc \= 0
+            then do
+                say 'XCPY has been ended - copy terminated by request.'
+                exit 0
+            end
+            if words(ovolume) = 0
+            then do
+                x = 99
+            end
+            else do
+                OrigDsetVolume = 'volume('||ovolume||')'
+                x = listdsi(dsn OrigDsetVolume directory prealloc)
+            end
+        end
+        else do
+            if x = 99
+            then do
+                say "Sorry . . XCPY detects that the Original dataset is "||,
+                    "uncataloged and "
+                say " no volume was specified."
+                say "If a dataset is uncataloged, XCPY requires a volume"||,
+                    " to locate it."
+                say " "
+                say "XCPY is now terminating."
+                exit
+            end
+            else do
+                say "listdsi failed rc = " x
+                say "lastcc = " lastcc " sysreason = " sysreason
+                exit
+            end
+        end
+    end
+end
+/*                                                                           */
+/* Extract dataset information from ISPF variables populated by LISTDSI      */
+/*                                                                           */
+Address ISPEXEC
+    if words(STRIP(volentered)) = 0
+    then do
+        volume   = sysvolume
+    end
+    else do
+        volume   = volentered
+    end
+    if words(STRIP(ovolume)) = 0
+    then do
+        ovolume = volume
+    end
+    unit     = sysunit
+    dsorg    = sysdsorg
+    if dsorg = '???'
+    then do
+        dsorg = 'PS'
+    end
+    recfm    = sysrecfm
+    lrecl    = syslrecl
+    blksize  = sysblksize
+    alloc    = sysalloc
+    upages   = sysusedpages
+    primary  = sysprimary
+    OrigPrim = primary
+    second   = sysseconds
+    OrigSec  = second
+    units    = sysunits
+    Origunit = units
+    adirblk  = sysadirblk
+    udirblk  = sysudirblk
+    dssms    = sysdssms
+    racfprot = sysracfa
+/*                                                                           */
+/* Make variable information available to the panel                          */
+/*                                                                           */
+    "vput (ovolume,volume,unit,dsorg,recfm,lrecl,blksize)"
+    "vput (alloc,upages,primary,second,units)"
+    "vput (adirblk,udirblk,dssms,racfprot)"
+    "vput (dsn,dsn2) profile"
+    if sysreason > 0 then
+    do
+        say "XCPY has failed with sysreason failure RC : " sysreason
+        exit
+    end
+/*                                                                           */
+    Displayflag = 1
+    Do while Displayflag = 1
+/*                                                                           */
+/* Display the panel                                                         */
+/*                                                                           */
+        "display panel(xcpypnl0) "
+/*                                                                           */
+/* End / Return on receipt of PF3                                            */
+/*                                                                           */
+        if rc \= 0
+        then do
+            say 'XCPY has been ended - copy terminated by request.'
+            exit 0
+        end
+        else do
+            Displayflag = 0
+        end
+/*                                                                           */
+/* Do not allow a copy of a dataset to a destination dataset which is        */
+/* smaller than the original....                                             */
+/*                                                                           */
+/*                                                                           */
+/* Calculate the maximum space allocation - taking secondary allocations     */
+/* into account.                                                             */
+/*                                                                           */
+        Origspace = OrigPrim + (OrigSec * 15)
+        Newspace = primary + (second * 15)
+/*                                                                           */
+/* Look for the truncated output from the displayed panel.                   */
+/*                                                                           */
+        unitsub = SUBSTR(units,1,5)
+        Origunitsub = SUBSTR(Origunit,1,5)
+/*                                                                           */
+/* Convert original dataset allocation to bytes.                             */
+/*                                                                           */
+        SELECT
+          WHEN Origunitsub = 'BLOCK'
+          THEN DO
+              Origspace = Origspace * blksize
+          END
+          WHEN Origunitsub = 'TRACK'
+          THEN DO
+              Origspace = Origspace * trackbytes
+          END
+          WHEN Origunitsub = 'CYLIN'
+          THEN DO
+              Origspace = Origspace * trackbytes * cyltracks
+          END
+          OTHERWISE nop
+        END
+/*                                                                           */
+/* Convert new dataset allocation to bytes.                                  */
+/*                                                                           */
+        SELECT
+          WHEN unitsub = 'BLOCK'
+          THEN DO
+              Newspace = Newspace * blksize
+          END
+          WHEN unitsub = 'TRACK'
+          THEN DO
+              Newspace = Newspace * trackbytes
+          END
+          WHEN unitsub = 'CYLIN'
+          THEN DO
+              Newspace = Newspace * trackbytes * cyltracks
+          END
+          OTHERWISE nop
+        END
+/*                                                                           */
+/* Test to ensure destination dataset is large enough to copy to.            */
+/*                                                                           */
+        if Newspace < Origspace
+        then do
+            if primary = 1
+            then do
+                ess = ''
+            end
+            else do
+                ess = 'S'
+            end
+            say 'Ooops - The destination dataset is too small! '
+            say '  '
+            say 'The allocation for dataset : '||dsn2
+            say ' Primary allocation        : '||primary||' '||units||ess
+            if second = 1
+            then do
+                ess = ''
+            end
+            else do
+                ess = 'S'
+            end
+            say ' Secondary allocation      : '||second||' '||units||ess
+            say '  '
+            say '  must be greater than or equal to the equivalent of '
+            say '  '
+            say OrigPrim||' primary and '||OrigSec||' secondary '||,
+                Origunit||'S'
+            say '  '
+            say 'Change the allocation and . .  have another go mate ;-) '
+            Displayflag = 1
+        end
+    end
+
+/*                                                                           */
+/* Build variables depending on the dataset characteristics                  */
+/*                                                                           */
+/*                                                                           */
+/* Ensure original dataset is fully qualified.                               */
+/*                                                                           */
+    dsn = ''''||STRIP(TRANSLATE(dsn,' ',''''))||''''
+/*                                                                           */
+/* Ensure destination dataset is fully qualified.                            */
+/*                                                                           */
+    dsn2 = ''''||STRIP(TRANSLATE(dsn2,' ',''''))||''''
+    if WORDS(STRIP(TRANSLATE(dsn2,' ',''''))) = 0
+    then do
+        say 'ERROR : Destination Dataset must be entered !'
+        exit 12
+    end
+    if (units = 'BLOCK')
+    then do
+        theunits = "BLOCK("||blksize||")"
+    end
+    else
+    do
+        theunits = units||" BLKSIZE("||blksize||")"
+    end
+    if (dssms = 'PDS')
+    then do
+        thedsntp = 'DSNTYPE(PDS)'
+        thedirbk = "DIR("||adirblk||")"
+    end
+    else
+    do
+        thedsntp = ' '
+        thedirbk = ' '
+    end
+    recfm1 = SUBSTR(recfm,1,1)
+    recfm2 = SUBSTR(recfm,2,1)
+    recfm3 = SUBSTR(recfm,3,1)
+    therecfm = "RECFM("||recfm1||" "||recfm2||" "||recfm3||")"
+    thelrecl = "LRECL("||lrecl||")"
+/*                                                                           */
+/* Issue the TSO ALLOCATE command to allocate the new dataset using the      */
+/* attributes based on the original - but which may have been altered by     */
+/* the user - (ie Change volume, directory blocks, etc . . . )      !!       */
+/*                                                                           */
+Address TSO
+  "ALLOC DATASET("||dsn2||") NEW VOLUME("||volume||") UNIT("||unit||") "||,
+  "DSORG("||dsorg||") "||theunits||" "||thelrecl||" "||therecfm||" "||,
+  "SPACE("||primary||","||second||") RELEASE CATALOG "||thedsntp||" "||thedirbk
+  if (RC > 0)
+  then do
+      say 'TSO dataset allocation has failed with RC : ' RC
+      exit
+  end
+/*                                                                           */
+/* Allocate SYSUT1, SYSUT2, SYSIN, SYSPRINT & SYSOUT to this REXX procedure  */
+/*                                                                           */
+Address TSO
+    "ALLOC F(SYSUT1) DSN("||dsn||") VOLUME("||ovolume||") SHR REUSE"
+    if (RC > 0)
+    then do
+        say 'TSO SYSUT1 allocation has failed with RC : ' RC
+        Call Freedsn2
+        exit
+    end
+    "ALLOC F(SYSUT2) DSN("||dsn2||") VOLUME("||volume||") SHR REUSE"
+    if (RC > 0)
+    then do
+        say 'TSO SYSUT2 allocation has failed with RC : ' RC
+        Call Freedsn2
+        exit
+    end
+    "ALLOC F(SYSIN) DUMMY REUSE"
+    if (RC > 0)
+    then do
+        Call Freedsn2
+        exit
+    end
+    "ALLOC F(SYSOUT) DUMMY REUSE"
+    if (RC > 0)
+    then do
+        Call Freedsn2
+        exit
+    end
+    "ALLOC F(SYSPRINT) DUMMY REUSE"
+    if (RC > 0)
+    then do
+        Call Freedsn2
+        exit
+    end
+/*                                                                           */
+/* If the dataset is a PDS, use IEBCOPY to copy the dataset, otherwise use   */
+/* IEBGENER.                                                                 */
+/*                                                                           */
+if (dssms = 'PDS')
+then do
+    ADDRESS TSO "TSOEXEC CALL 'SYS1.LINKLIB(iebcopy)'"
+    if (RC > 0)
+    then do
+        select
+            when RC = 4
+            then do
+                say 'IEBCOPY has failed.'
+                say 'One or more copy groups operations ended unsuccessfully'||,
+                    ' or were incompletely performed.'
+                say 'Recovery may be possible.  Return Code : '||RC
+            end
+            when RC = 8
+            then do
+                say 'IEBCOPY has failed.'
+                say 'An unrecoverable error exists - IEBCOPY ends with '||,
+                    ' Return Code : '||RC
+            end
+            OTHERWISE say 'IEBCOPY run under TSO has failed with RC : ' RC
+        end
+        Call Freedsn2
+        exit
+    end
+    else do
+        say 'IEBCOPY has been invoked . . . and finished with RC : '||RC
+    end
+end
+else do
+    ADDRESS TSO "TSOEXEC CALL 'SYS1.LINKLIB(iebgener)'"
+    if (RC > 0)
+    then do
+        select
+          when RC = 4
+          then do
+              say 'Probable successful completion - please investigate.'
+              say 'Return Code : '||RC
+          end
+          when RC = 8
+          then do
+              say 'Either processing was ended after you requested '||,
+                  'processing of user header labels only,'
+              say 'or a DBCS error was encountered.  Return Code : '||RC
+          end
+          when RC = 12
+          then do
+              say 'Either an unrecoverable error exists and the job step'||,
+                  ' is stopped, or a DBCS error was encountered.'
+              say 'Return Code : '||RC
+          end
+          when RC = 16
+          then do
+             say 'A user routine passed a return code of 16 to IEBGENER.'||
+             say 'Return Code : '||RC
+          end
+          OTHERWISE say 'IEBGENER run under TSO has failed with RC : ' RC
+      end
+      Call Freedsn2
+      exit
+    end
+    else do
+        say 'IEBGENER has been invoked . . . and finished with RC : '||RC
+    end
+end
+/*                                                                           */
+/* Free all allocated datasets                                               */
+/*                                                                           */
+    "FREE F(SYSUT1)"
+    if (RC > 0),
+    then do
+        say 'TSO FREE of SYSUT1 has failed with RC : ' RC
+        say 'Warning : Dataset may still be allocated !'
+        Call Freedsn2
+        "FREE F(SYSIN)"
+        "FREE F(SYSOUT)"
+        "FREE F(SYSPRINT)"
+        exit
+    end
+    Call Freedsn2
+    if (RC > 0),
+    then do
+        say 'TSO FREE of SYSUT2 has failed with RC : ' RC
+        say 'Warning : Dataset may still be allocated !'
+        "FREE F(SYSIN)"
+        "FREE F(SYSOUT)"
+        "FREE F(SYSPRINT)"
+        exit
+    end
+    "FREE F(SYSIN)"
+    if (RC > 0),
+    then do
+        say 'TSO FREE of SYSIN has failed with RC : ' RC
+        say 'Warning : Dataset may still be allocated !'
+        Call Freedsn2
+        "FREE F(SYSOUT)"
+        "FREE F(SYSPRINT)"
+        exit
+    end
+    "FREE F(SYSOUT)"
+    if (RC > 0),
+    then do
+        say 'TSO FREE of SYSOUT has failed with RC : ' RC
+        say 'Warning : Dataset may still be allocated !'
+        Call Freedsn2
+        "FREE F(SYSPRINT)"
+        exit
+    end
+    "FREE F(SYSPRINT)"
+    if (RC > 0),
+    then do
+        say 'TSO FREE of SYSPRINT has failed with RC : ' RC
+        say 'Warning : Dataset may still be allocated !'
+        Call Freedsn2
+        exit
+    end
+say ' '
+say 'Original Dataset    : ' dsn
+say 'On volume           : ' ovolume
+say ' '
+say '    has been successful copied to ...'
+say ' '
+say 'Destination Dataset : ' dsn2
+say 'On volume           : ' volume
+say 'Have a nice day :-)'
+say ' '
+exit 0
+/*                                                                           */
+/* Subroutine which frees the newly created dataset                          */
+/*                                                                           */
+Freedsn2:
+    Address TSO
+        "FREE dataset("||dsn2||")"
+        if (RC > 0),
+        then do
+            say 'TSO FREE has failed with RC : ' RC
+            say 'Warning : Datasets may still be allocated !'
+            exit
+        end
+RETURN

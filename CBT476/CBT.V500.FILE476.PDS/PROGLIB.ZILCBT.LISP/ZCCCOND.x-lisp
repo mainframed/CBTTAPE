@@ -1,0 +1,309 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; This compiles the "COND" function inline.
+;;;
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 04/06/88 - Support for GO tag optimization.                         *
+;* 04/12/88 - Miscellaneous optimizations.                             *
+;* 04/25/88 - Support for determination of superfluous initializations *
+;*            of PROG and &AUX variables to NIL.  This involves two    *
+;*            new fields in the contour that are used to detect cases  *
+;*            of a variable unconditionally being set before it is     *
+;*            ever referenced.  This is an extension of, and replaces, *
+;*            the SETQ-initialization-hacking scheme used in ZCCPROG.  *
+;*            This also requires a new P-code form, CSETNIL, and a new *
+;*            code generator module, ZCGCSNIL.                         *
+;* 05/02/88 - Now that ZCGSTTRG has been upgraded to handle GONIL and  *
+;*            GONOTNIL to GO tags et al., ZCCCOND no longer has to     *
+;*            check the contour structure to see if a (COND ... GO) or *
+;*            (COND ... RETURN) optimization is valid.  However, it    *
+;*            must check for MEMQ, since MEMQ is weird.                *
+;* 06/07/88 - Support for BLOCK and TAGBODY.                           *
+;* 06/23/88 - Support for PROG and RETURN removed.                     *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun zcccond (b v s e)
+ (prog (a branchlabel exitlabel f1 f2 tconstant valuep
+        save-tempcond f1pred)
+  (setq a b)
+  (setq exitlabel (gensym))
+  (putprop exitlabel v 'vartarg)
+  (putprop exitlabel s 'rettarg)
+  (putprop exitlabel t 'forceniltest)
+  (setq valuep (or v (not (zilcovta s))))
+  (setq save-tempcond (zilcec-tempcond (car e)))
+ loop
+  (when (null a) ; No more COND clauses...
+        (setf (zilcec-tempcond (car e)) save-tempcond)
+         ;
+         ; Generate a value of NIL only if a value is required
+         ; (it is SETQ'd or the COND is being evaluated for a value)
+         ;
+        (and valuep (modq body `(setnil nil nil (goto ,exitlabel))))
+        (modq body `(label ,exitlabel ,v ,s))
+        (return nil))
+
+  ; Create a new branching label.
+  ; F1 is the IF-clause.
+  ; F2 is the list of THEN-clauses.
+
+  (setq branchlabel (if (or (cdr a) valuep) (gensym) exitlabel))
+
+  (desetq (f1 . f2) (car a))
+  (setq tconstant
+        (or (eq f1 t)                  ; T is a true constant.
+            (if (atom f1)
+             then (not (symbolp f1))   ; Number, string, etc.
+             else (and (eq (car f1) 'quote)
+                       (consp (cdr f1))
+                       (cadr f1)))))   ; (QUOTE anything-except-NIL)
+
+  (cond
+   ;
+   ; If no THEN-clause, return value of IF-clause.
+   ;
+   ((null f2)
+    (zccevcom f1 nil `(gonotnil ,exitlabel) e))
+   ;
+   ; If there is exactly one THEN-clause, a number of optimizations
+   ; are possible.  Try them.
+   ;
+   ((progn (setq f1pred (if tconstant t (zccpred f1)))
+           (and (not tconstant)
+                (null (cdr f2))
+                (not (zcccond-weirdp f1pred)))
+    )
+    (zcccond-maybe-optimize f1pred (car f2)
+                            branchlabel exitlabel a v s e))
+   (t
+   ;
+   ; Otherwise, do normal compilation of multiple THEN clauses.
+   ;
+    (zcccond-punt f1pred f2 branchlabel exitlabel a v s e)))
+
+ (when tconstant
+       (setf (zilcec-tempcond (car e)) save-tempcond)
+       (return (modq body `(label ,exitlabel ,v ,s))))
+
+ (if (eq branchlabel exitlabel)
+  ;then
+     (when (and (null v) (null s))
+           (remprop exitlabel 'forceniltest))
+  ;else
+     (modq body `(label ,branchlabel nil nil))
+ )
+ (setq a (cdr a))
+ (setf (zilcec-tempcond (car e)) t) ; All if-clauses other than first
+ (go loop)))                        ; are conditionally executed
+
+
+(defun zcccond-maybe-optimize (s1 s2 branchlabel exitlabel a v s e
+                              &aux weirdp p tag progexit retval blkname)
+ ;
+ ; (COND ... (s1 s2) ...), where s1 has already been processed by
+ ;                         ZCCPRED to remove nested NULL/NOT.
+ ;
+ (setq weirdp (zcccond-weirdp s1))
+ (cond
+  ;
+  ; Optimize (COND ... (something (GO tag)) ...) with a
+  ; conditional branch to the GO tag rather than a conditional
+  ; branch around code that would go to the GO tag.
+  ;
+  ; Don't do it for ((AND ...) (GO ...)) - it generates worse code.
+  ;
+  ; Also don't do it if the IF-clause is "weird".
+  ; "Weird" in this context usually means a call to MEMQ, since
+  ; MEMQ has strange code generation.
+  ;
+  ((and (not weirdp)
+        (eq-car s2 'go)
+        (not (eq-car s1 'and))
+   )
+   (setq p (zccvalgo (cdr s2) e))  ; Get the GO tag pair
+   (setq tag (cdr p))              ; Get the tag
+   (if (notp s1)
+       (zccevcom (cadr s1) nil (if p `(gonil    ,tag)) e)
+       (zccevcom s1        nil (if p `(gonotnil ,tag)) e))
+   ;
+   ; Since we just ate a GO, we must do the same processing as is done
+   ; when a GO is seen.  All contours up to AND INCLUDING the contour
+   ; associated with the GO tag are marked permanently conditional.
+   ;
+   (zcccond-mark-perm-uncond tag e)
+  )
+  ;
+  ; Optimize (COND ... ((NULL form) NIL) ...)
+  ;        {same as ... ((NOT form) NIL) ...}
+  ;
+  ; Don't do it if form is a predicate, e.g. ((NOT (ATOM X)) NIL).
+  ;
+  ; Also don't do it if the IF-clause is "weird".
+  ; "Weird" in this context usually means a call to MEMQ, since
+  ; MEMQ has strange code generation.
+  ;
+  ((and (not weirdp)
+        (notp s1)
+        (eq s2 'nil)
+        (not (predp (cadr s1)))
+   )
+   (zccevcom (cadr s1) nil `(gonil ,exitlabel) e))
+  ;
+  ; Optimize (COND ... (variable variable) ...)
+  ;       or (COND ... ((SETQ ... variable form) variable) ...)
+  ;
+  ((symbolp s2)
+   (zcccond-optimize-variable-reference s1 s2 exitlabel nil
+                                  s1 s2 branchlabel exitlabel a v s e))
+  ;
+  ; If s2 is (RETURN-FROM blockname {something}),
+  ; try some more optimizations.
+  ;
+  ((and (eq-car s2 'return-from)
+        (cdr s2)            ; Skip if (RETURN-FROM) - syntax error
+        (null (cdddr s2))   ; Skip unless (RETURN-FROM blockname {x})
+        (progn
+         (setq blkname (cadr s2))
+         (setq retval (caddr s2))
+         (setq progexit (cdr (assq blkname
+                                   (zilcec-return-tags (car e)))))))
+   (cond
+    ;
+    ; Optimize (COND ... ((NULL form) (RETURN-FROM somewhere NIL)) ...)
+    ;        {same as ... ((NOT form) (RETURN-FROM somewhere NIL)) ...}
+    ;
+    ; Note that (RETURN-FROM x) and (RETURN-FROM x NIL) both work here.
+    ;
+    ; Don't do it if form is a predicate,
+    ; e.g. ((NOT (ATOM X)) (RETURN-FROM FOO NIL)).
+    ;
+    ; Also don't do it if the IF-clause is "weird".
+    ; "Weird" in this context usually means a call to MEMQ, since
+    ; MEMQ has strange code generation.
+    ;
+    ((and (not weirdp)
+          (notp s1)
+          (eq retval 'nil)
+          (not (predp (cadr s1)))
+     )
+     (zccevcom (cadr s1) nil `(gonil ,progexit) e)
+     ;
+     ; Since we just ate a RETURN-FROM, we must do the same processing
+     ; as is done when a RETURN-FROM is seen.  All contours up to AND
+     ; INCLUDING the contour associated with the RETURN-FROM are marked
+     ; permanently conditional.
+     ;
+     (zcccond-mark-perm-uncond progexit e)
+    )
+    ;
+    ; Optimize (COND ... (variable (RETURN-FROM somewhere variable))...)
+    ;       or (COND ...((SETQ ... variable form)
+    ;                    (RETURN-FROM somewhere variable))...)
+    ;
+    ((symbolp retval)
+     (zcccond-optimize-variable-reference s1 retval progexit t
+                                  s1 s2 branchlabel exitlabel a v s e))
+    ;
+    ; No special optimizations possible - generate normal code.
+    ;
+    (t
+     (zcccond-punt s1 `(,s2) branchlabel exitlabel a v s e))))
+  ;
+  ; No special optimizations possible - generate normal code.
+  ;
+  (t
+   (zcccond-punt s1 `(,s2) branchlabel exitlabel a v s e))))
+
+(defun zcccond-optimize-variable-reference (form var label returnp
+                                  s1 s2 branchlabel exitlabel a v s e
+                                        &aux l)
+ (cond
+  ;
+  ; Must be (COND ... (variable ...) ...)
+  ;      or (COND ... ((SETQ ... variable form) ...) ...)
+  ;
+  ((or (eq form var)
+       (and (eq-car form 'setq)
+            (evenp (setq l (length (cdr form))))
+            (not (zerop l))
+            (eq (nth (- l 2) (cdr form)) var)))
+   (zccevcom form nil `(gonotnil ,label) e)
+   ;
+   ; If we just ate a RETURN-FROM, we must do the same processing as is
+   ; done when a RETURN-FROM is seen.  All contours up to AND INCLUDING
+   ; the contour associated with the RETURN-FROM are marked permanently
+   ; conditional.
+   ;
+   (when returnp
+        (zcccond-mark-perm-uncond label e))
+  )
+  ;
+  ; No special optimizations possible - generate normal code.
+  ;
+  (t
+   (zcccond-punt s1 `(,s2) branchlabel exitlabel a v s e))))
+
+(defun zcccond-punt (s1 f2 branchlabel exitlabel a v s e)
+ ;
+ ; If the first form in the "pair" is a constant like "T", skip
+ ; compilation of the first form.  Otherwise, compile first form
+ ; in the "pair" with target of predicate only.
+ ;
+ (unless (eq s1 t) ; true if set by ZCCCOND from TCONSTANT only
+  (if (notp s1)
+      (zccevcom (cadr s1) nil `(gonotnil ,branchlabel) e)
+      (zccevcom s1        nil `(gonil    ,branchlabel) e)))
+ ;
+ ; If multiple THEN-clauses, compile them as an implicit PROGN.
+ ;
+ ; Note that all THEN-clauses, as well as any subsequent IF-clauses,
+ ; are conditionally executed.
+ ;
+ (setf (zilcec-tempcond (car e)) t)
+ (zccprogn f2 nil (if (or v s (cdr a)) `(goto ,exitlabel) nil) e))
+
+(defun zcccond-mark-perm-uncond (tag e)
+ ;
+ ; When we just ate a GO or RETURN-FROM, we must do the same processing
+ ; as is done when a GO or RETURN-FROM is seen.  All contours up to AND
+ ; INCLUDING the contour associated with the GO or RETURN-FROM are
+ ; marked permanently conditional.
+ ;
+ (loop with c = (get tag 'contour)
+       for cec in e
+       do (setf (zilcec-permcond cec) t)
+       until (eq cec c)                    ; Note placement of UNTIL!!!
+ )
+)
+
+(defun zcccond-weirdp (x)
+ (and (consp x)
+      (or (eq (car x) 'memq)
+          (and (memq (car x) '(not null))
+               (zcccond-weirdp (cadr x))))))
+
+(defmacro eq-car (x y)
+ (if (symbolp x)
+     `(and (consp ,x) (eq (zcar ,x) ,y))
+     (zerror "I want arg 1 to EQ-CAR to be a variable, OK?")))
+

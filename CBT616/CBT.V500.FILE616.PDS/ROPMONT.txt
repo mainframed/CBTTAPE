@@ -1,0 +1,693 @@
+         PRINT ON,NOGEN
+ROPMONT  CSECT
+*---------------------------------------------------------------------*
+* ROPMONT                                                             *
+* -------    This program runs as a started task and monitors the     *
+*            status of selected tasks in the system. Alerts are       *
+*            generated when a task is not in the expected state.      *
+*                                                                     *
+*     Input: A list of tasks that are to be monitored is read from    *
+*            sysin. The first eight bytes of each 80 record contain   *
+*            the task name (the JOB or STC name). This list can be    *
+*            refreshed at any time by issuing a command. To avoid ENQ *
+*            problems, SYSIN should point to a member of a PDS.       *
+*                                                                     *
+*            A number of commands may be issued using modify to alter *
+*            the behaviour of this program.                           *
+*                                                                     *
+*    Output: Messages are written to the system console (both WTO     *
+*            and WTOR).                                               *
+*                                                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SPACE 1
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         SPACE 1
+MAXTASKS EQU   100                          Maximum number of tasks
+         EJECT
+*---------------------------------------------------------------------*
+*      Chain Save areas and set up base register                      *
+*---------------------------------------------------------------------*
+         SPACE 1
+         USING ROPMONT,R12
+         SAVE  (14,12)                      SAVE REGISTERS
+         LR    R12,R15                      LOAD BASE REGISTER
+         ST    R13,SAVEAREA+4               SET BACKWARD POINTER
+         LA    R2,SAVEAREA                  NEW SAVEAREA
+         ST    R2,8(,R13)                   FORWARD CHAIN
+         LR    R13,R2                       -> MY SAVE AREA
+         ST    R12,SAVEBASE                 Save base address
+         SPACE 1
+*---------------------------------------------------------------------*
+*      Read program parameters                                        *
+*---------------------------------------------------------------------*
+         SPACE 1
+         BAL   R9,RDPARMS                   Read and verify params
+         LTR   R15,R15                      Any Errors ?
+         BNZ   EXIT                         Yes, exit now
+         SPACE
+*---------------------------------------------------------------------*
+* Setup environment to allow us to process Stop and Modify commands   *
+*---------------------------------------------------------------------*
+         SPACE 1
+         EXTRACT COMAREA,FIELDS=(COMM)      Get address of Comm Area
+         SPACE
+         L     R4,COMAREA                   -> comm address list
+         L     R5,0(R4)                     Get Stop/Modify ECB address
+         ST    R5,ECBLIST                   Put in ECBLIST
+         SPACE
+         LA    R6,4(,R4)                    -> Address of CIB
+         L     R5,0(,R6)                    Get CIB address
+         LTR   R5,R5                        Is there a Start CIB ?
+         BZ    NOCIB                        no, skip delete
+         SPACE
+         QEDIT ORIGIN=(R6),BLOCK=(R5)       Delete the start CIB
+         SPACE 1
+NOCIB    DS    0H
+*---------------------------------------------------------------------*
+* Issue QEDIT to allow modify to be issued against this job. The      *
+* CIBCTR value specifies how many modifies can be outstanding before  *
+* the message 'modify rejected, task busy' is issued. If this program *
+* is to be driven by automation, the value of 1 should perhaps be     *
+* increased a tad                                                     *
+*---------------------------------------------------------------------*
+         SPACE
+         QEDIT ORIGIN=(R6),CIBCTR=1         Allow Modify to be issued
+         SPACE 1
+*---------------------------------------------------------------------*
+* Issue Stimer to request notification after the monitoring interval  *
+*---------------------------------------------------------------------*
+         SPACE 1
+         STIMER REAL,TIMEXIT,BINTVL=MONINT  Call TIMEXIT when time up
+         SPACE 1
+*---------------------------------------------------------------------*
+* Main line code - wait for an event                                  *
+*                                                                     *
+*   The event can be: 1 - A time interval has expired                 *
+*                     2 - A mofify or stop command has been issued    *
+*                     3 - The operator replied to our WTOR            *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SPACE 1
+MAIN     DS    0H
+         WAIT  ECBLIST=ECBLIST,LONG=YES     Wait until an event occurs
+         SPACE
+         TM    TIMECB,X'40'                 Has Stimer fired ?
+         BO    INTERVAL                     Yes, go process
+         SPACE
+         TM    WTORECB,X'40'                Has WTOR been replied to ?
+         BO    WTORREP                      Yes, go process
+         SPACE
+*---------------------------------------------------------------------*
+* Stop or Modify has been issued                                      *
+*---------------------------------------------------------------------*
+         SPACE
+         L     R4,COMAREA                   -> Comm Area
+         LA    R6,4(,R4)                    -> CIB Address
+         L     R5,0(,R6)                    -> CIB
+         LTR   R5,R5                        Is CIB address present ?
+         BNZ   CHECKCIB                     Yes, go check it
+         ABEND 1,DUMP                       No Cib, Scream and shout !
+         SPACE
+CHECKCIB DS    0H
+         USING CIB,R5
+         CLI   CIBVERB,CIBMODFY             Is this a modify command ?
+         BE    MODIFY                       Yes, Go Process
+         SPACE 1
+*---------------------------------------------------------------------*
+*  Stop command issued - acknowledge and exit                         *
+*---------------------------------------------------------------------*
+         SPACE 1
+         LA    R1,1                         Message to display
+         BAL   R9,MSGOUT                    Display Ackowledgement
+         B     FINISH                       Go and terminate
+         SPACE 1
+*---------------------------------------------------------------------*
+*  Modify Command Issued - Process and delete CIB                     *
+*---------------------------------------------------------------------*
+         SPACE 1
+MODIFY   DS    0H
+         SPACE 1
+*---------------------------------------------------------------------*
+* Check the modify operand and process if valid:                      *
+*                                                                     *
+*     REFRESH           - reload the task table from SYSIN            *
+*     IGNORE,taskname   - Ignore the specified task until restarted   *
+*     IGNORE,ALL        - Ignore all tasks until restarted            *
+*     MONITOR,taskname  - Start monitoring a task again               *
+*     MONITOR,ALL       - Start monitoring all tasks                  *
+*                                                                     *
+*---------------------------------------------------------------------*
+         SPACE 1
+         LH    R7,CIBDATLN                  Get length of data
+         BCTR  R7,0                         -1 for execute
+         MVC   COMMAND,BLANKS               Clear from last time
+         EX    R7,ISOCMD                    Isolate Command
+         OC    COMMAND,BLANKS               Make it upper case
+         SPACE
+         CLC   COMMAND(8),=C'REFRESH '      Refresh required ?
+         BNE   TRYIGN                       No, try Ignore
+         SPACE
+         BAL   R9,RDPARMS                   Read in the new parms
+         LTR   R15,R15                      An error ?
+         BZ    REFOK                        No, carry on
+         BAL   R1,6                         Yes, tell operator
+         BAL   R9,MSGOUT
+         LA    R15,8                        Set RC=08
+         B     EXIT                         exit
+         SPACE
+REFOK    DS    0H
+         LA    R1,7
+         BAL   R9,MSGOUT                    Indicate refresh complete
+         B     MODEND                       End of modify
+         SPACE
+TRYIGN   DS    0H
+         CLC   COMMAND(7),=C'IGNORE,'       Is command Ignore
+         BNE   TRYMON                       No, try monitor
+*---------------------------------------------------------------------*
+* Set the ignore status for the specified task (or ALL)               *
+*---------------------------------------------------------------------*
+         SPACE
+         L     R2,TASKNUM                   Get number of tasks
+         L     R3,TASKTAB                   -> Task table
+         USING TASKENT,R3
+IGNORE   DS    0H
+         CLC   COMMAND+7(4),=C'ALL '        Ignore all specified ?
+         BNE   IGNORE2                      No, check task name
+         MVI   TASKSTAT,TASKIGN             Mark as ignore
+         B     IGNORE3
+IGNORE2  DS    0H
+         CLC   TASKNAME,COMMAND+7           Match on task name ?
+         BNE   IGNORE3                      No, Skip this one
+         MVI   TASKSTAT,TASKIGN             Yes, set ignore status
+         B     IGNORE4                      All done
+IGNORE3  DS    0H
+         LA    R3,TASKELEN(,R3)             -> Next entry
+         BCT   R2,IGNORE                    Try next task
+         SPACE
+         CLC   COMMAND+7(4),=C'ALL '        Was this ignore all ?
+         BE    IGNORE4                      yes, skip error
+         LA    R1,8                         No, task not found
+         BAL   R9,MSGOUT                    Tell operator
+         B     MODEND                       and finish modify routine
+IGNORE4  DS    0H
+         LA    R1,9
+         BAL   R9,MSGOUT                    Tell operator ignore done
+         B     MODEND                       End of modify processing
+         SPACE
+TRYMON   DS    0H
+         CLC   COMMAND(8),=C'MONITOR,'      Is command Monitor
+         BNE   MODERR                       No, error
+*---------------------------------------------------------------------*
+* Set the initial status for the specified task (or ALL)              *
+*---------------------------------------------------------------------*
+         SPACE
+         L     R2,TASKNUM                   Get number of tasks
+         L     R3,TASKTAB                   -> Task table
+MONIT    DS    0H
+         CLC   COMMAND+8(4),=C'ALL '        monitor all specified ?
+         BNE   MONIT2
+         MVI   TASKSTAT,TASKINIT            Mark as status INIT
+         B     MONIT3
+MONIT2   DS    0H
+         CLC   TASKNAME,COMMAND+8           Match on task name ?
+         BNE   MONIT3                       No, Skip this one
+         MVI   TASKSTAT,TASKINIT            Yes, set INIT status
+         B     MONIT4                       All done
+MONIT3   DS    0H
+         LA    R3,TASKELEN(,R3)             -> Next entry
+         BCT   R2,MONIT                     Try next task
+         SPACE
+         CLC   COMMAND+8(4),=C'ALL '        Was this monitor all ?
+         BE    MONIT4                       yes, skip error
+         LA    R1,10                        No, task not found then
+         BAL   R9,MSGOUT                    Tell the operator
+         B     MODEND                       End modify processing
+MONIT4   DS    0H
+         LA    R1,11                        Message No.
+         BAL   R9,MSGOUT                    Tell operator cmd complete
+         B     MODEND                       End modify processing
+         SPACE
+*---------------------------------------------------------------------*
+* Command not recognized - tell operator and ignore it                *
+*---------------------------------------------------------------------*
+         SPACE
+MODERR   DS    0H
+         LA    R1,12                        Select message no. 12
+         BAL   R9,MSGOUT                    Tell operator the bad news
+         SPACE
+*---------------------------------------------------------------------*
+* Delete the CIB (note this clears the ECB if it is the last CIB)     *
+*                (which it is because we set CIBCTR=1           )     *
+*---------------------------------------------------------------------*
+MODEND   DS    0H
+         QEDIT ORIGIN=(R6),BLOCK=(R5)       Delete the modify CIB
+         SPACE
+         B     MAIN                         Go wait for another event
+         SPACE 1
+ISOCMD   MVC   COMMAND(0),CIBDATA           ** Executed Instruction **
+         EJECT
+*---------------------------------------------------------------------*
+* WTOR reply processing routine                                       *
+*                                                                     *
+*    The operator has replied to our WTOR (So at least someone is out *
+*    there). We will clear the status counts of all tasks so that the *
+*    WTOR will not be re-issued until the long delay is exceeded      *
+*    again.                                                           *
+*                                                                     *
+*---------------------------------------------------------------------*
+WTORREP  DS    0H
+         OI    ECBA2,X'80'                  Remove WTOR ECB from list
+         XC    ECBA3,ECBA3                  Zero the ECB address
+         XC    WTORECB,WTORECB              Zero the WTOR ECB
+         SPACE
+         L     R2,TASKNUM                   Get task entry count
+         L     R3,TASKTAB                   -> first table entry
+         USING TASKENT,R3
+CLRCOUNT DS    0H
+         XC    TASKCNT,TASKCNT              Clear the task count
+         LA    R3,TASKELEN(,R3)             -> Next task entry
+         BCT   R2,CLRCOUNT                  loop through all entries
+         B     MAIN                         Go wait for more work
+         DROP  R3
+         EJECT
+*---------------------------------------------------------------------*
+* Interval processing routine                                         *
+*---------------------------------------------------------------------*
+INTERVAL DS    0H
+*---------------------------------------------------------------------*
+* Step 1 - go through our task list and mark any active task as       *
+*          pending confirmation                                       *
+*---------------------------------------------------------------------*
+         SPACE
+         L     R2,TASKNUM                   Get task entry count
+         L     R3,TASKTAB                   -> first table entry
+         USING TASKENT,R3
+SETPEND  DS    0H
+         CLI   TASKSTAT,TASKACT             Is this task active ?
+         BNE   NEXTPEND                     No, skip it
+         MVI   TASKSTAT,TASKPEND            Yes, mark as pending
+NEXTPEND DS    0H
+         LA    R3,TASKELEN(,R3)             -> Next task entry
+         BCT   R2,SETPEND                   loop through all entries
+         SPACE 1
+*---------------------------------------------------------------------*
+* Step 2 - Go through the ASCB list and mark the status of each       *
+*          task in the task table                                     *
+*---------------------------------------------------------------------*
+         SPACE
+         L     R5,16                        -> CVT
+         USING CVT,R5
+         L     R6,CVTASVT                   -> ASCB Vector Table
+         USING ASVT,R6
+         L     R7,ASVTMAXU                  Get maximum ASCB count
+         LA    R6,ASVTENTY                  -> First entry
+         USING ASCB,R8
+         DROP  R5,R6
+ASVTLOOP DS    0H
+         TM    0(R6),ASVTAVAL               Is this entry available ?
+         BO    ASVTNEXT                     Yes, skip it
+         L     R8,0(,R6)                    -> ASCB
+         L     R5,ASCBJBNS                  -> Job name
+*---------------------------------------------------------------------*
+* See if this task is in our task table                               *
+*---------------------------------------------------------------------*
+         L     R2,TASKNUM                   Get task entry count
+         L     R3,TASKTAB                   -> first table entry
+LOOKUP1  DS    0H
+*---------------------------------------------------------------------*
+* The following Ignore check is commented out. This causes the Ignore *
+* status of a task to be cleared when the task is restarted. If       *
+* this behaviour is not required, uncomment the next two lines.       *
+*---------------------------------------------------------------------*
+*        CLI   TASKSTAT,TASKIGN             In ignore status ?
+*        BE    LOOKUP2                      Yes, Do so
+         CLC   TASKNAME,0(R5)               Match on task name ?
+         BNE   LOOKUP2                      no, skip
+*---------------------------------------------------------------------*
+* Match found on task - mark as active                                *
+*---------------------------------------------------------------------*
+         MVI   TASKSTAT,TASKACT             Mark as active
+         XC    TASKCNT,TASKCNT              Zero State count
+         B     ASVTNEXT                     Go process next ASCB
+LOOKUP2  DS    0H
+         LA    R3,TASKELEN(,R3)             -> Next entry
+         BCT   R2,LOOKUP1                   Try the next entry
+ASVTNEXT DS    0H
+         LA    R6,4(,R6)                    -> Next entry
+         BCT   R7,ASVTLOOP                  Process this one
+         SPACE 1
+         DROP  R8
+*---------------------------------------------------------------------*
+* Step 3 - Go through the task table looking for inactive tasks and   *
+*          process any that are found                                 *
+*---------------------------------------------------------------------*
+         SPACE 1
+         L     R2,TASKNUM                   Get task entry count
+         L     R3,TASKTAB                   -> first table entry
+         MVI   LONGDLY,C'N'                 Indicate no long delays
+TASKCHK  DS    0H
+         CLI   TASKSTAT,TASKIGN             Is task in Ignore Status ?
+         BE    TASKNEXT                     Yes, skip it
+         CLI   TASKSTAT,TASKACT             Is this task active ?
+         BE    TASKNEXT                     Yes, skip it
+         SPACE
+         CLI   TASKSTAT,TASKINIT            Is task in initial state ?
+         BNE   TASKCHK2                     No, must be down or pend
+         SPACE
+         L     R5,TASKCNT                   Get state count
+         LA    R5,1(,R5)                    Up by one
+         ST    R5,TASKCNT                   And tuck away
+         C     R5,MAXDELAY                  Waiting too long ?
+         BL    TASKCHK1                     No, Skip long delay set
+         MVI   LONGDLY,C'Y'                 Yes, indicate long delay
+TASKCHK1 DS    0H
+         SR    R4,R4                        Clear for Divide
+         D     R4,MAXINIT                   Divide to get remainder
+         LTR   R4,R4                        Waiting too long
+         BNZ   TASKNEXT                     No, skip this one
+         SPACE
+         LA    R1,2                         Message No.
+         BAL   R9,MSGOUT                    Write message out
+         B     TASKNEXT
+         SPACE
+TASKCHK2 DS    0H
+         CLI   TASKSTAT,TASKPEND            Is task pending ?
+         BNE   TASKCHK3                     No, it must be down
+         SPACE 1
+         LA    R1,3                         Message No.
+         BAL   R9,MSGOUT                    Write message out
+         XC    TASKCNT,TASKCNT              Clear State count
+         MVI   TASKSTAT,TASKDOWN            Set down status
+         B     TASKNEXT                     go process next entry
+         SPACE
+TASKCHK3 DS   0H
+         L     R5,TASKCNT                   Get state count
+         LA    R5,1(,R5)                    Up by one
+         ST    R5,TASKCNT                   And tuck away
+         C     R5,MAXDELAY                  Waiting too long ?
+         BL    TASKCHK4                     No, Skip long delay set
+         MVI   LONGDLY,C'Y'                 Yes, indicate long delay
+TASKCHK4 DS    0H
+         SR    R4,R4
+         D     R4,MAXINIT                   Get remainder
+         LTR   R4,R4                        Been inactive too long ?
+         BNZ   TASKNEXT                     No, skip this one
+         SPACE
+         LA    R1,4                         Message No.
+         BAL   R9,MSGOUT                    Write message out
+         SPACE
+TASKNEXT DS    0H
+         LA    R3,TASKELEN(,R3)             -> next task entry
+         BCT   R2,TASKCHK                   Go check it out
+         SPACE
+*---------------------------------------------------------------------*
+* If the long delay flag is set - issue a WTOR if not already done    *
+*---------------------------------------------------------------------*
+         SPACE
+         CLI   LONGDLY,C'Y'                 Is long delay flag set ?
+         BNE   CHECKDOM                     No, see if DOM required
+         SPACE
+         CLC   ECBA3,=F'0'                  Is WTOR already issued ?
+         BNE   RESTIM                       Yes, then skip it
+         SPACE
+         XC    WTORECB,WTORECB              Clear WTOR ECB
+         WTOR  'ROPM020A Required task(s) inactive for excessive time. X
+               Reply OK when resolved',REPLY,2,WTORECB
+         SPACE
+*---------------------------------------------------------------------*
+* Add the WTOR ECB to the wait list and save the message ID for DOM   *
+*---------------------------------------------------------------------*
+         ST    R1,WTORID                    Save message ID
+         LA    R1,WTORECB                   -> WTOR ECB
+         ST    R1,ECBA3                     Save in ECB list
+         OI    ECBA3,X'80'                  Set end of list
+         NI    ECBA2,X'7F'                  Turn off old end of list
+         B     RESTIM                       Go wait for an event
+         SPACE
+CHECKDOM DS    0H
+*---------------------------------------------------------------------*
+* If a WTOR has been issued - delete it and remove from ECB list      *
+*---------------------------------------------------------------------*
+         SPACE
+         CLC   ECBA3,=F'0'                  Is WTOR out there ?
+         BE    RESTIM                       No, then skip DOM
+         SPACE
+         L     R1,WTORID                    Get message ID
+         DOM   MSG=(R1)                     Delete it
+         XC    ECBA3,ECBA3                  Clear the ECB address
+         OI    ECBA2,X'80'                  Set new end-of-list
+         SPACE
+*---------------------------------------------------------------------*
+* Reissue the Stimer to get control in a tad                          *
+*---------------------------------------------------------------------*
+RESTIM   DS    0H
+         XC    TIMECB,TIMECB                Clear the Stimer ECB
+         STIMER REAL,TIMEXIT,BINTVL=MONINT  Reissue Stimer
+         B     MAIN                         Go wait for next event
+         SPACE 1
+*---------------------------------------------------------------------*
+*      TERMINATION ROUTINE                                            *
+*---------------------------------------------------------------------*
+         SPACE 1
+FINISH   DS    0H
+         SR    R15,R15
+EXIT     DS    0H
+         L     R13,4(,R13)                  RESTORE SAVE AREA  ADDRESS
+         L     R14,12(R13)                  RESTORE R14
+         LM    R0,R12,20(R13)               RESTORE R0 to R12
+         BR    R14                          RETURN BACK
+         EJECT
+*---------------------------------------------------------------------*
+*  Read Parameters and build task table                               *
+*---------------------------------------------------------------------*
+         SPACE 1
+RDPARMS  DS    0H
+         ST    R9,SAVER9                    Save our return address
+         OPEN  (SYSIN,(INPUT))              Open input file
+         LA    R8,SYSIN                     -> DCB
+         USING IHADCB,R8
+         TM    DCBOFLGS,DCBOFOPN            Did it open ?
+         BO    OPENOK                       Yes, continue
+         LA    R15,4                        No, set return code
+         BR    R9                           and exit
+         DROP  R8
+         SPACE
+OPENOK   DS    0H
+         ICM   R1,15,TASKTAB                Get table address
+         BNZ   STOROK                       Already got one
+         SPACE 1
+         STORAGE OBTAIN,                    Get Task Table Storage     x
+               LENGTH=TASKELEN*MAXTASKS,    Room for MAXTASKS tasks    x
+               COND=YES                     Don't abend if error
+         SPACE 1
+         LTR   R15,R15                      Storage obtain error ?
+         BZ    STOROK                       No, go fill table
+         LA    R1,4                         Message No.
+         BAL   R9,MSGOUT                    Tell operator the bad news
+         L     R9,SAVER9                    Restore return addr
+         BR    R9                           Return to caller
+         SPACE 1
+STOROK   DS    0H
+         ST    R1,TASKTAB                   Save table address
+         LR    R3,R1                        Table address in R3
+         USING TASKENT,R3
+         SR    R2,R2                        Clear Task Count
+         SPACE 1
+RDLOOP   DS    0H
+         GET   SYSIN,CARD                   Read the next record
+         CLI   CARD,C'*'                    Is this a comment ?
+         BE    RDLOOP                       Yes, ignore it
+         C     R2,=AL4(MAXTASKS)            Table already full ?
+         BNL   TABFULL                      Yes, error
+         SPACE 1
+         MVC   TASKNAME,CARD                Move in the task name
+         MVI   TASKSTAT,X'00'               Clear the task status
+         XC    TASKCNT,TASKCNT              Clear task count value
+         LA    R3,TASKELEN(,R3)             -> Next entry
+         LA    R2,1(,R2)                    Up count of entries
+         B     RDLOOP                       Keep on trucking
+         SPACE
+EOD      DS    0H
+         CLOSE (SYSIN)                      Close input data set
+         SPACE 1
+         ST    R2,TASKNUM                   Save task count
+         BR    R9                           return to caller
+         DROP  R3
+         SPACE 1
+TABFULL  DS    0H
+         LA    R1,5                         Message No.
+         BAL   R9,MSGOUT                    Write message out
+         LA    R15,8                        Set RC=08
+         L     R9,SAVER9                    Restore return addr
+         BR    R9                           Return from whence we came
+         EJECT
+*---------------------------------------------------------------------*
+*  MSGOUT - Display a message to the operators                        *
+*           R1 = Message Number  R3 = Address of task entry (maybe)   *
+*---------------------------------------------------------------------*
+         SPACE 1
+MSGOUT   DS    0H
+         STM   R2,R9,MSGREGS                Save register R2 thru R9
+*
+* Message number to display is in R1
+*
+         LA    R2,MSGTAB                    -> Message table
+         BCTR  R1,0                         Subtract 1 to get offset
+         MH    R1,=AL2(MSGLEN)              Get byte offset
+         LA    R2,0(R1,R2)                  -> Message text
+         LA    R1,MSGLEN                    Get length of a message
+         BCTR  R1,0                         -1 for execute
+         EX    R1,MVMSG                     Isolate message text
+*---------------------------------------------------------------------*
+*  Scan the message for insertion points                              *
+*---------------------------------------------------------------------*
+         SPACE
+         USING TASKENT,R3
+         LA    R4,MSGTEXT                   -> Message text
+         LA    R5,MSGLEN                    Length of message
+ILOOP    DS    0H
+         CLC   0(8,R4),=C'TTTTTTTT'         Task insertion point ?
+         BNE   ILOOP2                       No
+         MVC   0(8,R4),TASKNAME             Yes, move in task name
+ILOOP2   DS    0H
+         LA    R4,1(,R4)                    -> Next position
+         BCT   R5,ILOOP                     Scan on
+*---------------------------------------------------------------------*
+*  Squeeze any multiple blanks out of the message text                *
+*---------------------------------------------------------------------*
+         SPACE
+         LA    R4,MSGTEXT                   -> Message to squeeze
+         LA    R5,MSGLEN                    Length to squeeze
+SQUEEZE  DS    0H
+         CLC   0(2,R4),=C'  '               Two blanks ?
+         BNE   SQUEEZE2                     Nope
+         MVC   0(MSGLEN,R4),1(R4)           Yes, remove one
+         BCTR  R5,0                         One less to scan now
+         LTR   R5,R5                        All done ?
+         BZ    SQUEEZE3                     Yes, go display
+SQUEEZE2 DS    0H
+         LA    R4,1(,R4)                    -> Next character
+         BCT   R5,SQUEEZE                   Squeeze some more
+SQUEEZE3 DS    0H
+         LA    R5,MSGLEN                    Max length of message
+         LA    R4,MSGTEXT+MSGLEN            -> Last byte + 1
+         BCTR  R4,0
+SQUEEZE4 DS    0H
+         CLI   0(R4),C' '                   End of message found ?
+         BNE   DOWTO                        Yes, Go issue
+         BCTR  R4,0                         Back up one byte
+         BCT   R5,SQUEEZE4                  Keep looking for the end
+         SPACE
+DOWTO    DS    0H
+         STH   R5,MSGLL                     Store message length
+         LA    R5,MSGLL                     -> Message len+text
+         WTO   TEXT=(R5)                    Write message to operator
+         LM    R2,R9,MSGREGS                Restore registers
+         BR    R9                           Return to caller
+         DROP  R3
+         SPACE
+MVMSG    MVC   MSGTEXT(0),0(R2)             ** Executed Instruction **
+MSGREGS  DS    8F
+MSGLL    DS    H
+MSGTEXT  DS    CL50
+         DC    CL50' '                      Must follow MSGTEXT !
+         EJECT
+         DROP  R12
+*---------------------------------------------------------------------*
+*  Stimer exit - post mainline                                        *
+*---------------------------------------------------------------------*
+TIMEXIT  DS    0H
+         USING TIMEXIT,R15
+         STM   R14,R2,12(R13)               Save the registers
+         L     R12,SAVEBASE                 Reload our Base address
+         DROP  R15
+         USING ROPMONT,R12
+         SPACE
+         POST  TIMECB                       Post mainline
+         SPACE
+         LM    R14,R12,12(R13)              Restore registers
+         BR    R14                          Get out of this place
+         DROP  R12
+         EJECT
+         LTORG
+MSGLEN   EQU   50
+MSGTAB   DS    0H
+         DC    CL50'ROPM001I Stop command acknowledged'
+         DC    CL50'ROPM002I Task TTTTTTTT is not yet active'
+         DC    CL50'ROPM003I Task TTTTTTTT is no longer avtive'
+         DC    CL50'ROPM004I Task TTTTTTTT is still inactive'
+         DC    CL50'ROPM005E Task table overflow'
+         DC    CL50'ROPM006E Refresh failed - terminating'
+         DC    CL50'ROPM007I Refresh complete'
+         DC    CL50'ROPM008E Ignore failed - task name not found'
+         DC    CL50'ROPM009I Ignore operation completed'
+         DC    CL50'ROPM010E Monitor failed - task name not found'
+         DC    CL50'ROPM011I Monitor operation completed'
+         DC    CL50'ROPM012E Modify command not recognized'
+         DC    CL50'ROPM013T Unable to obtain storage - terminating'
+SAVER9   DS    F                            R9 save area
+SAVEBASE DS    F                            Base address
+SYSIN    DCB   DDNAME=SYSIN,DSORG=PS,MACRF=(GM),LRECL=80,              X
+               RECFM=FB,EODAD=EOD
+CARD     DS    CL80
+COMMAND  DS    CL60                         Modify command area
+BLANKS   DC    CL60' '
+SAVEAREA DC    18F'0'
+         SPACE 1
+MONINT   DC    F'6000'                      Monitor Interval - One Min
+MAXINIT  DC    F'5'                         Init status limit
+MAXDELAY DC    F'15'                        WTOR Delay value
+         SPACE 1
+ECBLIST  DS    0F
+ECBA1    DS    F                            Stop/Modify ECB Address
+ECBA2    DC    X'80',AL3(TIMECB)            Stimer ECB address
+ECBA3    DC    F'0'                         WTOR ecb address
+         SPACE 1
+WTORECB  DC    F'0'                         WTOR ECB
+TIMECB   DC    F'0'                         Stimer ECB
+         SPACE 1
+WTORID   DS    F                            WTOR Message ID
+         SPACE 1
+COMAREA  DS    F                            Address of Comm Area
+         SPACE 1
+TASKTAB  DC    F'0'                         Task table address
+TASKNUM  DC    F'0'                         No. of task entries
+         SPACE
+LONGDLY  DC    C'N'                         Long Delay Flag (Y/N)
+REPLY    DS    CL2                          WTOR Reply area
+         SPACE
+TASKENT  DSECT
+TASKNAME DS    CL8                          Task Name
+TASKSTAT DS    XL1                          Task Status
+TASKINIT EQU   X'00'                        .. Task initial status
+TASKACT  EQU   X'01'                        .. Task is active
+TASKDOWN EQU   X'02'                        .. Task is inactive
+TASKPEND EQU   X'03'                        .. Task is Act/Pending
+TASKIGN  EQU   X'04'                        .. Task is in ignore state
+TASKSPAR DS    CL3
+TASKCNT  DS    F                            Task Count
+TASKELEN EQU   *-TASKNAME
+         DCBD  DSORG=(PS)
+         SPACE
+CIB      DSECT
+         IEZCIB
+         CVT   DSECT=YES
+         IHAASCB
+         IHAASVT
+         END

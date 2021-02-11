@@ -1,0 +1,334 @@
+U370AP00 TITLE 'xxxx370 Application Initialization'
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do:
+*----------------------------------------------------------------------
+         U#SET FUNC=UTIL
+*----------------------------------------------------------------------
+* Function:    Initialize xxxx370 application
+*              Called via UPROC ID=MAIN
+*
+*              - Enters supervisor state, key 8
+*
+*                All xxxx370 applications require APF authorization
+*                (sort of diminishes value of U370QENV, eh?)
+*
+*              - Copies VCON table to our TPU, anchored TGD@VTAB
+*
+*              - Updates VCON table to describe each CSECT's CPD & DSA
+*                address/length so U370DBUG may report them
+*
+*              - Initializes every DSA in the DSA pool for CSECTs
+*                identified in the VCON table (saves UPROC overhead;
+*                only has to be done once)
+*
+*              - Based on the length of a CSECT's SA, selects an
+*                appropriate SA initialization routine;
+*                SX@INIT contains the address of selected routine
+*                The SA initialization routines are in this CSECT
+*                Note that the CSECT can ignore the selected routine
+*                by coding UPROC INIT= values (or taking default)
+*
+* Entry: R0    ignored
+*        R1    ignored
+*
+* Exit:  R15 = return code = 00
+*
+* Diagnostics:
+*              1 - entry/exit
+*
+* Notes: AP00 is highly dependent on UPROC & UPEND implementations
+*        See also U370AP99, which is application termination CSECT
+*
+*        AP00 sets TGD@TCB
+*        AP00 should only be called by UPROC ID=MAIN
+*
+*----------------------------------------------------------------------
+* Reg  DSECT    usage
+*----------------------------------------------------------------------
+* R2
+* R3   SX
+* R4   CPD
+* R5            BXLE
+* R6            BXLE
+* R7            BXLE
+* R8   FINBLOK  RUNVTAB & subroutines only
+* R9
+* R10  TPU      CPD user fields
+*----------------------------------------------------------------------
+         TITLE ' '
+*
+*  Expand some DSECTs so our TPU can reference symbols in them
+*
+         DSAEX ,                  SX + SA
+         WATGD ,                  common
+         UVTAB MF=DSECT           U370VTAB VCON table
+*----------------------------------------------------------------------
+*  TPU - CPD user additions - contains VCON table (with updates)
+*----------------------------------------------------------------------
+TPU      DSECT ,                  task persistent data - user section
+TPUVHDR  DS    XL(L$VTHDR)             VCON table header
+TPUVTAB  DS    (TGD#VTE)XL(L$VTABE)    VCON table entries
+L$TPUVTB EQU   *-TPUVHDR               length of VCON table
+L$TPU    EQU   *-TPU                   length of user additions
+*----------------------------------------------------------------------
+U370AP00 UPROC ID=UAP0,L=L$SA,CPD=(Y,L$TPU),INIT=MIN
+*----------------------------------------------------------------------
+         USING PSA,0
+         MVC   TGD@TCB,PSATOLD         my TCB address
+         MVC   TGDSA1(4),VERFIELD      set SA verification field
+*
+*  Our SX@CPD isn't initialized yet, so rather than using U@CPD,
+*  we must use UPRLOC
+*
+         UPRLOC QCPD,R10               find my CPD
+         LA    R10,CPDUSER-CPD(,R10)   @ CPD user field
+         USING TPU,R10
+*----------------------------------------------------------------------
+*  Copy U370VTAB to our CPD
+*----------------------------------------------------------------------
+         ICM   R9,15,=V(U370VTAB)      find VCON table
+         BZ    VTABERR
+         USING VTABLE,R9
+*
+         L     R7,VTLIMIT              last byte in table
+         LR    R0,R10                  dest addr
+         LR    R8,R0
+         L     R1,=A(L$TPUVTB)         dest length
+         LA    R15,1(,R7)
+         LR    R14,R9                  source addr
+         SR    R15,R14                 source length
+         MVCL  R0,R14                  copy U370VTAB to CPDUSER
+         BC    5,COPYERR
+*
+*  Relocate addresses in VTHDR
+*
+         S     R7,VTINDEX              length of all entries - 1
+         DROP  R9,R10
+         USING VTABLE,R8
+         LA    R2,VTENTRY1             index
+         ST    R2,VTINDEX
+*                                      increment ok asis
+         AR    R2,R7
+         ST    R2,VTLIMIT              limit
+         ST    R8,TGD@VTAB             tell the world where
+         MVC   TGDSAVER,VERFIELD       copy SA verification field
+         EJECT ,
+*----------------------------------------------------------------------
+*  Run U370VTAB, initialize each CSECT's SX & CPD
+*  Also fill in VTAB fields not known until execution time
+*  UFINI defines a halfword containing CSECT length immediately
+*  behind the DSA QCON.
+*----------------------------------------------------------------------
+RUNVTAB  DS    0H
+         LM    R5,R7,VTHDR                  index, incr, limit
+         DROP  R8
+         USING VTABLE,R5
+*
+DSANEXT  DS    0H
+         ICM   R2,15,VTABVCON               @ CSECT
+         BZ    DSALOOP                      nobody home, skip
+*
+         L     R8,PROC@FIN-U370AP00(R2)     @ FINBLOK
+         USING FINBLOK,R8
+         MVC   VTCSL,FINLCS                 CSECT length
+         L     R3,FINQSX
+         AR    R3,RDSA                      @ DSA
+         ST    R3,VT@SX                     so U370DBUG can print addr
+         USING SX,R3
+*
+         ICM   R4,15,FINQCPD                CPD offset or 0
+         BZ    GOPREP
+         AR    R4,RDSA                      @ CPD
+         ST    R4,VT@CPD                    so U370DBG can print addr
+         USING CPD,R4
+*
+GOPREP   BAL   R10,PREPDSA                  prepare DSA
+         BAL   R10,SELINIT                  select DSA init routine
+         MVC   VTDSAL,SXLDSA                copy DSA length
+         MVC   VTCPDL,CPDL                  copy CPD length
+DSALOOP  BXLE  R5,R6,DSANEXT
+*----------------------------------------------------------------------
+*  Enter supervisor state, stay in key 8
+*----------------------------------------------------------------------
+         MODESET MODE=SUP                   supervisor state
+         OI    TGDFLG5,TGD5SUPR             indicate such
+*----------------------------------------------------------------------
+*  Return to caller
+*  Here we have to play a little game to return to ID=MAIN with
+*  it's R13 set at the savearea referenced by the VCON table,
+*  not the TGDSA1 savearea; this assures if ID=MAIN established
+*  an ESTAE, the SX points to the CPD with the ESTAE specification.
+*----------------------------------------------------------------------
+EXIT     DS    0H
+         UPEND ,                            return to ID=MAIN CSECT
+*
+COPYERR  WTO   'U370AP00 VCON table failure'
+VTABERR  WTO   'U370AP00 install error'
+         ABEND 370
+VERFIELD DC    C'SXSA'
+         EJECT ,
+*----------------------------------------------------------------------
+*  PREPDSA - initialize a single DSA
+*  Entry:  R2 @ CSECT
+*          R3 @ DSA
+*          R4 @ CPD or zero
+*----------------------------------------------------------------------
+PREPDSA  DS    0H
+*
+*  No need to clear DSA, UPROC ID=MAIN cleared whole DSA pool
+*
+         MVC   SXID,ID-U370AP00(R2)         copy CSECT's name
+         LH    R0,FINLSA                    SA length
+         STH   R0,SXLSA                     SA length
+         LA    R14,L$SXPFX                  everybody's got one
+         AR    R0,R14
+         STH   R0,SXLDSA                    SX+SA length
+         MVC   SXVER,VERFIELD               set SA verification field
+         LTR   R4,R4                        CPD present?
+         BZR   R10                          no, done
+*
+*  CPD is also in DSA pool, so it's already cleared
+*
+         ST    R4,SX@CPD                    link SX to CPD
+         MVC   CPDID,ID-U370AP00(R2)        copy CSECT's name
+         LH    R0,FINLCPD                   CPD length
+         STH   R0,CPDL
+         BR    R10
+         DROP  R4,R8
+         EJECT ,
+*----------------------------------------------------------------------
+*  SELINIT - select INITMVCL or INITRS DSA init routine, setup SX
+*
+*  The whole point of having two DSA init routines is to save
+*  the cost of MVCL if we can get by with XC
+*
+*  The DSA init routines are located here because UPROC can't know
+*  at assembly time whether the SA is long enough to require MVCL
+*
+*  We further reduce DSA initialization cost by pre-calculating
+*  the registers needed to perform DSA setup once (here), rather
+*  than every time the CSECT gets called
+*
+*  Fields which are modified by entry conventions are not included
+*  in the length calculation; SXR0 is the first field we clear
+*  in the DSA initialization routines
+*  SXVER     set in the PREPDSA routine
+*  SX@BACK   set by DSA init routine
+*  SX@FWD    cleared by UPEND macro of called routine
+*----------------------------------------------------------------------
+SELINIT  DS    0H
+         LH    R14,SXLSA          SA length
+         LA    R0,SXR0-SXBASE     length of uncleared SA fields
+         SR    R14,R0             length needed to clear
+         LR    R15,R14            save for later
+         LA    R0,256             maximum XC length
+         CR    R14,R0             length exceeds XC capabilities?
+         BH    SELMVCL            yes, br
+         EJECT ,
+*----------------------------------------------------------------------
+*  SELRS - setup SX for INITRS DSA init routine
+*----------------------------------------------------------------------
+*
+*  INITRS setup:
+*  SXAP00+0(4) = length of area to clear minus one
+*  SXAP00+4(4) = length of area to clear
+*  SXINIT+0(4) = A(INITRS)
+*
+SELRS    DS    0H
+         BCTR  R15,0              account for EX needs
+         ST    R15,SXAP00         save EX length
+         LA    R15,SX@BACK        @ 1st field to XC
+         ST    R15,SXAP00+4
+         LA    R15,INITRS         @ DSA init support routine
+         ST    R15,SX@INIT
+         BR    R10
+*----------------------------------------------------------------------
+*  DSA init - RS-length SA
+*
+*  Entry:
+*  R3  @ CSECT's SX
+*  R4  @ return address in UPROC
+*  R5  = SX@INIT
+*  R11 @ DSA pool
+*  R12 @ calling CSECT's UPROC expansion
+*  R13 @ calling CSECT's caller's SA
+*
+*  Preserves contents of SXVER in caller's SA
+*  It's not necessary to restore R0-R2, they're not modified
+*----------------------------------------------------------------------
+         PUSH  USING
+         DROP  ,
+         USING SX,R3
+         USING INITRS,R5
+INITRS   DS    0H
+         LM    R8,R9,SXAP00            restore 'SA clear' regs
+         EX    R8,CLEAR
+         LA    R7,SXBASE               @ our SA (clear hi byte)
+         ST    R7,SX@FWD-SXBASE(,R13)  caller's forward ptr @ our SA
+         ST    R13,SX@BACK             our backward ptr @ caller's SA
+         LR    R13,R7                  R13 @ our SA
+         BR    R4
+CLEAR    XC    0(*-*,R9),0(R9)         clear SA
+         POP   USING
+         EJECT ,
+*----------------------------------------------------------------------
+*  SELMVCL - setup SX for INITMVCL DSA init routine
+*----------------------------------------------------------------------
+*
+*  INITMVCL setup:
+*  SXAP00+0(4) =
+*  SXAP00+4(4) =
+*  SXINIT+0(4) = A(INITMVCL)
+*
+SELMVCL  DS    0H
+         ST    R15,SXAP00         MVCL length
+         LA    R15,SX@BACK        @ 1st field to MVCL
+         ST    R15,SXAP00+4
+         LA    R15,INITMVCL       @ DSA init support routine
+         ST    R15,SX@INIT
+         BR    R10
+*----------------------------------------------------------------------
+*  DSA init - MVCL-length SA
+*
+*  Entry:
+*  R3  @ CSECT's SX
+*  R4  @ return address in UPROC
+*  R5  = SX@INIT
+*  R11 @ DSA pool
+*  R12 @ calling CSECT's UPROC expansion
+*  R13 @ calling CSECT's caller's SA
+*
+*  Preserves contents of SXVER in caller's SA
+*  It's not necessary to restore R0-R2, they're not modified
+*----------------------------------------------------------------------
+INITMVCL DS    0H
+         LM    R8,R9,SXAP00            setup MVCL dest addr/length
+         SLR   R15,R15                 source length (R14 unneeded)
+         MVCL  R8,R14                  clear SA (preserve SXVER)
+         LA    R7,SXBASE               @ our SA
+         ST    R7,SX@FWD-SXBASE(,R13)  caller's forward ptr @ our SA
+         ST    R13,SX@BACK             our backward ptr @ caller's SA
+         LR    R13,R7                  R13 @ our SA
+         BR    R4
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+         LTORG ,
+*----------------------------------------------------------------------
+*  Dynamic savearea & workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F                standard MVS savearea
+SAX      DS    0D
+L$SA     EQU   *-SAVEAREA         length of savearea
+*
+         UFINI SECT=DSECT
+*
+         PRINT NOGEN
+         IHAPSA ,
+*
+U370AP00 UFINI DXDUAP00,L$SA
+         END   ,

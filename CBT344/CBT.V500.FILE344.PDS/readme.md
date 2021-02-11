@@ -1,0 +1,102 @@
+
+## $$$DOC.txt
+```
+ Thanks to Gilbert Saint-flour for letting me use his disclaimer:
+
+ Joerg Berning neither expresses nor implies any warranty
+ as to the fitness of these computer programs for any function.
+ The use of these programs or the results therefrom is entirely
+ at the risk of the user.  Consequently, the user may modify
+ these programs in any way he/she thinks fit.
+
+ These programs are Freeware and may be freely copied.  They
+ may be freely distributed to any other party on condition
+ that no inducement beyond reasonable handling costs is
+ offered or accepted by either side for such distribution.
+
+ I would be interested to hear of comments and/or proposed
+ enhancements.  Please write to joerg.berning(at)gmx.net.
+
+
+
+ What's new?
+
+ 25.03.2002:
+ 3.4Command Tracks
+   Works for: + volumes
+              + DSLevel without volume
+
+   Does not work for: - DSLevel with volume
+   Because I'm unable to get the DSLevel and volume from 3.4(panel
+   ISRUDLP)(I tried ZALVOL, ZDLDSNLV, ZDLPVL and some other 4282
+   variables) I have to grab the DSLevel or volume from the screen.
+
+ TSOCommand VGet
+   Lists all variables from the member VGETTAB.
+
+ EditMacro MacroRes
+   Added isredit preserve on.
+
+
+
+ The fun starts here:
+
+ EditMacro Add (<FromCol ToCol>)
+   Adds the numbers in the selected rows. Display at the bottom line.
+   Easily saveable with the MD(MakeData)-LineCommand.
+
+ TSO-BatchCommand AWSExtra
+   Extracts all the files from a with AWSUtil-produced dataset.
+
+ 3.4Command DelNoEnq
+   Frontend for the BYPASSNQ-Program(Gilbert Saint-flour).
+   Scratches the dataset under 3.4 with IEHPROGM.
+
+ TSO-BatchCommand HLQInfo
+   Produces a listing containing all HLQs and some RACF-Information.
+
+ TSOCommand LDDDef <dddef-entry>
+   LIST ALLZONES DDDEF(...). Says it all.
+
+ TSOCommand ListVTOC <volser>
+   &
+ EditMacro MacroRes
+   ISREDIT RESET
+
+   This REXX works to display the contents of a volume
+   and EDIF the result.  The resulting dataset display
+   is very handy.  Just load the 2 members into a
+   SYSPROC or SYSEXEC library and enter LISTVTOC volser.
+
+ 3.4Command LZ
+   Requires Target4-PKZIP-Utility.
+   Displays the contents of a ZIP-Archive.
+
+ 3.4Command LZD
+   Requires Target4-PKZIP-Utility.
+   Displays the contents of a ZIP-Archive more detailed.
+
+ Job MAN
+   For those OMVS-Commands...
+
+ TSOCommand OMVSSEG
+   Output is a listing of all UserIDs & groups and their OMVS-Segment-
+   information. Could take a while.
+
+ TSOCommand ShowDP
+   Produces a listing of all active address spaces sortet by
+   dispatching priority. Helps if your system is in compatibility mode.
+
+ TSOCommand SMPEWarn
+   Produces a listing of the |cataloged| datasets with dataset-
+   information(like how many free directory-blocks are available).
+
+ TBDisp
+   Produces a formatted listing of the table. Handy for ISMF-saved
+   tables. May take some time.
+
+ EditMacro Y99
+   Sets the memberstatistics to a specific date. Handy for resetting
+   Y2K-touched members.
+```
+

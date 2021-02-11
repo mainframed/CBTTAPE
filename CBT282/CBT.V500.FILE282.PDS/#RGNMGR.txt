@@ -1,0 +1,487 @@
+***********************************************************************
+*                                                                     *
+*              REGION MANAGER FUNCTION                                *
+*                                                                     *
+***********************************************************************
+         SPACE
+RGPMLIST DSECT
+RGCELLEN DS    A(*-*)              CELL LENGTH FOR GETCELL/FREECELL
+RGCELPTR DS    A(*-*)              CELL ADDRESS FOR GETCELL/FREECELL
+RGFLAGIN DS    XL4                 INPUT FLAGS
+RGMAXEXT DS    AL1                 MAX BLOCKS ALLOCATED - 1
+RGMINEXT DS    AL1                 MIN BLOCKS ALLOCATED - 1
+RGSPNUMB DS    AL1                 SUB-POOL NUMBER
+         DS    AL1                 SPARE
+RGMNCSIZ DS    F                   MIN CELL SIZE
+RGWORKDS DS    0F                  START OF ROUTINE WORK AREA
+MAXEXTS  DS    AL1                 MAX BLOCKS ALLOCATED - 1
+MINEXTS  DS    AL1                 MIN BLOCKS ALLOCATED - 1
+         DS    AL1                 SPARE
+         DS    AL1                 SPARE
+MAXCSIZE DS    A(*-*)              2**CEIL(LOG2(MAX CELL SIZE))
+LG2MAXSZ DS    A(*-*)              CEIL(LOG2(MAX CELL SIZE))
+MINCSIZE DS    A(*-*)              2**CEIL(LOG2(MIN CELL SIZE))
+LG2MINSZ DS    A(*-*)              CEIL(LOG2(MIN CELL SIZE))
+AVLLEN   DS    A(*-*)              AVAIL TABLE LENGTH AND
+AVLPTR   DS    A(*-*,4,*-*)          BXLE SEARCH REGISTERS
+*        AVL(N) FOR N BETWEEN ZERO AND (LG2MAXSZ-LG2MINSZ) IS THE
+*        LINK POINTER TO A LIST OF CELLS OF SIZE 2**(LG2MINSZ+N)
+*        THAT ARE LINKED TOGETHER BY THEIR FIRST WORD. THE ADDRESS
+*        OF AVL(N) IS 4 * N PLUS THE ADDRESS CONTAINED IN AVLPTR.
+*        A NON-ZERO LINK POINTER IS THE EXTENT NUMBER AND ADDRESS
+*        OF THE NEXT CELL.
+EXTLEN   DS    A(*-*)              EXTENT DESCRIPTOR TABLE LENGTH
+EXTPTR   DS    A(*-*,4,*-*)          AND BXLE SEARCH REGISTERS
+*        EXT(M) FOR M BETWEEN ZERO AND MAXEXTS IS THE MTH EXTENT
+*        DESCRIPTOR. FOR M BETWEEN ZERO AND MINEXTS, EXT(M) IS A
+*        PRIMARY EXTENT DESCRIPTOR. FOR M BETWEEN (MINEXTS+1) AND
+*        MAXEXTS, EXT(M) IS A DYNAMIC EXTENT DESCRIPTOR. IF THE
+*        HIGH ORDER BIT OF EXT(M) IS ON, THE EXTENT DESCRIPTOR IS
+*        UNUSED; OTHERWISE, IT IS THE ADDRESS OF AN EXTENT OF SIZE
+*        MAXCSIZE. THE ADDRESS OF EXT(M) IS 4 * M PLUS THE ADDRESS
+*        CONTAINED IN EXTPTR.
+RGRETCDE DS    A(*-*)              FINAL RETURN CODE
+RG2CEIL  DS    A(*-*)              2**CEIL(LOG2(CELL SIZE))
+RGWORKLN EQU   *-RGPMLIST          LENGTH OF WORKAREA
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE PROVIDES CELLS OF SIZE 2**K FOR K BETWEEN       *
+*        CEIL(LOG2(RGMNCSIZ)) AND CEIL(LOG2(PMXCSIZE)) BASED ON       *
+*        THE BUDDY SYSTEM RESERVATION AND LIBERATION ALGORITHM AS     *
+*        DESCRIBED IN KNUTH'S "INFORMATION STRUCTURES" (PP 442-5).    *
+*                                                                     *
+*        CALLING CONVENTIONS:                                         *
+*                                                                     *
+*              INITIALIZATION:     LA    R1,RGPMLIST                  *
+*                                  MVI   8(R1),X'00'                  *
+*                                 $CALL  RGNMGR                       *
+*                                  BC    15-BPOS,ERROR                *
+*                                                                     *
+*              TERMINATION:        LA    R1,RGPMLIST                  *
+*                                  MVI   8(R1),X'FF'                  *
+*                                 $CALL  RGNMGR                       *
+*                                  BC    15-BPOS,ERROR                *
+*                                                                     *
+*              GETCELL/FREECELL:   SET RGPMLIST+0 TO CELL LENGTH AND  *
+*                                  SET RGPMLIST+4 TO ZERO/CELL ADDRESS*
+*                                  LA    R1,RGPMLIST                  *
+*                                 $CALL  RGNMGR                       *
+*                                  BC    15-BPOS,ERROR                *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RGNMGR  $ENTER ,
+         LR    BASE,R1             TRANSFER CALLING PARM
+         USING RGPMLIST,BASE       AND TELL THE ASSEMBLER
+         TM    RGFLAGIN,X'FF'      SPECIAL ACTIONS .Q
+         BZ    RMINIT              BRA IF INITIALIZATION CALL
+         BO    RMTERM              BRA IF TERMINATION CALL
+         L     R1,RGCELLEN         GET CELL SIZE
+         BAL   RETURN,RMMXLOG2     ROUND UP TO NEAREST POWER OF TWO
+         B     RET8                BRA IF INVALID REQUEST - R/C=8
+         CL    R0,MINCSIZE         IS SIZE LESS THAN MINCSIZE .Q
+         BNL   *+8                 BRA IF NOT
+         LM    R0,R1,MINCSIZE      ELSE USE MINCSIZE
+         CL    R0,MAXCSIZE         IS SIZE GREATER THAN MAXCSIZE .Q
+         BH    RET8                BRA IF SO - R/C=8
+         ST    R0,RG2CEIL          SAVE 2**CEIL(LOG2(CELL SIZE))
+         OC    RGCELPTR(4),RGCELPTR GETCELL OR FREECELL .Q
+         BZ    RMGET               BRA IF GETCELL
+         B     RMFREE              BRA IF FREECELL
+         EJECT
+***********************************************************************
+*                                                                     *
+*                                  RMINIT                             *
+*                                                                     *
+*        THIS ROUTINE PERFORMS THE FOLLOWING:                         *
+*                                                                     *
+*          (1) INITIALIZES WORKAREA                                   *
+*                                                                     *
+*          (2) SETS UP MINIMUM AND MAXIMUM CELL SIZES                 *
+*                                                                     *
+*          (3) GETMAINS AREA FOR AVAIL TABLE AND EXTENT DESCRIPTOR    *
+*              TABLE                                                  *
+*                                                                     *
+*          (4) SETS UP BXLE REGS FOR AVAIL TABLE AND EXTENT           *
+*              DESCRIPTOR TABLE                                       *
+*                                                                     *
+*          (5) INITIALIZES AVAIL TABLE AND EXTENT DESCRIPTOR TABLE    *
+*                                                                     *
+*          (6) GETMAINS ONE CONTIGUOUS BLOCK OF CORE FOR PRIMARY      *
+*              EXTENTS                                                *
+*                                                                     *
+*          (7) SUBDIVIDES THE GETMAINED AREA, FILLING IN THE EXTENT   *
+*              DESCRIPTOR FOR EACH EXTENT, AND CHAINING THEM OFF THE  *
+*              LAST AVAIL TABLE ENTRY                                 *
+*                                                                     *
+*          (8) RETURNS WITH R/C=0 IF NO ERRORS; OTHERWISE, TERMINATES *
+*              WITH THE APPROPRIATE RETURN CODE                       *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RMINIT   XC    RGWORKDS(RGPMLIST+RGWORKLN-RGWORKDS),RGWORKDS
+         MVC   MAXEXTS(4),RGMAXEXT COPY INITIALIZATION PARMS
+         MVI   RGFLAGIN,X'80'      INDICATE INITIALIZATION DONE
+         SPACE 1
+RMINIT01 MVC   MAXCSIZE(8),=A(4096,12) SET MAX CELL SIZE
+         MVC   MINCSIZE(8),=A(8,3) SET DEFAULT MIN CELL SIZE
+         L     R1,RGMNCSIZ         GET REQUESTED MIN CELL SIZE
+         CL    R1,MINCSIZE         IS REQUESTED .LT. DEFAULT MIN .Q
+         BNH   RMINIT02            BRA IF SO - USE DEFAULT
+         CL    R1,MAXCSIZE         IS REQUESTED .GT. MAXCSIZE .Q
+         BH    RET8                ERROR IF YES
+         SPACE 1
+         BAL   RETURN,RMMXLOG2     GET 2**CEIL(LOG2(RGMNCSIZ))
+         B     *                     AND CEIL(LOG2(RGMNCSIZ))
+         STM   R0,R1,MINCSIZE          AND STORE THEM
+         SPACE 1
+RMINIT02 L     R1,MAXCSIZE+4       GET CEIL(LOG2(MAXCSIZE))
+         S     R1,MINCSIZE+4         - CEIL(LOG2(MINCSIZE))
+         LA    R1,1(,R1)               + 1
+         SLL   R1,2                GET AVAIL TABLE LENGTH
+         ST    R1,AVLLEN             AND STORE IT
+         SPACE 1
+RMINIT03 SR    R1,R1               ZAP R1
+         IC    R1,MAXEXTS          GET MAXEXTS
+         CLC   MAXEXTS(1),MINEXTS  IS MAXEXTS .LT. MINEXTS .Q
+         BNL   *+8                 BRA IF NOT
+         IC    R1,MINEXTS          ELSE USE MINEXTS
+         STC   R1,MAXEXTS          SET AS MAX EXTENTS
+         LA    R1,1(,R1)             + 1
+         SLL   R1,2                GET EXTENT DESCRIPTOR TABLE LENGTH
+         ST    R1,EXTLEN             AND STORE IT
+         SPACE 1
+RMINIT04 A     R1,AVLLEN           GET TOTAL LENGTH OF TABLES
+         LR    R0,R1               GET LENGTH TO R0
+        $CALL  SYGMAIN             GET AREA FOR TABLES
+         BC    BNEG,RET4           BRANCH IF FAILED
+         SPACE 1
+         LR    X1,R1               GET TABLE ADDRESS
+         LA    X2,4                GET BXLE INCREMENT
+         LR    X3,X1               GET
+         SR    X3,X2                BXLE
+         A     X3,AVLLEN             LIMIT
+         STM   X1,X3,AVLPTR        STORE BXLE SEARCH REGS.
+         A     X1,AVLLEN           GET BXLE START ADDRESS
+         A     X3,EXTLEN           GET BXLE LIMIT
+         STM   X1,X3,EXTPTR        STORE BXLE SEARCH REGS.
+         SPACE 1
+         SR    R0,R0               ZAP R0
+         LM    X1,X3,AVLPTR        GET BXLE REGS
+RMINIT06 ST    R0,0(,X1)           ZAP AVAIL POINTER
+         BXLE  X1,X2,RMINIT06      LOOP TILL ALL POINTERS ZAPPED
+         SPACE 1
+         LM    X1,X3,EXTPTR        LOAD BXLE REGS
+RMINIT07 MVC   0(4,X1),=X'80000000' SET EXTENT DESCRIPTOR TO UNUSED
+         BXLE  X1,X2,RMINIT07      LOOP TILL ALL DESCRIPTORS ZAPPED
+         SPACE 1
+RMINIT08 SR    X3,X3               ZAP X3
+         IC    X3,MINEXTS          GET MINEXTS
+         LA    X3,1(,X3)             + 1
+         M     X2,MAXCSIZE         COMPUTE PRIMARY EXTENT SIZE
+         LR    R0,X3               GET LENGTH TO R0
+        $CALL  SYGMAIN             GET PRIMARY EXTENTS
+         BC    BPOS,RMINIT09       BRANCH IF SUCCESS
+         LA    R0,4                RETURN CODE OF FOUR
+         ST    R0,RGRETCDE         SET EVENTUAL RETURN CODE
+         B     RMTERM03            TERMINATE WITH R/C=4
+         SPACE 1
+RMINIT09 DS    0H
+         LR    X1,R1               GET FIRST PRIMARY EXTENT ADDR
+         L     X2,MAXCSIZE         GET MAX CELL SIZE
+         SR    X3,X2               GET LAST PRIMARY
+         AR    X3,X1                 EXTENT ADDRESS
+         L     COUNT,AVLPTR+8      PTR -> PREVIOUS NODE
+         L     TEMP,EXTPTR         PTR -> EXTENT DESCRIPTOR
+         SR    R1,R1               ZAP EXTENT NUMBER
+         SPACE 1
+RMINIT10 ST    X1,0(,TEMP)         ADD CELL TO EXTENT DESCRIPTOR LIST
+         LA    TEMP,4(,TEMP)       POINT TO NEXT EXTENT DESCRIPTOR
+         ST    X1,0(,COUNT)        PREVIOUS NODE -> PRESENT NODE
+         STC   R1,0(,COUNT)        PREVIOUS NODE<-EXT# OF PRESENT NODE
+         LA    R1,1(,R1)           INCREMENT EXTENT NUMBER
+         LR    COUNT,X1            PTR -> PRESENT NODE
+         BXLE  X1,X2,RMINIT10      X1 -> NEXT NODE
+         XC    0(4,COUNT),0(COUNT) ZAP FOREWARD POINTER OF LAST NODE
+         SPACE 1
+         XC    RGCELLEN(8),RGCELLEN CLEAR CELL LENGTH & ADDRESS
+         B     RET0                RETURN WITH R/C=0
+         EJECT
+***********************************************************************
+*                                                                     *
+*                                  RMTERM                             *
+*                                                                     *
+*        THIS ROUTINE PERFORMS THE FOLLOWING:                         *
+*                                                                     *
+*          (1) FREES THE EXTENTS                                      *
+*                                                                     *
+*          (2) FREES THE AVAIL TABLE AND THE EXTENT DESCRIPTOR TABLE  *
+*                                                                     *
+*          (3) RESTORES THE RGPMLIST TO ITS ORIGINAL STATE            *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RMTERM   DS    0H
+         XC    RGRETCDE,RGRETCDE   SET EVENTUAL RETURN CODE TO ZERO
+         LM    X1,X3,EXTPTR        LOAD BXLE REGS
+         SPACE 1
+RMTERM01 TM    0(X1),X'80'         IS EXTENT DESCRIPTOR USED .Q
+         BO    RMTERM02            BRA IF NOT
+         L     R0,MAXCSIZE         GET FREEMAIN PARM REG 0
+         L     R1,0(,X1)           GET FREEMAIN PARM REG 1
+        $CALL  SYFMAIN             FREE EXTENT
+RMTERM02 BXLE  X1,X2,RMTERM01      LOOP TILL ALL EXTENTS FREED
+         SPACE 1
+RMTERM03 DS    0H
+         L     R0,AVLLEN           GET AVAIL TABLE LENGTH
+         A     R0,EXTLEN             + EXTENT DESCRIPTOR TABLE LENGTH
+         L     R1,AVLPTR           GET FREEMAIN PARM REG 1
+        $CALL  SYFMAIN             FREE TABLES
+         SPACE 1
+         L     R15,RGRETCDE        GET RETURN CODE
+         B     *+4(R15)            GO AS REQUIRED
+         B     RET0                IF ALL OK
+         B     RET4                IF SOME ERROR
+         B     RET8                IF ALL BAD
+         EJECT
+RET0     DS    0H
+        $CC    POS                 SUCCESSFUL RETURN
+         B     RETURN0             RETURN
+         SPACE 1
+RET4     DS    0H
+        $CC    NEG                 UNSUCCESSFUL RETURN
+         B     RETURN0             RETURN
+         SPACE 1
+RET8     DS    0H
+        $CC    DNO                 VERY UNSUCCESSFUL
+         B     RETURN0
+         SPACE 1
+RETURN0  DS    0H
+        $EXIT  RC=0                AND RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                                                                     *
+*                                  RMGET                              *
+*                                                                     *
+*        THIS ROUTINE PERFORMS THE FOLLOWING:                         *
+*                                                                     *
+*          (1) SEARCHES THE AVAIL TABLE FOR THE FIRST NON-EMPTY       *
+*              LIST OF NODES WITH SIZE GREATER THAN OR EQUAL TO       *
+*              THE REQUESTED CELL SIZE                                *
+*                                                                     *
+*          (2) GETS SECONDARY EXTENT IF SEARCH IS UNSUCCESSFUL,       *
+*              AN UNUSED EXTENT DESCRIPTOR IS AVAILABLE, AND THE      *
+*              GETMAIN IS SUCCESSFUL, ADDS IT TO THE EXTENT           *
+*              DESCRIPTOR TABLE, AND ENTERS IT INTO THE LAST          *
+*              AVAIL TABLE LIST                                       *
+*                                                                     *
+*          (3) REMOVES THE NODE FROM THE LIST, IF SEARCH IS           *
+*              SUCESSFUL                                              *
+*                                                                     *
+*          (4) SPLITS THE BLOCK IF THE NODE IS LARGER THAN THE        *
+*              REQUESTED CELL SIZE, ENTERS THE UNUSED HALF ON THE     *
+*              APPROPRIATE LIST AND REPEATS THIS UNTIL A NODE OF      *
+*              THE PROPER SIZE IS FOUND                               *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RMGET    S     R1,LG2MINSZ         COMPUTE INDEX INTO
+         SLL   R1,2                  AVAIL TABLE
+         LM    X1,X3,AVLPTR        LOAD BXLE SEARCH REGS
+         AR    X1,R1               ADD INDEX TO TABLE BASE ADDRESS
+         LR    TEMP,X1             SAVE START ADDRESS FOR LATER
+         SPACE 1
+RMGET01  L     COUNT,0(,X1)        GET LIST POINTER
+         LTR   COUNT,COUNT         IS LIST EMPTY .Q
+         BNZ   RMGET04             BRA IF NOT
+         BXLE  X1,X2,RMGET01       LOOP TIL END OR NON-EMPTY LIST
+         SPACE 1
+         LM    X1,X3,EXTPTR        GET EXTENT DESCRIPTOR BXLE REGS
+RMGET02  TM    0(X1),X'80'         EXTENT DESCRIPTOR USED .Q
+         BO    RMGET03             BRA IF NOT
+         BXLE  X1,X2,RMGET02       LOOP TIL EMPTY DESCRIPTOR FOUND
+         B     RET4                BRA IF ALL EXTENTS FILLED - R/C=4
+         EJECT
+RMGET03  L     R0,MAXCSIZE         GET EXTENT LENGTH
+        $CALL  SYGMAIN             GET EXTENT
+         BC    BNEG,RET4           BRANCH IF UNSUCCESSFUL
+         LR    COUNT,R1            GET NEW EXTENT ADDRESS
+         ST    COUNT,0(,X1)        ADD TO EXTENT DESCRIPTOR TABLE
+         S     X1,EXTPTR           GET EXTENT
+         SLL   X1,22                 NUMBER TO H.O. BYTE
+         OR    COUNT,X1                OF NEW EXTENT ADDRESS
+         LM    X1,X3,AVLPTR        GET AVAIL TABLE SEARCH REGS
+         LR    X1,X3               POINT AT LAST AVAIL TABLE ENTRY
+         XC    0(4,COUNT),0(COUNT) ZAP FOREWARD LINK IN NEW EXTENT
+         ST    COUNT,0(,X1)        ADD NEW EXTENT TO AVAIL TABLE
+         SPACE 1
+RMGET04  MVC   0(4,X1),0(COUNT)    REMOVE NODE FROM LIST
+         SPACE 1
+RMGET05  CR    X1,TEMP             IS NODE RIGHT SIZE .Q
+         BE    RMGET06             BRA IF SO
+         SR    X1,X2               POINT TO PREVIOUS AVAIL TABLE ENTRY
+         LR    R1,X1               GET OFFSET INTO
+         S     R1,AVLPTR             AVAIL TABLE
+         SRL   R1,2                    / 4
+         A     R1,LG2MINSZ               + LOG2(MINCSIZE)
+         BAL   RETURN,RM2EXPR1     GET 2**(R1)
+         LR    R1,R0               LOAD IT INTO R1
+         ALR   R1,COUNT            GET BUDDY ADDRESS FOR SPLIT
+         XC    0(4,R1),0(R1)       ZAP FOREWARD LINK IN BUDDY
+         ST    R1,0(,X1)           ADD BUDDY TO LIST
+         B     RMGET05             REPEAT TIL BLOCK OF RIGHT SIZE
+         SPACE 1
+RMGET06  ST    COUNT,RGCELPTR      STORE CELL ADDRESS
+         MVC   RGCELLEN,RG2CEIL    STORE CELL LENGTH
+         B     RET0                RETURN WITH R/C=0
+         EJECT
+***********************************************************************
+*                                                                     *
+*                                  RMFREE                             *
+*                                                                     *
+*        THIS ROUTINE PERFORMS THE FOLLOWING:                         *
+*                                                                     *
+*          (1) LOCATES THE EXTENT DESCRIPTOR CONTAINING THE CELL      *
+*              TO BE FREED                                            *
+*                                                                     *
+*          (2) VERIFIES THAT THE CELL DISPLACEMENT INTO THE EXTENT    *
+*              IS DIVISIBLE BY THE FIRST POWER OF TWO GREATER THAN    *
+*              OR EQUAL TO THE SIZE OF THE CELL TO BE FREED           *
+*                                                                     *
+*          (3) GETS THE EXTENT NUMBER INTO THE HIGH-ORDER BYTE OF     *
+*              THE CELL ADDRESS                                       *
+*                                                                     *
+*          (4) GETS THE EXTENT NUMBER AND CELL ADDRESS OF ITS BUDDY,  *
+*              OR ZERO, IF THERE IS NO BUDDY (IE. IF CELL SIZE        *
+*              EQUALS MAX CELL SIZE)                                  *
+*                                                                     *
+*          (5) FREES THE EXTENT AND RETURNS, IF THE CELL SIZE IS      *
+*              EQUAL TO THE MAX CELL SIZE, AND THE EXTENT IS A        *
+*              SECONDARY EXTENT                                       *
+*                                                                     *
+*          (6) SEARCHES THE APPROPRIATE AVAIL TABLE LIST FOR THE      *
+*              BUDDY OR THE CORRECT SPOT TO INSERT THE CELL           *
+*                                                                     *
+*          (7) REMOVES BUDDY FROM LIST (IF FOUND) AND GOES TO STEP    *
+*              4 WITH (COUNT) AND RG2CEIL CONTAINING ADDR AND SIZE    *
+*              OF THE NEW BLOCK TO BE FREED, OR INSERTS THE CELL      *
+*              INTO THE LIST AND RETURNS                              *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RMFREE   L     COUNT,RGCELPTR      GET CELL ADDRESS
+         LA    COUNT,0(,COUNT)     ZAP H.O. BYTE
+         MVC   RGCELLEN,RG2CEIL    PASS BACK ACTUAL LENGTH FREED
+         LM    X1,X3,EXTPTR        LOAD EXTENT DESCRIPTOR BXLE REGS
+         SPACE 1
+RMFREE01 TM    0(X1),X'80'         EXTENT DESCRIPTOR USED .Q
+         BO    RMFREE02            BRA IF NOT
+         CL    COUNT,0(,X1)        ADDRESS WITHIN THIS EXTENT .Q
+         BL    RMFREE02            BRA IF NOT
+         L     R0,MAXCSIZE         GET MAX CELL SIZE
+         AL    R0,0(,X1)             + EXTENT ADDRESS
+         CLR   COUNT,R0            ADDRESS WITHIN EXTENT .Q
+         BL    RMFREE03            BRA IF SO
+RMFREE02 BXLE  X1,X2,RMFREE01      LOOP TIL EXTENT FOUND
+         B     RET8                ERROR IF NOT FOUND - R/C=8
+         EJECT
+RMFREE03 LR    R1,COUNT            GET CELL ADDRESS
+         SL    R1,0(,X1)           GET CELL DISPLACEMENT
+         SR    R0,R0               ZAP TOP OF DIVIDEND
+         D     R0,RG2CEIL          GET DISPLACEMENT MOD (RG2CEIL)
+         LTR   R0,R0               IS IT ZERO .Q
+         BNZ   RET8                BRA IF NOT - R/C=8
+         SPACE 1
+         LR    R0,X1               GET EXTENT
+         S     R0,EXTPTR             NUMBER TO
+         SLL   R0,22                   H.O. BYTE
+         OR    COUNT,R0                  OF CELL ADDRESS
+         SPACE 1
+RMFREE04 LR    TEMP,COUNT          GET EXTENT NUMBER AND CELL ADDRESS
+         SL    TEMP,0(,X1)         GET CELL DISPLACEMENT
+         X     TEMP,RG2CEIL        GET BUDDY CELL DISPLACEMENT
+         AL    TEMP,0(,X1)         GET BUDDY CELL ADDRESS
+         L     R1,RG2CEIL          GET CELL SIZE
+         C     R1,MAXCSIZE         CHECK CELL SIZE
+         BM    RMFREE05            BRA IF CELL SIZE .LT. MAXCSIZE
+         SR    TEMP,TEMP           ZAP BUDDY POINTER
+         LR    R1,COUNT            GET EXTENT
+         SRL   R1,24                 NUMBER
+         EX    R1,RFREECLI         IS IT PRIMARY EXTENT .Q
+         BNL   RMFREE05            BRA IF NOT
+         L     R0,MAXCSIZE         GET FREEMAIN PARM REG 0
+         L     R1,0(,X1)           GET FREEMAIN PARM REG 1
+        $CALL  SYFMAIN             FREE SECONDARY EXTENT
+         MVC   0(4,X1),=X'80000000' SET EXTENT DESCRIPTOR TO UNUSED
+         B     RMFREE09            RETURN
+         SPACE 1
+RFREECLI CLI   MINEXTS,*-*         PRIMARY EXTENT .Q
+         EJECT
+RMFREE05 L     R1,RG2CEIL          GET CELL SIZE
+         BAL   RETURN,RMMXLOG2     GET
+         B     *                     (CEIL(LOG2(CELL SIZE))
+         S     R1,LG2MINSZ             - LG2MINSZ)
+         SLL   R1,2                      * 4
+         AL    R1,AVLPTR                   + A(AVAIL TABLE)
+         LR    X2,R1               X2 -> PROPER LIST TO INSERT NODE
+         SPACE 1
+RMFREE06 L     X3,0(X2)            X3 -> NEXT CELL
+         LTR   X3,X3               IS POINTER NULL .Q
+         BZ    RMFREE08            BRA IF SO - INSERT CELL
+         CLR   X3,TEMP             IS NEXT CELL BUDDY CELL .Q
+         BE    RMFREE07            BRA IF SO - MERGE CELL WITH BUDDY
+         CLR   COUNT,X3            IS CELL PTR .LE. NEXT CELL PTR .Q
+         BNP   RMFREE08            BRA IF SO - INSERT CELL
+         LR    X2,X3               ELSE ADVANCE PTR AND
+         B     RMFREE06              CONTINUE SEARCH
+         SPACE 1
+RMFREE07 MVC   0(4,X2),0(X3)       REMOVE BUDDY FROM LIST
+         L     R1,RG2CEIL          GET CELL SIZE
+         SLL   R1,1                DOUBLE CELL SIZE
+         ST    R1,RG2CEIL          AND PUT IT BACK
+         CLR   COUNT,TEMP          IS COUNT .LE. TEMP .Q
+         BNH   *+6                 BRA IF SO
+         LR    COUNT,TEMP          ELSE COUNT = TEMP
+         B     RMFREE04            REPEAT PROCESS
+         SPACE 1
+RMFREE08 ST    X3,0(,COUNT)        LINK(CELL PTR) = NEXT CELL PTR
+         ST    COUNT,0(,X2)        LINK(LAST CELL PTR) = CELL PTR
+         SPACE 1
+RMFREE09 XC    RGCELPTR,RGCELPTR   INDICATE CELL FREED
+         B     RET0                RETURN WITH R/C=0
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE RETURNS 4(R14) WITH R1 CONTAINING CEIL(LOG2(N)) *
+*        AND R0 CONTAINING 2**CEIL(LOG2(N)), IF THE NUMBER (N),       *
+*        SUPPLIED IN R1 UPON ENTRY, IS IN THE RANGE 1 TO 2**31-1;     *
+*        OTHERWISE, IT RETURNS 0(R14) WITH R0 AND R1 CONTAINING THE   *
+*        ORIGINAL CONTENTS OF R1.                                     *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RMMXLOG2 LTR   R0,R1               IS NUMBER .GT. 0 .Q
+         BNPR  RETURN              BRA IF NOT - ERROR
+         LA    RETURN,4(,RETURN)   SET EXIT ADDRESS
+         SR    R1,R1               ZAP EXPONENT
+         BCT   R0,*+8              BRA IF NUMBER .GT. 1
+         B     RM2EXPR1            GET 2**(R1)
+         SPACE 1
+         LA    R1,1(,R1)           INCREMENT EXPONENT
+         SRA   R0,1                DIVIDE NUMBER BY 2
+         BNZ   *-8                 LOOP IF QUOTIENT NON-ZERO
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE RETURNS 0(R14) WITH R0 CONTAINING 2**(R1).      *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+RM2EXPR1 LA    R0,1                R0=1
+         SLL   R0,0(R1)            R0=2**(R1)
+         BR    RETURN              RETURN
+         SPACE 2
+         LTORG ,
+         SPACE
+         DROP  BASE

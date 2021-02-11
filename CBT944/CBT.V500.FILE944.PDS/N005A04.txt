@@ -1,0 +1,507 @@
+A VTAM front-end for automatic sign-ons
+
+Our shop recently developed a public information system using
+CA-ROSCOE. While the development was made very easy
+using the RPF language, we had a problem with sign-ons to the
+system: CA-ROSCOE will not allow a particular user-id to be
+signed on more than once to a particular CA-ROSCOE region.
+
+To overcome this problem, I created a VTAM application
+front-end to assign a user-id and password and pass this
+information (and the terminal) to a particular CA-ROSCOE
+region. The information is passed in the terminal's log-on
+message: CA-ROSCOE will interpret 'xxxxxxxx/yyyyyyyy' as
+a user-id/password combination and attempt a sign-on for that
+user-id.
+
+The VTAM front-end, called PUBLIC, receives terminals via a
+log-on exit. It then scans an array of potential user-ids. When
+an entry of binary zeros (each entry being 8 bytes) is found, the
+terminal LU name is placed in the entry to mark its use. A
+user-id is then generated from the current array position and the
+terminal is passed with the right log-on message to a CA-
+ROSCOE region.
+
+The array table contains 100 8-byte entries, and the generated
+user-ids will have a suffix ranging from '00' to '99'. Since
+multiple CA-ROSCOE regions can share the same libraries,
+virtually unlimited (concurrent) use of the original 100 user-ids
+can be made, if the array table is enlarged for each potential
+CA-ROSCOE region. (Each region needs space for 100 8-byte
+entries.)
+
+When a user logs off one of the CA-ROSCOE regions, an exit
+inside the region is driven and a system command is issued,
+notifying PUBLIC that a particular terminal has logged off
+from a CA-ROSCOE region. PUBLIC will find the LU name
+in its user-id table and zeroize the entry.
+
+One minor problem with PUBLIC is that it does not perform an
+OPNDST on terminals it receives - only a CLSDST with PASS
+to the appropriate CA-ROSCOE region. This may cause other
+VTAM applications which passed the terminal to PUBLIC in
+the first place (such as CL/MENU) to complain about the
+terminal not being picked up by PUBLIC. If desired, an
+OPNDST can be inserted into PUBLIC's log-on exit to stop
+this.
+
+Another problem concerns terminals which suffer hardware
+problems and which are marked in VTAM tables as having a
+default owner of PUBLIC. It is possible for terminals to rapidly
+fail and come back on-line - this will cause PUBLIC to fill up
+its user-id table very fast. One possible solution might be to
+scan the table completely just to see if the LU is already in the
+table. Of course, the larger the table, the more the CPU will be
+utilized performing this task.
+
+With some modifications, this code could be used for other
+VTAM applications. It might be useful for other situations
+where several identical servers are first examined and the user
+is then transferred to the least-busy environment.
+
+
+PUBLIC SOURCE CODE
+
+*  THIS CODE HAS BEEN DEVELOPED USING ASSEMBLER H UNDER VTAM 3.2,
+*  IN AN MVS/XA 2.2.0 ENVIRONMENT.
+*  THE FOLLOWING VTAM INITIALIZATION STATEMENTS ARE NEEDED IN
+*  SOME MEMBER IN SYS1.VTAMLST:
+*                VBUILD TYPE=APPL
+*        PUBLIC  APPL   EAS=10,AUTH=(ACQ,PASS)
+*  THE APPLID SHOULD BE AVAILABLE WHEN THIS PROGRAM STARTS UP.  YOU CAN
+*  CHANGE THE NAME "PUBLIC" TO WHATEVER YOU WANT BUT YOU MUST ALSO
+*  CHANGE THE NAME IN THE DATA AREAS PORTION OF THIS CODE.  OTHER
+*  SECTIONS OF THIS PROGRAM MAY NEED TO BE CHANGED FOR YOUR USE,
+*  SO EXAMINE IT CAREFULLY.
+*  THIS PGM MUST BE IN AN APF LIBRARY FOR IT TO BE NON-SWAPPABLE
+*  (RECOMMENDED).  SPECIFY IN SCHEDXX.  THE PGM SHOULD BE LINKED AC=0.
+*  INCLUDE SYS1.MACLIB AND SYS1.AMODGEN IN THE SYSLIB CARD DURING
+*  ASSEMBLY.
+PUBLIC   CSECT
+         STM   R14,R12,12(R13)         SAVE REGISTERS
+         LR    R12,R15                 ESTABLISH ADDRESSABILITY
+         USING PUBLIC,R12
+         LA    R11,SAVEAREA            SET UP OUR SAVE AREA
+         ST    R13,4(R11)
+         ST    R11,8(R13)
+         LR    R13,R11
+*  GET USERID STORAGE
+         LH    R3,ROSNUM      GET NUMBER OF ADDRESS SPACES
+         MH    R3,=H'800'     MULTIPLY BY SPACE NEEDED FOR 100 USERIDS
+         LR    R0,R3                     GETMAIN SPACE
+         GETMAIN RC,LV=(0),BNDRY=DBLWD
+         LTR   R15,R15                   TEST RESULTS
+         BZ    GMOK
+         WTO   'GETMAIN FAILURE--EXITING',ROUTCDE=11
+         B     EXIT
+GMOK     ST    R1,USERIDS                SAVE ADDRESS TO USERID ARRAY
+*  OPEN VTAM ACB
+         OPEN  PUBACB
+         LTR   R15,R15                   TEST RESULTS
+         BZ    OPENOK
+         WTO   'PUBLIC ACB OPEN FAILURE',ROUTCDE=11,DESC=11
+         B     EXIT
+*  ENABLE LOGONS
+OPENOK   SETLOGON RPL=PUBRPL1,ACB=PUBACB,OPTCD=(SYN,START)
+         LTR   R15,R15                   TEST RESULTS
+         BZ    GETCOMM
+         WTO   'SETLOGON FAILED FOR PUBLIC',ROUTCDE=11,DESC=11
+         B     EXIT
+*  SETUP PROGRAM ANSWER AREA
+GETCOMM  LA    R3,ANSWER                 POINT AT ANSWER WORD
+         EXTRACT (3),FIELDS=COMM
+         L     R3,ANSWER                 GET COMLIST ADDRESS
+         USING COMLIST,R3
+         L     R4,COMCIBPT               GET POINTER TO CIB
+         USING CIBNEXT,R4
+*  REMOVE START CIB & SETUP FOR 100 SIMULTANEOUS OPER CMDS (OVERKILL!)
+         CLI   CIBVERB,CIBSTART          IS THIS A START CIB?
+         BNE   SETMOD                    IF NOT, IGNORE; ELSE REMOVE
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(4)
+         LTR   R15,R15                   TEST RESULTS
+         BZ    SETMOD
+         WTO   'PUBLIC START CIB STILL ON CHAIN',ROUTCDE=11,DESC=11
+SETMOD   QEDIT ORIGIN=COMCIBPT,CIBCTR=100
+         L     R5,COMECBPT               GET ADDR OF CMD ECB PROVIDED
+         ST    R5,LISTECBS               STORE IN WAIT LIST
+* MAIN LOOP.  HERE WE WAIT ON TWO EVENTS--EITHER THE POPPING OF TIMER,
+*             OR THE RECEPTION OF A MODIFY OR STOP COMMAND FROM THE
+*             OPERATOR.  WE NEED THE TIMER WHEN THERE ARE LONG PERIODS
+*             OF INACTIVITY--OTHERWISE, MVS MAY ABEND THE PROGRAM.
+WAITLOOP STIMER REAL,TIMEEXIT,BINTVL=WAIT5
+WAITCIB  WAIT  1,ECBLIST=LISTECBS
+         CLC   WAITECB(4),=F'0'          WAIT OVER-IS THIS A TIMER POP?
+         BE    CHKCMD                    IF NOT, CHECK FOR CMD
+         XC    WAITECB,WAITECB           ELSE IT WAS TIMER-CLEAR & REDO
+         B     WAITLOOP
+CHKCMD   L     R4,COMCIBPT               GET THE ADDR TO THE CMD VERB
+         CLI   CIBVERB,CIBMODFY          IS THIS A MODIFY VERB?
+         BNE   TESTSTOP                  IF NOT, CHECK FOR STOP VERB
+         LH    R6,CIBDATLN               GET MODIFY COMMAND LENGTH
+         C     R6,=F'8'                  IS LENGTH < 8?
+         BL    FREECIB                   IF SO, IGNORE THIS COMMAND
+*                                        (INSERT NEW CMD TESTS HERE)
+         CLC   CIBDATA(8),=CL8'SIGNOFF'  IS THIS A "SIGNOFF" COMMAND?
+         BNE   FREECIB                   IF NOT, IGNORE COMMAND
+         C     R6,=F'24'                 SIGNOFF CMD CORRECT LENGTH?
+         BL    FREECIB                   IF NOT, IGNORE CMD
+         L     R7,USERIDS                GET PTR TO USERID ARRAY
+         LH    R8,ROSNUM                 GET # OF CA-ROSCOE ADDR SPACES
+         MH    R8,=H'100'                MUL BY MAX # OF IDS IN EACH AS
+FREELOOP CLC   0(8,R7),CIBDATA+16        SEARCH FOR MATCH OF LU NAMES
+         BE    FREELOO2                  BRANCH IF LU NAME MATCHED
+         LA    R7,8(R7)                  INCREMENT ID POINTER
+         BCT   R8,FREELOOP               CONTINUE LOOPING
+         B     FREECIB                   IGNORE CMD IF LU NOT MATCHED
+FREELOO2 MVC   0(8,R7),=D'0'             ZERO LUNAME (CAN NOW REUSE)
+         L     R7,CURRENT                GET CURRENT LOGON COUNT
+         BCTR  R7,R0                     DECREMENT CURRENT LOGON COUNT
+         ST    R7,CURRENT                SAVE CURRENT LOGON COUNT
+*                                        FREE THE MODIFY CIB
+FREECIB  QEDIT ORIGIN=COMCIBPT,BLOCK=(4)
+         B     WAITCIB                   GO WAIT FOR NEXT EVENT
+TESTSTOP CLI   CIBVERB,CIBSTOP           STOP COMMAND?
+         BNE   ERROR                     IF NOT, WE HAVE AN ERROR
+*                                        IF STOP CIB, FREE IT AND EXIT
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(4)
+*  CLOSE VTAM ACB
+CLOSEACB CLOSE PUBACB
+*                                        CANCEL THE TIMER
+         TTIMER CANCEL
+* STATISTICS ARE NOW WRITTEN TO THE SYSTEM LOG (A LOG FILE MIGHT
+* BE BETTER)
+         L     R7,HISIGNON               ISSUE HIGH WATER MARK MESSAGE
+         CVD   R7,DECIMAL
+         UNPK  WTOMSG+8(4),DECIMAL+6(2)
+         OI    WTOMSG+11,X'F0'
+WTOMSG   WTO 'XXXX PUBLIC IDS WERE THE HIGHEST CONCURRENT NUMBER USED',X
+               ROUTCDE=11
+         L     R7,LOGCOUNT               ISSUE TOTAL LOGON MESSAGE
+         CVD   R7,DECIMAL
+         UNPK  WTOMSG2+8(6),DECIMAL+4(4)
+         OI    WTOMSG2+13,X'F0'
+WTOMSG2  WTO   'XXXXXX TOTAL LOGONS OCCURRED',ROUTCDE=11
+EXIT     L     R13,4(R13)                RESTORE REGISTERS
+         L     R14,12(R13)
+         LM    R0,R12,20(R13)
+         SR    R15,R15                   SET RETURN CODE
+         BR    R14                       RETURN
+*  ERROR MESSAGE FOR BAD CIBVERB
+ERROR    WTO   'PUBLIC CIBVERB NOT MODIFY OR STOP',ROUTCDE=11,DESC=11
+         B     CLOSEACB
+         DROP  R12
+*  LOGONEXIT--THIS EXIT WILL BE INVOKED ASYNCHRONOUSLY TO THE MAIN
+*             PROGRAM, WITH A HIGHER PRIORITY.  LOGONS WILL NOT BE
+*             ACQUIRED, WHICH MAY GENERATE ERROR MESSAGES FROM
+*             OTHER VTAM APPLICATIONS.  TO AVOID THIS, UNCOMMENT
+*             THE OPNDST CODE NEAR THE START OF THIS EXIT.
+LOGONEX  DS    0H
+         USING LOGONEX,R12               ADDRESSABILITY
+         LR    R12,R15
+         LR    R10,R1                    GET ENTRY PARMS
+         L     R4,16(R1)                 GET READ-ONLY RPL
+         USING IFGRPL,R4
+         LR    R9,R14                    SAVE RET ADDR
+         LA    R13,EXITSAVE              ESTABLISH SAVE AREA FOR EXIT
+         L     R7,LOGCOUNT               INCREMENT LOGON COUNT
+         LA    R7,1(R7)
+         ST    R7,LOGCOUNT
+         L     R8,20(R10)                GET CID
+         L     R10,4(R10)                GET PTR TO LU NAME
+*  MODIFY NIB TO HAVE LUNAME
+         MODCB NIB=PUBNIB,AM=VTAM,NAME=(*,0(R10))
+*  GET SESSION PARMS ASSOCIATED WITH THIS LU
+         INQUIRE RPL=PUBRPL,OPTCD=SESSPARM,NIB=PUBNIB,AREA=BINDAR,     X
+               AREALEN=100
+*  UPDATE NIB TO HAVE THE SAME SESSION PARMS
+         MODCB NIB=PUBNIB,AM=VTAM,BNDAREA=BINDAR
+         LA    R10,PUBNIB                POINT TO NIB
+         USING ISTDNIB,R10
+*  UNCOMMENT THIS CODE TO DO "EMPTY" OPNDST TO KEEP OTHER VTAM APPLS
+*  FROM SQUAWKING.
+*        OPNDST RPL=PUBRPL,NIB=PUBNIB,OPTCD=(SYN,ACCEPT,SPEC)
+*        TESTCB NIB=PUBNIB,AM=VTAM,CON=YES
+*        BNE   CONFAIL
+*   NOW FIND LOGMODE NAME AND INSERT INTO NIB
+GETLMODE L     R3,RPLAREA                GET RPLAREA FROM READ-ONLY RPL
+         LR    R2,R3
+         A     R2,RPLRLEN                ADD LENGTH
+         DROP  R4
+         ST    R2,CINITEND
+         LA    R4,12(R3)                 START OF BIND IMAGE
+         SR    R2,R2
+         ICM   R2,3,10(R3)               GET BIND LENGTH
+         AR    R4,R2                     PAST BIND/START OF SLU TYPE
+         LA    R3,2(R4)                  START OF SLU SYMBOL NAME
+         SR    R2,R2
+         IC    R2,1(R4)                  LENGTH OF SLU SYMBOL NAME
+         AR    R3,R2                     POINT PAST SLU SYM NAME
+         LA    R3,2(R3)                  POINT PAST RETIRED FIELDS
+         LA    R4,1(R3)                  POINT AT START OF USER DATA
+         SR    R2,R2
+         IC    R2,0(R3)                  GET LENGTH OF USER DATA
+         AR    R4,R2                     POINT PAST USER DATA
+         LA    R3,2(R4)                  POINT AT STRT OF DEV CHAR INFO
+         SR    R2,R2
+         ICM   R2,3,0(R4)                GET LENGTH OF DEV CHAR INFO
+         AR    R3,R2                     POINT PAST USER DATA
+         LA    R4,1(R3)                  PNT AT STRT OF SESS CRYPT DATA
+         SR    R2,R2
+         IC    R2,0(R3)                  GET LENGTH OF SESS CRYPT DATA
+         AR    R4,R2                     PNT PAST C DATA TO CTRL VECS
+         C     R4,CINITEND
+         BNL   NOVECTOR
+*                                        FIND THE VECTOR
+CHECKVEC CLI   0(R4),X'0D'               (AND THE ASSOC LOGMODE)
+         BNE   NEXTVECT                  B IF NOT RIGHT VECTOR
+         MODCB AM=VTAM,NIB=PUBNIB,LOGMODE=(*,2(R4))
+         B     VECFOUND                  NIB NOW UPDATED W/ RIGHT LMODE
+NEXTVECT LA    R3,2(R4)                  GO TO NEXT VECTOR IF IT EXISTS
+         SR    R2,R2
+         IC    R2,1(R4)
+         AR    R3,R2
+         LR    R4,R3
+ENDCHECK C     R4,CINITEND
+         BL    CHECKVEC                  B IF THERE ARE MORE VECTORS
+*                                        NO LOGMODE--TAKE DEFAULT
+NOVECTOR MODCB AM=VTAM,NIB=PUBNIB,LOGMODE=LMDUMMY
+* LOOK FOR TERMID (IN NIB) IN OUR ARRAY--IF NO HIT, WE
+* SHOULD CLSDST,PASS AND SAVE TERMID TO MARK USERID AS USED.
+* IF THERE'S A HIT, SOMETHING'S WRONG AND
+* WE SHOULD RELEASE USERID AND CLSDST,NOPASS.
+VECFOUND EQU   0H
+*  OPTIONAL SEND TO LU TO CONFIRM IT HAS BEEN ACQUIRED
+*        SEND RPL=PUBRPL,CHAIN=ONLY,BRACKET=(BB,EB),ACB=PUBACB,       X
+*              OPTCD=(SYN),RESPOND=(NEX,NFME,NRRN),STYPE=REQ,         X
+*              CONTROL=DATA,AREA=WAITMSG,RECLEN=39,ARG=(R8)
+         L     R2,USERIDS                POINT AT "USERID" AREA
+         LR    R3,R2                     DUPLICATE POINTER
+         LH    R7,ROSNUM                 GET NUMBER OF ADDRESS SPACES
+U2LOOP0  LA    R4,100                    SET LOOP CNT FOR MAX # PER AS
+U2LOOP   CLC   0(8,R3),=D'0'             TEST FOR FREE "USERID"
+         BE    U2LOOPF                   BRANCH IF FOUND
+         LA    R3,8(R3)                  POINT TO NEXT USERID
+         BCT   R4,U2LOOP                 CONTINUE TILL DONE FOR AS
+         A     R2,=F'800'                POINT TO NEXT BANK OF USERIDS
+         BCT   R7,U2LOOP0                CONTINUE TILL DONE FOR ALL AS
+         B     NOPASSLU                  EXIT-DO NOT PASS LU-CODE COULD
+*                                    DO AN OPNDST AND DISPLAY ERRORMSG
+U2LOOPF  LR    R6,R7              GET ADDRESS SPACE (AS) "NUMBER"
+         MH    R6,=H'8'           MULTIPLY BY LENGTH OF AS NAME
+         A     R6,=AL4(ROSTABL)   ADD AS NAME TABLE START ADDRESS
+*                                 SET NIB TO HAVE NAME OF TARGET AS
+         MODCB NIB=PUBNIB1,NAME=(*,0(R6))
+*                                 IS THIS AS UP AND AVAILABLE?
+         INQUIRE RPL=PUBRPL,ACB=PUBACB,OPTCD=APPSTAT,NIB=PUBNIB1
+         TESTCB  RPL=PUBRPL,FDBK=0
+         BE    U2LOOPG            IF SO, CALC LOGDATA AND PASS LU TO IT
+         LR    R3,R2              A PARTICULAR AS ISN'T AVAILABLE, SO
+         A     R3,=F'800'           JUMP PAST USERIDS FOR IT AND TRY TO
+         LR    R2,R3                ASSIGN A USERID FROM ANOTHER
+         BCT   R7,U2LOOP0           ADDRESS SPACE FOR THIS LU
+         B     NOPASSLU           NO IDS LEFT--ABANDON THIS LU
+*  CALCULATE THE USERID/PASSWORD TO BE USED AND PASS THE LU TO THE
+*  ADDRESS SPACE.  NOTE--THE CALCULATED USERID/PASSWORD COMBINATION
+*  IS FORMATTED FOR CA-ROSCOE ENVIRONS.  TSO ALSO ALLOWS FOR AUTOMATIC
+*  SIGNONS, BUT USES A DIFFERENT FORMAT.
+*  THE CA-ROSCOE FORMAT IS "USERID/PASSWORD".  A "SIGNON PROCEDURE" CAN
+*  BE ESTABLISHED FOR A PARTICULAR USERID AND THE USERID CAN THEN BE
+*  RESTRICTED.
+U2LOOPG  LA    R5,100                   GET MAX NUMBER OF IDS PER AS
+         SR    R5,R4                    SUBTRACT IDS ALREADY PASSED OUT
+         SR    R4,R4                    CLEAR R4 FOR DIVISION
+         D     R4,=F'10'                / BY 10 TO GET 10S & 1S DIGITS
+         O     R4,=F'240'               OR EACH DIGIT WITH X'F0'
+         O     R5,=F'240'               ... DIGITS NOW READABLE
+*  WE NOW HAVE THE CORRECT USERID NUMBER (00 THROUGH 99).  THIS WILL
+*  BE SUFFIXED TO THE GENERIC NAME FOR ALL USERIDS.  TOTAL LENGTH FOR
+*  MY USERIDS IS 4 CHARACTERS, WITH A COMMON PREFIX OF 2 CHARACTERS.
+*  YOUR IDS CAN HAVE A COMMON PREFIX OF BETWEEN 1 AND 6 CHARACTERS.
+*  THE COMMON PASSWORD IS THE SAME FOR ALL ID'S.
+         MVC   LOGMSG(2),=CL2'ZZ'       WRITE COMMON PREFIX
+         STC   R5,LOGMSG+2              WRITE 10S DIGIT
+         STC   R4,LOGMSG+3              WRITE 1S DIGIT
+         MVI   LOGMSG+4,C'/'               WRITE SEPERATOR
+         MVC   LOGMSG+5(8),=CL8'ZZZZZZZZ'  WRITE COMMON PASSWORD
+         MVC   LOGMSG+13(87),=XL87'00'     NULL REST OF LOGON MESSAGE
+         MVC   0(8,R3),NIBSYM           MOVE LUNAME INTO "USERID" SLOT
+INCLOG   L     R7,CURRENT
+         LA    R7,1(R7)           INCREMENT CURRENT LOGIN COUNT
+         ST    R7,CURRENT
+         C     R7,HISIGNON        IF THIS IS A NEW HIGH WATER MARK,
+         BL    PASSLU
+         ST    R7,HISIGNON        SAVE NEW NUMBER & TEST THRESHOLDS
+TEST50   L     R5,=F'50'
+         MH    R5,ROSNUM          CALCULATE 50% OF POSSIBLE USERIDS
+         CR    R7,R5              COMPARE HIGH WATER MARK
+         BL    PASSLU             PASS THE LU IF HWM < 50% THRESHOLD
+         CLI   P50FLAG,C'Y'       50% THRESHOLD ALREADY PASSED?
+         BE    TEST85             IF SO, TEST FOR 85% THRESHOLD
+         WTO   '50% OF THE PUBLIC IDS ARE IN USE--NOTIFY TSG',         X
+               ROUTCDE=11,DESC=11
+         MVI   P50FLAG,C'Y'       SET 50% THRESHOLD MESSAGE FLAG
+         B     PASSLU             GO PASS THE LU
+TEST85   L     R5,=F'85'
+         MH    R5,ROSNUM          CALCULATE 85% OF POSSIBLE USERIDS
+         CR    R7,R5              COMPARE WITH HIGH WATER MARK
+         BL    PASSLU             PASS THE LU IF HWM < 85% THRESHOLD
+         CLI   P85FLAG,C'Y'       85% THRESHOLD ALREADY PASSED?
+         BE    PASSLU             IF SO, JUST PASS LU
+         WTO   '85% OF THE PUBLIC IDS ARE IN USE--NOTIFY TSG',         X
+               ROUTCDE=11,DESC=11
+         MVI   P85FLAG,C'Y'       SET 85% THRESHOLD MESSAGE FLAG
+*  PASS THE LU TO THE APPROPRIATE CA-ROSCOE REGION, WITH THE RIGHT
+*  LOGON INFORMATION IN THE LOGON MESSAGE.
+*  CHANGE THE RECLEN PARM TO MATCH YOUR LOGON MESSAGE LENGTH.
+PASSLU   CLSDST RPL=PUBRPL,OPTCD=(SYN,PASS),NIB=PUBNIB,                X
+               RECLEN=13,AREA=LOGMSG,AAREA=(R6)
+         B     EXITLOGE
+*  DON'T PASS THE LU TO A CA-ROSCOE REGION--JUST LET VTAM HAVE IT BACK
+NOPASSLU CLSDST RPL=PUBRPL,OPTCD=(SYN,RELEASE),NIB=PUBNIB
+EXITLOGE BR    R9                 EXIT THE LOGON EXIT
+         DROP  R12
+*  STIMER EXIT--THIS EXIT WILL BE TAKE WHEN THE TIMER POPS
+TIMEEXIT DS    0H
+         LR    R12,R15                   ADDRESSABILITY
+         USING TIMEEXIT,R12
+         LR    R8,R14                    SAVE RETURN ADDRESS
+         POST  WAITECB                   POST THE TIMER ECB
+         BR    R8                        RETURN FROM EXIT
+         DROP  R12
+*  DATA AREAS
+EXITSAVE DS    18F                       EXIT SAVE AREA
+SAVEAREA DS    18F                       MAIN PGM SAVE AREA
+CINITEND DS    F
+BINDAR   DS    CL100                     BIND DATA AREA
+WAIT5    DC    F'30000'                  CONSTANT FOR 5 MINUTE WAIT
+LMDUMMY  DC    XL8'0000000000000000'     DUMMY LOGMODE NAME
+*  THE FOLLOWING AREAS SHOULD BE CHANGED/ELIMINATED TO MATCH CONDITIONS
+*  AT YOUR SITE.  ALSO,
+*  PLEASE CHANGE THE RECLEN PARM AT LABEL "PASSLU" FOR THE CORRECT
+*  LOGON MESSAGE LENGTH.
+PGMNAME  DC    XL1'08'                   APPLID NAME LENGTH
+         DC    CL8'PUBLIC'               APPLID NAME
+*  CA-ROSCOE APPLID NAME ARRAY.  FIRST ELEMENT IS ALWAYS 8 BLANKS.
+*  LUS WILL BE PASSED TO THE LOWEST ADDRESS SPACE NAMED IN THE ARRAY,
+*  UNTIL ITS CAPACITY IS EXAUSTED, AND THEN USE THE NEXT HIGHEST
+*  ADDRESS SPACE.
+*  NOTE!  THESE NAMES ARE THE VTAM APPLIDS--NOT THE STARTED TASK NAMES.
+ROSTABL  DC    CL8' '
+         DC    CL8'ROSRGN2'              2ND CA-ROSCOE AS APPLID
+         DC    CL8'ROSRGN1'              1ST CA-ROSCOE AS APPLID
+ROSNUM   DC    H'2'                      NUMBER OF CA-ROSCOE AS'S
+LOGMSG   DS    CL100                     LOGON MESSAGE
+*                                        NIB TO CHECK APPL AVAILABILITY
+*                                        CHANGE INITIAL NAME
+PUBNIB1  NIB   NAME=ROSRGN1
+*                                        NIB FOR LUS
+PUBNIB   NIB   MODE=RECORD
+PUBRPL1  RPL   AM=VTAM,ACB=PUBACB,OPTCD=SYN
+PUBRPL   RPL   AM=VTAM,ACB=PUBACB,OPTCD=SYN
+PUBACB   ACB   AM=VTAM,APPLID=PGMNAME,MACRF=LOGON,EXLST=PUBEXLST
+PUBEXLST EXLST AM=VTAM,LOGON=LOGONEX
+*                                        OPTIONAL MSG AFTER OPNDST
+WAITMSG  DC    X'F5C3114EC71DE0',C'Logging on ... please be patient'
+P50FLAG  DC    C'N'                      THRESHOLD FLAGS
+P85FLAG  DC    C'N'
+DECIMAL  DS    D                         WORK AREA
+HISIGNON DC    F'0'                      HIGH WATER MARK FIELD
+CURRENT  DC    F'0'                      CURRENT NUMBER OF SIGNONS
+LOGCOUNT DC    F'0'                      TOTAL COUNT OF LOGONS
+ANSWER   DS    F                         EXTRACT PTR
+LISTECBS DS    A                         THIS WILL PT TO THE CIB ECB
+         DC    X'80',AL3(WAITECB)        THIS WILL PT TO THE TIMER ECB
+WAITECB  DC    F'0'
+USERIDS  DS    F                         PTR TO USERID STORAGE
+         LTORG
+         DSECT
+         IEZCOM
+         DSECT
+         IEZCIB
+         IFGRPL
+         ISTDNIB
+         END
+
+
+Sample CA-ROSCOE SMF exit
+
+*  THE FOLLOWING IS A SAMPLE CS-ROSCOE "SMF" EXIT.  THIS EXIT IS
+*  DRIVEN WHEN A USER LOGS OFF OR IS KNOCKED OFF OF A CA-ROSCOE
+*  ADDRESS SPACE.  THE EXIT WILL CONSTRUCT AN OPERATOR COMMAND
+*  WHICH WILL NOTIFY THE FRONT END ("PUBLIC") THAT A PARTICULAR
+*  LU HAS LEFT A PARTICULAR CA-ROSCOE REGION:
+*         F PUBLIC,SIGNOFF REGNAME LUNAME
+*  PUBLIC WILL SCAN ITS TABLE OF USERIDS, FIND THE LUNAME AND
+*  RELEASE THAT ID FOR ANOTHER LOGON.
+*  FOR THE ASSEMBLY STEP, THE FILES SYS1.MACLIB, SYS1.AMODGEN AND
+*  THE CA-ROSCOE MACLIB FILE SHOULD BE CONCATENATED TO THE SYSLIB
+*  DD STATEMENT.  THE CA-ROSCOE MACLIB FILE SHOULD BE FIRST.
+*  THIS EXIT MUST BE LINK EDITED "AC=1".
+*  THIS EXIT HAS BEEN DEVELOPED UNDER CA-ROSCOE 5.6, ASSEMBLER H,
+*  VTAM 3.2 AND MVS/XA 2.2.0.
+SMFEXIT  CSECT
+         USING *,R12                    R12 WILL BE BASE REGISTER
+         STM   R14,R12,12(R13)          SAVE REGISTERS
+         LR    R12,R15                  INIT BASE REG FOR EXIT
+         SR    R7,R7                    CLEAR RETURN CODE
+         LTR   R1,R1                    CHECK PARMLIST
+         BZ    RETURN
+POSTINIT L     R11,0(R1)                INIT BASE REG FOR UXDSECT
+         USING UXDSECT,R11
+         L     R10,UXCODE
+         L     R3,0(R10)
+         L     R10,UXSCBADR             GET SCB ADDRESS
+         USING SCB,R10
+         L     R9,UXROTADR              GET ROT ADDRESS
+         USING ROT,R9
+         CLC   ROTAPPL(6),=CL6'ROSRGN'  IS THIS AN APPROPRIATE REGION?
+         BNE   RETURN
+         LA    R7,0                     SET CA-ROSCOE RETURN CODE
+         C     R3,=F'4'                 IS THIS A SIGNOFF?
+         BNE   RETURN                   BRANCH IF NOT
+         CLC   SCBFKEY(2),=CL2'ZZ'      PUBLIC ID?
+         BNE   RETURN                   BRANCH IF NOT
+*  BUILD THE MVS MODIFY COMMAND
+         GETMAIN RC,LV=MODLEN,BNDRY=DBLWD
+         LR    R8,R1
+         USING MODIFY,R8
+         MVC   MLENGTH(2),=H'37'
+         MVC   MNULL(2),=H'0'
+         MVC   MCOMMAND(17),=CL17'F PUBLIC,SIGNOFF '
+         MVC   MAPPLID(8),ROTAPPL
+         MVC   MTERMINL(8),SCBTRMNM
+*  ISSUE THE MVS COMMAND
+         MODESET KEY=ZERO,MODE=SUP
+         SR    R0,R0
+         MGCR  MODIFY
+         MODESET KEY=NZERO,MODE=PROB
+         FREEMAIN RC,LV=MODLEN,A=(R8)
+RETURN   EQU   *                        GO BACK TO CA-ROSCOE
+         L     R14,12(R13)              RESTORE R14
+         LR    R15,R7                   SET RETURN CODE
+         C     R3,=F'20'
+         BNE   RETURN2
+         SR    R15,R15
+RETURN2  LM    R2,R12,28(R13)           RESTORE R2 -> R12
+         BR    R14                      GO BACK TO CA-ROSCOE
+         LTORG
+         UXDSECT EXIT=(SMF)
+MODIFY   DSECT
+*                       SAMPLE DATA:
+MLENGTH  DS    H        '37'
+MNULL    DS    H        '0'
+         DS   0CL33
+MCOMMAND DS    CL17     'F PUBLIC,SIGNOFF '
+MAPPLID  DS    CL8      'ROSRGN1 '
+MTERMINL DS    CL8      'TERMNAME'
+MODLEN   EQU   *-MODIFY
+         DS   0H
+         SCB
+         ROT
+         END
+
+
+David R Saunders
+Senior Computer System Engineer
+University of Virginia (USA)          c University of Virginia 1992
+

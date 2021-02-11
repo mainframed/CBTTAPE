@@ -1,0 +1,1119 @@
+TIDYASM  TITLE 'T I D Y A S M  ***  ORGANIZE ASSEMBLER CODE'
+         PUNCH '  ORDER TIDYASM(P) '                            GP09251
+*          DATA SET ADPTIDYASM AT LEVEL 007 AS OF 03/12/81
+*********************************************************************
+*
+*        THIS ROUTINE WILL READ AN ASSEMBLER SOURCE FILE
+*        AND REPOSITION EACH SECTION OF EACH RECORD TO
+*        STANDARD ASSEMBLER SOURCE MARGINS (1 10 16).
+*        BOTH SOURCE AS WELL AS MACROS (IMBEDDED TOO) CAN
+*        BE HANDLED WITHIN THE SAME EXECUTION.
+*        QUOTED STRINGS ARE HANDLED BUT MUST BE PAIRED.
+*        PARM VALUES MAY BE USED TO OVERRIDE THE DEFAULT
+*        OF 31 AND 71 AS SPECIFICATION OF COMMENTS BOUNDARIES.
+*
+*        REQUIREMENTS:
+*              SYSPRINT - LISTING DDNAME
+*              SYSIN    - INPUT SOURCE FILE
+*              SYSPUNCH - OUTPUT SOURCE FILE
+*
+*        PARM VALUES IF ANY MUST BE SPECIFIED AS FOLLOWS:
+*              PARM='BB,EE' (DEFAULT = '31,71')
+*              BB - BEGINNING COLUMN FOR COMMENTS
+*              EE - ENDING COLUMN FOR COMMENTS
+*
+*        TRUNCATION OF COMMENTS IS HANDLED BY ADDING A CONTINUATION
+*        'COMMENTS' CARD.
+*
+* NOTE: IT HAS BEEN NOTICED BY ME THAT IF THE ALC CODE IS TOO MESSED
+*       UP, THEN THE PROGRAM WILL GO INTO A LOOP. ALSO IF YOU HAVE
+*       LITERALS DEFINED LIKE  =C'XXX' AS THE FIRST OPERAND, YOU WILL
+*       GO INTO A LOOP. SO PUT A VERY SMALL TIME ON YOUR JOB CARD
+*       JUST IN CASE. WILL TRY TO INVESTIGATE WHEN I GET SOME FREE
+*       TIME.     JIM MARSHALL,AFDSC/CMIS,WASHINGTON DC
+*
+*********************************************************************
+*
+*   LOOP FOR LITERALS, ETC. FIXED.
+*   PARM OPTION 'DATE' ADDED TO DETECT CHANGE DATES, BLANK THEM PRIOR
+*     TO PROCESSING, AND MOVE THEM BACK AFTER ALIGNMENT. SUPPORTED ARE
+*     @xxxxxxx STARTING IN COLUMN 64,  AS WELL AS FIVE NUMERIC IN
+*     63-71, OR TWO LETTERS AND FIVE NUMERICS.
+*   DEVTYPE AND MESSAGES ADDED TO CHECK FOR PRESENCE OF DDs. SYSPRINT
+*   or SYSPUNCH MAY BE OMITTED OR DUMMY, BUT NOT BOTH.
+*   ADDED DCB EXIT AND ALLOW DCB PARAMETER OVERRIDE TO PREVENT OUTPUT
+*     FROM CLOBBERING EXISTING DATA SETS. EITHER OUTPUT DATA SET MAY
+*     SPECIFY OR OMIT ASA CONTROL CHARACTERS (FBA,121 IS DEFAULT FOR
+*     PRINT, FB,80 FOR PUNCH)
+*  ASSORTED INEFFICIENT CODE WAS REPLACED OR TIGHTENED.
+*
+*                                              G. POSTPISCHIL   GP09254
+*  FIXED ANOTHER LOOP (LC FLAG)
+*                                              G. POSTPISCHIL   GP12326
+*
+*********************************************************************
+*
+*        THE FOLLOWING IS AN EXAMPLE OF ITS USE AS A TSO COMMAND
+*        VIA CALL WITHIN A CLIST.  TWO SECTIONS FOLLOW, FIRST
+*        THE INFORMATION TO BE INCLUDED WITHIN THE HELP DATASET,
+*        AND SECOND THE CLIST ITSELF.
+*
+*  )F FUNCTION
+*     THE JUSTASM CLIST INVOKES 'TIDYASM' TO REALIGN ASSEMBLER
+*     SOURCE FILES. EACH FIELD FOR EACH STATEMENT IS ALIGNED
+*     TO THE CORRECT COLUMN (1 10 16 31 72 ETC.).
+*  )X SYNTAX -
+*         JUSTASM DATASET-NAME
+*     REQUIRED  DATASET-NAME
+*     DEFAULTS  NONE
+*  )O OPERANDS -
+*     DATASET-NAME
+*             - UNQUALIFIED DATA SET NAME OF THE FILE TO BE
+*               JUSTIFIED.  THE REAL NAME MUST HAVE A SUFFIX
+*               OF 'ASM' AND A PREFIX OF YOUR USER-ID.
+*               EXAMPLE: TO JUSTASM A FILE NAMED
+*                        USERID.MYASM.ASM
+*                        ENTER 'JUSTASM MYASM'
+*
+*
+*********************************************************************
+*
+*  PROC 1 DSN
+*  FREE F(SYSIN SYSPRINT SYSPUNCH)
+*  ATTRIB TIDYASM LRECL(80) BLKSIZE(400) RECFM(F B)
+*  ALLOC F(SYSIN) DA(&DSN..ASM) SHR
+*  ALLOC F(SYSPUNCH) DA(NEW.&DSN..ASM) NE SP(1 5) TR US(TIDYASM) REL
+*  ALLOC F(SYSPRINT) DUMMY
+*  CALL 'USER.LINKLIB(TIDYASM)' '31,71'
+*  FREE ATTR(TIDYASM)
+*  FREE F(SYSPUNCH SYSIN SYSPRINT)
+*  ALLOC F(SYSPRINT) DA(*)
+*  ALLOC F(SYSIN) DA(*)
+*  DELETE &DSN..ASM
+*  REN NEW.&DSN..ASM &DSN..ASM
+*********************************************************************
+TIDYASM  START 0                                                GP09254
+*
+*        EQUATES
+*
+CC       EQU   X'80'
+EF       EQU   X'40'
+MAC      EQU   X'20'
+AIF      EQU   X'10'
+SI       EQU   X'08'
+LC       EQU   X'04'
+GC       EQU   X'02'
+CR       EQU   X'01'
+ALLBITS  EQU   X'FF'
+HIT      EQU   7
+NOHIT    EQU   8
+LPP      EQU   60            DATA LINES PER PAGE                GP09254
+*
+*   REGISTER ASSIGNMENTS
+*     0 - WORK
+*     1 - LENGTH OF TEXT - 1
+*     2 - WORK
+*     3 - WORK
+*     4 - WORK
+*     5 - POINTER TO INPUT AREA
+*     6 - POINTER TO DELIMITING BLANK AFTER TEXT
+*     7 - POINTER TO TEXT IN INPUT AREA
+*     8 - POINTER TO OUTPUT AREA
+*     9 - POINTER TO DESTNATION OF TEXT IN OUTPUT AREA
+*    10 - INTERNAL LINKAGE REGISTER
+*    11 - BASE REGISTER 1
+*    12 - BASE REGISTER 2
+*    13 - SAVE AREA POINTER
+*    14 - WORK
+*    15 - WORK
+*
+         SPACE 2
+         PRINT NOGEN
+***********************************************************************
+*                                                                     *
+*        PROCESS PARM INFORMATION IF ANY.  IF CMS DEFAULT TO          *
+*        COMMENTS START = COL 36 (PARM1) AND COMMENTS STOP =          *
+*        COL 71 (PARM2).  CHECK FOR CMS ENVIRONMENT BY LOOKING        *
+*        FOR THE FENCE THAT REGISTER ONE POINTS TO WHEN NO            *
+*        PARMS ARE ENTERED IN CMS. (RESTRICTION)                      *
+*                                                                     *
+*   CODE ADDED TO SUPPORT TSO CP PARM.              G. POSTPISCHIL    *
+*                                                                     *
+***********************************************************************
+         B     BEGIN-TIDYASM(,R15)   ADD ID                     GP09254
+         DC    AL1(17),CL17'TIDYASM &SYSDATE'                   GP09254
+BEGIN    STM   R14,R12,12(R13)    SAVE ENTRY REGISTERS          GP09254
+         LR    R11,R15       FIRST BASE                         GP09254
+         LA    R12,2048                                         GP09254
+         LA    R12,2048(R12,R11)   SECOND BASE                  GP09254
+         USING TIDYASM,R11,R12                                  GP09254
+         LA    R2,SAVE             LAZY SAVE AREA               GP09254
+         ST    R2,8(,R13)          SAVE FORWARD POINTER
+         ST    R13,4(,R2)          SAVE BACKWARD POINTER
+         LR    R13,R2              SET UP SAVE REG
+         SPACE 1
+         LA    R5,36               SET DEFAULT COMM START
+         LA    R7,71               SET DEFAULT COMM STOP
+         CLC   0(4,R1),=CL8'TIDYASM'  DON'T 0C4 IN OS           GP09254
+         BE    PARMCMS             YES, PROCESS CMS PARMS       GP09254
+         CLI   0(R1),C'*'          IS THIS CMS TEST?
+         BNE   PARMOS              NO, MUST BE OS
+PARMCMS  CLC   8(4,R1),=F'-1'      NULL PARM?
+         BE    NOPARM              YES, DEFAULT
+         LA    R5,6                SET LOOP LIMIT
+         LA    R3,8(,R1)           SET DATA POINTER
+         SR    R2,R2               CLEAR COUNT REG
+PARMCMSA CLI   0(R3),C' '          BLANK?
+         BE    PARMCMSD            YES, DONE
+         LA    R3,1(,R3)           BUMP TO NEXT CHAR
+         LA    R2,1(,R2)           BUMP COUNT
+         BCT   R5,PARMCMSA         CHECK NEXT CHAR
+         B     PARMERR             GREATER THAN 5, ERROR
+PARMCMSD LA    R1,6(,R1)           UPDATE TO SIMULATE OS PARM
+         B     PARMSAME            CONTINUE PARM SCAN
+PARMOS   L     R1,0(,R1)           GET PARM POINTER
+         LH    R2,0(,R1)           GET PARM SIZE
+         CLI   2(R1),0            POSSIBLE CP PARM ?            GP09254
+         BH    PARMSAME           NO; OS                        GP09254
+         SH    R2,=H'4'           ALLOW FOR LENGTH FIELD        GP09254
+         SH    R2,2(,R1)          ALLOW FOR COMMAND NAME        GP09254
+         LA    R1,2(,R1)          FINAGLE POSITION              GP09254
+PARMSAME LTR   R0,R2               ANY PARM GIVEN?
+         BNP   NOPARM              NO, DEFAULT
+         LA    R3,2(,R1)          POINT TO DATA PORTION OF PARM
+PARMDBLK CLI   0(R3),C' '         LEADING BLANK?                GP09254
+         BNE   PARMNBLK           NO; START SCANNING            GP09254
+         LA    R3,1(,R3)          ADVANCE POINTER               GP09254
+         BCT   R2,PARMDBLK        TRY AGAIN                     GP09254
+         B     NOPARM             ALL BLANK                     GP09254
+PARMNBLK CH    R2,=H'4'           ENOUGH FOR RESERVED WORD?     GP09254
+         BL    PARMPDAT                                         GP09254
+         CLC   =C'DATE',0(R3)     PROCESS CHANGE DATES?         GP09254
+         BNE   PARMPDAT           NO                            GP09254
+         OI    FLG2,FGDODATE      YES; REMEMBER                 GP09254
+         SH    R2,=H'4'           ALLOW FOR IT                  GP09254
+         BNP   NOPARM             DONE                          GP09254
+         LA    R3,4(,R3)          ADJUST                        GP09254
+PARMPDAT LR    R0,R2               REMEMBER START               GP09254
+         LR    R4,R3               SAVE FOR MOVE
+PARM1CHK CLI   0(R3),C','          END OF PARM 1
+         BE    PARM1END            YES, CHECK IF NAY GIVEN
+         LA    R3,1(,R3)           BUMP TO NEXT POS'N
+         BCT   R2,PARM1CHK         CHECK NEXT CHARACTER
+PARM1END LR    R5,R0               GET ORIGINAL SIZE
+         SR    R5,R2               GET NUMBER SCANNED
+         CH    R5,=H'2'            WITHIN LIMITS?
+         BH    PARMERR             NO, ERROR
+         LTR   R5,R5               CHECK IF 1ST PARM GIVEN
+         BZ    PARM2CHK            NONE, SKIP IT (DEFAULT)
+         LA    R14,PARMWORK+8      SET DATA POINTER FOR EXECUTE
+         SR    R14,R5              DECREMENT BY NUMBER TO MOVE
+         BCTR  R5,R0               DECREMENT FOR EXECUTE
+         EX    R5,PARMMOVE         MOVE TO WORK AREA
+         XC    WORK,WORK           CLEAR WORK AREA
+         MVZ   WORK,PARMWORK       MOVE FOR ZONE CHECK
+         CLC   WORK,ZEROS          WAS PARM NUMERIC?
+         BNE   PARMERR             NO, ERROR
+         PACK  WORK(8),PARMWORK(8)  MAKE DECIMAL FIRST
+         CVB   R5,WORK             CONVERT TO HEX
+PARM2CHK LA    R3,1(,R3)           BUMP TO NEXT CHAR
+         LR    R4,R3               SAVE FOR MOVE
+         BCTR  R2,R0               DECREMENT PARM SIZE
+         MVC   PARMWORK,ZEROS      CLEAR WORK AREA
+         LA    R14,PARMWORK+8      SET DATA POINTER FOR MOVE
+         SR    R14,R2              DECREMENT BY NUMBER LEFT TO MOVE
+         BCTR  R2,R0               DECREMENT FY NUMBER LEFT
+         EX    R2,PARMMOVE         MOVE TO WORK AREA
+         XC    WORK,WORK           CLEAR WORK AREA
+         MVZ   WORK,PARMWORK       MOVE ZONES FOR CHECK
+         CLC   WORK,ZEROS          ALL NUMERICS?
+         BNE   PARMERR             NO, ERROR
+         PACK  WORK(8),PARMWORK(8)  MAKE DECIMAL FIRST
+         CVB   R7,WORK             MAKE HEX
+NOPARM   ST    R5,COMMSTRT         SET COMMENT START FIELD
+         ST    R7,LIMIT            SET COMMENT STOP FIELD
+         CH    R5,=H'60'           WITHIN LIMITS?
+         BH    PARMERR             NO, ERROR
+         CH    R7,=H'71'           WITHIN LIMIT?
+         BH    PARMERR             NO, ERROR TOO
+         SR    R7,R5               GET COMMENTS SIZE
+         STH   R7,LIMITSZ          SAVE FOR FUTURE REF
+         CH    R7,=H'16'           WITHIN LIMITS?
+         BH    PARMEND             YES, CONTINUE
+PARMERR  WTO   'TIDYASM - INVALID PARM SPECIFIED, RETRY'
+         LA    R15,20              SET RETCODE
+         B     EXIT                RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                                                                     *
+*        INITIALIZE TRANSLATE TABLES AND OPEN FILES.  THEN SET UP     *
+*        READ AHEAD RECORD.                                           *
+*                                                                     *
+***********************************************************************
+PARMEND  OC    QBTABLE,QTABLE      INITIALIZE QUOTE BLANK
+         OC    QBTABLE,BTABLE      TABLE WITH QUOTES AND BLANKS
+         LA    R2,PGMBRET         POINT TO DUMMY RETURN         GP09254
+         SR    R3,R3              SET DUMMY COUNTER             GP09254
+         DEVTYPE PRINT+DCBDDNAM-IHADCB,PRTDEV    PRINT DD ?     GP09254
+         BXH   R15,R15,MISSPRT    NO PRINTER                    GP09254
+         CLI   PRTDEV+2,0         DD DUMMY ?                    GP09254
+         BNE   HAVEPRT            HOP FOR THE BEST              GP09254
+MISSPRT  STCM  R2,7,PRINT+DCBPUTA-IHADCB  MAKE NOP              GP09254
+         LA    R3,1(,R3)                                        GP09254
+         B     DONEPRT                                          GP09254
+HAVEPRT  OI    FLG2,FGPAGE         FORCE HEADING ON FIRST CARD
+         OPEN  (PRINT,OUTPUT)
+DONEPRT  DEVTYPE INPUT+DCBDDNAM-IHADCB,INPDEV    INPUT DD ?     GP09254
+         BXH   R15,R15,MISSINP    NO READER                     GP09254
+         CLI   INPDEV+2,0         DD DUMMY ?                    GP09254
+         BNE   HAVEINP            HOP FOR THE BEST              GP09254
+MISSINP  WTO   'TIDYASM: INPUT DD NOT USABLE'                   GP09254
+         ABEND 2540                                             GP09254
+         SPACE 1                                                GP09254
+HAVEINP  OPEN  (INPUT,(INPUT,REREAD))  OPEN SYSIN               GP09254
+         DEVTYPE PUNCH+DCBDDNAM-IHADCB,PUNDEV    PUNCH DD ?     GP09254
+         BXH   R15,R15,MISSPUN    NO PUNCHER                    GP09254
+         CLI   PUNDEV+2,0         DD DUMMY ?                    GP09254
+         BNE   HAVEPUN            HOP FOR THE BEST              GP09254
+MISSPUN  STCM  R2,7,PUNCH+DCBPUTA-IHADCB  MAKE NOP              GP09254
+         LTR   R3,R3         IS SYSPRINT USABLE ?               GP09254
+         BZ    DONEPUN       YES                                GP09254
+         WTO   'TIDYASM: NEED SYSPRINT OR SYSPUNCH FOR OUTPUT'  GP09254
+         ABEND 1403
+         SPACE 1                                                GP09254
+HAVEPUN  OPEN  (PUNCH,OUTPUT)                                   GP09254
+DONEPUN  GET   INPUT,CURRENT       GET FIRST CARD OF INPUT
+         B     PASTGET             SKIP BUFFER SHIFT
+GET      MVC   CURRENT(80),NEXT    MAKE LOOK AHEAD CURRENT
+         NI    FLG,ALLBITS-GC      RESET COMMENT CONTINUATION
+         TM    FLG,EF              END OF FILE ON PREVIOUS
+         BO    EODAD               YES, NO MORE READS
+         MVC   NEXT+71(8),NINES    MOVE HIGH VALUE TO NEW SEQ
+PASTGET  GET   INPUT,NEXT          READ LOOK AHEAD CARD
+ONCEMORE LA    R5,CURRENT          SET PERM. INPUT REC. POINTER
+         LR    R7,R5               COPY FOR WORKING REGISTER
+         LA    R8,PAREA            OUTPUT AREA
+         NI    FLG2,255-FGHAVDAT  RESET CHANGE DATE AVAILABLE   GP09254
+         MVC   CHDATE,=CL8' '     AND BLANK IT                  GP09254
+         EJECT
+***********************************************************************
+*                                                                     *
+*        CHECK TYPE OF RECORD JUST READ.  IF COMMENTS OR OTHER        *
+*        NON-PROCESS CARD, SKIP IT.                                   *
+*                                                                     *
+***********************************************************************
+         CLI   0(R7),C'*'          COMMENTS CARD
+         BE    CPUTA               YES, OUTPUT AS IS
+         CLC   0(2,R7),=CL2'.*'    MACRO COMMENTS
+         BE    CPUT                YES, OUTPUT AS IS
+         TM    FLG,CC              PREVIOUS IND. CONT?
+         BZ    SKIPCONT            NO, SKIP CONT. INIT.
+         LA    R6,1(,R7)           SET BEGINNING OF CARD
+         LR    R7,R6               COPY TO WORKING SET
+         B     CONTINUE
+SKIPCONT CLI   0(R7),C' '          IS LABEL PRESENT
+         BE    ORCHECK             NO - FIND OPERATOR
+         CLI   0(R7),C'*'          COMMENT
+         BE    CPUT                YES - OUTPUT CARD AS IS
+         CLI   0(R7),C'/'          JCL
+         BNE   LDELIM              NO - ISOLATE LABEL
+         CLI   1(R7),C'*'          /*
+         BNE   CPUT                NO - OUTPUT AS IS
+         OI    FLG2,FGPAGE         EJECT AFTER PRINTING
+         B     CPUT                OUTPUT CARD
+CPUTA    CLI   71(R5),C' '         CONTINUATION IN COMMENTS
+         BE    CPUT                NO, BRANCH AROUND
+         MVC   85(20,R8),ERR6MSG   INFORM USER
+CPUT     MVC   0(80,R8),0(R5)      MOVE COMMENT OR JCL
+         B     XCARD1              OUTPUT IT
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*        FIND AND PROCESS LABEL IF ONE IS PRESENT.                    *
+*                                                                     *
+***********************************************************************
+LDELIM   TRT   0(9,R7),BTABLE      LOOK FOR BLANK
+         BC    NOHIT,ERR1          LABEL EEROR
+         LR    R0,R1               SAVE ADDRESS
+         SR    R1,R7               FIND L'LABEL
+         BCTR  R1,R0               -1
+         EX    R1,LMOVE            MOVE TO OUTPUT
+         LR    R7,R0               A(FIRST BLANK)
+         EJECT
+***********************************************************************
+*                                                                     *
+*        FIND AND PROCESS OPERATOR.  IF A SPECIAL OPERATOR IS         *
+*        FOUND (MACRO TYPES)SET APPROPRIATE INDICATOR FOR COMMENT     *
+*        GENERATION ROUTINES.                                         *
+*                                                                     *
+***********************************************************************
+ORCHECK  LA    R1,70(,R5)          POINT TO COL 71
+         SR    R1,R7               NUMBER OF COLS AFTER LABEL
+         EX    R1,FINDNB           FIND OPERATOR
+         BC    NOHIT,ERR2
+         LR    R7,R1               A(OPERATOR)
+         TRT   0(9,R7),BTABLE      FIND OPERATOR END
+         BC    NOHIT,ERR3
+         LR    R6,R1               END OF OPERATOR
+         SR    R1,R7               L'OPERATOR
+         BCTR  R1,R0               -1
+         EX    R1,ORMOVE           MOVE OPERATOR
+         LR    R0,R1               SAVE LENGTH OF OPERAND
+         LA    R1,1(,R1)           UPDATE FOR BLANK
+         LA    R14,TSTBL           GET POINTER TO TABLE ORIGIN
+         LA    R15,R2              NUMBER OF THREE BYTE ENTRIES
+TRY3     EX    R1,MACOMP           COMPARE OPERATORS
+         BE    MACMATCH            BRANCH IF FOUND
+         LA    R14,6(,R14)         UPDATE TO NEXT IN LIST
+         BCT   R15,TRY3            GO CHECK NEXT
+         LA    R15,R8              NUMBER OF FOUR BYTE ENTRIES
+TRY4     EX    R1,MACOMP           COMPARE OPERATORS
+         BE    MACMATCH            BRANCH IF FOUND
+         LA    R14,6(,R14)         UPDATE TO NEXT IN LIST
+         BCT   R15,TRY4            GO CHECK NEXT
+         LA    R15,R10             NUMBER OF FIVE BYTE ENTRIES
+TRY5     EX    R1,MACOMP           COMPARE OPERATORS
+         BE    MACMATCH            BRANCH IF FOUND
+         LA    R14,6(,R14)         UPDATE TO NEXT IN LIST
+         BCT   R15,TRY5            GO CHECK NEXT IN LIST
+         NI    FLG,ALLBITS-SI-AIF  RESET MAC CONTINUE FLAG
+         B     MACEND              AROUND FOLLOWING TESTS
+MACMATCH OI    FLG,SI              SET MACRO COMMENT FLAG
+         CLC   0(6,R7),MACRO       IS THIS START OF MACRO
+         BNE   TST2                NO, TO NEXT TEST
+         OI    FLG,MAC             SET MACRO FLAG
+         B     MACEND              SKIP FOLLOWING TESTS
+TST2     CLC   0(5,R7),MEND        IS THIS END OF MACRO
+         BNE   TST3                NO, TO NEXT TEST
+         NI    FLG,ALLBITS-SI-AIF-MAC  RESET MACRO FLAGS
+         B     MACEND              SKIP NEXT TESTS
+TST3     CLC   0(4,R7),TSTBL       CHECK FOR 'AIF' OPERATOR
+         BNE   MACEND              NO, OTHER OPERAND
+         OI    FLG,AIF             SET 'AIF' FLAG
+         EJECT
+***********************************************************************
+*                                                                     *
+*        CHECK FOR SPECIAL ASSEMBLER CONTROL STATEMENTS, AND IF       *
+*        FOUND, BRANCH TO SET SPECIAL INDICATOR IN OUTPUT.            *
+*                                                                     *
+***********************************************************************
+MACEND   CLC   0(6,R7),=CL6'EJECT'  CONTROL OPERATOR
+         BE    ERR5                YES, AS IS
+         CLC   0(6,R7),=CL6'SPACE'  CONTROL OPERATOR
+*TEST*   BE    ERR5                YES, AS IS
+         LR    R1,R0               RESTORE OPERATOR LENGTH
+         LR    R7,R6               POINT TO END OF OPERATOR
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        DETERMINE BEGINNING OF OPERAND ADDRESS BASED ON SIZE OF      *
+*        OPERATOR.                                                    *
+*                                                                     *
+***********************************************************************
+         CH    R1,=H'4'            5-BYTE OPERATOR OR LESS
+         BNH   CONTINUE            YES; STANDARD SPACING        GP09254
+         LA    R9,11(R1,R8)        ELSE LEAVE ONE SPACE AFTER   GP09254
+         B     ODDLOC              BRANCH TO CONTINUE
+CONTINUE LA    R9,15(,R8)          A(DESTNATION)
+ODDLOC   LA    R1,70(,R5)          A(COL 71)
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*   IF USER REQUESTED CHANGE DATE PROCESSING, AND THIS CARD IS NOT    *
+*   CONTINUED, LOOK FOR A CHANGE DATE OF THE FORM ##### OR xx#####    *
+*   IF FOUND, SAVE IT, REPLACE BY BLANKS. PUT DATE BACK LATER         *
+*                                                                     *
+***********************************************************************
+DATCHECK TM    FLG2,FGDODATE CHECK FOR CHANGE DATE ?            GP09254
+         BZ    SKIPDATE      NO                                 GP09254
+         CLI   71(R5),C' '   CONTINUED CARD ?                   GP09254
+         BNE   SKIPDATE      YES; I USUALLY DON'T DATE THOSE    GP09254
+         STM   R0,R6,20(R13)      SAVE A FEW REGISTERS          GP09254
+         LA    R1,65(,R5)    POINT TO LAST POSSIBLE COLUMN      GP09254
+         L     R2,=F'-1'     MAKE DECREMENT                     GP09254
+         LA    R3,60(,R5)    SCAN STOPPER                       GP09254
+DATCHLUP CLI   0(R1),C' '    LEADING SPACE ?                    GP09254
+         BNE   DATCHBMP      NO                                 GP09254
+         MVC   WORK(6),=X'F0F0F0F0F0FF'      MOVE MASK          GP09254
+         NC    WORK(6),1(R1)    GET CARD TEXT                   GP09254
+         CLC   WORK(6),=X'F0F0F0F0F040'     FIVE DIGIT ENTRY?   GP09254
+         BE    DATCHHV5           WE HAVE A WINNER              GP09254
+         MVC   WORK(6),=X'FFC0C0C0FFFF'      MOVE MASK          GP09254
+         NC    WORK(6),1(R1)    GET CARD TEXT                   GP09254
+         CLC   WORK(6),=X'5CC0C0C05C40'     *XXX* TYPE ?        GP09254
+         BNE   DATCHCL7                                         GP09254
+DATCHHV5 OI    FLG2,FGHAVDAT      FOUND A DATE                  GP09254
+         MVC   CHDATE+3(5),1(R1)  SAVE IT                       GP09254
+         MVC   1(5,R1),=CL8' '    CLEAR IT                      GP09254
+         B     DONEDATE           AND LOOK FOR OPERATOR         GP09254
+DATCHCL7 MVC   WORK(8),=X'C0C0F0F0F0F0F0FF'  MOVE MASK          GP09254
+         NC    WORK(8),1(R1)    GET CARD TEXT                   GP09254
+         CLC   WORK(8),=X'C0C0F0F0F0F0F040'  SEVEN DIGIT ENTRY? GP09254
+         BNE   DATCHBMP                                         GP09254
+         OI    FLG2,FGHAVDAT      FOUND A DATE                  GP09254
+         MVC   CHDATE+1(7),1(R1)  SAVE IT                       GP09254
+         MVC   1(7,R1),=CL8' '    CLEAR IT                      GP09254
+         B     DONEDATE           AND LOOK FOR OPERATOR         GP09254
+DATCHBMP BXH   R1,R2,DATCHLUP                                   GP09254
+DONEDATE LM    R0,R6,20(R13)  RESTORE REGISTERS                 GP09254
+         SPACE 1
+SKIPDATE SR    R1,R6               NUMBER OF COLS LEFT
+         BM    XCARD               COPY CARD IF MINUS
+         EX    R1,FINDNB           FIND OPERAND
+         BC    NOHIT,XCARD         IF NONE OUTPUT CARD
+         LR    R4,R1               COPY START OP OPERAND
+         LR    R7,R1               COPY START OF OPERAND
+         EJECT
+***********************************************************************
+*                                                                     *
+*   PROCESS OPERAND INCLUDING QUOTED STRINGS AND CONTINUATIONS        *
+*   IF AN 'AIF' IS BEING PROCESSED, COPY ALL OF OPERAND TO PERIOD     *
+*   R1 = A(OPERAND)                                                   *
+*   R4 = A(OPERAND)                                                   *
+*   R5 = A(INPUT CARD)                                                *
+*   R7 = A(OPERAND)                                                   *
+*   R8 = A(OUTPUT CARD)                                               *
+*   R9 = A(OUTPUT OPERAND DESTINATION)                                *
+*   THE OPERAND SHOULD OCCUR BEFORE COL 25 - OTHERWISE IT IS          *
+*   CONSIDERED COMMENTS.                                              *
+*                                                                     *
+***********************************************************************
+         LA    R3,24(,R5)          COLUMN 25
+         CR    R1,R3               IS OPERAND BEFORE 25
+         BNL   COMLOC0             LO, IT IS NOW A COMMENT
+ODLOC2   TM    FLG,AIF             SPECIAL 'AIF' OPERATOR
+         BZ    ODLOC3              NO, BRANCH AROUND
+         LA    R3,70(,R5)          A(COL 72-1)
+         SR    R3,R1               NUMBER OF COLUMNS TO SCAN
+         EX    R3,AIFCHK           SCAN FOR PERIOD
+         BZ    XODMOVE3            NONE FOUND, COPY ALL OF CARD
+         NI    FLG,ALLBITS-AIF     RESET AIF FLAG
+         LR    R7,R1               SET NEW BEGINNING FOR SCAN
+ODLOC3   LA    R3,70(,R5)          A(COL 72-1)
+         SR    R3,R1               NUMBER OF COLS TO SCAN
+         BM    XODMOVE3            BRANCH IF NONE TO SCAN
+         EX    R3,QBCHECK          FIND A BLANK OR QUOTE
+         BZ    XODMOVE3            NEITHER FOUND, COPY CARD
+         CLI   0(R1),X'40'         BLANK OR QUOTE FOUND
+         BE    XODMOVE4            BRANCH IF BLANK
+         CLI   1(R1),X'40'         CHECK FOR "' " TYPE USAGE        SEC
+         BE    XODMOVE2            YES  - NO MORE CHECKING          SEC
+         CLI   1(R1),C','          IS IT OPERAND 1 LITERAL?     GP09254
+         BE    XODMOVE2            YES  - NO MORE CHECKING      GP09254
+         CLI   1(R1),C'('          IS IT OPERAND 1 LITERAL?     GP09254
+         BE    XODMOVE2            YES  - NO MORE CHECKING      GP09254
+*                                                                   SEC
+*       NOW CHECK FOR ATTRIBUTE USAGE                               SEC
+*                                                                   SEC
+         LR    R7,R1               GET START OF QUOTE               SEC
+         BCTR  R7,0                REDUCE BY 1 FOR CHECK            SEC
+         CLI   0(R7),C'L'          IS IT ONLY A LENGTH OPERAND  GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+         CLI   0(R7),C'K'          IS IT ONLY A COUNT OPERAND   GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+         CLI   0(R7),C'I'          IS IT ONLY AN INT. OPERAND   GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+         CLI   0(R7),C'N'          IS IT ONLY A NUMBER OPERAND  GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+         CLI   0(R7),C'S'          IS IT ONLY A SCALE OPERAND   GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+         CLI   0(R7),C'T'          IS IT ONLY A TYPE OPERAND    GP09254
+         BE    XODMOVE3            YES - DO NOT SET LITERAL FLAG    SEC
+XODMOVE2 XI    FLG,LC              FLIP LITERAL FLG
+LITCONT  LA    R1,1(,R1)           BUMP TO NEXT COLUMN
+         LR    R7,R1               SET NEW START FOR TRT
+         B     ODLOC3              BACK TO CONTINUE SCAN
+XODMOVE3 LA    R1,71(,R5)          SET ENTIRE CARD IF NO HIT
+         B     XODMOVE5            SKIP LITERAL TEST
+XODMOVE4 TM    FLG,LC              LITERAL STILL UNFINISHED?
+         BO    LITCONT             YES, BACK TO CONTINUE SCAN
+XODMOVE5 LR    R7,R4               RESTORE A(OPERAND)
+         EJECT
+***********************************************************************
+*                                                                     *
+*   R1 POINTS TO THE DELIMITER OF THE OPERAND, DETERMINE IF IT WILL   *
+*   FIT IN THE OUTPUT RECORD.                                         *
+*   R7 -A(OPERAND)                                                   *
+*                                                                     *
+***********************************************************************
+         SR    R4,R1
+         LCR   R4,R4
+         LA    R2,71(,R8)          A(COL 72)
+         SR    R2,R9               NUMBER OF BLANKS AFTER OP
+         BNZ   MOVECHK             BRANCH IF 1 OR MORE
+         DC    H'0'                PGM CHECK ************
+MOVECHK  CLR   R4,R2               WILL OPERAND FIT             GP09251
+         BH    ERR4                NO - OUTPUT CARD
+         BCTR  R4,R0               -1
+         EX    R4,ODMOVE           MOVE OPERAND TO OUTPUT
+         EJECT
+***********************************************************************
+*                                                                     *
+*        PROCESS COMMENTS FIELDS, AND GENERATE NEW COMMENTS CARD      *
+*        IF REQUIRED TO CONTINUE COMMENTS DATA.                       *
+*                                                                     *
+***********************************************************************
+         LA    R9,1(R4,R9)         GET END OF OUTPUT
+         L     R2,COMMSTRT         GET STARTING COMMENTS COL
+         BCTR  R2,R0               DECREMENT FOR EXECUTE
+         BCTR  R2,R0               ONCE MORE FOR FUDGE
+         AR    R2,R8               2 = OUTPUT COL COMM START
+         CR    R9,R2               END BEFORE COMMENT COL?
+         BL    SETCOL              BRANCH YES, USE DEFINED VAL
+         LA    R9,2(,R9)           NO, BUMP TO USE NEXT
+RESUME   DS    0H
+         LR    R7,R1               10 = INPUT END OF OP
+         LA    R4,70(,R5)          4 = INPUT COL 71
+         SR    R4,R1               4 = INPUT NUMBER LEFT TO MOVE
+         BM    XCARD               BRANCH IF NONE LEFT
+         EX    R4,FINDNB           FIND INPUT BEGIN'G OF COMMENTS
+         BZ    XCARD               BRANCH IF NO COMMENTS
+MOVECOM  DS    0H
+         LR    R7,R1               10 = INPUT BEGIN'G OF COMMENTS
+         LA    R2,70(,R5)          2 = INPUT COL 71
+CHK2     CR    R7,R2               START = STOP COMMENTS
+         BNL   SETSIZ              YES, DEFAULT
+         CLI   0(2),C' '           BLANK CHARACTER
+         BNE   SETSIZ              NO, SET SIZE OF INPUT
+         BCT   R2,CHK2             GO CHECK PREVIOUS CHAR
+SETSIZ   SR    R2,R1               2 = NUMB OF CHARS TO MOVE
+         BNM   CHKSUPCD            ENSURE RESULT IS POSITIVE
+         DC    H'0'                PGM CHECK IF ERROR
+CHKSUPCD TM    FLG2,FGDODATE       CHECK FOR SUPPORT CODES      GP09254
+         BZ    MOVEMORE            DON'T CHECK                  GP09254
+         LA    R3,0(R2,R7)         COPY END OF COMMENTS ADDR
+         SH    R3,=H'8'            DECREMENT BY EIGHT
+         CLI   1(R3),C'@'          SUPPORT CODE EXIST?
+         BNE   MOVEMORE            NO, ALL COMMENTS
+         SH    R2,=H'9'            DECREMENT BY NINE FOR MOVE
+         MVC   SUPCODE(8),1(R3)    SAVE SUPPORT CODE FOR LATER
+         LTR   R2,R2               ANYTHING TO MOVE NOW?
+         BNP   XCARD               NO, WRITE OUT RECORD
+MOVEMORE DS    0H                  LABEL
+         L     R4,LIMIT            GET END OF COMMENTS OFFSET
+         BCTR  R4,R0               DECREMENT FOR EXECUTE
+         AR    R4,R8               4 = OUTPUT COL COMM LIMIT
+         SR    R4,R9               4 = OUTPUT COLUMNS LEFT
+         NI    FLG,ALLBITS-CR      RESET COMMENT REQ
+         LA    R3,1(,R2)           SET INPUT SIZE AS DEFAULT
+         CR    R4,R2               CHECK IF INPUT FITS OUTPUT
+         BNL   SET                 BRANCH IF NO
+         LR    R3,R4               SET MAX OUTPUT SIZE
+         LA    R15,0(4,R7)         GET INPUT DATA PLUS OFFSET
+CHK      CLI   0(R15),C' '         LOOK FOR LAST BLANK
+         BE    SET                 FOUND LAST BLANK
+         BCTR  R15,R0              DECREMENT TO PREVIOUS
+         BCT   R3,CHK              DECR. FOR MOVE AND BRANCH
+         CH    R4,LIMITSZ          MAX OUTPUT LENGTH
+         BL    AROUND              TRY NEXT CARD IF LOW
+         B     ERR6                ELSE ERROR ASSUMED
+         EJECT
+***********************************************************************
+*                                                                     *
+*        MOVE COMMENTS TO OUTPUT CARD, AND DETERMINE IF ANOTHER       *
+*        COMMENTS CARD WILL BE NEEDED TO CONTINUE COMMENTS.           *
+*                                                                     *
+***********************************************************************
+SET      DS    0H
+         EX    R3,ODMOVE           MOVE DATA TO OUTPUT
+         LA    R3,1(,R3)           BUMP FOR EXECUTE
+AROUND   SR    R2,R3               DECREMENT AMOUNT MOVED
+         LTR   R2,R2               ANY LEFT TO MOVE
+         BNP   XCARD               NO, GO GENERATE RECORD
+         CLI   71(R5),C' '         CONTINUATION CARD
+         BNE   ERR6                YES, CANNOT CONT. COMMENTS
+         LA    R9,35(,R8)          SET NEW OUTPUT LOCATION
+         AR    R7,R3               UPDATE INPUT RECORD POINTER
+         MVI   80(R8),C'+'        SHOW CARD ADDED               GP09254
+         OI    FLG,CR              SET COMMENT CONT REQUEST
+         B     XCARD               GO PROCESS THIS CARD
+SETCOL   L     R9,COMMSTRT         GET START OF COMMENTS COL
+         BCTR  R9,R0               DECREMENT FOR EXECUTE
+         AR    R9,R8               9 = OUTPUT COL COMM START
+         B     RESUME              BRANCH TO CONTINUE
+COMLOC0  L     R9,COMMSTRT         GET START OF COMMENTS COL
+         BCTR  R9,R0               DECREMENT FOR EXECUTE
+         AR    R9,R8               9 = OUTPUT COL COMM START
+         B     MOVECOM             BRANCH TO CONTINUE
+XCARD    DS    0H
+         CLI   0(R8),C'*'          COMMENTS CARD?
+         BE    SEQNEW              YES, BRANCH TO TEST MORE
+         CLC   0(2,R8),=CL2'.*'    MACRO COMMENTS
+         BNE   SEQOLD              NO, USE OLD SEQUENCE
+SEQNEW   TM    FLG,GC              IS THIS COMMENT GENERATED
+         BZ    SEQOLD              NO, USE OLD SEQ NUMBER
+         MVI   80(R8),C'*'         FLAG ADDED CARD
+         SR    R1,R1               CLEAR FOR COUNT
+         LA    R15,CURRENT+79      FIND END OF CARD
+COUNT    TM    0(R15),X'F0'        FIND NUMERICS
+         BNO   SETNUMB             NON NUMERICS, SET COUNT
+         LA    R1,1(,R1)           UPDATE COUNT
+         CH    R1,=H'8'            CHECK LIMIT
+         BNL   SETNUMB             BRANCH IF ALL 8 NUMBERICS
+         BCT   R15,COUNT           GO CHECK NEXT
+         B     ERR7                ERROR IF FALL THROUGH
+         EJECT
+***********************************************************************
+*                                                                     *
+*        DETERMINE IF POSSIBLE WHAT THE NEXT SEQUENCE NUMBER SHOULD   *
+*        BE.  IF ABLE TO, INCREASE THE OLD SEQUENCE NUMBER BY 1.      *
+*                                                                     *
+***********************************************************************
+SETNUMB  LTR   R10,R1              COPY TO COUNT REG
+         BZ    ERR7                BRANCH IF NO NUMERICS
+         LR    R0,R10              SAVE COUNT OF NUMBS
+         BCTR  R10,R0              DECREMENT FOR RUBBER BANDS
+         MVC   SEQC(8),ZEROS       CLEAR FOR CONVERT
+         MVC   SEQN(8),ZEROS       CLEAR FOR CONVERT
+         LA    R15,CURRENT+80      GET POINTER TO END OF CARD
+         LA    R1,SEQC+8           FIND END OF SEQ
+         SR    R15,R0              BACKUP TO START OF NUMERICS
+         SR    R1,R0               DITTO FOR NEXT
+         EX    R10,MOVEC           MOVE CURRENT SEQ TO WORK
+         LA    R15,NEXT+80         GET END OF NEXT
+         LA    R1,SEQN+8           GET END OF WORK AREA
+         SR    R15,R0              TO START OF NUMBS
+         SR    R1,R0               DITTO
+         EX    R10,MOVEC           MOVE NEXT SEQ TO WORK
+         PACK  WORK(8),SEQC(R5)    PACK FOR CONVERT
+         CVB   R15,WORK            MAKE SEQ NUMB BINARY
+         PACK  WORK(8),SEQN(R5)    PACK FOR CONVERT
+         CVB   R1,WORK             MAKE SEQ NUMB BINARY
+         SR    R1,R15              GET SEQ NUMB DIFFERENCE
+         BNP   ERR7                INSURE REMAINDER EXISTS
+         C     R1,=F'1'            CAN NEW SEQUENCE BE ADDED?
+         BNH   ERR7                CANT ADD, ERROR
+         A     R15,=F'1'           UPDATE BY ONE HUNDRED
+         MVC   72(8,R8),CURRENT+72  SET UP NON NUMERICS
+         XC    SEQC(8),SEQC        CLEAR FOR UNPACK
+         CVD   R15,WORK            MAKE DECIMAL AGAIN
+         UNPK  SEQC(8),WORK+3(5)   MAKE PRINTABLE
+         OI    SEQC+7,C'0'         MAKE LAST PRINT TOO
+         LA    R15,SEQC+8          FIND END OF NEW SEQ
+         SR    R15,R0              WHERE TO START MOVE
+         LA    R1,80(,R8)          END OF OUTPUT CARD
+         SR    R1,R0               DECREMENT TO NUMERICS START
+         EX    R10,MOVEC           MOVE UPDATED SEQ NUMB
+         MVC   CURRENT+72(8),72(R8)  UPDATE CURRENT SEQ ALSO
+         B     NOCONT              SKIP OLD SEQUENCE RTN
+         EJECT
+***********************************************************************
+*                                                                     *
+*        OUTPUT CARD TO THE NEW FILE, AND DETERMINE IF ANOTHER        *
+*        COMMENTS CARD MUST BE GENERATED.  IF SO, RETURN TO           *
+*        COMMENTS ROUTINE TO CONTINUE THEM.                           *
+*                                                                     *
+***********************************************************************
+SEQOLD   MVC   71(9,R8),71(R5)     MOVE CONTIN. AND COMMENTS
+         TM    FLG,CR             CONTINUE COMMENTS NEXT CARD?  GP09254
+         BNZ   XCARD1             YES; DEFER ONE CARD           GP09254
+         CLI   SUPCODE,C'@'        ANY SUPPORT CODE FOR THIS REC
+         BNE   XCARD1              NO, SKIP SUPCODE
+         MVC   63(8,R8),SUPCODE    UPDATE SUPCODE IN REC
+XCARD1   NI    FLG,ALLBITS-CC      RESET CONTINUATION FLAG
+         CLI   71(R5),C' '         CONTINUATION CARD
+         BE    TSTLIT2             NO, GO CHECK LITERAL SW
+         OI    FLG,CC              SET CONTINUATION FLAG
+         B     NOCONT              AROUND LITERAL TESTS
+TSTLIT2  TM    FLG,LC              LITERAL CONTINUATION ON
+         BO    ERR5                YES, ERR MESSAGE
+NOCONT   DS    0H                  LABEL
+         TM    FLG2,FGHAVDAT      DID WE SAVE A CHANGE DATE ?   GP09254
+         BZ    XCARDPUT                                         GP09254
+         TM    FLG,CR             CONTINUE COMMENTS NEXT CARD?  GP09254
+         BNZ   XCARDPUT                                         GP09254
+         CLC   65(7,R8),=CL8' '   ROOM FOR CHANGE DATE?         GP09254
+         BNE   XCARDPUT           NO; TOO BAD                   GP09254
+         NI    FLG2,255-FGHAVDAT                                GP09254
+         LA    R14,CHDATE+L'CHDATE-1   END OF DATE              GP09254
+         LA    R15,69(,R8)        END OF INSERT - 1             GP09254
+         LA    R0,7               MAX TO MOVE                   GP09254
+INSDATE  MVC   1(1,R15),0(R14)    MOVE ONE BYTE                 GP09254
+         BCTR  R14,0                                            GP09254
+         BCTR  R15,0                                            GP09254
+         CLI   0(R15),C' '        BLANK ?                       GP09254
+         BNE   XCARDPUT                                         GP09254
+         BCT   R0,INSDATE         TRY AGAIN                     GP09254
+XCARDPUT LA    R0,80+1            NORMAL PUNCH SIZE + CC        GP09254
+         LR    R15,R8             COPY RECORD START             GP09254
+         BCTR  R15,0              ALLOW FOR CC                  GP09254
+         LA    R1,PUNCH           DCB                           GP09254
+         BAL   R14,PUTTER         WRITE A CARD                  GP09254
+XCARD15  BAL   R10,PRINTIT         PRINT OUTPUT IF DESIRES
+XCARD2   MVI   0(R8),C' '
+         MVC   1(131,R8),0(R8)     CLEAR OUTPUT                 GP09254
+         MVI   SUPCODE,0           IN-VALIDATE SUPPORT CODE
+         TM    FLG,CR              COMMENT CONT. REQ'D?
+         BZ    GET                 NO, BRANCH TO GET NEXT
+         OI    FLG,GC              SET COMMENT CONT. ACTIVE
+         MVI   0(R8),C'*'          SET COMMENT CHARACTER
+         TM    FLG,SI              SPECIAL OPERATOR
+         BZ    MOVEMORE            NO, NORMAL COMMENTS
+         TM    FLG,MAC             WITHIN A MACRO
+         BZ    MOVEMORE            NO, NORMAL COMMENTS
+         MVC   0(2,R8),=C'.*'      MOVE MACRO COMMENTS DATA
+         B     MOVEMORE            GO GET MORE COMMENTS
+         EJECT
+***********************************************************************
+*                                                                     *
+*        EXECUTED (RUBBER BAND) INSTRUCTIONS AND END OF INPUT ROUTINE *
+*                                                                     *
+***********************************************************************
+LMOVE    MVC   0(0,R8),0(R7)       MOVE LABEL TO OUTPUT
+ORMOVE   MVC   9(0,R8),0(R7)       MOVE OPERATOR
+FINDB    TRT   0(0,R7),BTABLE      FIND A BLANK
+FINDNB   TRT   0(0,R7),NBTABLE     FIND A NON-BLANK
+LITCHECK TRT   0(0,R7),QTABLE      FIND A QUOTE
+QBCHECK  TRT   0(0,R7),QBTABLE     LOOK FOR QUOTE OR BLANK
+AIFCHK   TRT   0(0,R7),PTABLE      LOOK FOR PERIOD (AIF)
+ODMOVE   MVC   0(0,R9),0(R7)       MOVE OPERAND
+COMMOVE  MVC   0(0,R9),0(R7)       MOVE COMMENT
+SHIFTL1  MVC   0(0,R7),1(R7)       MOVE TEXT OVER 2ND QUOTE
+MACOMP   CLC   0(0,R7),0(R14)      COMPARE FOR MACRO OPERATORS
+MVESPACE PACK  WORK,15(0,R8)       MOVE SPACE VALUE TO WORK
+MOVEC    MVC   0(1,R1),0(R15)      MOVE CURRENT SEQ
+PARMMOVE MVC   0(1,R14),0(R4)      MOVE PARM TO WORK AREA
+         SPACE 1                   EOD ON INPUT
+EOD      OI    FLG,EF              SET END OF FILE IND
+         B     ONCEMORE            DO FINAL CARD
+         SPACE 1                   EOD ON INPUT
+EODAD    CLOSE (INPUT,,PUNCH,,PRINT)  CLOSE INPUT AND OUTPUT
+EXIT     L     R13,4(,R13)
+         L     R15,RETCODE         GET RETURN CODE
+         L     R14,12(,R13)        GET RETURN REG
+         LM    R0,12,20(R13)       RESTORE REGS
+PGMBRET  BR    R14                 RETURN
+ DBO MODE=DC *************DEBUG************
+         EJECT ,
+***********************************************************************
+*                                                                     *
+*        PRINT ROUTINE.  ALL RECORDS THAT ARE PUNCHED WILL ALSO       *
+*        BE PRINTED.  THE TITLE FOR THE HEADER IS TAKEN FROM THE      *
+*        INPUT SOURCE ASSEMBLY FILE IF ONE EXISTS.                    *
+*                                                                     *
+***********************************************************************
+PRINTIT  CLI   0(R8),C'/'          JCL
+         BCR   8,R10               RETURN IF SO
+         CLC   9(6,R8),=C'TITLE '  IS THIS A TITLE CARD
+         BNE   PRINTIT1            NO - GO PRINT CARD
+         CLI   15(R8),C''''        HAS TITLE BEEN ALIGNED
+         BNE   PRINTIT1            NO - PRINT WITHOUT TITLE
+         MVI   HEADING+1,C' '                                   GP09254
+         MVC   HEADING+2(80),HEADING+1 PREFER SPACES TO HEX 0   GP09254
+         MVC   HEADING+1(55),16(R8)  MOVE TITLE TO HEADING
+         LA    R0,1                QUOTE COUNT
+         LA    R7,HEADING+1        A(HEADING+1)
+         LA    R2,54               MAXIMUMUM LENGTH - 1
+TQ0      EX    R2,LITCHECK         SEEK QUOTE
+         BC    HIT,TQ05
+         LA    R1,1(2,R7)          WHERE QUOTE SHOULD BE (COL 71)
+         B     TQ1
+TQ05     X     R0,=F'1'            ODD OR EVEN COUNT
+         CLI   1(R1),C''''         DOUBLE QUOTE
+         BE    TQ06                YES
+         LTR   R0,R0               EVEN NUMBER OF QUOTES
+         BZ    TQ1                 YES - EXIT
+TQ06     X     R0,=F'1'            ODD OR EVEN COUNT
+         LA    R1,1(,R1)           POINT TO SECOND QUOTE
+         LR    R6,R1
+         SR    R1,R7               NUMBER THRU 1ST QUOTE
+         SR    R2,R1               NUMBER TO SCAN
+         LR    R7,R6
+         EX    R2,SHIFTL1          CLEAR SECOND QUOTE
+         BCT   R2,TQ0              KNOCK 1 OFF AND BRANCH BACK
+TQ1      MVI   0(R1),C' '          BLANK TRAILING QUOTE
+         OI    FLG2,FGPAGE         FORCE NEW PAGE EJECT
+         B     PRINTIT1
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*        PRINT OUTPUT LINE, AND CAUSE OVERFLOW IF END OF PAGE OR      *
+*        IF THE EJECT REQUEST BIT HAS BEEN SET.                       *
+*                                                                     *
+***********************************************************************
+PRINTIT1 L     R1,LINES            GET LINE COUNT
+         LTR   R1,R1               NEW PAGE REQUIRED?
+         BZ    NEWPAGE             YES, GENERATE SKIP
+         TM    FLG2,FGPAGE         EJECT REQUIRED?
+         BNO   NPRINT              NO, NORMAL PRINT
+NEWPAGE  NI    FLG2,ALLBITS-FGPAGE RESET EJECT REQUEST
+         TM    DCBRECFM-IHADCB+PRINT,DCBRECCC  CARRIAGE CNTRL?  GP09254
+         BZ    NEWPGSKP           NO; SKIP PAGE HEADER          GP09254
+         LA    R0,81              NORMAL TITLE SIZE + CC        GP09254
+         LA    R15,HEADING        COPY RECORD START             GP09254
+         LA    R1,PRINT           DCB                           GP09254
+         BAL   R14,PUTTER         WRITE A CARD                  GP09254
+NEWPGSKP MVI   CCHAR,C'0'          DOUBLE SPACE AFTER PRINT
+         LA    R1,LPP              SET NEW LINE COUNT           GP09254
+NPRINT   BCTR  R1,R0               DECREMENT LINE COUNT
+         ST    R1,LINES            PUT IT BACK FOR LATER
+         LA    R0,107             NORMAL PRINT SIZE + CC        GP09254
+         LA    R15,CCHAR          COPY RECORD START             GP09254
+         LA    R1,PRINT           DCB                           GP09254
+         BAL   R14,PUTTER         WRITE A CARD                  GP09254
+         MVI   CCHAR,C' '
+         BR    R10                 RETURN
+         SPACE 2
+*---------------------------------------------------------------------*
+*   GENERALIZED PUT LOCATE ROUTINE                                    *
+*   CALLER SETS: R1 DCB  R0 DATA LENGTH  R15 RECORD W/CC  R14 RETURN  *
+*---------------------------------------------------------------------*
+         PUSH  USING                                            GP09254
+         USING IHADCB,R6     USER'S DCB                         GP09254
+PUTTER   STM   R14,R6,SUBSAVE     SAVE A LITTLE                 GP09254
+         LR    R6,R1         COPY DCB ADDRESS                   GP09254
+         LR    R3,R0         COPY DATA LENGTH (WITH CC)         GP09254
+         LR    R2,R15        COPY DATA                          GP09254
+         TM    DCBRECFM,DCBRECCC  USING CONTROL CHARACTERS?     GP09254
+         BNZ   PUTTERCC      YES                                GP09254
+         LA    R2,1(,R2)     SKIP CC                            GP09254
+         BCTR  R3,0          AND ADJUST LENGTH                  GP09254
+PUTTERCC TM    DCBRECFM,DCBRECU   U ?                           GP09254
+         BO    PUTTERSU      YES; SET DCBLRECL                  GP09254
+         TM    DCBRECFM,DCBRECF   F, RATHER THAN V OR D?        GP09254
+         BNZ   PUTTERHU      YES                                GP09254
+         LA    R0,4(,R3)     GET RECORD LENGTH WITH RDW         GP09254
+PUTTERSU STH   R0,DCBLRECL   STASH LENGTH                       GP09254
+PUTTERHU PUT   (1)           GET AN OUTPUT AREA                 GP09254
+         LR    R4,R1         GET RETURN AREA                    GP09254
+         LH    R5,DCBLRECL   GET LENGTH                         GP09254
+         TM    DCBRECFM,DCBRECF   U OR F ?                      GP09254
+         BNZ   PUTTERMV      YES; MOVE DATA                     GP09254
+         STCM  R5,3,0(R4)    MAKE LEFT HALF RDW                 GP09254
+         STCM  R5,12,2(R4)   MAKE ZEROS                         GP09254
+         LA    R4,4(,R4)     SKIP RDW                           GP09254
+         SH    R5,=H'4'      ADJUST LENGTH                      GP09254
+PUTTERMV ICM   R3,8,=C' '    WE'RE WRITNG TEXT DATA             GP09254
+         MVCL  R4,R2         MOVE DATA                          GP09254
+         LM    R14,R6,SUBSAVE     RESTORE                       GP09254
+         BR    R14                RETURN                        GP09254
+SUBSAVE  DC    9A(0)         LOCAL SAVER                        GP09254
+         EJECT
+***********************************************************************
+*                                                                     *
+*        ERROR MESSAGE GENERATION ROUTINE.  ALL ERROR MESSAGES        *
+*        THAT CAN BE GENERATED WILL BE MOVE WITHIN THIS ROUTINE.      *
+*                                                                     *
+***********************************************************************
+ERR1     MVC   85(20,R8),ERR1MSG   MOVE MSG TO OUTPUT
+         B     ERRX
+ERR2     MVC   85(20,R8),ERR2MSG   MOVE MSG TO OUTPUT
+         B     ERRX
+ERR3     MVC   85(20,R8),ERR3MSG   MOVE MSG TO OUTPUT
+         B     ERRX
+ERR4     MVC   85(20,R8),ERR4MSG   MOVE MSG TO OUTPUT
+         B     ERRX
+ERR5     MVC   85(20,R8),ERR5MSG   MOVE MSG TO OUTPUT
+         NI    FLG,255-LC          DON'T LOOP ON ERROR          GP12326
+         B     CPUT                OUPUT CARD AS IS
+ERR6     MVC   85(20,R8),ERR6MSG   MOVE MSG TO OUTPUT
+         B     ERRX                GO TO ERROR COMMON
+ERR7     MVC   85(20,R8),ERR7MSG   MOVE MSG TO OUTPUT
+         MVC   79(1,R8),SEQSAVE    RESTORE SEQ NUMB
+         MVC   NEXT+79(1),SEQSAVE+1  RESTORE SEQ NUMB
+         OI    RETCODE+3,X'04'     SET RETURN CODE
+         NI    FLG,ALLBITS-GC-CR   RESET COMMENTS CONTROL FLAGS
+         B     XCARD1              GENERATE NEW COMMENTS CARD
+ERR8     MVC   85(20,R8),ERR8MSG   MOVE MSG TO OUTPUT
+         NI    FLG,ALLBITS-LC      RESET LITERAL CONTINUATION
+         B     NOCONT              GO OUTPUT CARD
+ERRX     MVC   0(80,R8),0(R5)      MOVE ORIGINAL CARD TO OUTPUT
+         OI    RETCODE+3,X'08'     SET ERROR RETURN CODE
+         B     XCARD
+         EJECT
+***********************************************************************
+*                                                                     *
+*        LITERAL POOL AND CONSTANTS AREA.                             *
+*                                                                     *
+***********************************************************************
+         LTORG
+         SPACE 1
+SAVE     DC    18A(0)        SAVE AREA                          GP09254
+WORK     DS    D'0'
+SEQC     DS    D
+SEQN     DS    D
+ZEROS    DC    CL8'00000000'
+NINES    DC    CL8'99999999'
+PARMWORK DC    CL8'00000000'
+SUPCODE  DC    CL8' '
+CHDATE   DC    CL8' '        EXTRACTED CHANGE DATE              GP09254
+RETCODE  DC    F'0'
+LINES    DC    F'0'
+PTABLE   DC    75X'00',C'.',180X'00'
+PAD      DC    F'0'
+COMMSTRT DC    F'0'                START OF COMMENTS
+LIMIT    DC    F'0'                END OF COMMENTS
+BTABLE   DC    64X'00',C' ',191X'00'
+NBTABLE  DC    64X'FF',X'00',191X'FF'
+QTABLE   DC    125X'00',C'''',130X'00'
+QBTABLE  DC    XL256'00'           INITIALIZED ON ENTRY
+SEQSAVE  DC    H'0'                SEQ SAVE AREA
+LIMITSZ  DC    H'0'                SIZE OF COMMENTS
+         SPACE 1
+FLG      DC    X'00'
+*                                  80 = CONTINUATION CARD
+*                                  40 = END OF FILE INDICATOR
+*                                  20 = PROCESSING MACRO
+*                                  10 = PROCESSING 'AIF' INSTR
+*                                  08 = PROCESSING SPECIAL MACRO INSTR
+*                                  04 = LITERAL CONTINUATION
+*                                  02 = CURRENT RECORD IS COMMENTS CONT
+*                                  01 = COMMENTS CONT REQUESTED
+         SPACE 1
+FLG2     DC    X'00'         PROCESSING FLAGS                   GP09254
+FGPAGE   EQU   X'01'           PAGE EJECT                       GP09254
+FGDODATE EQU   X'40'           CHECK FOR CHANGE DATES           GP09254
+FGHAVDAT EQU   X'80'           DATE TEXT STASHED                GP09254
+         SPACE 1
+HEADING  DC    C'1'    1/2
+         DC    CL132' TIDY-ASM MARGINS AND ORGANIZE ASSEMBLER CODE'
+         SPACE 1
+CCHAR    DC    CL1' '  1/2
+PAREA    DC    CL132' '  2/2
+         SPACE 1
+ERR1MSG  DC    CL20'LABEL TOO LONG'
+ERR2MSG  DC    CL20'NO OPERATOR'
+ERR3MSG  DC    CL20'OPERATOR TOO LONG'
+ERR4MSG  DC    CL20'NOTE, NOT ALIGNED'
+ERR5MSG  DC    CL20'-'
+ERR6MSG  DC    CL20'COMMENT TOO LONG'
+ERR7MSG  DC    CL20'SEQUENCING ERROR'
+ERR8MSG  DC    CL20'UNBALANCED QUOTES'
+ERR9MSG  DC    CL20'NOTE, COMMENT CONT'
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        SPECIAL OPERATORS TABLE TO HANDLE MACRO AND COPY STATEMENTS  *
+*                                                                     *
+***********************************************************************
+TSTBL    DC    CL6'AIF'
+         DC    CL6'AGO'
+         DC    CL6'ANOP'
+         DC    CL6'GBLA'
+         DC    CL6'GBLB'
+         DC    CL6'GBLC'
+         DC    CL6'LCLA'
+         DC    CL6'LCLB'
+         DC    CL6'LCLC'
+         DC    CL6'ACTR'
+         DC    CL6'SETA'
+         DC    CL6'SETB'
+         DC    CL6'SETC'
+MEND     DC    CL6'MEND'
+         DC    CL6'MNOTE'
+         DC    CL6'MEXIT'
+         DC    CL6'PRINT'
+         DC    CL6'PUNCH'
+         DC    CL6'REPRO'
+MACRO    DC    CL6'MACRO'
+         EJECT ,
+***********************************************************************
+**                                                                   **
+**   OPEN DCB EXIT - if RECFM, LRECL, BLKSIZE preset, no change      **
+**   a) device is unit record - default U, device size, device size  **
+**   b) all others - default to values assembled after DCB           **
+**                                                                   **
+**   For FB, if LRECL > BLKSIZE, make LRECL=BLKSIZE                  **
+**   For VB, if LRECL+3 > BLKSIZE, will fail                         **
+**                                                                   **
+***********************************************************************
+         PUSH  USING                                            GP09254
+         DROP  ,                                                GP09254
+         USING OCDCBEX,R15                                      GP09254
+         USING IHADCB,R1     DECLARE OUR DCB WORK SPACE         GP09254
+OCDCBEX  LR    R11,R1        SAVE DCB ADDRESS AND OPEN FLAGS    GP09254
+         N     R1,=X'00FFFFFF'   NO 0C4 ON DCB ACCESS IF AM31   GP09254
+         SR    R2,R2         FOR POSSIBLE DIVIDE                GP09254
+         LH    R3,DCBBLKSI   GET CURRENT BLOCK SIZE             GP09254
+         SR    R4,R4         FOR POSSIBLE LRECL=X               GP09254
+         ICM   R4,3,DCBLRECL GET CURRENT RECORD LENGTH          GP09254
+         TM    DCBRECFM,DCBRECLA  ANY RECORD FORMAT SPECIFIED?  GP09254
+         BNZ   OCDCBFH       YES                                GP09254
+         MVC   DCBRECFM,DEFRECFM                                GP09254
+OCDCBFH  LTR   R4,R4                                            GP09254
+         BNZ   OCDCBLH       HAVE A RECORD LENGTH               GP09254
+         L     R4,DEFINFO+4       SET DEVICE SIZE FOR UNIT RECORD
+         C     R4,DEFLRECL        COMPARE TO REQUEST            GP09254
+         BNH   *+8           USE SMALLER                        GP09254
+         L     R4,DEFLRECL   SET LRECL=PREFERRED RECORD SIZE    GP09254
+         TM    DEFRECFM,DCBRECCC  DEFAULT TO CC?                GP09254
+         BZ    OCDCBLN       NO; KEEP IT                        GP09254
+         TM    DCBRECFM,DCBRECCC  CARRIAGE CONTROL ?            GP09254
+         BNZ   OCDCBLD       YES; SET                           GP09254
+         BCTR  R4,0          DECREASE FOR MISSING CC            GP09254
+         B     OCDCBLD       AND SET IT                         GP09254
+OCDCBLN  TM    DCBRECFM,DCBRECCC  CARRIAGE CONTROL ?            GP09254
+         BZ    OCDCBLD       NO; SET                            GP09254
+         LA    R4,1(,R4)     INCREASE FOR INSERTED CC           GP09254
+OCDCBLD  STH   R4,DEFLRECL   SAVE DATA LENGTH FOR PGM USE       GP09254
+         TM    DCBRECFM,DCBRECF   USING U OR F ?                GP09254
+         BNZ   OCDCBLH       YES; NO ADJUST                     GP09254
+         LA    R4,4(,R4)     ALLOW FOR RDW                      GP09254
+         SPACE 1                                                GP09254
+*   NOW CHECK BLOCK SIZE                                        GP09254
+OCDCBLH  LTR   R3,R3         ANY ?                              GP09254
+         BNZ   *+8           YES                                GP09254
+         L     R3,DEFBLKSI   SET OUR PREFERRED SIZE             GP09254
+         C     R3,DEFINFO+4  LEGAL ?                            GP09254
+         C     R3,DEFINFO+4  LEGAL ?                            GP09254
+         BNH   *+8                                              GP09254
+         L     R3,DEFINFO+4  NO; SHORTEN                        GP09254
+         TM    DCBRECFM,DCBRECU   U?                            GP09254
+         BO    OCDCBBU       YES                                GP09254
+         TM    DCBRECFM,DCBRECF   FIXED ?                       GP09254
+         BZ    OCDCBBV       NO; CHECK VAR                      GP09254
+         DR    R2,R4                                            GP09254
+         CH    R3,=H'1'      DID IT FIT ?                       GP09254
+         BE    OCDCBBF       BARELY                             GP09254
+         BH    OCDCBBB       ELSE LEAVE BLOCKED                 GP09254
+         LA    R3,1          SET ONE RECORD MINIMUM             GP09254
+OCDCBBF  NI    DCBRECFM,255-DCBRECBR   BLOCKING NOT NEEDED      GP09254
+OCDCBBB  MR    R2,R4         BLOCK SIZE NOW MULTIPLE OF LRECL   GP09254
+         B     OCDCBXX       AND GET OUT                        GP09254
+*   VARIABLE                                                    GP09254
+OCDCBBV  LA    R5,4(,R4)     LRECL+4                            GP09254
+         CR    R5,R3         WILL IT FIT ?                      GP09254
+         BNH   *+8           YES                                GP09254
+         OI    DCBRECFM,DCBRECSB  SET SPANNED                   GP09254
+         B     OCDCBXX       AND EXIT                           GP09254
+*   UNDEFINED                                                   GP09254
+OCDCBBU  LR    R4,R3         FOR NEATNESS, SET LRECL = BLOCK SIZE
+*   EXEUNT  (Save DCB options for EXCP compatibility in main code)
+OCDCBXX  STH   R3,DCBBLKSI   UPDATE POSSIBLY CHANGED BLOCK SIZE GP09254
+         STH   R4,DCBLRECL     AND RECORD LENGTH                GP09254
+         TM    DCBRECFM,DCBRECF   USING U OR F ?                GP09254
+         BNZ   OCDCBXD       YES; NO ADJUST                     GP09254
+         LH    R0,DCBLRECL   GET RECORD LENGTH                  GP09254
+         SH    R0,=H'4'            DATA LENGTH                  GP09254
+OCDCBXD  STH   R0,DEFLRECL   SAVE FOR PUT                       GP09254
+         BR    R14           RETURN TO OPEN                     GP09254
+         POP   USING                                            GP09254
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        DATA CONTROL BLOCKS AND BUFFER AREAS FOR INPUT RECORDS.      *
+*                                                                     *
+***********************************************************************
+INPUT    DCB   DSORG=PS,MACRF=GM,DDNAME=SYSIN,EODAD=EOD,EXLST=EXLIST
+INPDEV   DC    2F'0',F'80,32720',X'90'    DEFAULT FB,80,80      GP09254
+         SPACE 1
+PUNCH    DCB   DSORG=PS,MACRF=PL,DDNAME=SYSPUNCH,EXLST=EXLIST   GP09254
+PUNDEV   DC    2F'0',F'80,6160',X'90'    DEFAULT FB,80,6160     GP09254
+         SPACE 1
+PRINT    DCB   DSORG=PS,MACRF=PL,DDNAME=SYSPRINT,EXLST=EXLIST   GP09254
+PRTDEV   DC    2F'0',F'121,6171',X'94'    DEFAULT FBA,121,6171  GP09254
+         SPACE 1
+EXLIST   DC    0A(0),X'85',AL3(OCDCBEX)                         GP09254
+         SPACE 1
+CURRENT  DC    CL80' '
+NEXT     DC    81C'9'
+         PRINT NOGEN
+         DCBD  DEVD=DA,DSORG=PS                                 GP09254
+         ORG   IHADCB+PRTDEV-PRINT                              GP09254
+DEFINFO  DS    2XL4          UCBTBYTs,DEVCAP                    GP09254
+DEFLRECL DS    F             PREFERRED LRECL                    GP09254
+DEFBLKSI DS    F             PREFERRED BLOCK SIZE               GP09254
+DEFRECFM DS    X             PREFERRED RECORD FORMAT            GP09254
+         SPACE 1
+         YREGS ,                                                GP09254
+         END

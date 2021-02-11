@@ -1,0 +1,1100 @@
+* -------------------------------------------------------------------
+*
+*  This subroutine can be called to perform random reads against
+*  any sorted sequential disk file. Records can be read by key,
+*  in sequence, or in skip-sequential order.
+*
+*  The best use of this routine is for improving the run times of
+*  jobs which need to access only a few records out of very large
+*  files. Since the program logically finds records in the file, it
+*  is not as efficient at reading lots of records in sequence as
+*  standard QSAM.
+*
+*  The program determines all of the multi-volume extents for the
+*  file, then determines the key ranges for each extent. It performs
+*  a binary search for the requested key. It also keeps a tree
+*  structure of keys it has already found, to improve the response
+*  as additional records are read.
+*
+*  Author - Martin Kline
+* -------------------------------------------------------------------
+*
+*  CALLING ROUTINE PROVIDES:
+*
+*   0-3   work area pointer
+*   4-11  ddname
+*  12-13  call-type
+*         'CL' = close
+*         'GN' = get next
+*         'GU' = get unique
+*
+*  14-15  key length
+*  16-17  key position
+*  18-37  key
+*  38-41  record length field
+*  42-45  return code
+*         00 - ok                       04 - eof (sequential)
+*         08 - not found (direct)       12 - open failed
+*         16 - parm type invalid        20 - key length invalid
+*         24 - not dasd file            28 - parm change invalid
+*         32 - area too small for rec   36 - key not in record
+*         40 - key sequence error
+*
+*  46-49  area length
+*  50-?   record area
+*
+* -------------------------------------------------------------------
+*   REGISTER USAGE
+*
+*    R3  - frequently has dcb address
+*    R9  - file section work area pointer
+*    R10 - caller's parm list
+*    R11 - working storage
+*    R12 - base register
+*    R13 - save area address
+*    R14 - subroutine linkage
+*    R15 - return codes
+*
+* -------------------------------------------------------------------
+*  SPECIAL NOTES:
+*
+*  1)  Code allows for concatenated and multi-volume dasd files by
+*      determining extents of each section and maintaining open dcbs
+*      for each.
+*
+*  2)  No index file is maintained.  Records are found using binary
+*      search technique.  Known keys (1 per block) are kept in a tree
+*      structure to avoid unnecessary repeated i/o.
+*
+*  3)  Program assumes keys are defined correctly and data is in
+*      sequence.  Duplicate keys are acceptable.  The first record
+*      with duplicate keys is returned on get-unique call.  Get-next
+*      call(s) return following records (duplicate or not).
+*
+*  4)  Performance will improve as more records are processed, since
+*      index information is collected dynamically.  However, the
+*      overhead of reading records remains higher than normal QSAM.
+*      If the calling program will be requesting more than 10% of the
+*      records in the file, it may be more efficient to use QSAM to
+*      process the file, assuming request keys are in sequence.
+*
+*  5)  Variable length records are returned to the caller without
+*      the rdw.
+*
+*  6)  Program has been written to be reenterable to support multiple
+*      files simultaneously, and to remove any requirement for COBOL
+*      programs to be linked with it.
+*
+* -------------------------------------------------------------------
+*
+         MACRO
+&LAB     MODE24
+&LAB     LA    14,*+6                       point past bsm
+         BSM   0,14                         change to amode 24
+         MEND
+*
+         MACRO
+&LAB     MODE31
+&LAB     LA    14,*+10                      point past bsm
+         O     14,HIGHBIT                   set high order bit
+         BSM   0,14                         change to amode 31
+         MEND
+*
+         PRINT NOGEN
+RANDSEQ  CSECT
+         STM   14,12,12(13)                 save caller's regs
+         LR    12,15                        set up base reg
+         USING RANDSEQ,12                   establish my addressability
+         GETMAIN R,LV=72                    get save area
+*
+         ST    1,8(,13)                     chain
+         ST    13,4(,1)                           save
+         LR    13,1                                    areas
+         L     1,4(,13)                     pick up
+         L     1,24(,1)                             original parm
+*
+         LA    1,0(,1)                      fix reg 1
+         L     10,0(,1)                     copy parm reg
+*
+         MODE31 ,                           change to amode 31
+*
+         USING PARMLIST,10                  set up parm addressability
+         CLC   PMTYPE,=C'CL'                close request ?
+         BE    CLOSE                        yes - go do it
+*
+         CLC   PMTYPE,=C'GN'                get next ?
+         BE    PMTYPEOK                     yes - type ok
+*
+         CLC   PMTYPE,=C'GU'                get unique ?
+         BNE   PMTYPERR                     no - parm invalid
+*
+PMTYPEOK CLC   PMKEYLEN,=H'20'              key too long ?
+         BH    KEYLNERR                     yes - error
+*
+         CLC   PMKEYLEN,=H'1'               key too short ?
+         BL    KEYLNERR                     yes - error
+*
+         L     11,PMWKPTR                   get primary work address
+         LTR   11,11                        pointer zero ?
+         BNZ   BYFIRST                      no - go on
+*
+         GETMAIN RU,LV=BWSIZE,LOC=(BELOW,ANY)  get work space
+*
+         ST    1,PMWKPTR                    save ptr in parm list
+         LR    11,1                         point to work space
+         USING BWSPACE,11                   space addressability
+*
+         XC    BWSPACE(256),BWSPACE         clear space
+         XC    BWSPACE+256(BWSIZE-256),BWSPACE+256  clear space
+*
+         GETMAIN RU,LV=WORKSIZE,LOC=(BELOW,ANY)  get work space
+*
+         ST    1,WORKPTR                    save work area pointer
+         LR    9,1                          copy work area address
+         USING WORKAREA,9                   establish addressability
+*
+         LR    0,1                          copy work area address
+         LA    1,WORKSIZE                   get work length
+         XR    15,15                        clear reg 15
+         MVCL  0,14                         clear work area
+*
+         MVC   DDNAME,PMDDNAME              copy ddname to work area
+         MVC   KEYLEN,PMKEYLEN              copy key length
+         MVC   KEYPOS,PMKEYPOS              copy key position
+         MVC   WKDCB,MODELDCB               copy model dcb
+         LA    3,WKDCB                      point to dcb
+         USING IHADCB,3                     dcb addressability
+*
+         MVC   DCBDDNAM,DDNAME              put ddname into dcb
+*
+         MVC   OPENAREA,OPENLIST            copy open list
+         LA    1,OPENAREA                   point to open list
+*
+         OPEN  ((3),INPUT),MF=(E,(1))       open dcb
+*
+         LTR   15,15                        ok ?
+         BNZ   OPENFAIL                     no - fail
+*
+         CLI   DCBDEVT,X'21'                dasd file ?
+         BL    BADDEVT                      no - error
+*
+         CLI   DCBDEVT,X'2F'                dasd file ?
+         BH    BADDEVT                      no - error
+*
+         MVC   BLKSIZE,DCBBLKSI             save blksize
+         DROP  3                            lose addressability
+*
+         LA    4,1                          volume counter
+*
+CNTVOLS  MODE24 ,                           switch to amode 24
+*
+         FEOV  (3)                          force eov - next vol
+*
+         MODE31 ,                           switch to amode 31
+*
+         USING IHADCB,3                     dcb addressability
+         CLI   DCBDEVT,X'21'                dasd file ?
+         BL    BADDEVT                      no - error
+*
+         CLI   DCBDEVT,X'2F'                dasd file ?
+         BH    BADDEVT                      no - error
+*
+         CLC   BLKSIZE,DCBBLKSI             block size larger ?
+         BNL   BLKSIZOK                     no - go on
+*
+         MVC   BLKSIZE,DCBBLKSI             get largest block size
+         DROP  3                            lose addressability
+*
+BLKSIZOK LA    4,1(,4)                      count vols
+         B     CNTVOLS                      loop to count vols
+*
+EOF1     STH   4,NUMVOLS                    save volume counter
+         XR    2,2                          clear reg 2
+         ICM   2,3,BLKSIZE                  get largest blksize
+*
+         GETMAIN RU,LV=(2),LOC=(BELOW,ANY)   get i/o area
+*
+         ST    1,IOAREA                     save io area address
+         MVC   CLOSAREA(TCLOSLEN),TCLOSLST  set up close area
+         LA    1,CLOSAREA                   point to close parm list
+*
+         CLOSE ((3),LEAVE),TYPE=T,MF=(E,(1))   position to last block
+*
+         USING IHADCB,3                     dcb addressability
+         MVC   WKFDADHI,DCBFDAD             save hi disk address
+         DROP  3                            lose addressability
+*
+         LA    1,WKDCB                      point to dcb
+         BAL   14,CALLTTR                   go get high ttr
+*
+         ST    1,WKTTRHI                    save high ttr
+         MVC   WKTTRLO,=X'00000100'         set low ttr
+         CLC   WKTTRHI,WKTTRLO              hi ttr less than minimum ?
+         BL    SEMPTY1                      yes - empty extent
+*
+         LA    0,WKTTRLO                    point to low ttr
+         LR    1,3                          point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             prepare to read 1st block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to work area
+         BAL   14,READ                      go read 1st block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         AH    1,KEYPOS                     point to first key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         MVC   WKKEYLO(0),0(1)              executed move
+         EX    2,*-6                        move key
+         MVC   SAVEKEY(0),WKKEYLO           executed copy
+         EX    2,*-6                        save key
+*
+SEMPTY1  LH    4,NUMVOLS                    get number of volumes
+         BCT   4,SETUP                      continue if more than one
+*
+         B     ENDSETUP                     else skip remaining vols
+*
+SETUP    GETMAIN RU,LV=WORKSIZE,LOC=(BELOW,ANY)  get work space
+*
+         ST    1,WKCHAIN                    chain work area
+         LR    9,1                          copy work area address
+         USING WORKAREA,9                   establish addressability
+*
+         LR    0,1                          copy work area address
+         LA    1,WORKSIZE                   get work length
+         XR    15,15                        clear reg 15
+         MVCL  0,14                         clear work area
+*
+         MVC   WKDCB,MODELDCB               copy model dcb
+         LA    3,WKDCB                      point to dcb
+         USING IHADCB,3                     dcb addressability
+*
+         MVC   DCBDDNAM,DDNAME              put ddname into dcb
+*
+         MVC   OPENAREA,OPENLIST            copy open list
+         LA    1,OPENAREA                   point to open list
+*
+         OPEN  ((3),INPUT),MF=(E,(1))       open dcb
+*
+         LTR   15,15                        ok ?
+         BNZ   OPENFAIL                     no - fail
+*
+         DROP  3                            lose addressability
+*
+         LR    5,4                          copy volume counter
+         BCT   5,SKIPVOLS                   skip vols up to previous
+*
+         B     SKIPVOLX                     first - go on
+*
+SKIPVOLS MODE24 ,                           switch to amode 24
+         FEOV  (3)                          force eov - next vol
+*
+         BCT   5,SKIPVOLS                   loop to get right extent
+*
+         MODE31 ,                           switch to amode 31
+*
+SKIPVOLX MVC   CLOSAREA(TCLOSLEN),TCLOSLST  set up close area
+         LA    1,CLOSAREA                   point to close parm list
+*
+         CLOSE ((3),LEAVE),TYPE=T,MF=(E,(1))   position to last block
+*
+         USING IHADCB,3                     dcb addressability
+         MVC   WKFDADHI,DCBFDAD             save hi disk address
+         LA    1,WKDCB                      point to dcb
+         BAL   14,CALLTTR                   go get high ttr
+*
+         ST    1,WKTTRHI                    save high ttr
+         DROP  3                            lose addressability
+*
+         MVC   WKTTRLO,=X'00000100'         set low ttr
+         CLC   WKTTRHI,WKTTRLO              hi ttr less than minimum ?
+         BL    SEMPTY2                      yes - empty extent
+*
+         LA    0,WKTTRLO                    point to low ttr
+         LR    1,3                          point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             prepare to read 1st block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read 1st block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         AH    1,KEYPOS                     point to first key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         MVC   WKKEYLO(0),0(1)              executed move
+         EX    2,*-6                        move key
+         CLC   WKKEYLO(0),SAVEKEY           executed compare
+         EX    2,*-6                        compare keys
+         BH    SEQERR                       if higher, error
+*
+         MVC   SAVEKEY(0),WKKEYLO           executed copy
+         EX    2,*-6                        save key
+*
+SEMPTY2  MVI   POINTFLG,0                   clear point flag
+         BCT   4,SETUP                      loop for all extents
+*
+ENDSETUP DS    0H
+*
+BYFIRST  CLC   KEYLEN,PMKEYLEN              same keylen as 1st call ?
+         BNE   PARMERR                      no - error
+*
+         CLC   KEYPOS,PMKEYPOS              same keypos as 1st call ?
+         BNE   PARMERR                      no - error
+*
+         CLC   DDNAME,PMDDNAME              same ddname as 1st call ?
+         BNE   PARMERR                      no - error
+*
+         CLC   PMTYPE,=C'GN'                get next ?
+         BE    PROCGN                       yes - get next record
+*
+         CLC   PMTYPE,=C'GU'                get unique ?
+         BE    PROCGU                       yes - perform random search
+*
+         B     PMTYPERR                     no - parm invalid
+*
+* -------------------------------------------------------------------
+*  PROCGN   -   process get-next request
+* -------------------------------------------------------------------
+*
+PROCGN   CLI   POINTFLG,0                   point done ?
+         BNE   GNNEXT                       yes - go on
+*
+         L     9,WORKPTR                    point to first wk area
+*
+GNLOOP1  OC    WKCHAIN,WKCHAIN              more areas chained ?
+         BZ    GNLOOP1X                     no - go on
+*
+         L     9,WKCHAIN                    point to next work area
+         B     GNLOOP1                      loop
+*
+GNLOOP1X CLC   WKTTRHI,WKTTRLO              hi ttr less than minimum ?
+         BNL   SEMPTY3                      no - not empty extent
+*
+         CL    9,WORKPTR                    last extent ?
+         BE    EODAD                        yes - end of file
+*
+         LR    0,9                          save work pointer
+         L     9,WORKPTR                    point to last extent
+*
+GNLOOP2  CL    0,WKCHAIN                    this extent next in chain ?
+         BE    GNLOOP1X                     yes - use it
+*
+         L     9,WKCHAIN                    point to previous extent
+         B     GNLOOP2                      loop
+*
+SEMPTY3  LA    1,WKDCB                      point to dcb
+         LA    0,=F'1'                      ttr of first record
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0)                      point to it
+*
+         MODE31 ,                           switch to amode 31
+*
+         MVI   POINTFLG,1                   indicate first point done
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         B     GNDONE                       go return rec to caller
+*
+GNNEXT   BAL   14,DEBLOCK                   go find next rec
+*
+         LTR   15,15                        end of file ?
+         BZ    GNDONE                       no - go pass rec to caller
+*
+         MVC   PMRCODE,=F'4'                set eof error code
+         LA    15,4                         set return code
+         B     EEXIT                        go to exit
+*
+GNDONE   CLM   0,15,PMBUFLEN                rec fit in user area ?
+         BH    SIZEERR                      no - error
+*
+         LR    14,1                         point to record
+         LR    15,0                         get actual record length
+         STCM  15,15,PMRECLEN               set length for return
+         LA    0,PMREC                      point to user area
+         ICM   1,15,PMBUFLEN                get area length
+         MVCL  0,14                         move record
+         MVC   PMRCODE,=F'0'                set error code
+         XR    15,15                        set return code
+         B     EEXIT                        go to exit
+*
+* -------------------------------------------------------------------
+*  PROCGU   -   process get-unique request
+* -------------------------------------------------------------------
+*
+PROCGU   L     9,WORKPTR                    point to work area
+         MVI   POINTFLG,0                   indicate point required
+         LH    1,KEYLEN                     get key length
+         BCTR  1,0                          minus 1 for execute
+*
+GUSECT   CLC   WKTTRHI,WKTTRLO              this extent empty ?
+         BL    GUSECT1                      yes - skip it
+*
+         CLC   PMKEY(0),WKKEYLO             is key higher than low key
+         EX    1,*-6                         in this section ?
+         BH    GUSECTOK                     yes - is in this section
+*
+GUSECT1  L     9,WKCHAIN                    get next work area
+         LTR   9,9                          any ?
+         BNZ   GUSECT                       yes - loop
+*
+         B     GUNOTFND                     no - not found (< low key)
+*
+GUSECTOK XR    7,7                          clear reg 7
+         ICM   7,3,WKTTRHI                  init max tt for range
+         XR    6,6                          init low tt for range
+         LA    8,WKTTRLO                    point to tree construct
+         USING TREE,8                       tree addressability
+*
+GUTREE   LH    1,PMKEYLEN                   get key length
+         BCTR  1,0                          minus 1 for compare
+         CLC   PMKEY(0),TRKEY               is key less than tree ?
+         EX    1,*-6                        well, is it ?
+         BNH   GULOW                        yes - go handle that
+*
+         ICM   6,3,TRTTR                    set new low tt
+         ICM   1,15,TRPTRHI                 get high branch pointer
+         BZ    GUHI1                        if zero, go on
+*
+         LR    8,1                          make that branch current
+         B     GUTREE                       go look again
+*
+GUHI1    LR    2,7                          copy high tt
+         SR    2,6                          minus low tt
+         SRL   2,1                          divide by 2
+         LTR   2,2                          result = 0 ?
+         BZ    GUHI2                        yes - found best tt
+*
+         MVC   SAVEKEY,TRKEY                save key
+*
+         GETMAIN RU,LV=TRSIZE,LOC=ANY       get space for new branch
+*
+         XC    0(TRSIZE,1),0(1)             clear it
+         ST    1,TRPTRHI                    add branch to tree
+         LR    8,1                          make branch current
+         AR    2,6                          add low tt of range
+         SLL   2,16                         shift for ttR0
+         ST    2,TRTTR                      set tt00 into branch
+         MVI   TRTTR+2,1                    make it into ttr0
+*
+         MVC   TTR0,TRTTR                   copy ttr below 16m line
+         LA    0,TTR0                       point to ttr
+         LA    1,WKDCB                      point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             prepare to read block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         AH    1,KEYPOS                     point to first key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         MVC   TRKEY(0),0(1)                executed move
+         EX    2,*-6                        move key to tree
+         CLC   TRKEY(0),SAVEKEY             executed compare
+         EX    2,*-6                        is key lower ?
+         BL    SEQERR                       low - sequence error
+*
+         B     GUTREE                       now go look again
+*
+GUHI2    SLL   6,16                         change tt into tt00
+         ST    6,TTR0                       save tt00
+         MVI   TTR0+2,1                     change it into ttr0
+         LA    0,TTR0                       point to ttr0
+         LA    1,WKDCB                      point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             position to read block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         B     GUSCANS                      go scan sequentially
+*
+GULOW    ICM   7,3,TRTTR                    set new high tt
+         ICM   1,15,TRPTRLO                 get low branch pointer
+         BZ    GULOW1                       if zero, go on
+*
+         LR    8,1                          make that branch current
+         B     GUTREE                       go look again
+*
+GULOW1   LR    2,7                          copy high tt
+         SR    2,6                          minus low tt
+         SRL   2,1                          divide by 2
+         LTR   2,2                          result = 0 ?
+         BZ    GULOW2                       yes - found best tt
+*
+         MVC   SAVEKEY,TRKEY                save the key
+*
+         GETMAIN RU,LV=TRSIZE,LOC=ANY       get space for new branch
+*
+         XC    0(TRSIZE,1),0(1)             clear it
+         ST    1,TRPTRLO                    add branch to tree
+         LR    8,1                          make branch current
+         AR    2,6                          add low tt of range
+         SLL   2,16                         shift for ttr0
+         ST    2,TRTTR                      set tt00 into branch
+         MVI   TRTTR+2,1                    make it into ttr0
+*
+         MVC   TTR0,TRTTR                   copy ttr below 16m line
+         LA    0,TTR0                       point to ttr
+         LA    1,WKDCB                      point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             prepare to read block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         AH    1,KEYPOS                     point to first key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         MVC   TRKEY(0),0(1)                executed move
+         EX    2,*-6                        move key to tree
+         CLC   TRKEY(0),SAVEKEY             executed compare
+         EX    2,*-6                        key in sequence ?
+         BH    SEQERR                       no - error
+*
+         B     GUTREE                       now go look again
+*
+GULOW2   LTR   6,6                          first block (0) ?
+         BZ    GULOW3                       yes - do not back up 1
+*
+         BCTR  6,0                          back up one block
+*
+GULOW3   SLL   6,16                         change tt into tt00
+         ST    6,TTR0                       save tt00
+         MVI   TTR0+2,1                     change it into ttr0
+         LA    0,TTR0                       point to ttr0
+         LA    1,WKDCB                      point to dcb
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0),TYPE=REL             position to read block
+*
+         MODE31 ,                           switch to amode 31
+*
+         LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         LH    15,KEYPOS                    get key position
+         AH    15,KEYLEN                    plus length
+         CR    15,0                         more than rec size ?
+         BH    FITERR                       yes - error
+*
+         B     GUSCANS                      go scan sequentially
+*
+GUSCANS  LH    3,PMKEYPOS                   get key offset
+         AR    3,1                          point to key
+         LH    2,PMKEYLEN                   get key length
+         BCTR  2,0                          minus 1 for compare
+         CLC   PMKEY(0),0(3)                key match ?
+         EX    2,*-6                        does key match ?
+         BE    GUFOUND                      yes - found record
+*
+         BL    GUNOTFND                     passed key - not found
+*
+         BAL   14,DEBLOCK                   get next record
+*
+         B     GUSCANS                      go check its key
+*
+GUFOUND  CLM   0,15,PMBUFLEN                rec fit in user area ?
+         BH    SIZEERR                      no - error
+*
+         LR    14,1                         point to record
+         LR    15,0                         get actual record length
+         STCM  15,15,PMRECLEN               set length for return
+         LA    0,PMREC                      point to user area
+         ICM   1,15,PMBUFLEN                get area length
+         MVCL  0,14                         move record
+         MVI   POINTFLG,1                   indicate first point done
+         MVC   PMRCODE,=F'0'                set error code
+         XR    15,15                        set return code
+         B     EEXIT                        go to exit
+*
+* -------------------------------------------------------------------
+*  CLOSE  -  process close request
+* -------------------------------------------------------------------
+*
+CLOSE    L     11,PMWKPTR                   get primary work address
+         LTR   11,11                        pointer zero ?
+         BZ    NOCLOSE                      yes - forget close
+         L     9,WORKPTR                    point to first work area
+*
+CLLOOP1  LTR   9,9                          valid ?
+         BZ    CLOSEX                       no - go on
+*
+         MODE24 ,                           switch to amode 24
+*
+         LA    3,WKDCB                      point to dcb
+         MVC   CLOSAREA(CLOSELEN),CLOSELST  set up close area
+         LA    1,CLOSAREA                   point to close parm list
+*
+         CLOSE ((3)),MF=(E,(1))             close file
+*
+         LA    1,WKDCB                      point to dcb
+*
+         FREEPOOL (1)                       free buffer pool
+*
+         MODE31 ,                           switch to amode 31
+*
+* -------------------------------------------------------------------
+*  How to free storage from a tree structure
+*
+*   Cannot free one element until all subordinate elements are gone.
+*   Reg 2 will point to current element (most of the time).  Go down
+*   the tree structure using the low then the high pointers of each
+*   element, saving the address of the element that points to the
+*   current element in the ttr field of the current element.  As
+*   each low or high pointer is picked up, it is zeroed.  When both
+*   pointers are zero, the previous pointer (from pointer) is picked
+*   up and the current element is freemained.  Then the previous
+*   element becomes current, and the pointers are checked again for
+*   the now current element.  The previous pointer of the first
+*   element is set to zero, and when recognized as the last remaining
+*   element, is not freemained, since it is actually part of the
+*   segment work area, and is freemained with that.
+* -------------------------------------------------------------------
+*
+         XR    3,3                          clear reg 3 (prev tree)
+         LA    2,WKTTRLO                    point to initial tree
+         PUSH  USING                        save addressability
+         DROP  8                            remove addressability
+         USING TREE,2                       set tree addressability
+*
+CLLOOP2  ST    3,TRTTR                      save from address in ttr
+CLLOOP2A LR    3,2                          copy tree address
+         L     1,TRPTRLO                    get low pointer
+         XC    TRPTRLO,TRPTRLO              clear pointer
+         LTR   2,1                          low pointer zero ?
+         BNZ   CLLOOP2                      no - do it again
+*
+         LR    2,3                          restore tree address
+         L     1,TRPTRHI                    get high pointer
+         XC    TRPTRHI,TRPTRHI              clear pointer
+         LTR   2,1                          high pointer zero ?
+         BNZ   CLLOOP2                      no - do it again
+*
+         LR    2,3                          restore tree address
+         L     4,TRTTR                      get from address from ttr
+         LR    1,2                          copy this tree address
+         LTR   2,4                          set new tree address
+         BZ    CLLOOP2X                     if zero, at top
+*
+         FREEMAIN RC,LV=TRSIZE,A=(1)        free tree storage
+         B     CLLOOP2A                     go do previous tree
+*
+CLLOOP2X LR    1,9                          copy wk address
+         L     9,WKCHAIN                    get next wk address
+         FREEMAIN RC,LV=WORKSIZE,A=(1)      free this work area
+         B     CLLOOP1                      do it again for next area
+*
+CLOSEX   LR    1,11                         point to main work area
+         FREEMAIN RC,LV=BWSIZE,A=(1)        free main work area
+*
+         XC    PMWKPTR,PMWKPTR              clear work pointer
+         MVC   PMRCODE,=F'0'                set error code
+*
+NOCLOSE  XR    15,15                        set return code
+         B     EEXIT                        go to exit
+         DROP  2
+         POP   USING
+*
+* -------------------------------------------------------------------
+*  ERROR ROUTINES
+* -------------------------------------------------------------------
+*
+EODAD    MVC   PMRCODE,=F'4'                set error code
+         LA    15,4                         set return code
+         B     EEXIT                        go to exit
+*
+GUNOTFND MVC   PMRCODE,=F'8'                set error code
+         LA    15,4                         set return code
+         B     EEXIT                        go to exit
+*
+SIZEERR  MVC   PMRCODE,=F'32'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+FITERR   MVC   PMRCODE,=F'36'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+SEQERR   MVC   PMRCODE,=F'40'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+PARMERR  MVC   PMRCODE,=F'28'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+OPENFAIL MVC   PMRCODE,=F'12'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+BADDEVT  MVC   PMRCODE,=F'24'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+KEYLNERR MVC   PMRCODE,=F'20'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+PMTYPERR MVC   PMRCODE,=F'16'               set error code
+         LA    15,8                         set return code
+         B     EEXIT                        go to exit
+*
+EEXIT    MODE24 ,                           switch to amode 24
+*
+         LR    1,13                         point to my save area
+         L     13,4(,13)                    point to caller's save area
+         ST    15,16(,13)                   save return code
+*
+         FREEMAIN R,LV=72,A=(1)             free the storage
+*
+         LM    14,12,12(13)                 restore caller's regs
+         BR    14                           return
+*
+* -------------------------------------------------------------------
+*  READ subroutine
+*    input r1 = dcb address
+*    output r1 = rec pointer, r0 = length
+*    read a block, determine record length (minus rdw if recfm=v),
+*    point to data (past rdw if recfm=v)
+*    saves block length, record pointer, and record length for
+*    deblock routine.
+* -------------------------------------------------------------------
+*
+READ     STM   0,15,READSAVE                save regs
+         LR    5,1                          copy work area address
+*
+         PUSH  USING                        save current addressability
+         DROP  9
+         USING WORKAREA,5                   work area addressability
+*
+         L     4,IOAREA                     point to io area
+         LA    3,WKDCB                      get dcb address
+*
+         MODE24 ,                           switch to amode 24
+*
+         MVC   DECBLIST(READLEN),READLIST   build read decb
+*
+         READ  RDDECB,SF,(3),(4),'S',MF=E start read operation
+*
+         CHECK RDDECB                       complete read operation
+*
+         MODE31 ,                           switch to amode 31
+*
+         USING IHADCB,3                     dcb addressability
+         TM    DCBRECFM,DCBRECU             undefined records ?
+         BO    READU                        yes - handle them
+*
+         BZ    READU                        yes - handle them
+*
+         TM    DCBRECFM,DCBRECV             variable records ?
+         BO    READV                        yes - handle them
+*
+         TM    DCBRECFM,DCBRECBR            fixed-blocked records ?
+         BO    READFB                       yes - handle them
+*
+READF    MVC   RDBLKSIZ,DCBBLKSI            use blksize for fixed recs
+         XR    0,0                          clear reg 0
+         ICM   0,3,DCBBLKSI                 pick up block size
+         L     1,IOAREA                     point to io area
+         B     READXIT                      go to read exit
+*
+READV    L     1,IOAREA                     point to io area
+         MVC   RDBLKSIZ,0(1)                blksize is in 1st 2 bytes
+         LH    0,4(,1)                      get first rec length
+         SH    0,=H'4'                      minus 4
+         LA    1,8(,1)                      point to data part of rec
+         B     READXIT                      go to read exit
+*
+READFB   L     1,RDDECB+16                  pick up iob address
+         LH    0,DCBBLKSI                   get dcb block size
+         SH    0,14(1)                      calculate read length
+         STH   0,RDBLKSIZ                   save block length
+         LH    0,DCBLRECL                   get lrecl from dcb
+         L     1,IOAREA                     point to record
+         B     READXIT                      go to read exit
+*
+READU    L     1,RDDECB+16                  pick up iob address
+         LH    0,DCBBLKSI                   get dcb block size
+         SH    0,14(1)                      calculate read length
+         STH   0,RDBLKSIZ                   save block length
+         L     1,IOAREA                     point to record
+         B     READXIT                      go to read exit
+*
+READXIT  STH   0,RDRECLEN                   save record length
+         ST    1,RDRECPTR                   save record pointer
+         ST    5,RDWKAREA                   save work area address
+         LM    2,15,READSAVE+8              restore regs 2 thru 15
+         BR    14                           go back
+*
+         DROP  5                            drop addressability
+         POP   USING                        restore addressability
+*
+* -------------------------------------------------------------------
+*    DEBLOCK
+*    output 1 = rec pointer, r0 = length
+*    returns address and length of next record in block,
+*    or reads next block if necessary.
+* -------------------------------------------------------------------
+*
+DEBLOCK  STM   0,15,DBLKSAVE                save regs
+         L     9,RDWKAREA                   point to current work area
+         USING WORKAREA,9                   work addressability
+         LA    3,WKDCB                      point to dcb
+         USING IHADCB,3                     dcb addressability
+*
+         L     1,RDRECPTR                   point to record
+         AH    1,KEYPOS                     point to first key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         MVC   SAVEKEY(0),0(1)              executed move
+         EX    2,*-6                        move key
+*
+         L     1,RDRECPTR                   point to record
+         AH    1,RDRECLEN                   point past end of record
+         L     2,IOAREA                     point to io area
+         AH    2,RDBLKSIZ                   point past end of block
+         CR    1,2                          end of block ?
+         BNL   DBREAD                       yes - go read another
+*
+         TM    DCBRECFM,DCBRECBR            blocked records ?
+         BZ    DBREAD                       no - read another (why?)
+*
+         TM    DCBRECFM,DCBRECF             fixed records ?
+         BO    DBFIXED                      yes - handle them
+*
+         LH    0,0(,1)                      get next rec len from rdw
+         SH    0,=H'4'                      minus 4
+         STH   0,RDRECLEN                   save next record length
+         LA    1,4(,1)                      point past rdw
+         ST    1,RDRECPTR                   save record pointer
+         AH    1,KEYPOS                     point to key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         CLC   SAVEKEY(0),0(1)              executed compare
+         EX    2,*-6                        compare keys
+         BH    SEQERR                       if high, sequence error
+*
+         L     1,RDRECPTR                   get record pointer
+         XR    15,15                        set return code
+         B     DEBLKXIT                     go to deblock exit
+*
+DBFIXED  LH    0,DCBLRECL                   get lrecl
+         STH   0,RDRECLEN                   set lrecl (again?)
+         XR    15,15                        set return code
+         B     DEBLKXIT                     go to deblock exit
+*
+DBREAD   CLC   DCBFDAD,WKFDADHI             last block in section ?
+         BNE   DBREAD1                      no - read next
+*
+         CL    9,WORKPTR                    last section ?
+         BE    DBEODAD                      yes - end of data
+*
+         LR    8,9                          save workarea pointer
+         LH    0,NUMVOLS                    get number of sections
+         L     9,WORKPTR                    get first work area ptr
+*
+DBCHAIN  CL    8,WKCHAIN                    current = next on chain ?
+         BE    DBEOV                        yes - use previous
+*
+         L     9,WKCHAIN                    get next work area pointer
+         LTR   9,9                          zero ?
+         BZ    DBEODAD                      yes - end of data (how?)
+*
+         BCT   0,DBCHAIN                    loop through volumes
+*
+         B     DBEODAD                      not found - eodad (how?)
+*
+DBEOV    LA    1,WKDCB                      point to dcb
+         LA    0,=F'1'                      set ttr for first block
+*
+         MODE24 ,                           switch to amode 24
+*
+         POINT (1),(0)                      set up to read first block
+*
+         MODE31 ,                           switch to amode 31
+*
+DBREAD1  LA    1,WORKAREA                   point to dcb
+         BAL   14,READ                      go read block
+*
+         L     1,RDRECPTR                   get record pointer
+         AH    1,KEYPOS                     point to key
+         LH    2,KEYLEN                     get key length
+         BCTR  2,0                          minus 1 for execute
+         CLC   SAVEKEY(0),0(1)              executed compare
+         EX    2,*-6                        compare keys
+         BH    SEQERR                       if high, sequence error
+*
+         L     1,RDRECPTR                   get record pointer
+         XR    15,15                        set return code
+         B     DEBLKXIT                     go to deblock exit
+*
+DBEODAD  XR    0,0                          clear reg 0 (length)
+         XR    1,1                          clear reg 1 (pointer)
+         LA    15,8                         set eodad return code
+         B     DEBLKXIT                     go to deblock exit
+*
+DEBLKXIT LM    2,14,DBLKSAVE+8              restore regs 2 thru 14
+         BR    14                           return from deblock
+*
+* -------------------------------------------------------------------
+*  CALLTTR - interface to documented ttr conversion routine
+*    converts mbbcchhr (from dcb + 5) into ttr0 in reg 1.
+*    see dfp system programming reference (sc26-4567)
+* -------------------------------------------------------------------
+*
+CALLTTR  STM   0,15,TTRSAVE                 save regs
+         LA    3,TTRSAVE                    point to save area
+         DROP  ,                            no addressability
+         USING IHADCB,1                     dcb addressability
+*
+         LA    2,DCBFDAD                    point to mbbcchhr
+         L     1,DCBDEBAD                   pick up deb address
+         LA    1,0(,1)                      fix deb address
+         L     15,16                        point to cvt
+         USING CVT,15                       cvt addressability
+*
+         L     15,CVTPRLTV                  point to converter routine
+         BALR  14,15                        call converter
+*
+         LR    1,0                          save returned ttr
+         L     0,0(,3)                      restore reg 0
+         LM    2,15,8(3)                    restore regs 2-15
+         BR    14                           go back
+*
+         DROP  15,1                         lose addressability
+*
+HIGHBIT  DC    0F'0',X'80000000'
+MODELDCB DCB   DDNAME=X,DSORG=PS,MACRF=(RCP),BUFNO=2,EODAD=EOF1
+MYDCBLEN EQU   *-MODELDCB
+OPENLIST OPEN  (0,INPUT),MF=L
+OPENLEN  EQU   *-OPENLIST
+TCLOSLST CLOSE (0,LEAVE),TYPE=T,MF=L
+TCLOSLEN EQU   *-TCLOSLST
+CLOSELST CLOSE (0),MF=L
+CLOSELEN EQU   *-CLOSELST
+READLIST READ  LDECB,SF,MF=L
+*
+BWSPACE  DSECT ,
+TTRSAVE  DS    16F                     save area for ttr conversion
+DBLKSAVE DS    16F                     save area for deblock routine
+READSAVE DS    16F                     save area for read routine
+RDRECPTR DC    A(0)                    record pointer for read
+WORKPTR  DC    A(0)                    last segment work pointer
+RDWKAREA DC    A(0)                    work area used by last read
+IOAREA   DC    A(0)                    io area address
+TTR0     DC    A(0)                    ttr work area
+OPENAREA DS    CL(OPENLEN)             space for open list
+         DS    0F
+CLOSAREA DS    CL(TCLOSLEN)            space for close list
+         DS    0F
+DECBLIST READ  RDDECB,SF,MF=L          space for read list
+READLEN  EQU   *-DECBLIST
+BLKSIZE  DC    H'0'                    largest blocksize of all parts
+RDRECLEN DC    H'0'                    read record length
+RDBLKSIZ DC    H'0'                    read block size
+KEYLEN   DS    H                       original key length
+KEYPOS   DS    H                       original key position
+NUMVOLS  DS    H                       number of volumes (calculated)
+DDNAME   DS    CL8                     original dd name
+SAVEKEY  DS    CL(L'WKKEYLO)           save key area
+POINTFLG DC    X'00'                   point indicator (0 = not done)
+BWSIZE   EQU   *-BWSPACE
+*
+* -------------------------------------------------------------------
+*  work area format
+*    there will be one work area for each volume.  areas will be
+*    chained with the last volume first.
+* -------------------------------------------------------------------
+*
+WORKAREA DSECT ,                       work area
+WKCHAIN  DS    F                       next work area address or zero
+WKTTRHI  DS    F                       hi used ttr of last volume
+WKTTRLO  DS    F     <--.              ttr of record with low key
+WKPTRLO  DS    F        |  TREE        pointer to lower key in tree
+WKPTRHI  DS    F        |  FORMAT      pointer to higher key in tree
+WKKEYLO  DS    CL20  <--'              first key in first block
+WKFDADHI DS    CL8                     hi used full disk address
+WKDCB    DS    CL(MYDCBLEN)            dcb for last or only volume
+WORKSIZE EQU   *-WORKAREA              length of work area dsect
+*
+* -------------------------------------------------------------------
+*  input parameter fields
+* -------------------------------------------------------------------
+*
+PARMLIST DSECT ,
+PMWKPTR  DS    F                       address of randseq wk area
+PMDDNAME DS    CL8                     requestor ddname
+PMTYPE   DS    CL2                     request type
+PMKEYLEN DS    H                       key length
+PMKEYPOS DS    H                       key position
+PMKEY    DS    CL20                    key
+PMRECLEN DS    AL4                     return record length
+PMRCODE  DS    AL4                     return code
+PMBUFLEN DS    AL4                     size of record area
+PMREC    DS    AL4                     return data area
+*
+* -------------------------------------------------------------------
+*  tree branch format
+* -------------------------------------------------------------------
+*
+TREE     DSECT ,
+TRTTR    DS    F                       ttr of rec with key
+TRPTRLO  DS    F                       pointer to lower key in tree
+TRPTRHI  DS    F                       pointer to higher key in tree
+TRKEY    DS    CL20                    first key in the block
+TRSIZE   EQU   *-TREE
+*
+* -------------------------------------------------------------------
+*
+         DCBD  DSORG=BS,DEVD=DA
+         IEZDEB
+         CVT   DSECT=YES
+         END

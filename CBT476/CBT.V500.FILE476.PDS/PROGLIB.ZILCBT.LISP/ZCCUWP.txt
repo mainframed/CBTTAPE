@@ -1,0 +1,162 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;;
+;;; This compiles the "UNWIND-PROTECT" special form inline.
+;;;
+;;; The code works something like this:
+;;;
+;;;
+ ; (unwind-protect (protected-form) (cleanup-form1) (cleanup-form2))
+ ;
+ ; generates:
+
+#|--------------------------------------------------------------------|
+         L     14,ZLCCATCH         Address of current catch frame     |
+         ST    14,frame+0(,11)     Store into new frame               |
+         L     14,ZLCSALST         Save special ALIST                 |
+         L     15,ZLCFALST         Save fluid ALIST                   |
+         XR    0,0                 Tag slot = hex zeroes              |
+         LA    1,label1            Address of cleanup forms code      |
+         STM   11,1,frame+4(11)    Save stack, base, etc. into frame  |
+         LA    14,label2           Address to return to after cleanup |
+         ST    14,frame+12(,11)    Store into new frame               |
+         LA    14,frame+0(,11)     Address of new frame               |
+         ST    14,ZLCCATCH         Make it the active catch frame     |
+ ... code to evaluate protected-form ...                              |
+ ... which returns a value in register r1 ...                         |
+         NOP   label2              (for future multiple value support)|
+         ST    r1,frame+32(,11)    Save return value in frame         |
+label1   DS    0H                  Fall thru or branch from THROW     |
+         L     14,frame+0(,11)     Get previous catch frame address   |
+         ST    14,ZLCCATCH         Unhook this, make previous active  |
+ ... code to evaluate cleanup-form1 ...                               |
+ ... code to evaluate cleanup-form2 ...                               |
+         LA    14,frame+0(,11)     Set address of this frame          |
+         L     15,frame+12(,11)    Load return address                |
+         BR    15                  Fall through or return to THROW    |
+label2   DS    0H                  Continue here if no THROW          |
+         L     r2,frame+32(,11)    Load value from protected-form     |
+----------------------------------------------------------------------|#
+
+; The structure of the unwind-protect frame is as follows.
+;
+; frame+0  (+x'00')  Address of previous CATCH/UWP frame (zero if none)
+; frame+4  (+x'04')  Saved register 11 (stack pointer from catcher)
+; frame+8  (+x'08')  Saved register 12 (base register from catcher)
+; frame+12 (+x'0C')  Return address (to branch to following catch)
+; frame+16 (+x'10')  Saved special alist (variable binding stack)
+; frame+20 (+x'14')  Saved fluid alist (variable binding stack)
+;
+; frame+24 (+x'18')  Zero for UNWIND-PROTECT; the tag for CATCH
+;
+; The following fields are present only in UNWIND-PROTECT frames:
+;
+; frame+28 (+x'1C')  Address of the cleanup forms code to invoke
+;                    (during unwind, contains the tag being thrown to)
+; frame+32 (+x'20')  Return value stored from evaluating protected form
+;                    (during unwind, contains return value from THROW)
+; End of frame.
+;
+
+;
+; For more information, see ZILTHROW.
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 04/06/88 - Support for GO tag optimization.                         *
+;* 04/08/88 - Support for GO and RETURN out of UNWIND-PROTECT.         *
+;* 04/25/88 - Support for determination of superfluous initializations *
+;*            of PROG and &AUX variables to NIL.  This involves two    *
+;*            new fields in the contour that are used to detect cases  *
+;*            of a variable unconditionally being set before it is     *
+;*            ever referenced.  This is an extension of, and replaces, *
+;*            the SETQ-initialization-hacking scheme used in ZCCPROG.  *
+;*            This also requires a new P-code form, CSETNIL, and a new *
+;*            code generator module, ZCGCSNIL.                         *
+;* 06/16/88 - Support for multiple values, in that information is put  *
+;*            on the label to record the use of the return value.      *
+;* 11/01/88 - Bug fix - if the protected form never returns.           *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun zccuwp (b v s e)
+ (prog (protected-form       ; Arg 1 to UNWIND-PROTECT
+        cleanup-forms        ; Arg 2 to UNWIND-PROTECT
+        label1               ; a label to be used by the generated code
+        label2               ; a label to be used by the generated code
+        label3               ; a label to be used by the generated code
+       )
+
+;;; Syntax check and set locals.
+
+  (or b
+      (return (modq body
+                    '(error "Missing protected form" unwind-protect))))
+  (or (cdr b)
+      (return (modq body
+                    '(error "Missing cleanup forms" unwind-protect))))
+
+  (desetq (protected-form . cleanup-forms) b)
+
+;;; Create labels to be used in code generation.
+;;; Note:  No properties need be set for the labels, for they are not
+;;;        processed by the normal ZILCO label handling.
+
+  (setq label1 (gensym)
+        label2 (gensym)
+        label3 (gensym))
+
+  (putprop label1 label2 'uwplabel)
+
+  (putprop label1 v 'vartarg) ; Info used when compiling VALUES.
+  (putprop label1 s 'rettarg) ; Info used when compiling VALUES.
+
+;;; Generate P-code.
+
+  (modq body `(beginuwp ,label1 ,label2 ,v ,s)) ; Initialize UWP frame.
+  ;
+  ; Set up a contour to prevent overoptimizing GO's (see ZCCCOND).
+  ; This needs to surround only the protected form.
+  ;
+  ; Protected forms within an UNWIND-PROTECT are considered conditional
+  ; because a non-local exit may occur at any point, causing execution
+  ; to continue beyond the scope of the protected forms without any of
+  ; the code inside being executed.  This does not apply to cleanup
+  ; forms, however.
+  ;
+  (let ((e (cons (zccmkcec 'unwind-protect e) e)))
+   (setf (zilcec-permcond (car e)) t)
+
+; 11/01/88 bug fix...
+
+;;;(zccevcom protected-form nil `(uwp ,label1) e)  ; Protected form.
+   (zccevcom protected-form nil `(goto ,label3) e) ; Protected form.
+  )
+
+; 11/01/88 bug fix...
+  (putprop label3 t 'referenced) ; Force generation.
+  (modq body `(label ,label3 nil (uwp ,label1))) ; Process returns.
+
+  (zccprogn cleanup-forms nil nil e)        ; Evaluate cleanup forms.
+
+  (modq body `(enduwp ,label2 ,v ,s))       ; Finish up UWP processing.
+
+ ) ; end PROG
+) ; end DEFUN ZCCUWP
+

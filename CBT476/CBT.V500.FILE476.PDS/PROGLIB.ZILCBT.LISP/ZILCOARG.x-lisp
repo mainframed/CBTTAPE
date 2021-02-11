@@ -1,0 +1,792 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "ZILCOARG"
+;
+; This function makes the PARMS list out of the argument list passed
+; to it.  For example...
+;
+;  (DEFUN FOO (A B C) ...)  results in call (ZILCOARG 'FOO '(A B C))
+;                            which builds the following list:
+;
+; ((A . G00001) (B . G00002) (C . G00003))
+;
+;   where:  (GET 'G00001 'POSITION) ==> 1
+;           (GET 'G00002 'POSITION) ==> 2
+;           (GET 'G00003 'POSITION) ==> 3
+;
+; The return value is:
+;
+;   T  - if the argument list is valid
+;   NIL - if there is an error in the argument list
+;
+; In addition, it also assigns properties to the named function:
+;
+; PARMS   - the list of dotted pairs constructed by this function
+; MINARGS - the minimum number of arguments
+; MAXARGS - the maximum number of arguments
+; RESTARG - the &REST argument if there is one, else NIL
+; LEXPRARG - the name of the single arg if the function is a LEXPR
+; ALLOW-OTHER-KEYS-P - if &ALLOW-OTHER-KEYS is in the lambda list.
+;
+;
+; NIL is allowed as a first-level lambda list arg.  It is
+; treated as a destructuring spec with no components.
+;
+;
+; Destructuring works something like this:
+;
+; Given a lambda list like the following...
+;
+; (LAMBDA ((A (B C) D . E) X Y &OPTIONAL (O 1 O?) &REST Z &AUX (U 2))
+;
+; a list is built as follows:
+;
+;
+;    The list           Plist of (CDR <--))
+;
+;  (
+;   (G01 . G02)      (POSITION 1 DESTRVARS ((A . G09)
+;                                           (B . G10)
+;                                           (C . G11)
+;                                           (D . G12)
+;                                           (E . G13)))
+;   (X   . G03)      (POSITION 2)
+;   (Y   . G04)      (POSITION 3)
+;   (O   . G05)      (POSITION 4 OPTIONAL T INIT 1
+;                                           SUPPLIEDP (O? . G08))
+;   (Z   . G06)      (POSITION 5)
+;   (U   . G07)      (POSITION 6 AUX T INIT 2)
+;   (O?  . G08)      (POSITION 7 OWNED T)
+;   (A   . G09)      (POSITION 8  OWNED T INIT (CAR G01))
+;   (B   . G10)      (POSITION 9  OWNED T INIT (CAADR G01))
+;   (C   . G11)      (POSITION 10 OWNED T INIT (CDADR G01))
+;   (D   . G12)      (POSITION 11 OWNED T INIT (CADDR G01))
+;   (E   . G13)      (POSITION 12 OWNED T INIT (CDDDR G01))
+;  )
+;
+;
+; &KEY variables work something like this:
+;
+; Given a lambda list like the following...
+;
+; (LAMBDA (&KEY ((:A A) "a" A?))
+;
+; a list is built as follows:
+;
+;
+;    The list           Plist of (CDR <--))
+;
+;  (
+;   (A   . G01)      (POSITION 1 KEY T KEYWORD :A INIT "a"
+;                                      SUPPLIEDP (A? . G02))
+;   (A?  . G02)      (POSITION 2 OWNED T)
+;  )
+;
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+#.(progn
+   (defvar ignore-list '(ignore ignored ignorable ignoreable
+                         *ignore* *ignored* *ignorable* *ignoreable*)
+    "The possible lambda-list-arg names that are not to generate
+     an error when found more than once."
+   )
+   '(eval-when (compile) nil)
+  )
+
+(declare (special *destructuring-vars*))
+
+(defun zilcoarg (f x) ; F = the function name, X = the argument list
+ (catch 'lambda-list-errors
+  (prog (l n argvars a min max mode opt aux auxvars restarg
+         init suppliedp supvars temp temp2 arglist-ok-p
+         allow-other-keys-p key keyword keyvars
+         *destructuring-vars*)
+
+       (setq n 1 l x)
+
+       (unless (listp x)
+
+ ; If the arglist is not NIL or a list, this is a LEXPR.
+
+ ;;; Note: There is no possible lossage by using the same property name
+ ;;;       "LEXPRARG" because (cdar argvars) is always a fresh gensym.
+
+               (cond
+                ((or
+                     (not (symbolp x))
+                     (eq (pbind x) x)
+                 )
+                 (princ "Error: ")
+                 (prin1 x)
+                 (princ " is an invalid lambda list.")
+                 (terpri)
+                 (return nil)))
+               (setq argvars (list (setq temp (zilcoarg1 x 1 nil))))
+               (putprop f 0 'minargs)
+               (putprop f 0 'maxargs)
+               (remprop f   'restarg)
+               (putprop f argvars 'parms) ; Singleton, needn't nreverse.
+               (putprop f x 'lexprarg)
+               (putprop (cdr temp) t 'lexprarg)
+               (return t)
+       )
+
+  loop (or l (go process-return))
+       (when (atom l)
+             (setq a l l '(nil)); to force processing thru to end
+             (go make-&rest-arg))
+       (setq a (car l))
+       (when (llkeywdp a) ; If it's a lambda list keyword
+             (case a
+                   (&optional         (go process-&optional))
+                   ((&rest &body)     (go process-&rest))
+                   (&aux              (go process-&aux))
+                   (&key              (go process-&key))
+                   (&allow-other-keys (go process-&allow-other-keys))
+                   (t
+                    (princ "Error: Unsupported LAMBDA list keyword: ")
+                    (prin1 a)
+                    (terpri)
+                    (return nil))))
+
+  ; At this point, the mode should not be &REST.  If the mode was
+  ; set to &REST, control would have gone to CREATE-PARM.
+  ; (Let's hear it for structured programming!!!)
+
+  (when (eq mode '&rest)
+        (princ "Error:  Too many &REST args in lambda list.")
+        (terpri)
+        (return nil))
+
+  create-parm
+
+       (cond
+             ((consp a)                ; List in &optional or &aux mode.
+              (case mode
+                    (&aux
+                     (setq init (cdr a))
+                     (cond
+                      ((null init)
+                       (setq a (car a)))
+                      ((or (atom init) (cdr init))
+                       (go bad-argument))
+                      (t
+                       (setq a (car a))
+                       (setq init (car init)))))
+                    (&optional
+                     (setq init (cdr a) suppliedp nil)
+                     (cond
+                      ((null init)
+                       (setq a (car a)))
+                      ((atom init)
+                       (go bad-argument))
+                      ((null (cdr init))
+                       (setq a (car a) init (car init)))
+                      ((null (cddr init))
+                       (psetq a (car a) init (car init)
+                                        suppliedp (cadr init)))
+                      (t
+                       (go bad-argument))))
+                    (&key
+                     (setq init (cdr a) suppliedp nil)
+                     (cond
+                      ((null init)
+                       (setq a (car a)))
+                      ((atom init)
+                       (go bad-argument))
+                      ((null (cdr init))
+                       (setq a (car a) init (car init)))
+                      ((null (cddr init))
+                       (psetq a (car a) init (car init)
+                                        suppliedp (cadr init)))
+                      (t
+                       (go bad-argument))))
+                    (t ; Mode not optional or aux, just required arg
+                     (setq init nil suppliedp nil))))
+             (t   ; A is an atom.
+              (setq init nil suppliedp nil)))
+;
+; Now, A may be either an atom or still a cons.  If it is still a cons
+; it needs destructuring.
+;
+       (case mode
+        ((nil)
+              (push (zilcoarg1 a n nil) argvars)
+              (setq n (1+ n))
+        )
+        (&rest
+              (setq restarg (zilcoarg1 a nil nil))
+        )
+        (&aux
+              (push (cons a init) auxvars)
+        )
+        (&optional
+              (push (setq temp (zilcoarg1 a n '&optional init))
+                    argvars)
+              (setq n (1+ n))
+              (when suppliedp (setq temp2 (zilcoarg1 suppliedp nil nil))
+                              (push temp2 supvars)
+                              (putprop (cdr temp) temp2 'suppliedp))
+        )
+        (&key
+              (if (consp a)
+                  (if (consp (cdr a))
+                      (setq keyword (car a) a (cadr a))
+                      (setq keyword (keywordify (car a)) a (car a)))
+                  (setq keyword (keywordify a)))
+              (push (setq temp (zilcoarg1 a nil '&key init))
+                    keyvars)
+              (unless (keywordp keyword)
+               (princ "Error: &KEY keyword is not a keyword: ")
+               (prin1 keyword)
+               (terpri)
+               (return nil))
+              (putprop (cdr temp) keyword 'keyword)
+              (when suppliedp (setq temp2 (zilcoarg1 suppliedp nil nil))
+                              (push temp2 supvars)
+                              (putprop (cdr temp) temp2 'suppliedp))
+        )
+        (t
+              (princ "Error: Lambda list args not allowed after ")
+              (prin1 mode)
+              (terpri)
+              (return nil)
+        )
+       )
+       (setq l (cdr l))
+       (go loop)
+
+ process-&optional
+
+       (when opt
+             (princ "Error: Duplicate \"&OPTIONAL\" in lambda list.")
+             (terpri)
+             (return nil))
+       (when restarg
+             (princ
+              "Error: \"&REST\" precedes \"&OPTIONAL\" in lambda list.")
+             (terpri)
+             (return nil))
+       (when aux
+             (princ
+             "Warning: \"&AUX\" precedes \"&OPTIONAL\" in lambda list.")
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (when key
+             (princ
+             "Warning: \"&KEY\" precedes \"&OPTIONAL\" in lambda list.")
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (setq mode '&optional
+             opt t)
+       (or min (setq min (1- n)))
+       (setq l (cdr l))
+       (go loop)
+
+ process-&aux
+
+       (when aux
+             (princ "Error: Duplicate \"&AUX\" in lambda list.")
+             (terpri)
+             (return nil))
+       (setq mode '&aux
+             aux t)
+       (or max (setq max (1- n)))
+       (or min (setq min max))
+       (setq l (cdr l))
+       (go loop)
+
+ process-&rest
+
+       (setq l (cdr l))
+       (unless (consp l)
+               (princ "Warning: Missing &REST arg in lambda list.")
+               (terpri)
+               (go loop))
+       (setq a (car l))
+
+ make-&rest-arg
+
+       (when (llkeywdp a)
+             (princ "Warning: Missing &REST arg in lambda list.")
+             (terpri)
+             (go loop))
+       (when restarg
+             (princ "Error: Too many &REST args in lambda list.")
+             (terpri)
+             (return nil))
+       (when aux
+             (princ
+             "Warning: \"&AUX\" precedes &REST arg in lambda list.")
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (when key
+             (princ
+             "Warning: \"&KEY\" precedes &REST arg in lambda list.")
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (or max (setq max (1- n)))
+       (or min (setq min max))
+       (setq mode '&rest
+             restarg a)
+       (go create-parm)
+
+ process-&key
+
+       (when key
+             (princ "Error: Duplicate \"&KEY\" in lambda list.")
+             (terpri)
+             (return nil))
+       (setq mode '&key
+             key t)
+       (or max (setq max (1- n)))
+       (or min (setq min max))
+       (setq l (cdr l))
+       (go loop)
+
+ process-&allow-other-keys
+
+       (when allow-other-keys-p
+        (princ "Error: Duplicate \"&ALLOW-OTHER-KEYS\" in lambda list.")
+        (terpri)
+        (return nil))
+       (setq mode '&allow-other-keys
+             allow-other-keys-p t)
+       (setq l (cdr l))
+       (go loop)
+
+ process-return
+
+       (and key
+            (null restarg)
+            (setq restarg (zilcoarg1 (gensym) nil nil)))
+
+       (or min (setq min (1- n)))
+       (or max (setq max (1- n)))
+       (putprop f min 'minargs)
+       (putprop f max 'maxargs)
+       (putprop f restarg 'restarg)
+       (putprop f allow-other-keys-p 'allow-other-keys-p)
+       (setq n max)
+       ;
+       ; Assign &REST variable.
+       ;
+       (when restarg
+             (setq n (1+ n))
+             (putprop (cdr restarg) n 'position)
+             (push restarg argvars)
+       )
+       ;
+       ; Assign &KEY variables.
+       ;
+       (when keyvars
+             (setq keyvars (nreverse keyvars))
+             (loop for p in keyvars do
+              (setq n (1+ n))
+              (putprop (cdr p) n 'position)
+              (push p argvars)
+             )
+       )
+       ;
+       ; Assign "supplied-p" variables.
+       ;
+       (when supvars
+             (setq supvars (nreverse supvars))
+             (loop for s in supvars do
+              (setq n (1+ n))
+              (putprop (cdr s) n 'position)
+              (putprop (cdr s) t 'owned)
+              (push s argvars)
+             )
+       )
+       ;
+       ; Assign &AUX variables.
+       ;
+       (when auxvars
+             (loop for (var . init) in (nreverse auxvars) do
+              (setq n (1+ n))
+              (push (zilcoarg1 var n '&aux init) argvars)
+             )
+       )
+       ;
+       ; Process destructured variables.
+       ;
+       (when *destructuring-vars*
+             (setq *destructuring-vars* (nreverse *destructuring-vars*))
+             (loop for p in *destructuring-vars* do
+              (setq n (1+ n))
+              (putprop (cdr p) n 'position)
+              (push p argvars)
+             )
+       )
+       (setq argvars (nreverse argvars))
+       (setq arglist-ok-p t)
+       (loop for l on argvars
+        (let (
+              ((a . b) (car l))
+             )
+         (when (or (not (symbolp a))
+                   (eq (pbind a) a))
+               (princ "Error: ")
+               (prin1 a)
+               (princ " is an invalid lambda list argument.")
+               (terpri)
+               (setq arglist-ok-p nil)
+         )
+         (when (and (assq a (cdr l))
+                    (not (memq a '#.ignore-list)))
+               (princ "Error: ")
+               (prin1 a)
+               (princ " is a duplicate lambda list argument.")
+               (terpri)
+               (setq arglist-ok-p nil)
+         )
+        )
+       )
+       (putprop f argvars 'parms)
+       (return arglist-ok-p)
+
+ bad-argument
+
+       (princ "Error: ")
+       (prin1 a)
+       (princ " is an invalid lambda list element.")
+       (terpri)
+       (return nil)
+
+  )
+ )
+)
+
+(defun zilcoarg1 (v n mode &optional init)
+ (let ((a (gensym)))
+      (putprop a n 'position)
+      (case mode
+       (&aux
+                  (putprop a t    'aux)
+                  (putprop a init 'init))
+       (&optional
+                  (putprop a t    'optional)
+                  (putprop a init 'init))
+       (&key
+                  (putprop a t    'key)
+                  (putprop a init 'init))
+       (destructuring
+                  (putprop a t    'owned)
+                  (putprop a init 'init))
+      )
+      (cond
+       ((and v (atom v))
+        (cons v a))
+       (t                        ; If var null or a list, destructure.
+        (let ((p (cons (gensym) a)))
+             (get-destructuring-stuff p v)
+             p)))))
+
+(defun get-destructuring-stuff (p v) ; p = the pair, v = the de-form
+ (let (
+       (vars (build-destructure-list (car p) v nil))
+      )
+      (putprop (cdr p) (nreverse vars) 'destrvars)))
+
+(defun build-destructure-list (a b c)
+ ;
+ ; A - the generated variable name used to build initialization forms
+ ;
+ ; B - the destructuring form, e.g. (X (Y Z) W)
+ ;
+ ; C - the list so far
+ ;
+ (prog (d mode form init suppliedp opt aux rest key allow-other-keys-p
+        restform restarg keyword keyhacks)
+   loop
+       (when (null b)
+             (go cleanup))
+       (when (atom b)
+             (let (
+                   (x (zilcoarg1 b nil 'destructuring a))
+                  )
+                  (push x *destructuring-vars*)
+                  (push x c)
+             )
+             (go cleanup))
+       (setq d (car b))
+       (when (llkeywdp d)
+             (case d
+                  (&optional         (go destructure-&optional))
+                  ((&rest &body)     (go destructure-&rest))
+                  (&aux              (go destructure-&aux))
+                  (&key              (go destructure-&key))
+                  (&allow-other-keys (go destructure-&allow-other-keys))
+                  (t
+                   (princ "Error: ")
+                   (prin1 d)
+                   (princ " is an unsupported lambda list keyword.")
+                   (terpri)
+                   (throw 'lambda-list-errors nil))))
+
+       (if (consp d)
+        then
+            (case mode
+                  (&aux
+                   (setq init (cdr d) suppliedp nil)
+                   (cond
+                    ((null init)
+                     (setq d (car d)))
+                    ((or (atom init) (cdr init))
+                     (go bad-argument))
+                    (t
+                     (setq d (car d))
+                     (setq init (car init)))))
+                  (&optional
+                   (setq init (cdr d) suppliedp nil)
+                   (cond
+                    ((null init)
+                     (setq d (car d)))
+                    ((atom init)
+                     (go bad-argument))
+                    ((null (cdr init))
+                     (setq d (car d) init (car init)))
+                    ((null (cddr init))
+                     (psetq d (car d) init (car init)
+                                      suppliedp (cadr init)))
+                    (t
+                     (go bad-argument))))
+                  (&key
+                   (setq init (cdr d) suppliedp nil)
+                   (cond
+                    ((null init)
+                     (setq d (car d)))
+                    ((atom init)
+                     (go bad-argument))
+                    ((null (cdr init))
+                     (setq d (car d) init (car init)))
+                    ((null (cddr init))
+                     (psetq d (car d) init (car init)
+                                      suppliedp (cadr init)))
+                    (t
+                       (go bad-argument))))
+                  (t ; Mode not optional or aux, just required arg
+                   (setq init nil suppliedp nil)))
+        else
+            (setq init nil suppliedp nil)
+        endif
+       )
+
+       (case mode
+             (&key
+              (if (consp d)
+                  (if (consp (cdr d))
+                      (setq keyword (car d) d (cadr d))
+                      (setq keyword (keywordify (car d)) d (car d)))
+                  (setq keyword (keywordify d)))
+              (unless (keywordp keyword)
+               (princ "Error: &KEY keyword is not a keyword: ")
+               (prin1 keyword)
+               (terpri)
+               (throw 'lambda-list-errors nil))
+              (push `(,d ,keyword ,init ,suppliedp) keyhacks)
+              (go continue)
+             )
+       )
+
+
+       ;
+       ; Create initialization forms to be evaluated to set the
+       ; destructured variables.
+       ;
+       ; Yes, I know that the code will be horrible, especially for
+       ; recursively nested destructuring and particularly for
+       ; &optional (yeccch!), but why bother to come up with a
+       ; clever hack for something that will be used relatively
+       ; rarely?  Common LISP doesn't even require it except for
+       ; DEFMACRO anyhow.
+       ;
+       (setq form
+        (case mode
+              ((nil)     `(car ,a))
+              (&optional `(cond (,a (car ,a)) (t ,init)))
+              (&rest     a)
+              (&aux      init)
+              (t
+               (princ "Error: Args not permitted in lambda list after ")
+               (prin1 mode)
+               (terpri)
+               (throw 'lambda-list-errors nil))))
+
+       (when (and (consp d) (memq mode '(&optional &aux &rest)))
+             (let* ((g (gensym))
+                    (x (zilcoarg1 g nil 'destructuring form)))
+                   (push x *destructuring-vars*)
+                   (push x c)
+                   (setq form g))
+       )
+
+       (setq c (build-destructure-list form d c))
+       (when suppliedp
+             (setq form `(cond (,a t) (t nil)))
+             (let ((x (zilcoarg1 suppliedp nil 'destructuring form)))
+                  (push x *destructuring-vars*)
+                  (push x c)))
+
+       (setq a `(cdr ,a))
+
+ continue
+
+       (setq b (cdr b))
+       (go loop)
+
+ destructure-&optional
+
+       (when opt
+             (princ
+"Error: Duplicate \"&OPTIONAL\" in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (when rest
+             (princ
+"Error: \"&REST\" precedes \"&OPTIONAL\" in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (when aux
+             (princ
+"Warning: \"&AUX\" precedes \"&OPTIONAL\" in destructuring lambda list."
+             )
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (setq mode '&optional
+             opt t)
+       (go continue)
+
+ destructure-&aux
+
+       (when aux
+             (princ
+"Error: Duplicate \"&AUX\" in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (setq mode '&aux
+             aux t)
+       (or restform (setq restform a))
+       (go continue)
+
+ destructure-&rest
+
+       (when rest
+             (princ
+"Error: Too many &REST args in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (when aux
+             (princ
+"Warning: \"&AUX\" precedes \"&REST\" in destructuring lambda list."
+             )
+             (terpri)
+             (princ "Binding in INIT forms may be incorrect.")
+             (terpri))
+       (setq mode '&rest
+             rest t
+             restform a)
+       (unless (cdr b)
+             (princ
+"Error: Invalid destructuring lambda list syntax with \"&REST\"."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (go continue)
+
+ destructure-&key
+
+       (when key
+             (princ
+"Error: Duplicate \"&KEY\" in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (setq mode '&key
+             key t)
+       (or restform (setq restform a))
+       (go continue)
+
+ destructure-&allow-other-keys
+
+       (when allow-other-keys-p
+             (princ
+"Error: Duplicate \"&ALLOW-OTHER-KEYS\" in destructuring lambda list."
+             )
+             (terpri)
+             (throw 'lambda-list-errors nil))
+       (setq mode '&allow-other-keys
+             allow-other-keys-p t)
+       (go continue)
+
+ bad-argument
+
+       (princ "Error: ")
+       (prin1 d)
+       (princ " is an invalid destructuring lambda list element.")
+       (terpri)
+       (throw 'lambda-list-errors nil)
+
+ cleanup
+
+       (when keyhacks
+
+        (unless restarg
+         (setq restarg (gensym))
+         (let ((x (zilcoarg1 restarg nil 'destructuring restform)))
+              (push x *destructuring-vars*)
+              (push x c)
+              (setq restform restarg)))
+
+        (loop for (dd kk ii ss) in (nreverse keyhacks) do
+         (let ((ff (let ((g (gensym)))
+                        `(let ((,g (getk ,restarg ',kk)))
+                              (cond
+                               (,g (car ,g))
+                               (t ,ii))))))
+          (when (consp dd)
+                (let* ((g (gensym))
+                       (x (zilcoarg1 g nil 'destructuring ff)))
+                      (push x *destructuring-vars*)
+                      (push x c)
+                      (setq ff g))
+          )
+          (setq c (build-destructure-list ff dd c))
+          (when ss
+                (setq ff `(cond ((getk ,restarg ',kk) t) (t nil)))
+                (let ((x (zilcoarg1 ss nil 'destructuring ff)))
+                     (push x *destructuring-vars*)
+                     (push x c)))
+
+        )))
+
+       (return c)
+
+
+ )
+)
+

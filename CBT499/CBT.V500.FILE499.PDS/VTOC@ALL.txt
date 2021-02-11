@@ -1,0 +1,608 @@
+/* **************************************************************** */
+/* * Print a list of all volumes & a VTOC listing per volume      * */
+/* **************************************************************** */
+
+#pragma runopts (PLIST(MVS))         /* MVS type parameter received */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#pragma linkage (VTOC_UCB, OS)       /* Get all online DASD devices */
+#pragma linkage (VTOC_HDR, OS)       /* Format 4 DSCB & free space  */
+#pragma linkage (VTOC_LST, OS)       /* Get a DSCB & map list       */
+
+/* **************************************************************** */
+/* * UCB info layout returned from assembler program.             * */
+/* **************************************************************** */
+typedef struct _ucb_inf              /* table with volser,type & UCB*/
+{
+  char ucb_vols ??( 6 ??);           /* length of volser table entry*/
+  char z001;                         /* binary zeroes ............. */
+  char ucb_utyp;                     /* hex unit type               */
+  unsigned short int ucb_addr;       /* UCB address of volser       */
+} struc_ucb_inf;
+
+/* **************************************************************** */
+/* * VTOC header info layout returned from assembler program.     * */
+/* *      (DSCB4 and free space information)                      * */
+/* **************************************************************** */
+typedef struct _hdr_inf              /* table with header info      */
+{
+  unsigned long  int hdr_ucba;       /* storage area for UCB address*/
+  unsigned short int hdr_numc;       /* numcyl                      */
+  unsigned short int hdr_tcyl;       /* # trks/cyl                  */
+  unsigned short int hdr_trks;       /* trksize                     */
+  unsigned short int hdr_dtrk;       /* dscb/trk                    */
+  unsigned short int hdr_dirt;       /* dir.blks/trk                */
+  unsigned short int hdr_numd;       /* num dscbs                   */
+  unsigned short int hdr_avad;       /* avail dscbs                 */
+  unsigned short int hdr_numa;       /* numalt                      */
+  unsigned short int hdr_nexc;       /* nextalt - cyl               */
+  unsigned short int hdr_next;       /* nextalt - trk               */
+  unsigned short int hdr_trkt;       /* available - total trks      */
+  unsigned short int hdr_cylf;       /* available - full cyls       */
+  unsigned short int hdr_trkf;       /* available - full trks       */
+  unsigned short int hdr_extf;       /* available - # extents       */
+  unsigned short int hdr_cylc;       /* contiguous cyl              */
+  unsigned short int hdr_trkc;       /* contiguous trk              */
+  unsigned short int hdr_frag;       /* fragmentation index         */
+  unsigned short int hdr_virs;       /* free virs                   */
+  unsigned short int hdr_cyla;       /* cyls in VTOC                */
+  unsigned short int hdr_trka;       /* trks in VTOC                */
+  unsigned short int hdr_vtcs;       /* VTOC location - start cyl   */
+  unsigned short int hdr_vtts;       /* VTOC location - start trk   */
+  unsigned short int hdr_vtce;       /* VTOC location - end cyl     */
+  unsigned short int hdr_vtte;       /* VTOC location - end trk     */
+  unsigned short int hdr_smsi;       /* SMS indicator               */
+  char  hdr_idx  ??( 60 ??);         /* indexed ?                   */
+} struc_hdr_inf;
+
+/* **************************************************************** */
+/* * Detail line info layout returned from assembler program.     * */
+/* **************************************************************** */
+typedef struct _dsn_inf              /* table with detail line info */
+{
+  char det_dsn  ??( 44 ??);          /* data set name               */
+  unsigned short int det_seq;        /* file seq number             */
+  unsigned short int det_blks;       /* block size                  */
+  unsigned short int det_lrec;       /* lrecl                       */
+  unsigned short int det_cyla;       /* cyls allocated              */
+  unsigned short int det_trka;       /* tracks allocated            */
+  unsigned short int det_ext;        /* # of extents                */
+  unsigned short int det_refy;       /* last ref date               */
+  unsigned short int det_refm;       /* last ref date               */
+  unsigned short int det_refd;       /* last ref date               */
+  unsigned short int det_crey;       /* creation date               */
+  unsigned short int det_crem;       /* creation date               */
+  unsigned short int det_cred;       /* creation date               */
+  unsigned short int det_expy;       /* expiry date                 */
+  unsigned short int det_expm;       /* expiry date                 */
+  unsigned short int det_expd;       /* expiry date                 */
+  char det_dso  ??( 4 ??) ;          /* data set organization       */
+  char det_recf ??( 3 ??) ;          /* record format               */
+  char det_racf ??( 3 ??) ;          /* racf indicator              */
+} struc_dsn_inf;
+
+/* **************************************************************** */
+/* * Map line info layout returned from assembler program.        * */
+/* **************************************************************** */
+typedef struct _map_inf              /* table for allocation map    */
+{
+  unsigned short int map_vtcs;       /* VTOC location - start cyl   */
+  unsigned short int map_vtts;       /* VTOC location - start trk   */
+  unsigned short int map_vtce;       /* VTOC location - end cyl     */
+  unsigned short int map_vtte;       /* VTOC location - end trk     */
+  unsigned short int map_cyla;       /* # cyls                      */
+  unsigned short int map_trka;       /* # trks                      */
+  unsigned short int map_ext;        /* # of extents                */
+  unsigned short int map_extn;       /* extent number               */
+  char map_dsn  ??( 44 ??);          /* DSN                         */
+} struc_map_inf;
+
+/* **************************************************************** */
+/* * Function definitions                                         * */
+/* **************************************************************** */
+int comp_dsn (const void *, const void *); /* compare dsn (char)    */
+int comp_map (const void *, const void *); /* compare structure map */
+void calc_space (unsigned short int);      /* calculate free space  */
+void pr_free ();                           /* print free space info */
+void pr_det_hdr (char ??( 6 ??));          /* print detail page hdr */
+void pr_map_hdr (char ??( 6 ??), unsigned int);  /* map page header */
+void pr_map_det (unsigned short int, unsigned short int, /* map     */
+                 unsigned short int, unsigned short int, /*  detail */
+                 unsigned short int, unsigned short int, /* map     */
+                 unsigned short int, unsigned short int, /*  detail */
+                 char ??( 44 ??) );              /* map detail line */
+
+/* **************************************************************** */
+/* * Global variables - free space info and output files          * */
+/* **************************************************************** */
+unsigned short int FreeVtcs;         /* VTOC location - start cyl   */
+unsigned short int FreeVtts;         /* VTOC location - start trk   */
+unsigned short int FreeVtce;         /* VTOC location - end cyl     */
+unsigned short int FreeVtte;         /* VTOC location - end trk     */
+unsigned short int FreeExt;          /* # of extents                */
+unsigned short int FreeExtn;         /* extent number               */
+signed short int FreeCyla;           /* # unallocated cyls          */
+signed short int FreeTrka;           /* # unallocated trks          */
+FILE * outp01;                       /* define file                 */
+FILE * outp02;                       /* define file                 */
+
+/* **************************************************************** */
+/* * Main routine for VTOC listing                                * */
+/* **************************************************************** */
+int main(int arg_count,char *arg_list ??( ??) )
+{
+  struc_ucb_inf tmp_v ??( 1 ??);              /* Temp. work stor.   */
+  struc_ucb_inf tab_v ??( 1000 ??);           /* max. 1000 VOLSER's */
+  struc_ucb_inf *ptr_v, *ptr_vv;              /*         & pointers */
+  char system_id ??( 9 ??);                   /* system id          */
+  char dev_t ??( 5 ??);                       /* device type - char */
+
+  struc_hdr_inf tab_h;                        /* header information */
+  struc_hdr_inf *ptr_h;                       /*         & pointer  */
+  char sms_ind ??( 18 ??);                    /* SMS indicator      */
+
+  struc_dsn_inf tab_d ??( 3000 ??);           /* max. 3000 DSN's    */
+  struc_dsn_inf *ptr_d;                       /*         & pointer  */
+  unsigned int len_d, tot_d;                  /* length & amount    */
+
+  struc_map_inf tmp_m ??( 1 ??);              /* Temp. work stor.   */
+  struc_map_inf tab_m ??( 9000 ??);           /* max. 9000 ext's    */
+  struc_map_inf *ptr_m, *ptr_mm;              /*         & pointers */
+  unsigned int len_m, tot_m;                  /* length & amount    */
+
+  unsigned int ctr_lpp, ctr_dsn, ctr_pn;      /* counters           */
+  unsigned int k=1, l, m=0;                   /* counter/flag & len */
+
+  int dat_yy, dat_mm, dat_dd, tim_hh, tim_mm; /* date & time parts  */
+  time_t ltime;                               /* date & time        */
+  struct tm *dat_tim;                         /* date & time        */
+
+                                              /* open files         */
+  outp01 = fopen("dd:OUTP01","w, RECFM=FBA,LRECL=133,BLKSIZE=18354");
+  outp02 = fopen("dd:OUTP02","w, RECFM=FBA,LRECL=133,BLKSIZE=18354");
+
+  time(&ltime);                               /* get date & time    */
+  dat_tim = localtime(&ltime);                /* local time         */
+  dat_yy  = dat_tim->tm_year;                 /* convert year       */
+  dat_mm  = dat_tim->tm_mon + 1;              /* convert month      */
+  dat_dd  = dat_tim->tm_mday;                 /* convert day        */
+  tim_hh  = dat_tim->tm_hour;                 /* convert hours      */
+  tim_mm  = dat_tim->tm_min;                  /* convert minutes    */
+
+  if (dat_yy > 95) {dat_yy = dat_yy + 1900;}
+  else {dat_yy  = dat_yy + 2000;}
+
+/* **************************************************************** */
+/* * Get a list of all online DASD volumes.                       * */
+/* **************************************************************** */
+ptr_v = tab_v;                                /* set table pointer  */
+VTOC_UCB(ptr_v,&system_id);                   /* Get online DASD    */
+
+/* **************************************************************** */
+/* * Set up volume list if VOLSER's were specified in the JCL.    * */
+/* **************************************************************** */
+if (strncmp(arg_list ??( 1 ??), "MAP", 3) == 0) { /* check MAP parm */
+  k++;                                        /* next entry         */
+  arg_count--;                                /* one less volser    */
+}                                             /* end if             */
+
+ptr_vv = tab_v;                               /* set table pointer  */
+while (arg_count > 1) {                       /* input from JCL     */
+  ptr_v = ptr_vv;                             /* start search at... */
+  l = strlen(arg_list ??( k ??));             /* length of volser   */
+  while ( *(ptr_v->ucb_vols) < 0xFF &         /* do while volumes   */
+    (strncmp(arg_list ??( k ??), ptr_v->ucb_vols, l)) != 0) {
+    ptr_v++;                                  /* increment pointer  */
+  }
+  if ( *(ptr_v->ucb_vols) != 0xFF) {          /* valid VOLSER found */
+    *tmp_v  = *ptr_vv;                        /* exchange values    */
+    *ptr_vv = *ptr_v;                         /* exchange values    */
+    *ptr_v  = *tmp_v;                         /* exchange values    */
+    ptr_vv++;                                 /* set table pointer  */
+    m = 1;                                    /* Valid volser found */
+  }                                           /* end if ...         */
+  else {                                      /* last VOLSER reached*/
+    if (m==0)                                 /* no volser found    */
+      fprintf(outp01,"##### Invalid or offline VOLSER or generic ==> "
+              "%s <== #####\n", arg_list ??( k ??) );
+    else {                                    /* VOLSER fully qual. */
+      fprintf(outp01,"*** Volume(s) processed for name / generic ==> "
+              "%s ***\n", arg_list ??( k ??) );
+      m=0;                                    /* reset found flag   */
+    }
+    arg_count--; k++;                         /* Next volser        */
+  }                                           /* end if ...         */
+}                                             /* end while          */
+if (ptr_v != ptr_vv) *(ptr_vv->ucb_vols) = 0xFF;
+                                              /* set end of table   */
+
+/* **************************************************************** */
+/* * List of all online volumes & a VTOC listing per volume.      * */
+/* **************************************************************** */
+fprintf(outp01,"*** LIST OF DASD VOLUMES ***  DATE="      /* header */
+        "%.4i/%.2i/%.2i  TIME=%.2i:%.2i  SYSTEM=%s\n",
+        dat_yy, dat_mm, dat_dd, tim_hh, tim_mm, system_id);
+
+ptr_h  = &tab_h;                              /* set table pointer  */
+ptr_v  = tab_v;                               /* set table pointer  */
+ptr_vv = ptr_v;                               /* set table pointer  */
+while ( *(ptr_v->ucb_vols) < 0xFF) {          /* do while volumes   */
+  switch(ptr_v->ucb_utyp) {                        /* convert dev.  */
+    case (0x0F): { strcpy(dev_t, "3390"); break;}  /* 3390 device   */
+    case (0x0E): { strcpy(dev_t, "3380"); break;}  /* 3380 device   */
+    case (0x0D): { strcpy(dev_t, "3350"); break;}  /* 3350 device   */
+    default: strcpy(dev_t, "????");                /* unlisted      */
+  }                                                /* end switch    */
+  fprintf(outp01,"%s  %s  %.4X\n",            /* print volser list  */
+          ptr_v->ucb_vols, dev_t, ptr_v->ucb_addr);
+
+  /* ************************************************************** */
+  /* * Print header for a VTOC listing.                           * */
+  /* ************************************************************** */
+  VTOC_HDR(ptr_v,ptr_h);                  /* get DSCB4 & free space */
+
+  switch(ptr_h->hdr_smsi) {                        /* convert dev.  */
+    case (1): { strcpy(sms_ind, "SMS-MANAGED VOLUME"); break;}
+    case (2): { strcpy(sms_ind, "SMS INITIAL STATUS"); break;}
+    default: strcpy(sms_ind, "NOT SMS-MANAGED   ");
+  }                                                /* end switch    */
+
+  fprintf(outp02,"\fVOLSER=%s  DEVTYP=%s  NUMCYL=%4i  TRKS/CYL"
+         "=%2i  TRKSIZE=%5i  DSCB/TRK=%2i  DIR.BLKS/TRK=%2i     "
+         "DATE=%.4i/%.2i/%.2i  TIME=%.2i:%.2i\n",
+         ptr_v->ucb_vols, dev_t, ptr_h->hdr_numc, ptr_h->hdr_tcyl,
+         ptr_h->hdr_trks, ptr_h->hdr_dtrk, ptr_h->hdr_dirt,
+         dat_yy, dat_mm, dat_dd, tim_hh, tim_mm);
+  fprintf(outp02,"VTOC INFORMATION:  NUM DSCBS=%5i   AVAIL DSCBS=%5i"
+         "   VTOC LOCATION=%4.4i.%4.4i-%4.4i.%4.4i  NUMALT=%2i"
+         "  NEXTALT=%4.4i.%4.4i\n",
+         ptr_h->hdr_numd, ptr_h->hdr_avad, ptr_h->hdr_vtcs,
+         ptr_h->hdr_vtts, ptr_h->hdr_vtce, ptr_h->hdr_vtte,
+         ptr_h->hdr_numa, ptr_h->hdr_nexc, ptr_h->hdr_next);
+  fprintf(outp02,"AVAILABLE SPACE: %5i TRACKS, CONSISTING OF %4i "
+         "FULL CYLINDERS AND %5i TRACKS IN %4i EXTENTS "
+         "                    UNIT=%.4X\n",
+         ptr_h->hdr_trkt, ptr_h->hdr_cylf, ptr_h->hdr_trkf,
+         ptr_h->hdr_extf, ptr_v->ucb_addr);
+  fprintf(outp02,"LARGEST CONTIGUOUS SPACE: %4i FULL CYLINDERS AND "
+         "%4i TRACKS.  FRAGMENTATION INDEX: %4i "
+         "    %s    VOLSER=%s\n",
+         ptr_h->hdr_cylc, ptr_h->hdr_trkc,
+         ptr_h->hdr_frag, sms_ind, ptr_v->ucb_vols);
+  fprintf(outp02,"%.60s    FREE VOLUME INDEX RECORDS: %4i"
+         "                     SYSTEM=%s \n \n",
+         ptr_h->hdr_idx, ptr_h->hdr_virs, system_id);
+  pr_det_hdr(ptr_v->ucb_vols);         /* print detail page header  */
+
+  /* ************************************************************** */
+  /* * Set up first entry (VTOC) and get rest of listing          * */
+  /* ************************************************************** */
+  ptr_d = tab_d;                       /* set detail table pointer  */
+  ptr_m = tab_m;                       /* set map table pointer     */
+  if (strncmp(arg_list ??( 1 ??), "MAP", 3) != 0) /* if not MAP     */
+    len_m = 0;                                   /* set no-map flag */
+  else {                                         /* else setup map  */
+    ptr_m->map_vtcs = ptr_h->hdr_vtcs;           /* The VTOC is the */
+    ptr_m->map_vtts = ptr_h->hdr_vtts;           /*     first map   */
+    ptr_m->map_vtce = ptr_h->hdr_vtce;           /*     entry.      */
+    ptr_m->map_vtte = ptr_h->hdr_vtte;           /* Initialize the  */
+    ptr_m->map_cyla = ptr_h->hdr_cyla;           /*     VTOC alloc. */
+    ptr_m->map_trka = ptr_h->hdr_trka;           /*     variables.  */
+    ptr_m->map_extn = 1;                         /* The VTOC can    */
+    ptr_m->map_ext  = 1;                         /*     only be in  */
+    strcpy(ptr_m->map_dsn,                       /*     one extent. */
+           "**** VTOC **** VTOC **** VTOC **** VTOC ****");
+    len_m = 1;                                   /* MAP wanted      */
+  }
+  VTOC_LST(ptr_v,ptr_d,&tot_d,&len_d,ptr_m,&tot_m,&len_m,ptr_h);
+
+  /* ************************************************************** */
+  /* * Sort the VTOC listing in data set sequence                 * */
+  /* ************************************************************** */
+  if (tot_d > 1)                              /* if sort needed     */
+    qsort(ptr_d, tot_d, len_d, comp_dsn);     /*    call qsort      */
+
+  /* ************************************************************** */
+  /* * Print the VTOC listing                                     * */
+  /* ************************************************************** */
+  ctr_lpp=8; ctr_dsn=0; ctr_pn=1;             /* init. counters     */
+  while (ctr_dsn < tot_d) {                   /* while data sets    */
+    if (ctr_lpp > 60) {                       /* if lpp>60 new page */
+      fprintf(outp02,"\n                                           "
+             "               ### PAGE:%i ###\f", ctr_pn); /* pg end */
+      pr_det_hdr(ptr_v->ucb_vols);            /* print page header  */
+      ctr_lpp=2; ctr_pn++;                    /* 2 header lines.    */
+    }                                         /* end if             */
+    fprintf(outp02,"\n"
+           "%.44s  %.2i/%.2i/%.2i  %3i  %.2i/%.2i/%.2i  %.2i/"
+           "%.2i/%.2i  %.4s  %.3s   %5i  %5i   %.3s  %5i  %5i %3i",
+           ptr_d->det_dsn,  ptr_d->det_refy, ptr_d->det_refm,
+           ptr_d->det_refd, ptr_d->det_seq,  ptr_d->det_crey,
+           ptr_d->det_crem, ptr_d->det_cred, ptr_d->det_expy,
+           ptr_d->det_expm, ptr_d->det_expd, ptr_d->det_dso,
+           ptr_d->det_recf, ptr_d->det_blks, ptr_d->det_lrec,
+           ptr_d->det_racf, ptr_d->det_cyla, ptr_d->det_trka,
+           ptr_d->det_ext);
+    ptr_d++; ctr_lpp++; ctr_dsn++;            /* increment          */
+  }                                           /* end while          */
+  /* ************************************************************** */
+  /* * Print end of VTOC.                                         * */
+  /* ************************************************************** */
+  fprintf(outp02,"\n### PAGE:%i ###                      >>>>> END "
+         "OF VTOC. *** %i DATA SETS ON VOLUME %s <<<<<",
+         ctr_pn, tot_d, ptr_v->ucb_vols);
+
+  /* ************************************************************** */
+  /* * Print a map of data set allocation on the device is req.   * */
+  /* ************************************************************** */
+  if (strncmp(arg_list ??( 1 ??), "MAP", 3) == 0) { /* if MAP ...   */
+    /* ************************************************************ */
+    /* * Sort the VTOC map in allocation sequence                 * */
+    /* ************************************************************ */
+    if (tot_m > 1)                            /* sort needed ?      */
+      qsort(ptr_m, tot_m, len_m, comp_map);   /* call qsort         */
+
+    /* ************************************************************ */
+    /* * Print the allocation map header.                         * */
+    /* ************************************************************ */
+    ctr_pn = 1; ctr_lpp=4;                  /* set counters         */
+    fprintf(outp02,"\f          >>>>> ALLOCATION MAP "
+           "FOR VOLSER %s    ---  DEVICE TYPE=%s <<<<<\n",
+           ptr_v->ucb_vols, dev_t);         /* print map header     */
+    pr_map_hdr(ptr_v->ucb_vols, ctr_pn);    /* print map page hdr   */
+
+    /* ************************************************************ */
+    /* * Determine and calculate free space at start of vtoc      * */
+    /* ************************************************************ */
+    FreeExtn = 0;                           /* init extent number   */
+    FreeExt  = ptr_h->hdr_extf;             /* # of free extents    */
+    k = 0;                                  /* free space flag      */
+
+    if (ptr_m->map_vtcs != 0) k=1;          /* 1st alloc not cyl 0  */
+    if ((ptr_m->map_vtcs == 0) &&           /* 1st alloc cyl 0 but  */
+        (ptr_m->map_vtts != 1)) k=1;        /*     not track 1      */
+    if (k) {                                /* if free space        */
+      FreeExtn++;                           /* next extent number   */
+      FreeVtcs = 0;                         /* start cyl = 0        */
+      FreeVtts = 0;                         /* start trk = 0        */
+      FreeVtce = ptr_m->map_vtcs;           /* end cyl - 1st alloc  */
+      FreeVtte = ptr_m->map_vtts;           /* end trk - 1st alloc  */
+      calc_space(ptr_h->hdr_tcyl-1);        /* calc # free space    */
+      pr_free();                            /* print free space info*/
+      ctr_lpp++; k=0;                       /* incr & reset flag    */
+    }
+
+    /* ************************************************************ */
+    /* * Print the allocation map detail.                         * */
+    /* ************************************************************ */
+    ctr_dsn=1;                              /* set count - 1st dsn  */
+
+    /* ************************************************************ */
+    /* * Do while map entries                                     * */
+    /* ************************************************************ */
+    while (ctr_dsn < tot_m) {                 /* while map entries  */
+      if (ctr_lpp > 61) {                     /* if lpp>61 new page */
+        ctr_lpp=3; ctr_pn++;                  /* 2 header lines.    */
+        fprintf(outp02,"\f");                 /* next page          */
+        pr_map_hdr(ptr_v->ucb_vols, ctr_pn);  /* print page hdr     */
+      }                                       /* end if             */
+
+      if (k) {
+        /* ******************************************************** */
+        /* * Calculate and print free space info                  * */
+        /* ******************************************************** */
+        FreeExtn++;                         /* next extent number   */
+        FreeVtcs = ptr_mm->map_vtce;        /* start cyl            */
+        FreeVtts = ptr_mm->map_vtte;        /* start trk            */
+        FreeVtce = ptr_m->map_vtcs;         /* end cyl              */
+        FreeVtte = ptr_m->map_vtts;         /* end trk              */
+        calc_space(ptr_h->hdr_tcyl-1);      /* calc free space      */
+        pr_free();                          /* print free space info*/
+        ctr_lpp++; k=0;                     /* incr & reset flag    */
+      }
+      else {
+        /* ******************************************************** */
+        /* * Print map detail                                     * */
+        /* ******************************************************** */
+        pr_map_det(ptr_m->map_vtcs, ptr_m->map_vtts,  /* print map  */
+                   ptr_m->map_vtce, ptr_m->map_vtte,  /*    detail  */
+                   ptr_m->map_cyla, ptr_m->map_trka,  /*    line    */
+                   ptr_m->map_ext,  ptr_m->map_extn, ptr_m->map_dsn);
+        ptr_mm = ptr_m;                             /* set pointer  */
+        ptr_m++; ctr_dsn++; ctr_lpp++;              /* increment    */
+
+        /* ******************************************************** */
+        /* * Determine if free space                              * */
+        /* ******************************************************** */
+        if ((ptr_m->map_vtcs - ptr_mm->map_vtce) > 1) k=1;    /*free*/
+        if ((ptr_m->map_vtcs == ptr_mm->map_vtce) &&
+            ((ptr_m->map_vtts - ptr_mm->map_vtte) > 1)) k=1;  /*free*/
+        if (((ptr_m->map_vtcs - ptr_mm->map_vtce) == 1) &&
+            ((ptr_m->map_vtts != 0) ¦¦
+             (ptr_mm->map_vtte != (ptr_h->hdr_tcyl-1)))) k=1; /*free*/
+      }                                       /* end if             */
+    }                                         /* end while          */
+
+    /* ************************************************************ */
+    /* * Process end of map                                       * */
+    /* ************************************************************ */
+    if (ctr_lpp > 58) {                       /* if lpp>58 new page */
+      ctr_pn++;                               /* next page          */
+      fprintf(outp02,"\f");                   /* next page          */
+      pr_map_hdr(ptr_v->ucb_vols, ctr_pn); /* print map page hdr */
+    }                                         /* end if             */
+
+    /* ************************************************************ */
+    /* * Calculate and print free space info                      * */
+    /* ************************************************************ */
+    if (k) {
+      FreeExtn++;                           /* next extent number   */
+      FreeVtcs = ptr_mm->map_vtce;          /* start cyl            */
+      FreeVtts = ptr_mm->map_vtte;          /* start trk            */
+      FreeVtce = ptr_m->map_vtcs;           /* end cyl              */
+      FreeVtte = ptr_m->map_vtts;           /* end trk              */
+      calc_space(ptr_h->hdr_tcyl-1);        /* calc free space      */
+      pr_free();                            /* print free space info*/
+      k = 0;                                /* reset flag           */
+    }
+
+    /* ************************************************************ */
+    /* * Print last entry of map                                  * */
+    /* ************************************************************ */
+    pr_map_det(ptr_m->map_vtcs, ptr_m->map_vtts,  /* print map      */
+               ptr_m->map_vtce, ptr_m->map_vtte,  /*    detail line */
+               ptr_m->map_cyla, ptr_m->map_trka,
+               ptr_m->map_ext,  ptr_m->map_extn, ptr_m->map_dsn);
+
+    /* ************************************************************ */
+    /* * Determine and calculate free space at end of volume      * */
+    /* ************************************************************ */
+    if (ptr_m->map_vtce != (ptr_h->hdr_numc-1)) k=1;    /*free space*/
+    if ((ptr_m->map_vtce == (ptr_h->hdr_numc-1)) &&
+        (ptr_m->map_vtte != (ptr_h->hdr_tcyl-1))) k=1;  /*free space*/
+    if (k) {
+      FreeExtn++;                           /* next extent number   */
+      FreeVtcs = ptr_m->map_vtce;           /* start cyl            */
+      FreeVtts = ptr_m->map_vtte;           /* start trk            */
+      FreeVtce = ptr_h->hdr_numc - 1;       /* end cyl              */
+      FreeVtte = ptr_h->hdr_tcyl;           /* end trk              */
+      calc_space(ptr_h->hdr_tcyl-1);        /* calc free space      */
+      pr_free();                            /* print free space info*/
+    }
+
+    /* ************************************************************ */
+    /* * Print end of allocation map.                             * */
+    /* ************************************************************ */
+    fprintf(outp02,"\n          >>>>> END OF ALLOCATION MAP "
+           "FOR VOLSER %s <<<<<",
+           ptr_v->ucb_vols);
+  }                                           /* end if             */
+  ptr_v++;                                    /* Next volser        */
+}                                             /* end while          */
+
+/* **************************************************************** */
+/* * end of volume listing and VTOC lists.                        * */
+/* **************************************************************** */
+fprintf(outp01,"%s%i %s\n",
+        "*** NUMBER OF VOLUMES: ", ptr_v-ptr_vv, "***");
+fclose(outp01);                               /* close file         */
+fclose(outp02);                               /* close file         */
+return 0;
+}                                             /* end of main        */
+
+/* **************************************************************** */
+/* * Compare 2 values and return result (for qsort)               * */
+/* **************************************************************** */
+int comp_dsn (const void *s1, const void *s2) {
+  return (strncmp((char *)s1, (char *)s2, 44));
+}
+
+int comp_map (const void *s1, const void *s2) {
+  struc_map_inf *p1, *p2;                     /* declare struc      */
+  p1=s1; p2=s2;                               /* assign pointers    */
+  if (p1->map_vtcs > p2->map_vtcs)            /* CYLS not sorted ?  */
+    return 1;                                 /*   then sort        */
+  if ((p1->map_vtcs == p2->map_vtcs) &&       /* CYLS equal and     */
+      (p1->map_vtts > p2->map_vtts))          /* trks not sorted ?  */
+    return 1;                                 /*   then sort        */
+  return -1;
+}
+
+/* **************************************************************** */
+/* * Calculate free space                                         * */
+/* **************************************************************** */
+void calc_space (unsigned short num_trk_cyl) {
+  /* ************************************************************** */
+  /* * Free space starts just after last allocated space          * */
+  /* ************************************************************** */
+  if (FreeVtts == num_trk_cyl) {              /* end of cyl ?       */
+    FreeVtcs++;                               /* start cyl=next cyl */
+    FreeVtts = 0;                             /* start track=0      */
+  }
+  else                                        /* not on cyl boundary*/
+    FreeVtts++;                               /* start trk=next trk */
+
+  /* ************************************************************** */
+  /* * Free space ends just before next allocated space.          * */
+  /* ************************************************************** */
+  if (FreeVtte == 0) {                        /* start of new cyl ? */
+    FreeVtce--;                               /* end cyl=prev cyl   */
+    FreeVtte = num_trk_cyl;                   /* end trk=trks/cyl-1 */
+  }
+  else                                        /* not on cyl boundary*/
+    FreeVtte--;                               /* end trk=prev trk   */
+
+  /* ************************************************************** */
+  /* * Calculate the size of the free space area                  * */
+  /* ************************************************************** */
+  FreeCyla = FreeVtce - FreeVtcs;             /* free cyls          */
+  if ((FreeVtts==0) && (FreeVtte == num_trk_cyl)) { /* full cyl ?   */
+    FreeCyla++;                               /* incr. free cyls    */
+    FreeTrka = 0;                             /* 0 free trks        */
+  }
+  else {                                      /* not full cyl       */
+    FreeTrka = FreeVtte - FreeVtts + 1;       /* calc # trks        */
+    if ((FreeTrka <= 0) ¦¦                    /* end trk < start trk*/
+        ((FreeVtts != 0) && (FreeVtte != num_trk_cyl) &&
+         (FreeCyla != 0)) ) {                 /* # cyls not 0       */
+      FreeCyla--;                             /* decr. free cyls    */
+      FreeTrka = FreeTrka + num_trk_cyl + 1;  /* calc # trks        */
+    }
+  }
+  return;                                     /* end space calc     */
+}
+
+/* **************************************************************** */
+/* * Print detail line page header                                * */
+/* **************************************************************** */
+void pr_det_hdr (char volser ??( 6 ??)) {
+  fprintf(outp02,"D A T A   S E T   N A M E           (%s)  "
+         "LAST REF  SEQ   CREDT     EXPDT    DSO  RECFM  BLKSZ  "
+         "LRECL  RACF  CYLAL  TRKAL  EX\n", volser);
+  fprintf(outp02,"--------------------------------------------  "
+         "--------  ---  --------  --------  ---  -----  -----  "
+         "-----  ----  -----  -----  --");
+}
+
+/* **************************************************************** */
+/* * Print map page header                                        * */
+/* **************************************************************** */
+void pr_map_hdr (char volser ??( 6 ??), unsigned int page_num) {
+  fprintf(outp02,"     LOCATION DEC.        LOCATION HEX.     "
+         "   SPACE        EXTENT                              "
+         "  ### PAGE:%i ###\n", page_num);
+  fprintf(outp02,"  CYL. TRK. CYL. TRK.  CYL. TRK. CYL. TRK.  "
+         "CYLS.  TRKS.  NUM OF TOT  D A T A   S E T   N A M E"
+         "        (%s)\n", volser);
+  fprintf(outp02,"  ---- ---- ---- ----  ---- ---- ---- ----  "
+         "-----  -----  ----------  -------------------------");
+}
+
+/* **************************************************************** */
+/* * Print free space info                                        * */
+/* **************************************************************** */
+void pr_free () {
+  fprintf(outp02,"\n  %4.4i.%4.4i-%4.4i.%4.4i  %4.4X.%4.4X-"   /*   */
+         "%4.4X.%4.4X  %5i  %5i  %3i OF %3i  *** FREE ***",    /*   */
+         FreeVtcs, FreeVtts, FreeVtce, FreeVtte,               /*   */
+         FreeVtcs, FreeVtts, FreeVtce, FreeVtte,               /*   */
+         FreeCyla, FreeTrka, FreeExtn, FreeExt);               /*   */
+}
+
+/* **************************************************************** */
+/* * Print map detail line                                        * */
+/* **************************************************************** */
+void pr_map_det (unsigned short int vtcs, unsigned short int vtts,
+                 unsigned short int vtce, unsigned short int vtte,
+                 unsigned short int cyla, unsigned short int trka,
+                 unsigned short int ext, unsigned short int extn,
+                 char dsn ??( 44 ??) ) {
+  fprintf(outp02,"\n  %4.4i.%4.4i-%4.4i.%4.4i  %4.4X.%4.4X-"
+         "%4.4X.%4.4X  %5i  %5i  %3i OF %3i  %.44s",
+         vtcs, vtts, vtce, vtte, vtcs, vtts, vtce, vtte,
+         cyla, trka, extn, ext, dsn);
+}

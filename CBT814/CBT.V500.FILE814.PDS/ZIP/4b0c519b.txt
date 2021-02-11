@@ -1,0 +1,362 @@
+An MPF exit for dataset waits
+
+In my shop, we periodically had jobs submitted which went
+into swapped out wait states because a required dataset was not
+available. This occurred if the job required an exclusive/shared
+enqueue while another address space already held a conflicting
+exclusive/shared enqueue on the dataset. Typically, when
+someone submitted a job of this nature, it stayed swapped out
+until they decided to follow up on it wondering why it was not
+executing. Since these jobs tied up initiators and had a negative
+impact on overall throughput, I implemented an MPF exit
+program to detect the situation and hurry along a resolution.
+The program, called ENQDTECT, is called when a 'wait for
+dataset' message appears on the console. In turn, it informs
+applicable TSO users of the lockout situation so they can take
+appropriate action.
+
+When a job is waiting for a dataset, three messages appear on
+the console. IEF861I indicates a reserved dataset is unavailable
+to the identified job. IEF099I is a highlighted 'waiting for
+dataset' message which stays on the console until the job
+begins executing. A third message, IEF863I, lists individual
+datasets which are holding up the job. By invoking
+ENQDTECT at the point IEF863I is issued, any TSO user who
+holds a conflicting dataset is informed via a console SEND
+message. The message lists both the dataset name and job
+involved.
+
+Since conflicting enqueues are sometimes held by other batch
+jobs, CICS regions, etc, the program also attempts to inform
+the originating TSO user of the situation where applicable. In
+my environment, 'TS' in positions 1 to 2 of the job name
+indicates a TSO user job. The program makes use of this to
+send a message to the submitter. In this message, the submitter
+is notified of who holds an enqueue on a dataset which is
+causing their job to wait along with the dataset name. Up to the
+first nine holding address spaces are listed individually with a
+number indicating how many there are. Usually nine covers the
+situation: if there happen to be more a '+' appears after 9 in the
+message. Most jobs of this nature get cancelled without the
+need to know the additional enqueues since so many other tasks
+lock them out. By informing both the submitter and any
+conflicting TSO users of the situation, it is usually resolved
+promptly without the need for operator intervention.
+
+The code in ENQDTECT requires MVS to have the PTF for
+APAR OY42931 installed. This APAR is responsible for
+putting the job name into the IEF863I message which the
+program uses. To invoke this code, put the following entry in
+the MPFLST member of SYS1.PARMLIB:
+
+      IEF863I,SUP(NO),RETAIN(NO),USEREXIT(ENQDTECT)
+
+Before implementing ENQDTECT, examine and change
+appropriately the three environment-specific lines of code
+involved in sending a message to the submitting TSO user-id.
+Comments appear in the code to highlight these. If you do not
+have a shop standard, the exit still offers the benefit of
+informing TSO users holding a job from executing. In some
+cases the submitting user is also the address space causing the
+conflict, so they find out either way. The code for ENQDTECT
+is written as re-entrant and should be assembled into a
+LNKLST library prior to issuing the SET MPF command to
+make the above entry active.
+
+
+ENQDTECT SOURCE CODE
+
+ENQDTECT CSECT
+ENQDTECT AMODE 31
+ENQDTECT RMODE ANY
+         STM   R14,R12,12(R13)    SAVE CALLER'S REGISTERS
+         BALR  R12,0              ESTABLISH PROGRAMS
+         USING *,R12                    BASE REGISTER
+         L     R9,0(R1)           ESTABLISH ADDRESSABILITY
+         USING CTXT,R9                  TO EXIT PARAMETER LIST
+         GETMAIN RC,LV=WORKLEN,SP=230,LOC=ANY
+         LTR   R15,R15            GETMAIN OK?
+         BNZ   BADGET1            IF NOT, GET OUT
+         LR    R10,R1             ESTABLISH ADDRESSABILITY
+         USING WORKAREA,R10             TO PROGRAM WORKAREA
+         ST    R13,SAVEADDR       SAVE CALLER'S SAVEAREA ADDRESS
+         ST    R10,WORKADDR       SAVE FOR FREEMAIN
+         L     R1,PSAAOLD-PSA(0,0) EXTRACT WAITING TASK'S ASID
+         MVC   WAITASID,ASCBASID-ASCB(R1) SAVE WAITING ASID
+         L     R3,CTXTTXPJ        ESTABLISH ADDRESSABILITY TO
+         USING CTXTATTR,R3             MESSAGE ATTRIBUTES
+         LA    R4,CTXTTMSG        ESTABLISH ADDRESSABILITY TO
+         USING MSGTEXT,R4              MESSAGE TEXT
+         MVI   SAVEDSN,C' '       CLEAR SAVEDSN
+         MVC   SAVEDSN+1(L'SAVEDSN-1),SAVEDSN
+         SR    R5,R5              CLEAR R5
+         LA    R6,MSGAREA         POINT TO BEGINNING OF DSNAME
+FINDBLK1 CLI   0(R6),C' '         IS THIS A BLANK?
+         BE    GOTBLNK1           IF YES, END OF DSNAME
+         LA    R5,1(,R5)          BUMP COUNT
+         LA    R6,1(,R6)          BUMP TO NEXT CHARACTER
+         B     FINDBLK1           GO CHECK THIS CHARACTER
+GOTBLNK1 ST R5,SAVEDSNL           SAVE DSNAME LENGTH
+         BCTR  R5,0               SUBTRACT 1 FOR EXECUTED MOVE
+         EX    R5,DSNMOVE         MVC SAVEDSN(0),MSGAREA
+         MVI   SAVEJOB,C' '       CLEAR SAVEJOB
+         MVC   SAVEJOB+1(L'SAVEJOB-1),SAVEJOB
+         LA    R6,1(,R6)          BUMP TO JOBNAME
+         LA    R5,15(,R5)         FIXED AREA + DSNAME LENGTH
+         LH    R2,CTXTTLEN        TOTAL MESSAGE LENGTH
+         SR    R2,R5              JOBNAME LENGTH
+         BCTR  R2,0               SUBTRACT 1 FOR EXECUTED MOVE
+         EX    R2,JOBMOVE         MVC SAVEJOB(0),0(R6)
+         MVC   SEND1MSG(SEND1LEN),SEND1TXT  INIT MESSAGE 1 AREA
+         MVC   SEND1DSN,SAVEDSN   MOVE DSNAME TO MESSAGE
+         B     DOSCAN
+DSNMOVE  MVC   SAVEDSN(0),MSGAREA EXECUTED MOVE
+JOBMOVE  MVC   SAVEJOB(0),0(R6)   EXECUTED MOVE
+         DROP  R3
+         DROP  R4
+DOSCAN   L     R6,SAVEDSNL        LENGTH OF ENQUEUED DSNAME
+         LA    R5,SAVEDSN         ADDRESS OF ENQUEUED DSNAME
+         GETMAIN RC,LV=4096,SP=230,LOC=ANY
+         LTR   R15,R15            GETMAIN OK?
+         BNZ   BADGET2            IF NOT, GET OUT
+         ST    R1,QSCANPTR        SAVE GETMAINED ADDRESS
+         LR    R7,R1              TELL GQSCAN WHERE THE STORAGE STARTS
+         LA    R13,QSCANSAV       SAVEAREA FOR GQSCAN
+         GQSCAN AREA=((R7),4096),REQLIM=10,SCOPE=ALL,                  X
+               RESNAME=(MAJRNAME,(R5),(R6)),MF=(E,GQPARMS)
+         LR    R8,R15             LOAD RC
+         B     GQRCODE(R8)        BRANCH BASED ON RC
+GQRCODE  B     SCANOK             SCAN OK
+         B     FREEWORK           NO ENQUEUES FOUND
+         B     SCANOK             SCAN OK, AREA FULL
+         B     BADSCAN            QUEUE SCAN ERRORS
+         B     BADSCAN            LOGIC ERROR
+         B     BADSCAN            AREA FILLED, TOKEN SPECIFIED
+SCANOK   ST    R0,RIBLNGTH        STORE RIB, RIBE LENGTH
+         LTR   R8,R1              ANY RIBS?
+         BZ    FREEWORK           IF NOT, GET OUT
+         MVI   SAVEPLUS,C' '      ASSUME 9 OR LESS OWNERS
+         LA    R11,HOLDOWNS       ADDRESS HOLD OWNERS TABLE
+         ZAP   NUMOWNS,=P'0'      ZERO OWNERS COUNT
+         L     R7,QSCANPTR        ADDRESS OF RIBS
+         USING RIB,R7             ADDRESS RIB
+RIBSRCH  LR R3,R7                 START OF RIB
+         AH    R3,RIBLNGTH        FIXED PART OF RIB
+         AH    R3,RIBVLEN         LENGTH OF VARIABLE PART
+         USING RIBE,R3            ADDRESS RIBE
+         L     R2,RIBNRIBE        NUMBER OF RIBES IN RIB
+RIBESRCH TM RIBESFLG,RIBESTAT     IS THIS A RESOURCE OWNER?
+         BO    RIBOWNER           IF YES, GO PROCESS IT
+         B     NEXTRIBE           GO TO NEXT RIBE
+RIBOWNER CP    NUMOWNS,=P'9'      HAVE THERE BEEN NINE ALREADY?
+         BE    ENDSRCH9           IF YES, THAT'S ALL WE WANT
+         MVC   0(8,R11),RIBEJBNM  SAVE JOBNAME IN OWNER TABLE
+         LA    R11,8(,R11)        BUMP TO NEXT TABLE ENTRY
+         AP    NUMOWNS,=P'1'      ADD 1 TO NUMBER OF OWNERS
+         CLC   WAITASID,RIBEASID  IS IT THE TASK'S ASID?
+         BE    NEXTRIBE           IF YES, IGNORE IT
+         L     R4,CVTPTR          ADDRESS CVT
+         CLC   RIBESYSN,CVTSNAME-CVT(R4) IS THE OWNER ON THIS SYSTEM?
+         BNE   NEXTRIBE           IF NOT, DON'T SEND MESSAGE
+         L     R4,CVTASVT-CVTMAP(,R4) ADDRESS ASVT
+         SR    R5,R5              CLEAR R5
+         LH    R5,RIBEASID        LOAD ASID VALUE
+         SLL   R5,2               COMPUTE ASVT ENTRY
+         L     R5,ASVTFRST-ASVT(R5,R4) ADDRESS ENTRY
+         ICM   R1,15,ASCBTSB-ASCB(R5) IS IT A TSO USER?
+         BZ    NEXTRIBE           IF NOT, DON'T SEND MESSAGE
+         MVC   SEND1JOB,SAVEJOB   PUT JOB IN SEND MESSAGE 1
+         MVC   SEND1USR(8),RIBEJBNM SAVE OWNER ID
+         LA    R5,SEND1USR        PREPARE TO FIND BLANK IN USER
+FINDBLK2 CLI   0(R5),C' '         IS THIS A BLANK?
+         BE    GOTBLNK2           IF YES, GO MOVE PAREN
+         LA    R5,1(,R5)          BUMP TO NEXT CHARACTER
+         B     FINDBLK2           GO CHECK IT
+GOTBLNK2 MVI   0(R5),C')'         FINISH OFF MESSAGE WITH PAREN
+         SR    R0,R0              CLEAR R0 PRIOR TO SVC
+         LA    R1,SEND1MSG        ADDRESS SEND MESSAGE 1
+         SVC   34                 ISSUE SEND
+         LTR   R15,R15            DID SEND WORK?
+         BZ    NEXTRIBE           IF YES, CONTINUE ON
+         WTO   ' ENQDTECT - SEND 1 FAILED',ROUTCDE=(2)
+         B     FREEWORK           THINGS AREN'T GOING WELL, GET OUT
+NEXTRIBE AH    R3,RIBELENG        POINT TO NEXT RIBE
+         BCT   R2,RIBESRCH        GO LOOK AT NEXT RIBE
+         SR    R4,R4              ZERO R4
+         L     R5,RIBNRIBE        NUMBER OF RIBES
+NEXTRIB  AH R4,RIBELENG           ADD LENGTH OF A RIBE
+         BCT   R5,NEXTRIB         DO THE ADD NUMBER OF RIBES TIMES
+         AH    R4,RIBLNGTH        ADD LENGTH OF RIB
+         AH    R4,RIBVLEN         ADD LENGTH OF VARIABLE SECTION
+         AR    R7,R4              POINT TO NEXT RIB
+         BCT   R8,RIBSRCH         PROCESS NEXT RIB, IF THERE IS ONE
+         B     ENDSRCH            THERE WERE 9 OWNERS OR LESS
+ENDSRCH9 MVI   SAVEPLUS,C'+'      INDICATE MORE THAN 9 OWNERS
+ENDSRCH  MVC   0(2,R11),=X'FFFF'  MARK LOGICAL END OF TABLE
+         FREEMAIN RU,LV=4096,A=QSCANPTR,SP=230  FREE GQSCAN WORK
+         LTR   R15,R15            FREEMAIN OK?
+         BNZ   BADFREE            IF NOT, GET OUT
+* IF A TSO BATCH JOB NAME STANDARD DOESN'T EXIST REMOVE FOLLOWING LINES
+* IF A TSO BATCH JOB NAME STANDARD DOES EXIST CHANGE 3 LINES TO MATCH
+*  CHANGE FOLLOWING LINE TO MATCH SHOP STANDARD FOR TSO BATCH JOB NAME
+         CLC   SAVEJOB(2),=C'TS'  WAS THIS A TSO USER'S JOB?
+         BNE   FREEWORK           IF NOT, DON'T SEND MESSAGE
+         MVC   SEND2MSG(SEND2LEN),SEND2TXT INIT SEND MESSAGE 2
+         CP    NUMOWNS,=P'1'      WAS THERE JUST ONE OWNER?
+         BE    MOVEUSER           IF YES, SET UP APPROPRIATE LITERALS
+         OI    NUMOWNS,X'0F'      MAKE PRINTABLE
+         UNPK  SEND2NUM(1),NUMOWNS MOVE NUMBER OF OWNERS TO MESSAGE
+         MVC   SEND2NUM+1(1),SAVEPLUS INSERT PRESET > 9 FLAG
+         B     SENDMSG2           GO SEND MESSAGE 2
+MOVEUSER MVC   SEND2LIT(12),=C'SINGLE USER ' SET UP LITERALS FOR
+         MVC   SEND2LIT+12(8),HOLDOWNS          A SINGLE
+         MVC   SEND2LIT+20(2),=C'  '                USER
+*  CHANGE FOLLOWING LINE IF FIRST 7 CHARS OF JOB NAME IS NOT TSO USERID
+SENDMSG2 MVC   SEND2USR(7),SAVEJOB MOVE TSOUSER TO MESSAGE
+         MVC   SEND2JOB,SAVEJOB   MOVE JOBNAME TO MESSAGE
+         MVC   SEND2DSN,SAVEDSN   MOVE DATASET TO MESSAGE
+         STIMER WAIT,DINTVL=ONESECND ALLOW ANY PREVIOUS MSG TO ARRIVE
+         SR    R0,R0              CLEAR R0 PRIOR TO SVC
+         LA    R1,SEND2MSG        ADDRESS SEND MESSAGE 2
+         SVC   34                 ISSUE SEND
+         LTR   R15,R15            DID SEND WORK?
+         BZ    INITMSG3           IF YES, GO SEND MESSAGE 3
+         WTO   ' ENQDTECT - SEND 2 FAILED',ROUTCDE=(2)
+         B     FREEWORK
+INITMSG3 CP    NUMOWNS,=P'1'      WAS THERE ONLY ONE OWNER?
+         BE    FREEWORK           IF YES, NO NEED FOR MESSAGE 3
+         MVC   SEND3MSG(SEND3LEN),SEND3TXT INIT SEND MESSAGE 3
+*  CHANGE FOLLOWING LINE IF FIRST 7 CHARS OF JOB NAME IS NOT TSO USERID
+         MVC   SEND3USR(7),SAVEJOB MOVE TSOUSER TO SEND
+         LA    R4,HOLDOWNS        ADDRESS OF OWNERS TABLE
+         LA    R5,SEND3WHO        ADDRESS OF WHERE TO MOVE THEM
+MOVEOWNS MVC   0(8,R5),0(R4)      MOVE AN OWNER TO THE MESSAGE
+         LA    R4,8(,R4)          BUMP TO NEXT TABLE ENTRY
+         CLC   0(2,R4),=X'FFFF'   LOGICAL END OF TABLE?
+         BE    SENDMSG3           IF YES, GO SEND MESSAGE
+         LA    R5,8(,R5)          BUMP TO NEXT MESSAGE CHARACTER
+         MVI   0(R5),C' '         BLANK IT OUT
+         LA    R5,1(,R5)          BUMP TO NEXT CHARACTER
+         B     MOVEOWNS           GO MOVE NEXT OWNER
+SENDMSG3 STIMER WAIT,DINTVL=ONESECND ALLOW PREVIOUS MSG TO ARRIVE
+         SR    R0,R0              CLEAR R0 PRIOR TO SVC
+         LA    R1,SEND3MSG        ADDRESS SEND MESSAGE 3
+         SVC   34                 ISSUE SEND
+         LTR   R15,R15            DID SEND WORK?
+         BZ    FREEWORK           IF YES, TIME TO LEAVE
+         WTO   ' ENQDTECT - SEND 3 FAILED',ROUTCDE=(2)
+* IF A TSO BATCH JOB NAME STANDARD DOESN'T EXIST REMOVE PREVIOUS LINES
+         B     FREEWORK
+BADGET1  WTO   ' ENQDTECT - GETMAIN 1 FAILED',ROUTCDE=(2)
+         B      GOHOME
+BADGET2  WTO   ' ENQDTECT - GETMAIN 2 FAILED',ROUTCDE=(2)
+         B      FREEWORK
+BADFREE  WTO   ' ENQDTECT - FREEMAIN FAILED',ROUTCDE=(2)
+         B      FREEWORK
+BADSCAN  WTO   ' ENQDTECT - GQSCAN FAILED',ROUTCDE=(2)
+FREEWORK L      R13,SAVEADDR      RESTORE CALLER'S SAVEAREA
+         FREEMAIN RU,LV=WORKLEN,A=WORKADDR,SP=230    FREE WORK AREA
+GOHOME   LM    R14,R12,12(R13)    RESTORE CALLER'S REGISTERS
+         BR    R14                RETURN TO CALLER
+SEND1TXT DS    0F                 TEXT FOR 'HOLDING MESSAGE'
+         DC    AL2(SEND1LEN)
+         DC    AL2(0)
+         DC    C'SE '
+         DC    CL5'''JOB '
+         DS    CL8'        '
+         DC    CL41' IS REQUESTING A DATASET WHICH YOU HOLD: '
+         DS    CL44
+         DC    CL8''',USER=('
+         DS    CL8
+SEND1LEN EQU   *-SEND1TXT
+SEND2TXT DS    0F                 TEXT FOR 'JOB WAITING' MESSAGE
+         DC    AL2(SEND2LEN)
+         DC    AL2(0)
+         DC    C'SE '
+         DC    C'''JOB '
+         DS    CL8
+         DC    C' WAITING FOR '
+         DC    C'THE FOLLOWING    USERS'
+         DC    C' TO RELEASE '
+         DS    CL44
+         DC    C''''
+         DC    C',USER=('
+         DS    CL7
+         DC    C')'
+SEND2LEN EQU   *-SEND2TXT
+SEND3TXT DS    0F                 TEXT FOR 'USERS:' MESSAGE
+         DC    AL2(SEND3LEN)
+         DC    AL2(0)
+         DC    C'SE '
+         DC    C'''USERS: '
+         DC    CL80' '
+         DC    C''''
+         DC    C',USER=('
+         DS    CL7
+         DC    C')'
+SEND3LEN EQU   *-SEND3TXT
+         DS    0D
+MAJRNAME DC    CL8'SYSDSN  '    GQSCAN MAJOR RESOURCE NAME
+ONESECND DC    0D'0',C'00000100'
+         LTORG
+CVTMAP   CVT   LIST=YES,DSECT=YES  COMMUNICATIONS VECTOR TABLE
+PSA      IHAPSA                 PREFIX SAVE AREA
+RIB      ISGRIB                 RESOURCE INFOMATION BLOCK
+ASCB     IHAASCB                ADDRESS SPACE CONTROL BLOCK
+ASVT     IHAASVT                ADDRESS SPACE VECTOR TABLE
+         IEZVX100               WTO USER EXIT PARM LIST
+MSGTEXT  DSECT
+MSGID    DS    CL14             'IEF863I DSN ='
+MSGAREA  DS    CL45             DSNAME IN MESSAGE + BLANK BEFORE JOB
+WORKAREA DSECT
+         DS    0D
+QSCANSAV DS    18F               GQSCAN SAVE AREA
+GQPARMS  GQSCAN SCOPE=ALL,MF=L
+SEND1MSG DS    0F                'YOU ARE HOLDING' SEND MESSAGE
+         DS    CL12
+SEND1JOB DS    CL08
+         DS    CL41
+SEND1DSN DS    CL44
+         DS    CL8
+SEND1USR DS    CL8
+SEND2MSG DS    0F                 'YOUR JOB IS WAITING' SEND MESSAGE
+         DS    CL12
+SEND2JOB DS    CL8
+         DS    CL13
+SEND2LIT DS    CL22
+         ORG   SEND2LIT
+         DS    CL14
+SEND2NUM DS    CL1
+         DS    CL7
+         ORG
+         DS    CL12
+SEND2DSN DS    CL44
+         DS    CL8
+SEND2USR DS    CL7
+         DS    CL1
+SEND3MSG DS    0F                 'USERS' SEND MESSAGE
+         DS    CL15
+SEND3WHO DS    CL80
+         DS    CL8
+SEND3USR DS    CL7
+         DS    CL1
+QSCANPTR DS    A                  ADDRESS OF GQSCAN WORK AREA
+WORKADDR DS    A                  ADDRESS OF PROGRAM WORK AREA
+SAVEADDR DS    A                  ADDRESS OF INVOKING SAVEAREA
+RIBLNGTH DS    H                  LENGTH OF RIB
+RIBELENG DS    H                  LENGTH OF RIBE
+WAITASID DS    H                  ASID OF WAITING JOB
+NUMOWNS  DS    PL1                NUMBER OF RESOURCE OWNERS
+SAVEDSN  DS    CL44               DATASET WHICH IS HELD
+SAVEDSNL DS    F                  LENGTH OF DSNAME IN IEF863I MSG
+SAVEPLUS DS    CL1                + INDICATES > 9 OWNERS
+SAVEJOB  DS    CL8                NAME OF WAITING JOB
+HOLDOWNS DS    CL74               MAX IS UP TO 9 OWNERS + X'FFFF'
+WORKLEN  EQU   *-WORKAREA         LENGTH OF DYNAMIC STORAGE AREA
+         END   ENQDTECT
+
+
+Ernie Ishman
+Senior Systems Programmer
+Geisinger System Services (USA)                        c Xephon 1992
+

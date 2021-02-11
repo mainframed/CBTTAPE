@@ -1,0 +1,508 @@
+         TITLE '*** PARSEASM: PARSE AN ASSEMBLER SOURCE FILE ***'
+PARSEASM CSECT
+*********************************************************************
+* READS AN INPUT FILE AND PARSES IT. INPUT FILE MUST BE RECFM=FB,   *
+* LRECL=80. DDNAME USED IS INPUT1.                                  *
+* RETURNS A SET OF TEXT STRINGS FOR EACH STATEMENT IN THE INPUT FILE*
+* THE CALLER PASSES AN 8-BYTE PARAMETER AREA WHICH WILL CONTAIN AN  *
+* ERROR INDICATOR AND THE ADDRESS OF THE FIRST TEXT BUFFER ON       *
+* RETURN. IT IS THE CALLER'S RESPONSIBILITY TO FREE THE TEXT BUFFER *
+* STORAGE WHEN PROCESSING IS FINISHED.                              *
+* AUTHOR R THORNTON JULY 2000                                       *
+*********************************************************************
+*          DS    0F                                                 *
+* RETDATA  DS    0CL8     RETURN DATA FROM PARSER, 8 BYTES          *
+* RETFLAG  DS    CL1         INDICATOR: C' ' = NO ERRORS FOUND,     *
+* *                                     C'X' = ONE OR MORE ERRORS,  *
+* *                                     C'E' = END OF INPUT FILE    *
+*          DS    CL3                                                *
+* RETXTADR DS    A           ADDRESS OF FIRST TEXT STRING           *
+*********************************************************************
+*          DS    0F                                                 *
+* TXTSTRG  DS    0CL256   TEXT STRING BUFFER (256 BYTES)            *
+* TXTNEXT  DS    A           ADDRESS OF NEXT TEXT BUFFER OR ZERO    *
+* TXTTYPE  DS    CL1         BUFFER CONTENT TYPE:                   *
+* *                             C'C' = COMMENT RECORD               *
+* *                             C'N' = STATEMENT NAME               *
+* *                             C'O' = OPERATION NAME               *
+* *                             C'P' = POSITIONAL OPERAND           *
+* *                             C'K' = KEYWORD OPERAND              *
+* *                             C'V' = KEYWORD OPERAND VALUE        *
+* *                             C'?' = ERROR RECORD                 *
+* TXTERROR DS    CL1         ERROR INDICATOR:                       *
+*                               C' ' = NO ERROR FOUND               *
+*                               C'N' = NAME SYNTAX ERROR            *
+*                               C'C' = CONTINUATION ERROR           *
+*                               C'L' = LENGTH EXCEEDS MAX FOR ITEM  *
+* TXTRECNO DS    XL2         INPUT FILE RECORD NUMBER FOR THE ERROR *
+* TXTLENG  DS    XL1         ACTUAL LENGTH OF THE FOLLOWING TEXT    *
+* TXTTEXT  DS    CL247       TEXT OF THE FIELD                      *
+*********************************************************************
+* SOME PARSING RULES:                                               *
+* 1. WHEN COLUMN 1 OF AN INPUT RECORD IS AN ASTERISK, THE ENTIRE    *
+*    LINE (COL 1-72) IS CONSIDERED TO BE A COMMENT.                 *
+* 2. WHEN COLUMN 1 IS NON-BLANK, BUT IS NOT AN ASTERISK, IT IS THE  *
+*    STATEMENT NAME FIELD. STATEMENT NAME MUST BEGIN WITH A-Z, @,   *
+*    #, OR $. IT CANNOT BE MORE THAT 8 CHARACTERS LONG, AND THE     *
+*    REMAINING CHARACTERS MUST BE 0-9, A-Z, @, #, OR $.             *
+* 3. ONE OR MORE BLANKS FOLLOW THE STATEMENT NAME.                  *
+* 4. OPERATION FOLLOWS THE STATEMENT NAME. CHARACTER FORMAT IS SAME *
+*    FOR STATEMENT NAME, EXCEPT IT CAN BE UP TO 16 CHARACTERS LONG. *
+*    ONE OR MORE BLANKS FOLLOW STATEMENT NAME.                      *
+* 5. OPERANDS FOLLOW THE OPERATION. EACH OPERAND FIELD IS FOLLOWED  *
+*    BY A COMMA EXCEPT THE LAST, WHICH IS FOLLOWED BY A BLANK.      *
+* 6. WHEN THE LAST OPERAND ON A RECORD ENDS WITH A COMMA, COLUMN 72 *
+*    MUST BE NON-BLANK.                                             *
+* 7. A COMMENT MAY FOLLOW THE LAST OPERAND ON A RECORD, BUT IT IS   *
+*    IGNORED BY THIS PARSING ROUTINE.                               *
+* 8. COLUMNS 73-80 MAY CONTAIN ANY DESIRED VALUE, BUT IT IS IGNORED *
+*    BY THIS ROUTINE.                                               *
+* 9. AN OPERAND MAY BE A POSITIONAL PARAMETER FOLLOWED BY A COMMA OR*
+*    A KEYWORD FOLLOWED BY AN EQUAL SIGN AND ITS VALUE. KEYWORDS AND*
+*    POSITIONAL PARAMETERS ARE FORMED BY THE SAME RULES AS ARE      *
+*    OPERATION NAMES.                                               *
+*10. KEYWORD PARAMETER VALUES ARE EXPRESSIONS THAT END WITH A COMMA.*
+*    COMMAS CONTAINED WITHIN PAIRED PARENTHESES, PAIRED QUOTES, OR  *
+*    PAIRED APOSTROPHES ARE CONSIDERED PART OF THE PARAMETER VALUE. *
+*    BLANKS CONTAINED BETWEEN PAIRED QUOTES OR APOSTROPHES ARE ALSO *
+*    CONSIDERED PART OF THE PARAMETER VALUE.                        *
+*11. VALID CONTINUATION RECORDS ARE BLANK IN COLUMNS 1-15 AND NON-  *
+*    BLANK IN COLUMN 16.                                            *
+*                                                                   *
+* AUTHOR R THORNTON JULY 2000                                       *
+*********************************************************************
+*
+*********************************************************************
+*        SAVE REGISTERS, SET UP BASE REGS, CHAIN SAVE AREAS         *
+*********************************************************************
+         USING PARSEASM,R3,R4
+         STM   R14,R12,12(R13)         SAVE CALLER'S REGS
+         LR    R3,R15                  SET UP BASE FIRST BASE REG
+         LA    R4,4095(R3)             SET UP SECOND
+         LA    R4,1(R4)                    BASE REGISTER
+         LA    R15,MYSAVE              POINT TO MY REGISTER SAVE AREA
+         ST    R15,8(R13)              SET LSA IN CALLER'S SAVE
+         ST    R13,4(R15)              SET HSA IN MY SAVE AREA
+         LR    R13,R15                 SET UP SAVE AREA POINTER
+         B     START                   BRANCH AROUND CONSTANTS
+         DC    CL8'PARSEASM'           PROGRAM NAME IDENTIFIER
+         DC    CL8'&SYSDATE'           ASSEMBLY DATE
+         DC    CL8'&SYSTIME'           ASSEMBLY TIME
+MYSAVE   DS    18F                     MY REGISTER SAVE AREA
+*********************************************************************
+*        PROCESS PARM FIELD                                         *
+*********************************************************************
+START    L     R2,0(R1)                GET PARM FIELD ADDR
+         ST    R2,RETPTR               SAVE RETURN AREA POINTER
+         USING RETDATA,R2
+         XC    RETDATA,RETDATA         CLEAR RETURN DATA AREA
+         MVI   RETFLAG,C' '            INDICATE NO ERROR FOUND
+         DROP  R2
+*********************************************************************
+*        OPEN INPUT FILE                                            *
+*********************************************************************
+OPEN     OPEN  INPUT1                  OPEN INPUT FILE
+*********************************************************************
+*             MAINLINE ROUTINE                                      *
+*********************************************************************
+MAINLINE CLI   ENDOFILE,1              END OF FILE READ?
+         BE    EOJ                     YES
+         BAL   R14,GETIN               READ INPUT RECORD
+         CLI   INREC,C'*'              COMMENT RECORD?
+         BNE   MLPARSE                 YES
+         BAL   R14,COMMENTS            GO PROCESS THE COMMENT
+         B     RETURN                  LOOP THROUGH INPUT FILE
+MLPARSE  BAL   R14,PARSMAIN            NO, GO PARSE THE RECORD
+         B     RETURN                  AND RETURN
+*********************************************************************
+*             READ INPUT FILE SUBROUTINE                            *
+*********************************************************************
+GETIN    ST    R14,GI14                SAVE RETURN ADDRESS
+         CLI   ENDOFILE,1              END OF FILE READ?
+         BE    GIXIT                   YES
+         CLI   RECHELD,1               RECORD IN HOLD AREA?
+         BNE   GETAREC                 NO
+         MVC   INREC,HOLDREC           YES, USE IT
+         MVI   RECHELD,0               AND CLEAR THE INDICATOR
+         GET   INPUT1,INREC            READ NEXT RECORD
+         LH    R15,INPCOUNT            GET INPUT RECORD COUNTER
+         LA    R15,1(R15)              ADD 1
+         LH    R15,INPCOUNT            UPDATE INPUT RECORD COUNT
+GIXIT    L     R14,GI14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+GI14     DS    A                       RETURN ADDRESS
+SETEOF   MVI   ENDOFILE,1              INDICATE END OF FILE
+         B     GIXIT                   AND RETURN TO CALLER
+*********************************************************************
+*        COMMENT RECORDS ARE PROCESSED HERE                         *
+*********************************************************************
+COMMENTS ST    R14,CM14                SAVE RETURN ADDRESS
+         BAL   R14,GETBUFF             GO GET BUFFER STORAGE
+         USING TXTSTRG,R12
+         L     R11,RETPTR              POINT TO CALLER RETURN AREA
+         USING RETDATA,R11
+         ST    R12,RETXTADR            SAVE TEXT POINTER IN CALLER AREA
+         DROP  R11
+         MVI   TXTTYPE,C'C'            INDICATE COMMENT
+         MVI   TXTERROR,C' '           INDICATE NO ERROR OCCURRED
+         MVI   TXTLENG,72              SET COMMENT TEXT LENGTH
+         MVC   TXTTEXT(72),INPUT1      MOVE IN COMMENT
+         DROP  R12
+CMXIT    L     R14,CM14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+CM14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        PARSEASM MAINLINE                                          *
+*********************************************************************
+PARSMAIN ST    R14,PM14                SAVE RETURN ADDRESS
+         MVI   ERROR,0                 CLEAR ERROR INDICATOR
+         BAL   R14,GETBUFF             GO GET BUFFER STORAGE
+         USING TXTSTRG,R12
+         L     R11,RETPTR              POINT TO CALLER RETURN AREA
+         USING RETDATA,R11
+         ST    R12,RETXTADR            SAVE TEXT POINTER IN CALLER AREA
+         DROP  R12
+         DROP  R11
+         ST    R12,CURRTXT             SAVE TEXT BUFFER ADDRESS
+         MVI   TXTUSED,0               INDICATE TEXT BUFFER AVAILABLE
+         BAL   R14,GETSTNAM            GET STATEMENT NAME
+         CLI   ERROR,C' '              ANY LINE ERROR?
+         BE    PMXIT                   YES
+         BAL   R14,GETOPER             GET OPERATOR
+         CLI   ERROR,C' '              ANY LINE ERROR?
+         BE    PMXIT                   YES
+         ??????
+PMXIT    L     R14,PM14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+PM14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        GET STORAGE FOR A TEXT BUFFER AND RETURN ADDRESS IN R12    *
+*********************************************************************
+GETBUFF  ST    R14,GB14                SAVE RETURN ADDRESS
+         STORAGE OBTAIN,LENGTH=256,ADDR=(12) GET BUFFER STORAGE
+         USING TXTSTRG,R12
+         XC    TXTSTRG(256),TXTSTRG    CLEAR TEST STORAGE AREA
+         DROP  R12
+GBXIT    L     R14,GB14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+GB14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        GET STATEMENT NAME                                         *
+*********************************************************************
+GETSTNAM ST    R14,GS14                SAVE RETURN ADDRESS
+         LA    R12,INREC               POINT TO 1ST BYTE OF RECORD
+         ST    R12,CURRCOL             SAVE CURRENT COLUMN ADDRESS
+         CLI   0(R12),C' '             STATEMENT NAME PRESENT?
+         BE    GSXIT                   NO, JUST EXIT
+         BAL   R14,GETWORD             GO EXTRACT NAME FROM RECORD
+         CLI   ERROR,C' '              ANY ERROR FOUND?
+         BE    GSTEXT                  NO, GO BUILD TEXT BLOCK
+         BAL   R14,LINERROR            ERROR, GO PRODUCE ERROR TEXT
+         B     GSXIT                   AND EXIT
+GSTEXT   L     R12,CURRTXT             POINT TO CURRENT TEXT BLOCK
+         CLI   TXTUSED,0               IS IT AVAILABLE FOR USE?
+         BE    GSGOTIT                 YES
+         BAL   R14,GETBUFF             NO, GET ANOTHER
+         L     R1,CURRTXT              POINT TO CURRENT TEXT BLOCK
+         ST    R12,TXTNEXT-TXTSTRG(R1) SET CURRENT TEXT FORWARD PTR
+         ST    R12,CURRTXT             SAVE THIS BLOCK AS CURRENT
+         MVI   TXTUSED,0               SHOW IT AVAILABLE
+         USING TXTSTRG,R12
+GSGOTIT  MVI   TXTUSED,1               SHOW TXT BLOCK USED
+         MVI   TXTTYPE,C'N'            INDICATE CONTENT IS NAME FIELD
+         MVI   TXTERROR,C' '           INDICATE NO ERROR
+         MVC   TXTRECNO,INPCOUNT       MOVE IN INPUT RECORD NUMBER
+         LR    R1,R11                  COMPUTE
+         S     R1,CURRCOL                 NAME FIELD LENGTH
+         CH    R1,H247                 OVER 247 BYTES LONG?
+         BNH   GSSVLNG                 NO
+         LH    R1,H247                 YES, FORCE TO 247 BYTES
+GSSVLNG  STC   R1,TXTLENG              SAVE ITS LENGTH
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         L     R10,CURRCOL             POINT TO 1ST BYTE OF FIELD
+         EX    R1,GSMVTXT              MOVE THE FIELD
+         CLI   TXTLENG,8               VALID NAME LENGTH?
+         BNH   GSTST1ST                YES
+         MVI   TXTERROR,C'L'           NO, SET LENGTH ERROR
+         DROP  R12
+GSSETERR L     R12,RETPTR              POINT TO CALLER DATA AREA
+         USING RETDATA,R12
+         MVI   RETFLAG,C'X'            SET ERROR INDICATOR
+         DROP  R12
+         B     GSXIT                   AND EXIT
+         USING TXTSTRG,R12
+GSTST1ST TRT   TXTTEXT(1),NATCHARS     1ST BYTE IS NATIONAL CHAR?
+         BZ    GSTSTRST                YES
+GSSYNTX  MVI   TXTERROR,C'N'           SHOW NAME SYNTAX ERROR
+         B     GSSETERR                GO FLAG THE ERROR
+GSTSTRST SR    R1,R1                   CLEAR FOR INSERT
+         IC    R1,TXTLENG              GET TEXT LENGTH
+         BCT   R1,GSXIT                SUBTRACT 1
+         BCTR  R1,0                    GET REMAINING LENGTH CODE
+         LA    R10,TXTTEXT+1           POINT TO REST OF TEXT
+         EX    R1,GSSCNRST             SCAN REST FOR VALID CHARS
+GSSCNRST TRT   0(1,R10),NATCHNBR       EXECUTED SCAN
+         BNZ   GSSYNTX                 BRANCH IF INVALID
+         DROP  R12
+GSXIT    L     R14,GS14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+GS14     DS    A                       RETURN ADDRESS
+GSMVTXT  MVC   TXTTEXT-TXTSTRG(1,R12),0(R10) EXECUTED MOVE
+*********************************************************************
+*                                                                   *
+*********************************************************************
+ZXXZXX   ST    R14,ZZ14                SAVE RETURN ADDRESS
+ZZXIT    L     R14,ZZ14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+ZZ14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        LINE ERROR: PRODUCE A TEXT BLOCK CONTAINING THE LINE       *
+*********************************************************************
+LINERROR ST    R14,LE14                SAVE RETURN ADDRESS
+         L     R12,CURRTXT             POINT TO CALLER'S RETURN AREA
+         CLI   TXTUSED,0               WAS CURRENT BUFFER USED?
+         BE    LEBUILD                 NO
+         BAL   R14,GETBUFF             YES, GET ANOTHER BUFFER
+         L     R1,CURRTXT              POINT TO CURRENT TEXT BUFFER
+         ST    R12,TXTNEXT-TXTSTRG(R1) SET FORWARD POINTER IN CURRENT
+         ST    R12,CURRTXT             SAVE CURRENT TEXT BUFFER ADDR
+         MVI   TXTUSED,0               SHOW CURRENT TEXT BLOCK UNUSED
+         USING TXTSTRG,R12
+LEBUILD  MVI   TSTTYPE,C'?'            SHOW CONTENTS UNKNOWN (ERROR)
+         MVC   TXTERROR,ERROR          MOVE IN ERROR BYTE
+         MVC   TXTRECNO,INPCOUNT       RECORD NUMBER
+         MVI   TXTLENG,80              TEXT LENGTH
+         MVC   TXTTEXT,INREC           SEND ENTIRE INPUT RECORD
+         MVI   TXTUSED,1               SHOW TEXT BLOCK USED
+         DROP  R12
+         L     R12,RETPTR              POINT TO CALLER'S DTA AREA
+         USING RETDATA,R12
+         MVI   RETFLAG,C'X'            SHOW ERROR OCCURRED
+         DROP  R12
+LEXIT    L     R14,LE14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+LE14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        GET NEXT WORD FROM INREC: ON ENTRY, CURRCOL POINTS TO THE  *
+*        CURRENT COLUMN IN INREC, WHICH IS ASSUMED TO BE THE FIRST  *
+*        BYTE OF THE WORD TO BE EXTRACTED. ON RETURN, R11 POINTS TO *
+*        THE COLUMN 1 BYTE PAST THE END OF THE WORD (OR TO COL 72). *
+*        IF A SCAN ERROR OCCURS, THE ERROR BYTE WILL BE NON-BLANK.  *
+*********************************************************************
+GETWORD  ST    R14,GW14                SAVE RETURN ADDRESS
+         MVI   ERROR,C' '              CLEAR ERROR BYTE
+         L     R11,CURRCOL             POINT TO CURRENT COLUMN
+         C     0(R11),C' '             1ST BYTE IS A BLANK?
+         BNE   GWINIT2                 NO, OK
+GWERRZ   MVI   ERROR,C'Z'              ERROR, ZERO LENGTH WORD
+         MVC   SCANEND,COL72AD         SET SCANEND AT COL72
+         B     GWXIT                   ALL THROUGH
+GWINIT2  C     R11,COL72AD             PAST END OF INREC DATA?
+         BH    GWERRZ                  NO
+GWCKBLNK TRT   0(80,R11),SCANBLNK      LOOK FOR NEXT BLANK
+         BNZ   GWTST72                 BRANCH IF BLANK FOUND
+GWSET72  L     R11,COL72AD             POINT TO COLUMN 72
+         B     GWXIT                   AND EXIT
+GWTST72  C     R1,COL72AD              BLANK FOUND BEFORE COL 73?
+         BH    GWSET72                 NO, SET TO COL 72
+         LR    R11,R1                  OK, POINT TO THE BLANK
+         ST    R11,SCANEND             SAVE LAST SCAN END ADDR
+GWXIT    L     R14,GW14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+GW14     DS    A                       RETURN ADDRESS
+*********************************************************************
+*        GET OPERATION NAME                                         *
+*********************************************************************
+GETOPER  ST    R14,GO14                SAVE RETURN ADDRESS
+         LA    R12,INREC               POINT TO 1ST BYTE OF RECORD
+         ST    R12,CURRCOL             SAVE CURRENT COLUMN ADDRESS
+         CLI   0(R12),C' '             STATEMENT NAME PRESENT?
+         BE    GOXIT                   NO, JUST EXIT
+         BAL   R14,GETWORD             GO EXTRACT NAME FROM RECORD
+         CLI   ERROR,C' '              ANY ERROR FOUND?
+         BE    GOTEXT                  NO, GO BUILD TEXT BLOCK
+         BAL   R14,LINERROR            ERROR, GO PRODUCE ERROR TEXT
+         B     GOXIT                   AND EXIT
+GOTEXT   L     R12,CURRTXT             POINT TO CURRENT TEXT BLOCK
+         CLI   TXTUSED,0               IS IT AVAILABLE FOR USE?
+         BE    GOGOTIT                 YES
+         BAL   R14,GETBUFF             NO, GET ANOTHER
+         L     R1,CURRTXT              POINT TO CURRENT TEXT BLOCK
+         ST    R12,TXTNEXT-TXTSTRG(R1) SET CURRENT TEXT FORWARD PTR
+         ST    R12,CURRTXT             SAVE THIS BLOCK AS CURRENT
+         MVI   TXTUSED,0               SHOW IT AVAILABLE
+         USING TXTSTRG,R12
+GOGOTIT  MVI   TXTUSED,1               SHOW TXT BLOCK USED
+         MVI   TXTTYPE,C'N'            INDICATE CONTENT IS NAME FIELD
+         MVI   TXTERROR,C' '           INDICATE NO ERROR
+         MVC   TXTRECNO,INPCOUNT       MOVE IN INPUT RECORD NUMBER
+         LR    R1,R11                  COMPUTE
+         S     R1,CURRCOL                 NAME FIELD LENGTH
+         CH    R1,H247                 OVER 247 BYTES LONG?
+         BNH   GOSVLNG                 NO
+         LH    R1,H247                 YES, FORCE TO 247 BYTES
+GOSVLNG  STC   R1,TXTLENG              SAVE ITS LENGTH
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         L     R10,CURRCOL             POINT TO 1ST BYTE OF FIELD
+         EX    R1,GOMVTXT              MOVE THE FIELD
+         CLI   TXTLENG,16              VALID NAME LENGTH?
+         BNH   GOTST1ST                YES
+         MVI   TXTERROR,C'L'           NO, SET LENGTH ERROR
+         DROP  R12
+GOSETERR L     R12,RETPTR              POINT TO CALLER DATA AREA
+         USING RETDATA,R12
+         MVI   RETFLAG,C'X'            SET ERROR INDICATOR
+         DROP  R12
+         B     GOXIT                   AND EXIT
+         USING TXTSTRG,R12
+GOTST1ST TRT   TXTTEXT(1),NATCHARS     1ST BYTE IS NATIONAL CHAR?
+         BZ    GOTSTRST                YES
+GOSYNTX  MVI   TXTERROR,C'N'           SHOW NAME SYNTAX ERROR
+         B     GOSETERR                GO FLAG THE ERROR
+GOTSTRST SR    R1,R1                   CLEAR FOR INSERT
+         IC    R1,TXTLENG              GET TEXT LENGTH
+         BCT   R1,GOXIT                SUBTRACT 1
+         BCTR  R1,0                    GET REMAINING LENGTH CODE
+         LA    R10,TXTTEXT+1           POINT TO REST OF TEXT
+         EX    R1,GOSCNRST             SCAN REST FOR VALID CHARS
+GOSCNRST TRT   0(1,R10),NATCHNBR       EXECUTED SCAN
+         BNZ   GOSYNTX                 BRANCH IF INVALID
+         DROP  R12
+GOXIT    L     R14,GO14                GET RETURN ADDRESS
+         BR    R14                     RETURN TO CALLER
+GO14     DS    A                       RETURN ADDRESS
+GOMVTXT  MVC   TXTTEXT-TXTSTRG(1,R12),0(R10) EXECUTED MOVE
+*********************************************************************
+*             END OF INPUT FILE                                     *
+*********************************************************************
+EOFIN    CLOSE INPUT1                  CLOSE INPUT FILE
+         L     R2,RETPTR               GET RETURN AREA POINTER
+         USING RETDATA,R2
+         MVI   RETFLAG,C'E'            SHOW END OF FILE
+         DROP  R2
+*********************************************************************
+*             RETURN TO CALLER                                      *
+*********************************************************************
+RETURN   L     R14,12(R13)             RESTORE RETURN REG: R14
+         LM    R14,R12,12(R13)         RESTORE CALLER'S REGISTERS
+         SR    R15,R15                 SET RETURN CODE = 0
+         BR    R14                     RETURN TO CALLER
+*********************************************************************
+*        STORAGE AND FILE AREAS                                     *
+*********************************************************************
+*
+DBLWD    DS    D                       DOUBLEWORD WORK AREA
+SCANEND  DC    A(0)                    @ END OF LAST SCAN
+CURRTXT  DC    A(0)                    @ CURRENT TEXT BUFFER
+CURRCOL  DC    A(0)                    @ CURRENT INREC COLUMN
+COL72AD  DC    A(INCONT)               @ INREC COLUMN 72
+ERROR    DC    X'00'                   ERROR INDICATOR
+H247     DC    H'247'                  CONSTANT 247
+*
+TXTUSED  DC    X'00'                   01=CURRENT TEXT BUFFER USED
+ENDOFILE DC    X'0'                    END OF INPUT1 FILE INDICATOR
+INPCOUNT DC    H'0'                    INPUT RECORD COUNTER
+RECHELD  DC    X'0'                    X'01'=RECORD IN HOLD AREA
+HOLDREC  DS    CL80                    RECORD BEING HELD FOR PROCESSING
+*
+INREC    DS    0CL80                    INPUT RECORD
+         DS    CL71                        DATA (COL 1-71)
+INCONT   DS    CL1                         CONTINUATION BYTE
+         DS    CL8                         CARD NUMBER
+*
+SCANBLNK DC    256X'00'                SCAN TABLE FOR BLANK
+         ORG   SCANBLNK+C' '
+         DC    C' '
+         ORG
+SCANONBK DC    256X'FF'                SCAN TABLE FOR NON-BLANK
+         ORG   SCANONBK+C' '
+         DC    X'00'
+         ORG
+NATCHARS DC    256X'FF'                VERIFY A-Z, @, #, $
+         ORG   NATCHARS+C'@'
+         DC    X'00'
+         ORG   NATCHARS+C'#'
+         DC    X'00'
+         ORG   NATCHARS+C'$'
+         DC    X'00'
+         ORG   NATCHARS+C'A'
+         DC    9X'00'
+         ORG   NATCHARS+C'J'
+         DC    9X'00'
+         ORG   NATCHARS+C'R'
+         DC    8X'00'
+         ORG
+NATCHNBR DC    256X'FF'                VERIFY A-Z, @, #, $, 0-9
+         ORG   NATCHARS+C'@'
+         DC    X'00'
+         ORG   NATCHARS+C'#'
+         DC    X'00'
+         ORG   NATCHARS+C'$'
+         DC    X'00'
+         ORG   NATCHARS+C'A'
+         DC    9X'00'
+         ORG   NATCHARS+C'J'
+         DC    9X'00'
+         ORG   NATCHARS+C'R'
+         DC    8X'00'
+         ORG   NATCHARS+C'0'
+         DC    10X'00'
+         ORG
+*********************************************************************
+*             DCB'S                                                 *
+*********************************************************************
+INPUT1   DCB   DSORG=PS,MACRF=GM,DDNAME=INPUT1,EODAD=SETEOF,           X
+               RECFM=FBA,LRECL=80
+         LTORG
+*********************************************************************
+*  DSECT FOR CALLER PASSED AREA                                     *
+*********************************************************************
+RETDATA  DSECT ,        RETURN DATA FROM PARSER, 8 BYTES          *
+RETFLAG  DS    CL1         INDICATOR: C'0' = NO ERRORS FOUND,     *
+*                                     C'X' = ONE OR MORE ERRORS,  *
+*                                     C'E' = END OF INPUT FILE    *
+         DS    CL3                                                *
+RETXTADR DS    A           ADDRESS OF FIRST TEXT STRING           *
+*********************************************************************
+*  DSECT FOR EACH TEXT BUFFER RETURNED TO THE CALLER                *
+*********************************************************************
+TXTSTRG  DSECT ,        TEXT STRING BUFFER (256 BYTES)            *
+TXTNEXT  DS    A           ADDRESS OF NEXT TEXT BUFFER OR ZERO    *
+TXTTYPE  DS    CL1         BUFFER CONTENT TYPE:                   *
+*                             C'C' = COMMENT RECORD               *
+*                             C'N' = STATEMENT NAME               *
+*                             C'O' = OPERATION NAME               *
+*                             C'P' = POSITIONAL OPERAND           *
+*                             C'K' = KEYWORD OPERAND              *
+*                             C'V' = KEYWORD OPERAND VALUE        *
+*                             C'?' = ERROR RECORD                 *
+TXTERROR DS    CL1         ERROR INDICATOR:                       *
+*                             C' ' = NO ERROR FOUND               *
+*                             C'N' = NAME SYNTAX ERROR            *
+*                             C'C' = CONTINUATION ERROR           *
+*                             C'L' = LENGTH EXCEEDS MAX FOR ITEM  *
+TXTRECNO DS    XL2         INPUT FILE RECORD NUMBER FOR THE ERROR *
+TXTLENG  DS    XL1         ACTUAL LENGTH OF THE FOLLOWING TEXT    *
+TXTTEXT  DS    CL247       TEXT OF THE FIELD                      *
+*********************************************************************
+PARSEASM CSECT
+*********************************************************************
+*             REGISTER EQUATES                                      *
+*********************************************************************
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R14      EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END

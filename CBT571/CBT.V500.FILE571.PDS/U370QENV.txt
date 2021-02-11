@@ -1,0 +1,304 @@
+U370QENV TITLE 'Query execution environment'
+*
+*  Hercules 2.16.5 doesn't seem to understand STSI in S/370 mode,
+*  so this circumvents the issue of detecting Hercules' presence
+*
+         GBLB  &G#HERC       0=issue STSI 1=assume HERC presence
+*
+* Copyright 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do:
+*----------------------------------------------------------------------
+         U#SET FUNC=UTIL
+*----------------------------------------------------------------------
+* Function:    UQENV macro support
+*
+*              Query the execution environment for:
+*
+*              - APF authorization
+*
+*              - Hercules emulator presence (optional)
+*                Requires APF authorization
+*
+* Entry: Problem or supervisor state, key 8
+*
+*        R0    bits 00-07 - options
+*
+*              Following equates defined in U#EQU macro:
+*
+*              QNV$PAGE - leave 4K page allocated (TGDPGLV, TGD@PAGE)
+*                         See QNV$SPID for the subpool (and hence the
+*                         page's attributes) in Data Areas section.
+*
+*              QNV$QHEP - query Hercules emulator presence
+*                         The test requires APF authorization, which
+*                         not all xxxx370 applications may possess.
+*
+*              bits 08-31 - presently ignored
+*
+*        R1    presently ignored
+*        R2    presently ignored
+*
+* Exit:  Supervisor state (if we're authorized)
+*        R15 = return code = 00
+*              TGDFLG2 valid
+*
+* Diagnostics:
+*              2 - APF authorization
+*              3 - Hercules presence
+*              8 - entry/exit
+*              9 - show SA at exit
+*
+* Notes:  We don't establish an initial ESTAE environment via UPROC
+*         since we want UTILSTAE to issue ESTAE with supervisor state
+*         and key 0, meaning that all the RRRs get called that way.
+*         xxxx370 must pay attention to when it establishes its ESTAE
+*         so this happens correctly.  If we're not APF authorized,
+*         none of that matters; the RRRs get driven in problem state
+*         with TCB protect key (8).
+*
+*         The UQENV macro reminds CSECTs with UPROC ID=MAIN of this
+*         via a MNOTE.
+*
+*         TGD@PAGE may be used by whatever CSECTs require it, as long
+*         as they're aware the page is not exclusively theirs to use
+*         If the page is not allocated, TGD@PAGE=X'00'
+*
+*         Users of TGDFLG2 are urged to check both the 'valid' bit
+*         and the related bit to assure correctness.
+*----------------------------------------------------------------------
+* Reg  DSECT    usage
+*----------------------------------------------------------------------
+* R2
+* R3            @ 4KB page (TGD@PAGE)
+* R4            4096 (4K) constant
+* R5            TGDPGLV: subpool (bits 00:07); length (bits 16:31)
+* R6
+* R7
+* R8
+* R9  CPD       @ CPD
+* R10
+*----------------------------------------------------------------------
+         TITLE ' '
+U370QENV UPROC ID=UQNV,L=L$SA,CPD=(Y,0,ESTAE)
+*----------------------------------------------------------------------
+         STM   R0,R2,SAENTRY           save entry parms
+         MVI   TGDFLG2,0               invalidate any previous results
+*                                      (might be called more than once)
+*----------------------------------------------------------------------
+*  Check for APF authorization (TGD2APF)
+*----------------------------------------------------------------------
+         TESTAUTH FCTN=1               APF authorized?
+         LTR   R15,R15
+         BZ    AUTH
+*
+         UDIAG 2,'QENV not APF authorized'
+         B     AUTHDONE
+*
+AUTH     DS    0H
+         UDIAG 2,'QENV APF authorized'
+         OI    TGDFLG2,TGD2APF         APF authorized
+         BAL   R14,STSUPR              supervisor state
+*
+AUTHDONE DS    0H
+         OI    TGDFLG2,TGD2VAPF        TGD2APF bit now valid
+         EJECT ,
+*----------------------------------------------------------------------
+*  Determine whether Hercules emulator is present (TGD2HEP)
+*----------------------------------------------------------------------
+         TM    SAR0B0,QNV$QHEP         query Herc presence?
+         BNO   QNVNHEP                 no, br
+         AIF   (NOT &G#HERC).HERCON
+         UDIAG 3,'QENV checking for Hercules'
+*
+*  Don't check APF authorization, we prefer an ABEND if not authorized
+*  If this is the first time U370QENV has been called, and no other
+*  CSECT has established an ESTAE, the application goes down which is
+*  probably the right thing to do.
+*
+         BAL   R14,STSUPR              supervisor state
+         USTATE KEY=0                  subpool we want needs key 0
+         UESTAE STSIBAD                switch ESTAE routines
+*
+*  Allocate 4k page-aligned storage
+*
+         SLR   R4,R4                   in case already allocated
+         ICM   R3,15,TGD@PAGE          already allocated?
+         BNZ   USEPAGE                 yes, use it
+*
+         OI    SAFLG1,SA1GM            indicate GETMAIN
+         L     R4,=F'4096'             4K
+         LR    R5,R4
+         ICM   R5,8,=AL1(QNV$SPID)     TGD@PAGE subpool
+         GETMAIN RU,LV=(R4),BNDRY=PAGE,SP=QNV$SPID
+         LR    R3,R1
+         ST    R5,TGDPGLV              FREEMAIN LV=(0) parm
+         ST    R3,TGD@PAGE             save for others to use
+*
+*  Use the STSI instruction (only valid on S/390 & above on real
+*  hardware) to detect the Hercules emulator's presence
+*  Since STSI requires 'grande' registers, we're not going to
+*  expect much of anything back from STSI
+*  Just the fact that we don't take an operation exception is
+*  enough to detect Hercules' presence
+*
+USEPAGE  DS    0H
+         LM    R0,R1,STSIPRMS          STSI R0, R1 - parms
+*
+*  STSI instruction
+*
+         DC    X'B27D',S(0)            store system information
+         BC    1,NOSYSIB               cc=3, no SYSIB stored
+*
+         USNAP 'UTILHERC herc SYSIB!',(R3),(R4)
+*
+NOSYSIB  DS    0H
+.HERCON  ANOP
+         UDIAG 3,'QENV Hercules present'
+         OI    TGDFLG2,TGD2VHEP+TGD2HEP     Hercules emulator present
+QNVNHEP  DS    0H
+         STIDP D2     ** temp **
+         USNAP 'QENV D2',D2,L$D2
+         EJECT ,
+*----------------------------------------------------------------------
+*  Check caller's exit options
+*----------------------------------------------------------------------
+RESTART  DS    0H                      RRR resumes here
+         TM    SAR0B3,QNV$PAGE         leave page allocated?
+         BO    EXIT                    yes, br
+         TM    SAFLG1,SA1GM            did we allocate it?
+         BNO   EXIT                    no, leave it alone
+*
+         LM    R0,R1,TGDPGPRM          restore FREEMAIN parms
+         FREEMAIN R,LV=(0),A=(1)       release storage
+         XC    TGDPGLV,TGDPGLV
+         XC    TGD@PAGE,TGD@PAGE       indicate not allocated
+         NI    SAFLG1,255-SA1GM        indicate FREEMAIN'd
+*
+EXIT     DS    0H
+         UDIAG 9,'QENV SA',(SAREG),L$SA
+         UDIAG 8,'QENV exit'
+         UPEND ,                       return to caller
+         EJECT ,
+*----------------------------------------------------------------------
+*  ESTAE retry routine
+*  U370STAE calls this a RRR - Remote Recovery Routine
+*  Admittedly somewhat excessive, serves as demo & test case
+*----------------------------------------------------------------------
+*
+*  Notes:  There was a bug in U370QENV whereby it would ABENDS30A-1
+*  on the FREEMAIN due to A=(R3) being invalid (following an ABENDS0C1
+*  on the STSI instruction).  The bug appears to be repaired, but it
+*  is worth noting that the registers you get in RRR code aren't the
+*  regs you might expect; they're from the last call to U370STAE.
+*  And only R2-R12 at that.  Well worth remembering....
+*
+*  Specifically the bug was repaired by replacing
+*
+*        FREEMAIN R,LV=(R5),A=(R3)
+*
+*  with
+*
+*        LM    R0,R1,TGDPGPRM          restore FREEMAIN parms
+*        FREEMAIN R,LV=(0),A=(1)       release storage
+*
+STSIBAD  DS    0H                      handle ABEND
+         UDIAG 2,'QENV no Hercules'
+         OI    TGDFLG2,TGD2VHEP        TGD2HEP bit valid
+         UESTAE RETRY2                 trim RESTART path
+         B     RESTART
+*
+*  Request a SNAP next time U370QENV runs through U370STAE.SUPPORT
+*
+RETRY2   DS    0H                      handle ABEND
+         UDIAG 2,'QENV RETRY2'
+         OI    TGDFLG2,TGD2VHEP        TGD2HEP bit valid
+         U@CPD ,R10,ERR=NOCPD          find our CPD
+         LA    R0,SNAPMFL              addr of SNAP parmlist
+         ST    R0,CPDE@SNP             for U370STAE.SUPPORT
+         DROP  R10
+         UESTAE RETRY3,SNAP=Y          enable TGDE@SNP
+         B     RESTART                 try FREEMAIN again
+*
+*  Note: If the SNAP parmlist is placed in our SAVEAREA, it will
+*  be cleared next time UPROC executes.  Normally U370QENV is only
+*  called once per TCB, at startup; however, the UPROC caveat is
+*  certainly applicable to other CSECTS.
+*
+*  You might want to place the SNAP parmlist in SAVEAREA (or the
+*  CPDUSER area) when you want to specify a STORAGE list of
+*  addresses to SNAP.
+*
+SNAPMFL  SNAP  MF=L,SDATA=(CB,ERR,DM),PDATA=ALL
+*
+RETRY3   DS    0H                      handle ABEND
+         UDIAG 2,'QENV RETRY3'
+         OI    TGDFLG2,TGD2VHEP        TGD2HEP bit valid
+         UESTAE BAIL                   trim again (SNAP=NO default)
+         B     EXIT                    OK, really try to exit
+*
+*  Catastrophic CSECT failure
+*
+BAIL     DS    0H
+         UDIAG 2,'QENV BAIL'
+         UESTAE 0                      disable CSECT's ESTAE
+         UABEND =X'FF'
+*
+NOCPD    DS    0H
+         UDIAG 2,'QENV no CPD'
+         UESTAE 0                      disable CSECT's ESTAE
+         UABEND =X'F0'
+*----------------------------------------------------------------------
+*  Generate state switch subroutines
+*----------------------------------------------------------------------
+         USTATE MF=GEN,STSUPR=Y
+         EJECT ,
+*----------------------------------------------------------------------
+*  Data areas
+*----------------------------------------------------------------------
+STSIR0   DC    F'0'                    STSI parm reg 0
+STSIR1   DC    F'1'                    STSI parm reg 1
+STSIPRMS EQU   STSIR0,8                LM target
+*
+*  TGD@PAGE subpool id
+*
+QNV$SPID EQU   253                     Space within LSQA
+*                                      Job oriented
+*                                      Fixed
+*                                      Protection key=0
+*                                      Task-related
+*                                      Not fetch-protected
+*                                      Swappable
+*
+*  Allows a task running in key 0 to acquire fixed, accountable,
+*  protected storage in the LSQA for the user's region that is
+*  job-oriented and freed when the task terminates.
+*
+         LTORG ,
+*----------------------------------------------------------------------
+*  Dynamic savearea & workarea - based R13
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F                standard MVS savearea
+SAENTRY  DS    3F                 R0:R2 from entry
+SAR0     EQU   SAENTRY+(R0*4),4
+SAR0B0   EQU   SAR0+0,1
+SAR0B1   EQU   SAR0+1,1
+SAR0B2   EQU   SAR0+2,1
+SAR0B3   EQU   SAR0+3,1
+SAR1     EQU   SAENTRY+(R1*4),4
+SAR2     EQU   SAENTRY+(R2*4),4
+         USTATE MF=L              USTATE workarea
+SAFLG1   DS    X                  U370QENV flags
+SA1GM    EQU   128                GETMAIN issued
+SAFLG2   DS    X                  TGDFLG2 copied, show for diaglvl 3
+D2       DS    8D
+L$D2     EQU   *-D2
+SAX      DS    0D
+L$SA     EQU   *-SAVEAREA         length of savearea
+*
+         WATGD ,
+*
+U370QENV UFINI DXDUQENV,L$SA
+         END   ,

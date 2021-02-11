@@ -1,0 +1,459 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; ZCPEXEC is the function called by the "default ZIL printer", ZDPRINT,
+; when the file argument is not a symbol.  The file argument is assumed
+; to be a stream (which is why we call it "stream" in this code).
+;
+; ZCPEXEC, like ZDPRINT, takes three required arguments:
+;
+; arg 1 = the object to be printed, if applicable.
+; arg 2 = the file to print it on.
+; arg 3 = a fixnum built from the following boolean values:
+;
+;    ....00  =  print a character object (TYO)
+;    ....01  =  print a LISP object (PRINC/PRIN1)
+;    ....10  =  control, not print (CTERPRI/TERPRI)
+;    ...x..  =  0 = don't slashify, 1 = slashify
+;    ..x...  =  0 = unconditional, 1 = conditional
+;    .1....  =  CHARPOS request (ZGETFPO/ZPUTFPO)
+;    1.....  =  CLRSCRN request
+;
+
+(include #.(zil-source-member zcsdfstr));
+
+(eval-when ()
+ #.(progn
+    (defvar lp  "("               "left  list      parenthesis")
+    (defvar rp  ")"               "right list      parenthesis")
+    (defvar lvp "#("              "left  vector    parenthesis")
+    (defvar rvp ")"               "right vector    parenthesis")
+    (defvar lsp "#<STRUCT "       "left  structure parenthesis")
+    (defvar rsp ">"               "right structure parenthesis")
+    (defvar lfp "#<FUNARG "       "left  funarg    parenthesis")
+    (defvar rfp ">"               "right funarg    parenthesis")
+   )
+)
+
+;-----------------------------------------------------------------------
+;
+; temporary temporary temporary temporary temporary temporary temporary
+
+(defmacro upper-case-p (char)
+ `(string-index "ABCDEFGHIJKLMNOPQRSTUVWXYZ" (string ,char)))
+
+; temporary temporary temporary temporary temporary temporary temporary
+;
+;-----------------------------------------------------------------------
+
+(defmacro write-char (char &optional stream)
+ ;(tyo char stream)
+ `(zcprint ,char ,stream #.%%%tyo))
+
+(defmacro princ-string (string &optional stream)
+ ;(princ string stream)
+ `(zdprint ,string ,stream #.%%%princ))
+
+(defmacro %tyo (char stream)
+ `(zcpexec-tyo ,char ,stream))
+
+(defmacro %princ (object stream)
+ `(zcpprint-low-level ,object ,stream nil))
+
+(defmacro %prin1 (object stream)
+ `(zcpprint-low-level ,object ,stream t))
+
+;=====================================================================
+
+(defun zcpexec (object stream bits)
+ (cond
+  (;(streamp stream)
+   (and (structp stream) (eq (vref stream 0) 'stream))
+   (case bits
+    (#.%%%tyo      (zcpexec-tyo      object stream))
+    (#.%%%princ    (zcpexec-princ    object stream))
+    (#.%%%prin1    (zcpexec-prin1    object stream))
+    (#.%%%terpri   (zcpexec-terpri   object stream))
+    (#.%%%cterpri  (zcpexec-cterpri  object stream))
+    (#.%%%charpos  (zcpexec-charpos  object stream))
+    (#.%%%clrscrn  (zcpexec-clrscrn  object stream))
+    (t (zcpexec-error stream (zcpexec-bits-operation bits)
+                             "Unknown operation passed to ZCPEXEC"
+                             (zcpexec-bits-operation bits)))))
+  ((symbolp stream)
+   (case bits
+    (#.%%%tyo
+             (zcpexec-tyo      object (zcpexec-prepare-stream stream)))
+    (#.%%%princ
+             (zcpexec-princ    object (zcpexec-prepare-stream stream)))
+    (#.%%%prin1
+             (zcpexec-prin1    object (zcpexec-prepare-stream stream)))
+    (#.%%%terpri
+             (zcpexec-terpri   object (zcpexec-prepare-stream stream)))
+    (#.%%%cterpri
+             (zcpexec-cterpri  object (zcpexec-prepare-stream stream)))
+    (#.%%%charpos
+             (zcpexec-charpos  object (zcpexec-prepare-stream stream)))
+    (#.%%%clrscrn
+             (zcpexec-clrscrn  object (zcpexec-prepare-stream stream)))
+    (t
+     (zerror `("Unsupported ZCPEXEC operation for output file "
+               ,(prin1-to-string stream))
+             (zcpexec-bits-operation bits)))))
+  (t
+   (zerror `("Invalid output file argument to "
+             ,(zcpexec-bits-operation bits)
+             " (not symbol or stream)")
+           (prin1-to-string stream)))))
+
+(defun zcpexec-bits-operation (bits)
+ (case bits
+       (#.%%%tyo      "TYO"        )
+       (#.%%%princ    "PRINC"      )
+       (#.%%%prin1    "PRIN1"      )
+       (#.%%%terpri   "TERPRI"     )
+       (#.%%%cterpri  "CTERPRI"    )
+       (#.%%%charpos  "CHARPOS"    )
+       (#.%%%clrscrn  "CLRSCRN"    )
+       (t             (string-append "unknown (" (tostring bits) ")"))))
+
+(declare (special *zcpexec-stream-table*))
+
+(defun zcpexec-prepare-stream (stream)
+ (when (symbolp stream)
+       (unless (boundp '*zcpexec-stream-table*)
+        (setq *zcpexec-stream-table* nil)
+        (unless (boundp '*print-case*)   (setq *print-case*   nil))
+        (unless (boundp '*print-escape*) (setq *print-escape* nil))
+        (unless (boundp '*print-length*) (setq *print-length* nil))
+        (unless (boundp '*print-level*)  (setq *print-level*  nil))
+       )
+       (let* ((fileid stream)
+              (p (assq fileid *zcpexec-stream-table*))
+             )
+             (cond
+              (p
+               (setq stream (cdr p)))
+              (t
+               (setq stream (make-stream
+                                 :identifier
+                                 (list 'file fileid (zildsno fileid))
+                                 :type 'file
+                                 :output-function
+                                 #'(lambda (char)
+                                           (write-char char fileid))
+                                 :princ-function
+                                 #'(lambda (string)
+                                           (princ-string string fileid))
+                            ))
+               (push (cons fileid stream) *zcpexec-stream-table*)))))
+ stream
+)
+
+(defun zcpexec-error (stream fun message &optional (arg1 () arg1?)
+                                                   (arg2 () arg2?)
+                                                   (arg3 () arg3?))
+ (cterpri)
+ (princ ";Error detected for stream ")
+ (princ (stream-identifier stream))
+ (princ ":")
+ (terpri)
+ (princ ";")
+ (princ message)
+ (when arg1? (princ " - ") (prin1 arg1))
+ (when arg2? (princ " ")   (prin1 arg2))
+ (when arg3? (princ " ")   (prin1 arg3))
+ (terpri)
+ (zerror (string-append fun " failure"))
+)
+
+(defmacro punt (&rest operations)
+ `(progn
+   ,.(mapcar
+      #'(lambda (o)
+         `(defun ,(concat "ZCPEXEC-" o) (object stream)
+           (zcpexec-error stream ,(string o) "Unsupported operation")))
+   operations)
+   ))
+
+;
+; TYO - the basic output operation, outputs a character
+;
+
+(defun zcpexec-tyo (object stream)
+ (unless (characterp object)
+  (zcpexec-error stream "TYO" "Argument not a character" object))
+ (funcall (or (stream-output-function stream)
+           (zcpexec-error stream "TYO"
+                          "No output operations possible on stream"))
+          object
+ )
+ (setf (stream-last-char stream) object)
+ (if (eql object #.eol)
+     (setf (stream-charpos stream) 1)
+     (incf (stream-charpos stream)))
+ object
+)
+
+;
+; PRINC
+;
+
+(defun zcpexec-princ (object stream)
+ (zcpexec-prin object stream 0 nil))
+
+;
+; PRIN
+;
+
+(defun zcpexec-prin1 (object stream)
+ (zcpexec-prin object stream 0 t))
+
+;
+; TERPRI
+;
+
+(defun zcpexec-terpri (object stream)
+ (zcpexec-tyo #.eol stream)
+ ; set newlinep true - actually, tyo does this implicitly when eol
+ nil
+)
+
+;
+; CTERPRI
+;
+
+(defun zcpexec-cterpri (object stream)
+ (cond
+  ((eql (stream-last-char stream) #.eol)
+   nil)
+  (t
+   (zcpexec-terpri object stream)
+   t)))
+
+;
+; CHARPOS
+;
+
+(defun zcpexec-charpos (object stream)
+ (cond
+  ((null object)
+   (stream-charpos stream))
+  ((or (not (fixnump object))
+       (minusp object))
+   (zcpexec-error stream "CHARPOS" "Invalid value for CHARPOS" object))
+  ((< object (stream-charpos stream))
+   (zcpexec-error stream "CHARPOS" "Cannot set CHARPOS to this" object))
+  (t
+   (dotimes (i (- object (stream-charpos stream)))
+            (zcpexec-tyo #\sp stream))
+   (setf (stream-charpos stream) object)
+  )))
+;
+; CLRSCRN
+;
+
+(punt clrscrn)
+
+;=======================================================================
+
+(declare (special
+                  *print-case*
+                  *print-escape*
+                  *print-length*
+                  *print-level*
+         ))
+
+(defun zcpexec-prin (object stream level escape)
+ (let (
+       (*print-escape* escape)
+      )
+      (zcpprint-1 object stream level escape)))
+
+(defun zcpprint-1 (object stream level escape)
+ (cond
+  ((symbolp object)
+   (zcpprint-symbol object stream level escape))
+  ((or (and (atom object) (not (vecp object)))
+       (eq object (zilunbnd))
+       (eq object (rmnil)))
+   (zcpprint-low-level object stream escape))
+  (t
+   (zcpprint-with-components object stream level escape)))
+ object
+)
+
+(defun zcpprint-low-level (object stream escape)
+ (let ((string    (tostring object escape))
+       (princfun  (stream-princ-function stream))
+      )
+      (cond
+       (princfun ; If a low-level PRINC function is defined, use it.
+        (funcall princfun string))
+       (t
+        (let ((outputfun
+               (or (stream-output-function stream)
+                   (zcpexec-error stream "PRINC"
+                          "No output operations possible on stream")))
+              (stringlen (string-length string))
+              (lastchar  nil)
+             )
+         ;
+         ; check for room on current line if appropriate ........
+         ;
+         (dotimes (i stringlen)
+                  (funcall outputfun (setq lastchar (char string i))))
+         (setf (stream-last-char stream) lastchar)
+         (incf (stream-charpos stream)   stringlen)
+        )))
+ )
+ object
+)
+
+(defun zcpprint-symbol (object stream level escape)
+ (if escape (zcpprint-symbol-prin1 object stream)
+            (zcpprint-symbol-princ object stream)))
+
+(defun zcpprint-symbol-princ (object stream)
+ (let* ((case *print-case*)
+        (prrep (symbol-name object))
+        (cased-string
+         (case case
+          ((nil)       nil)
+          (:upcase     (string-upcase prrep))
+          (:downcase   (string-downcase prrep))
+          (:capitalize (string-capitalize prrep))
+          (t
+           (setq *print-case* nil)
+           (warn "Invalid value for *PRINT-CASE*, resetting to NIL"
+                 case)
+           nil)))
+       )
+  (cond
+   ((null cased-string)
+    (zcpprint-low-level prrep stream nil))
+   (t
+    (do ((i 0 (1+ i))
+         (s nil)
+         (l (string-length prrep))
+         (pchar nil)
+         (cchar nil)
+        )
+        ((eql i l)
+         (setq s (if s (string-appendl (nreverse s)) prrep))
+         (zcpprint-low-level s stream nil))
+        (setq pchar (char prrep i)
+              cchar (char cased-string i))
+        (cond
+         ((upper-case-p pchar)
+          (unless s (push (string-substr prrep 1 i) s))
+          (push (string cchar) s))
+         (t
+          (when s (push (string pchar) s))))
+    )))))
+
+(defun zcpprint-symbol-prin1 (object stream)
+ (let ((case *print-case*))
+  (cond
+   ((null case)
+    (zcpprint-low-level object stream t))
+   (t
+    (let ((prrep (tostring object t)))
+     ;
+     ; Note:  This code assumes that ZIL slashification always
+     ;        does its thing by surrounding the data with
+     ;        vertical bars, and never just inserts backslashes
+     ;        in front of the funny characters.  (This is a good
+     ;        assumption, since such a slashifier is guaranteed
+     ;        to be independent of maclispification of the readtable.)
+     ;
+     ;        Anyhow, this is what ZILADMP does, and therefore
+     ;        nobody should ever change ZILADMP to slashify by
+     ;        means of backslashes.
+     ;
+     (%princ (if (eql (char prrep 0) #\|)
+                 prrep
+                 (case case
+                  (:upcase     (string-upcase prrep))
+                  (:downcase   (string-downcase prrep))
+                  (:capitalize (string-capitalize prrep))
+                  (t
+                   (setq *print-case* nil)
+                   (warn
+                     "Invalid value for *PRINT-CASE*, resetting to NIL"
+                         case)
+                   prrep)))
+             stream))))))
+
+(defun zcpprint-with-components (object stream level escape)
+ (cond
+  ((and *print-level* (>= level *print-level*))
+   (%tyo #\# stream))
+  ((consp object)
+   (zcpprint-list object stream (1+ level) escape #.lp #.rp))
+  ((vectorp object)
+   (zcpprint-vector object stream (1+ level) escape #.lvp #.rvp))
+  ((funargp object)
+   (%princ #.lfp stream)
+   (zcpprint-1 (funfun object) stream (1+ level) escape)
+   ;;;;;;;;;;; (funenv object) does not get printed.
+   (%princ #.rfp stream)
+  )
+  (t
+   (zcpprint-structure object stream (1+ level) escape))))
+
+(defun zcpprint-list (object stream level escape lp rp)
+ (%tyo (lp) stream)
+ (when object
+  (prog ((count 1) (length *print-length*))
+   loop
+       (when (and length (> count length))
+             (%princ "..." stream)
+             (return))
+       (zcpprint-1 (zcar object) stream level escape)
+       (setq object (cdr object))
+       (when (null object) (return))
+       (incf count)
+       (cond
+        ((atom object)
+         (%princ " . " stream)
+         (zcpprint-1 object stream level escape))
+        (t
+         (%tyo #\sp stream)
+         (go loop)))))
+ (%tyo (rp) stream)
+)
+
+(defun zcpprint-vector (object stream level escape ldlm rdlm)
+ (let ((vl (vlength object))
+       (pl *print-length*)
+      )
+  (%princ ldlm stream)
+  (unless (zerop vl)
+   (prog ((count 0))
+    loop
+        (when (and pl (>= count pl))
+              (%princ "..." stream)
+              (return))
+        (zcpprint-1 (vref object count) stream level escape)
+        (incf count)
+        (when (eql count vl) (return))
+        (%tyo #\sp stream)
+        (go loop)))
+  (%princ rdlm stream)
+ )
+)
+
+(defun zcpprint-structure (object stream level escape)
+ (let ((print-method (get (vref object 0) 'defstruct-print-method)))
+  (if print-method
+   (let ((*print-escape* escape)) ; escape not CL, use *print-escape*
+        (funcall print-method object stream level))
+   (zcpprint-vector object stream (1+ level) escape #.lsp #.rsp))))
+

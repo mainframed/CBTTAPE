@@ -1,0 +1,488 @@
+CCFDELET TITLE '- UTILITY THAT DELETES DATASETS WITHOUT RESTORING THEM'
+***********************************************************************
+* PROGRAM: CCFDELET
+*
+* PURPOSE: DELETE A DATA SET IN A WAY THAT ONLY REQUIRES JCL.
+* NO CONTROL CARDS ARE REQUIRED. FURTHERMORE, IF THE DATA SET IS
+* MIGRATED, IT WILL BE DELETED WITHOUT FIRST BEING RECALLED.
+* NOTE, HOWEVER, THAT WHEN THERE ARE A LARGE NUMBER OF DATASETS TO
+* DELETE, A SYSIN DD CARD SPECIFYING A FILE OF CONTROL CARDS CAN BE
+* SUPPLIED. EACH RECORD IN THIS FILE SHOULD HOLD A (LEFT JUSTIFIED)
+* NAME OF A DATASET TO BE DELETED. THE SYSIN DD STATEMENT IS EXPECTED
+* WHEN THE PARM ON THE EXEC CARD IS NOT SPECIFIED.
+*
+* USAGE: INVOKE CCFDELET WITH THE PARM FIELD ON THE EXEC CARD SET TO
+* THE NAME OF THE DATA SET THAT IS TO BE DELETED. IN ADDITION
+* YOU MAY SUPPLY
+* A SYSPRINT DD CARD. FOR INSTANCE, IF UIS.TST.GARBAGE IS TO BE
+* DELETED:
+*
+*   //    EXEC PGM=CCFDELET,PARM='UIS.TST.GARBAGE'
+*   //SYSPRINT DD SYSOUT=*
+*
+* IF THE SYSPRINT CARD IS OMITTED, CCFDELET WILL DYNAMICALLY ALLOCATE
+* ONE (AS IF //SYSPRINT DD SYSOUT=* WERE PRESENT).
+*
+* LOGIC:
+*   SEARCH TIOT (TASK IO TABLE) FOR SYSPRINT DD NAME.
+*   IF NOT FOUND, DYNAMICALLY ALLOCATE A SYSPRINT SYSOUT DATASET.
+*   FETCH THE PARAMETER, I.E, THE NAME OF THE DATASET TO BE DELETED.
+*   IF THE PARAMETER IS ABSENT, THEN OPEN THE SYSIN DATA SET AND
+*   READ IT A RECORD AT A TIME. FROM EACH RECORD EXTRACT A DATA SET
+*   NAME TO DELETE.
+*   FOR EACH NAME, WHETHER OBTAINED FROM THE PARM FIELD OR THE SYSIN
+*   DATA SET,
+*   PLUG THE NAME INTO AN IDCAMS LISTC CONTROL CARD AND A DELETE
+*   CONTROL CARD. THEN CALL IDCITER.
+*   IDCITER LINKS TO IDCAMS (WHICH WILL PERFORM THE DELETE)
+*   SPECIFYING THAT THAT SYSIN AND SYSPRINT "IO" WILL BE PERFORMED BY
+*   IROUTINE AND OROUTINE, RESPECTIVELY SUBROUTINES OF CCFDELETE.
+*   IROUTINE FIRST ISSUES A LISTC COMMAND FOR THE DATASET IN ORDER
+*   MAINLY TO DETERMINE IF THE DATASET IS ON TAPE OR DASD, BUT IF THE
+*   OUTPUT FROM IDCAMS SHOWS THAT THE DATASET DOESN'T EXIST, GO NO
+*   FURTHER. THERE IS NOTHING ELSE TO DO. RETURN WITH A CONDITION CODE
+*   OF 0. IF THE DATASET DOES EXIST, DETERMINE THAT THE DATASET IS ON
+*   TAPE IF BYTE 5 OF THE DEVTYPE FIELD IS "8" (AND VOLSER IS NOT
+*   "MIGRAT". OTHERWISE, IT IS DASD. IF THE DATASET IS TAPE, ADD
+*   "NOSCRATCH" TO THE IDCAMS DELETE COMMAND. NO MATTER WHETHER THE
+*   DATASET IS ON TAPE OR DASD, NEXT PASS THE DELETE COMMAND TO
+*   IDCAMS. IF IDCAMS GENERATES A "DATASET NOT FOUND" MESSAGE FOR THE
+*   DATASET SUPPOSED TO BE ON DISK. ISSUE THE DELETE COMMAND AGAIN,
+*   THIS TIME WITH A NOSCRATCH PARAMETER AND RETURN A CONDITION CODE
+*   OF 0. ALL THIS DETERMINATION AND MODIFICATION OF CONTROL CARDS AND
+*   CONDITION CODES IS DONE BY THE OUTPUT ROUTINE, OROUTINE, WHICH
+*   ALSO WRITES EACH OUTPUT LINE TO SYSPRINT.
+*
+*   TOM SIPUSIC           MARCH, 1993
+*
+*   CHANGES:
+*   4/5/94    BUG CORRECTED. TEST FOR "MIGRAT", NOT "MIGRATE"
+*
+***********************************************************************
+         EJECT
+CCFDELET START
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         SAVE  (14,12)            |
+         LR    R12,R15            |
+         USING CCFDELET,R12       |
+         ST    R13,SAVEAREA+4     |- STANDARD LINKAGE
+         LR    R2,R13             |
+         LA    R13,SAVEAREA       |
+         ST    R13,8(R2)          |
+* REGISTER USAGE
+*  R2  POINTER TO FLAGS           (FOR IDCAMS INPUT  (IROUTINE))
+*  R2  POINTER TO FLAGS           (FOR IDCAMS OUTPUT (OROUTINE))
+*  R3    POINTER TO PARM FROM EXEC CARD
+*  R3 POINTER TO USER DATA        (FOR IDCAMS INPUT  (OROUTINE))
+*  R3 POINTER TO RECORD INFO LIST (FOR IDCAMS OUTPUT (OROUTINE))
+*  R4 PTR TO S99RB                (IN DYNALLOC SECTION)
+*  R4    LENGTH OF PARM FROM EXEC CARD
+*  R4 OFFSET W.R.T ICARDAR OF NEXT INPUT             (IROUTINE)
+*  R4 LENGTH OF LINE TO PRINT     (FOR IDCAMS OUTPUT (OROUTINE))
+*  R5 PTR TO LINE TO "INPUT"      (FOR IDCAMS INPUT  (IROUTINE))
+*  R5 PTR TO LINE TO PRINT        (FOR IDCAMS OUTPUT (OROUTINE))
+*  R6 POINTER TO WHERE IDCAMS WANTS INPUT (IDCAMS INPUT (IROUTINE))
+*  R6 LENGTH TO PLUG INTO RDW     (FOR IDCAMS OUTPUT (OROUTINE))
+*  R7    RETURN CODE FROM IDCAMS
+*  R7 PTR TO USER AREA            (FOR IDCAMS OUTPUT (OROUTINE))
+*  R8 PTR TO TIOT DD ENTRIES      (IN GETDDNAM SECTION)
+*  R8 PTR TO S99RBP               (IN DYNALLOC SECTION)
+*  R9 WORK REG.                   (IN GETDDNAM SECTION)
+*  R9 PTR TO S99RB                (IN DYNALLOC SECTION)
+*  R12   BASE REGISTER
+         SPACE 2
+         L     R3,0(,R1)          LOAD POINTER TO 2 DIGIT PARM
+         EJECT
+         TITLE     '-  GETDDNAM  -  TEST SYSIN DD CARD PRESENCE'
+***********************************************************************
+*                                                                     *
+*     THIS GETDDNAM SECTION WAS CRIBBED FROM CCFVS1CM.                *
+*                                                                     *
+*          SUBSECTION  --  GETDDNAM                                   *
+*                                                                     *
+*     REGISTER 1 ON ENTRY CONTAINS THE ADDRESS OF AN 8 CHARACTER      *
+*     DDNAME, PADDED ON THE RIGHT WITH BLANKS IF NECESSARY.  ON       *
+*     RETURN, REGISTER 1 CONTAINS '1' IF THE SPECIFIED DD NAME IS     *
+*     PRESENT IN THE TIOT (I.E., A DD CARD IS PRESENT), OR '0' IF     *
+*     THE DD CARD IS ABSENT.                                          *
+*     'DUMMY' DD CARDS ARE TREATED AS ABSENT.                         *
+*                                                                     *
+***********************************************************************
+           SPACE   3
+GETDDNAM   EQU     *
+           SPACE   1
+           EXTRACT TIOTADDR,FIELDS=(TIOT)   GET ADDR(TIOT)
+           SPACE   1
+           L       R8,TIOTADDR         GET ADDR (TIOT)
+           LA      R8,24(,R8)          POINT TO FIRST DD ENTRY
+           SLR     R9,R9               CLEAR WORK REG
+           EJECT
+GETDLOOK   EQU     *
+           SPACE   1
+           ICM     R9,B'0001',0(R8)    GET LENGTH (DD ENTRY)
+           BZ      DYNALLOC              BRANCH IF NO MORE ENTRIES
+           SPACE   1
+           CLC     =C'SYSPRINT',4(R8)  DDNAME FOUND?
+           BE      OPENDSNS              YES, BRANCH (DON'T DYNALLOC)
+           SPACE   1
+           LA      R8,0(R8,R9)         GET NEXT DD ENTRY
+           B       GETDLOOK            KEEP LOOKING
+           SPACE   1
+           SPACE   3
+TIOTADDR   DC      A(0)                HOLDS TIOT ADDRESS
+         EJECT
+         TITLE 'CCFDELET -- DYNAMICALLY ALLOCATE SYSPRINT DATA SET'
+***********************************************************************
+* DYNAMICALLY ALLOCATE FILE TO SYSPRINT OUTPUT FILE SINCE IT WAS NOT  *
+* PRESENT IN THE JCL.                                                 *
+***********************************************************************
+DYNALLOC   DS  0H
+         SPACE
+         MVI   DYNAFLAG,X'01'     FLAG THAT DYNALLOC BEING DONE
+*        LA    R0,50              AMOUNT OF STORAGE NEEDED FOR REQUEST
+         GETMAIN R,LV=56          GET THE STORAGE
+         LR    R8,R1              SAVE THE ADDRESS OF RETURNED STORAGE
+         USING S99RBP,R8          ESTABLISH ADDRESSABILITY
+         SPACE
+         LA    R9,S99RBPTR+4      WILL PUT RB JUST BEYOND S99RBP
+         USING S99RB,R9           ESTABLISH ADDRESSABILITY
+         ST    R9,S99RBPTR        RBPTR POINTS TO RB
+         OI    S99RBPTR,S99RBPND  TURN ON RBPTR'S HIGH ORDER BIT
+         XC    S99RB(RBLEN),S99RB ENTIRELY ZERO OUT RB
+         MVI   S99RBLN,RBLEN      PUT LENGTH OF IN ITS LENGTH FIELD
+         MVI   S99VERB,S99VRBAL   SET VERB CODE FIELD TO "ALLOCATE"
+         SPACE
+         MVC   S99TXTPP,=A(TUPTRLST)  STORE ADDRESS OF TUP LIST IN RB
+         SPACE
+         LR    R1,R8              ADDRESS OF REQUEST BLOCK PTR IN R1
+         DYNALLOC                 INVOKE DYNAMIC ALLOCATION
+         B     PSTDYNAL           DYNAMIC ALLOC DONE. GO TO NEXT TASK
+RBLEN    EQU   (S99RBEND-S99RB)
+* REQUEST BLOCK EXTENSION
+RBX      DS    0F
+EID      DC    C'S99RBX'          ID
+EVER     DC    X'01'              VERSION NUMBER
+RBSVR    DC    X'80'              PROCESSING OPTION
+ESUBP    DS    XL1                SUBPOOL FOR MESSAGE BLOCKS
+EKEY     DS    XL1                STORAGE KEY FOR MESSAGE BLOCKS
+EMGSV    DS    XL1                SEVERITY FOR MESSAGES
+TUPTRLST DC    A(DDTU)
+* THE FOLLOWING DC COMMENTED OUT BECAUSE IT IS GEORGETOWN, IT POINTS
+* TO A TEXT UNIT THAT IS THE EQUIVALENT OF THE JCL "DEST=N1R9",
+* WHICH AT GEORGETOWN SENDS THE OUTPUT TO CA-VIEW.
+*        DC    A(DASUSTU)                                               0001980
+         DC    AL1(S99TUPLN),AL3(SYSOUTTU) S99TUPLN MARKS LAST TUPTR
+LTUPTLST EQU   *-TUPTRLST         LENGTH OF TEXT-UNIT-POINTER LIST
+DDTU     DC    AL2(DALDDNAM)      TU FOR DDNAME OF SYSIN
+         DC    X'0001'
+         DC    X'0008'
+         DC    C'SYSPRINT'
+DASUSTU  DC    AL2(DALSUSER)  NODE WHERE SYSOUT ROUTED    |             0002080
+         DC    X'0001'                                    |
+         DC    X'0004'                                    |
+         DC    CL4'N1R9'                                  |_ SAR
+SYSOUTTU DC    AL2(DALSYSOU)  SYSOUT=*
+         DC    X'0000'
+PSTDYNAL DS    0H                 HERE WHEN DYNAMIC ALLOCATION DONE
+         EJECT
+         TITLE '- DELETE THE DATA SET NAMED IN THE EXEC PARM FIELD'
+***********************************************************************
+*                                                                     *
+*                                                                     *
+***********************************************************************
+OPENDSNS   DS  0H
+         OPEN  (SYSPRINT,(OUTPUT)) OPEN MESSAGE DATASET.
+         EJECT
+***********************************************************************
+* PROCESS PARM, WHICH,IF PRESENT, IS THE NAME OF THE DATASET TO DELETE
+***********************************************************************
+         LH    R4,0(,R3)          LENGTH OF PARAMETER
+         LTR   R4,R4              IF PARM LENGTH NOT POSITIVE,
+         BNH   NOPARM               BRANCH TO OBTAIN DSN(S) ELSEWHERE
+         BCTR  R4,0               SUBTRACT 1 TO USE AS LENGTH IN MVC
+         LA    R3,2(,R3)          POINT TO DATA SET NAME
+EXMVCFL  EX    R4,FILLLIST        MOVE THE DSB TO IDCAMS LISTC STMT.
+EXMVCFD  EX    R4,FILLDELT        MOVE THE DSB TO IDCAMS DELETE STMT.
+         BAL   R14,IDCITER        CALL ROUTINE THAT INVOKES IDCAMS
+         ST    R15,COMPCODE       COMP CODE FOR CCFDELET
+         B     EXCCFDEL           CLEAN UP AND EXIT FROM CCFDELET
+         SPACE
+FILLLIST MVC   LDSNAME(0),0(R3)   USED BY EX AT EXMVCFL
+FILLDELT MVC   DDSNAME(0),0(R3)   USED BY EX AT EXMVCFD
+         EJECT
+NOPARM   DS    0H                 HERE WHEN NO PARM WAS PROVIDED
+***********************************************************************
+* NO PARM FIELD WAS PROVIDED IN THE JCL;                              *
+* SO GET DATA SETS TO DELETE FROM SYSIN DD.                           *
+***********************************************************************
+         SPACE 2
+         OPEN  (SYSIN,(INPUT))   OPEN LIST-OF-DSNS DATASET
+DELLOOP  DS    0H                 EACH ITER. DELETES A DSN FROM SYSIN
+         GET   SYSIN              GET THE NAME OF A DATASET TO DELETE
+         MVC   LDSNAME,0(R1)      PLUG IT INTO THE TWO CONTROL CARDS
+         MVC   DDSNAME,0(R1)        THAT TELL IDCAMS WHAT TO DO.
+         MVC   DNSCR,=C'    '     RESET FIELD INDICATING NOSCRATCH.
+         BAL   R14,IDCITER        CALL ROUTINE THAT INVOKES IDCAMS
+         L     R14,COMPCODE       HIGHEST RETURN CODE PRIOR THIS CALL
+         CR    R15,R14            IF THE NEW RETURN CODE IS NOT HIGHER
+         BNH   DELLOOP              THEN START NEXT ITERATION
+         ST    R15,COMPCODE         ELSE REVISE
+         B     DELLOOP            BRANCH TO BEGIN NEXT ITERATION
+EOF      DS    0H                 HERE WHEN NO MORE RECORDS IN SYSIN
+         CLOSE SYSIN
+         B     EXCCFDEL           CLEAN UP AND EXIT FROM CCFDELET
+         SPACE
+COMPCODE DC    F'0'               MAX COMP CODE (FROM CALLS TO IDCITER)
+         EJECT
+IDCITER  DS    0H                 THE VALUE OF PARM IS NOW IN R4
+***********************************************************************
+* LINK TO IDCAMS, WHICH WILL DELETE THE DATA SET FOR US.              *
+***********************************************************************
+         SPACE 2
+         SAVE  (14,12)            |
+         ST    R13,ITERSAVE+4     |- STANDARD LINKAGE
+         LR    R2,R13             |
+         LA    R13,ITERSAVE       |
+         ST    R13,8(R2)          |
+         MVC   SWRKAREA,=X'FFFFFFFF' REINITIALIZE RC MODIFIER
+         MVC   IWRKAREA,=F'0'        REINITIALIZE ICARDAR INDEX
+         XR    0,0
+         XR    R1,R1
+         LINK  EP=IDCAMS,                                              X
+               PARAM=(ZEROHALF,   NO SPECIAL EXEC OPTIONS              X
+               ZEROHALF,          NO SPECIAL DDNAMES                   X
+               ZEROHALF,          NO SPECIAL PAGE NUMBERING            X
+               IOLIST),           WE WILL CONTROL "IO"                 X
+               VL=1
+         EJECT
+***********************************************************************
+* HERE UPON RETURN FROM IDCAMS. RETURN WITH CONDITION                 *
+* CODE RECEIVED FROM IDCAMS.                                          *
+***********************************************************************
+CLOSEM   EQU   *
+         C     R15,=F'4'          RETURN FROM IDCAMS = 4?
+         BNE   CHECKRC8             NO, BRANCH TO RETURN TO CALLER
+         N     R15,SWRKAREA         YES, 0 RC IF 4 FOR DSN NOT CATLGD
+         B     RETURN
+         SPACE
+CHECKRC8 EQU   *
+         C     R15,=F'8'          RETURN FROM IDCAMS = 8?
+         BNE   RETURN               NO, BRANCH TO RETURN TO CALLER
+         N     R15,SWRKAREA         YES, 0 RC IF 8 FOR DSN NOT ON VOL
+         SPACE
+RETURN   EQU   *
+         L     R13,4(R13)         RESTORE SAVE AREA ADDRESS
+         RETURN (14,12),RC=(15)   RETURN FROM IDCITER
+ITERSAVE DS    18F
+         SPACE
+         EJECT
+EXCCFDEL DS    0H
+         CLOSE SYSPRINT
+         CLI   DYNAFLAG,X'01'     WAS SYSPRINT DYNAMICALLY ALLOCATED?
+         BNE   PSTFREE              NO, BRANCH TO BYPASS FREEMAIN
+         FREEMAIN R,LV=56,A=(R8)
+PSTFREE  DS    0H
+         L     R15,COMPCODE       HIGHEST RETURN CODE PRIOR THIS CALL
+         L     R13,4(R13)         RESTORE SAVE AREA ADDRESS
+         RETURN (14,12),RC=(15)   RETURN FROM CCFDELET
+         DROP  R12
+         EJECT
+         DS    0F
+SAVEAREA DS    18F
+ZEROHALF DC    H'0'
+IOLIST   DS    0F
+         DC    X'00000002'        WILL CONTROL 2 DATASETS
+         DC    A(SIN)             POINT TO THE WORD 'DDSYSIN'
+         DC    A(IROUTINE)        ROUTINE THAT WILL DO SYSOUT
+         DC    A(SWRKAREA)        WORK AREA
+         DC    A(SOUT)            POINT TO THE WORD 'DDSSYSOUT'
+         DC    A(OROUTINE)        ROUTINE THAT WILL DO SYSOUT
+         DC    A(SWRKAREA)        WORK AREA
+SWRKAREA DC    X'FFFFFFFF'        WORK AREA
+IWRKAREA DC    F'0'               INDEX TO ARRAY OF INPUT CARDS.
+SOUT     DC    C'DDSYSPRINT'      WE'LL CONTROL IO TO THIS FILE.
+SIN      DC    C'DDSYSIN   '      WE'LL CONTROL IO TO THIS FILE.
+         EJECT
+         EJECT
+***********************************************************************
+* IDCAMS CALLS THIS ROUTINE TO OBTAIN INPUT CARDS.                    *
+***********************************************************************
+IROUTINE DS    0H
+         SAVE  (14,12)            |
+         LR    R12,R15            |
+         USING IROUTINE,R12       |
+         ST    R13,SAVEAREI+4     |- STANDARD LINKAGE
+         LR    R2,R13             |
+         LA    R13,SAVEAREI       |
+         ST    R13,8(R2)          |
+         SPACE 2
+* PROCESS PARAMETER LIST PASSED FROM IDCAMS
+         L     R2,4(R1)           POINTER TO FLAGS
+         CLI   0(R2),X'00'        IDCAMS REQUESTING OPEN?
+         BNE   INOTOPEN           NO, BRANCH.  IT'S GET.
+* FAKE THE OPEN. WE CREATE "INPUT CARDS" FROM PARM DATA.
+         XR    R15,R15            0 RETURN CODE
+         B     IROUTEND           PREPARE TO RETURN TO IDCAMS
+         SPACE
+INOTOPEN EQU   *                  HERE IF NOT OPEN REQUEST
+         CLI   0(R2),X'04'        IDCAMS REQUESTING CLOSE?
+         BNE   DOAGET             NO, BRANCH.  IT'S A GET.
+* ACT AS IF WE HAVE CLOSED SYSIN.
+         XR    R15,R15            0 RETURN CODE
+         B     IROUTEND           PREPARE TO RETURN TO IDCAMS
+         SPACE
+DOAGET   EQU   *                  HERE IF IDCAMS WANTING NEXT INPUT
+         L     R3,0(R1)           POINTER TO USER DATA (ICARDAR INDEX)
+         L     R4,4(R3)   OFFSET W.R.T. ICARDAR FOR NEXT INP. LINE DATA
+         LA    R5,ICARDAR(R4)     PTR LINE TO "INPUT"
+         L     R6,8(R1)           WHERE TO PUT ADDRESS OF INPUT CARD
+         MVC   0(8,R6),0(R5)      MOVE IT (AND LINE LENGTH) THERE
+         L     R15,8(R5)          SET RETURN CODE FROM ICARDAR ENTRY
+         LA    R4,12(R4)          BUMP UP 1 INDEX FOR ICARDAR
+         ST    R4,4(R3)             AND STORE IT IN PARMLIST
+         B     IROUTEND
+         SPACE 1
+ICARDAR  DS    0D                 ARRAY OF INFO TO SEND BACK TO IDCAMS
+         DC    A(LSYSINCD)        POINTER TO THE 1ST CARD
+         DC    F'80'                LENGTH OF CARD
+         DC    F'0'                   RETURN CODE
+         DC    A(DSYSINCD)        POINTER TO THE 2ND CARD
+         DC    F'80'                LENGTH OF CARD
+         DC    F'0'                   RETURN CODE
+         DC    F'0'              SIGNAL NOTHING MORE TO PRINT
+         DC    F'0'                 LENGTH OF CARD
+         DC    F'4'                   RETURN CODE (END OF DATA)
+         EJECT
+***********************************************************************
+* HERE UPON COMPLETION OF SYSOUT REQUEST FROM IDCAMS                  *
+***********************************************************************
+IROUTEND EQU   *
+         L     R13,4(R13)         RESTORE SAVE AREA ADDRESS
+         L     R14,12(R13)        LOAD RETURN ADDRESS
+         RETURN (14,12),RC=(15)   RETURN TO CALLER
+         DROP  R12
+         EJECT
+SAVEAREI DS    18F                SAVE AREA FOR CCFDELET ROUTINE
+         LTORG
+         EJECT
+***********************************************************************
+* IDCAMS CALLS THIS ROUTINE TO ALLOW US TO HANDLE SYSPRINT IO.        *
+***********************************************************************
+OROUTINE DS    0H
+         SAVE  (14,12)            |
+         LR    R12,R15            |
+         USING OROUTINE,R12       |
+         ST    R13,SAVEAREO+4     |- STANDARD LINKAGE
+         LR    R2,R13             |
+         LA    R13,SAVEAREO       |
+         ST    R13,8(R2)          |
+         SPACE 2
+* PROCESS PARAMETER LIST PASSED FROM IDCAMS
+         L     R2,4(R1)           POINTER TO FLAGS
+         CLI   0(R2),X'00'        IDCAMS REQUESTING OPEN?
+         BNE   ONOTOPEN           NO, BRANCH.  IT'S PUT OR CLOSE.
+         XR    R15,R15            0 RETURN CODE (SYSPRINT ALREADY OPEN)
+         B     OROUTEND           PREPARE TO RETURN TO IDCAMS
+         SPACE
+ONOTOPEN EQU   *                  HERE IF NOT OPEN REQUEST
+         CLI   0(R2),X'04'        IDCAMS REQUESTING CLOSE?
+         BNE   DOAPUT             NO, BRANCH.  IT'S PUT.
+* SYSPRINT WILL BE CLOSED JUST BEFORE CCFDELET ENDS.
+         XR    R15,R15            0 RETURN CODE
+         B     OROUTEND           PREPARE TO RETURN TO IDCAMS
+         SPACE
+DOAPUT   EQU   *                  HERE IF A RECORD PASSED FOR OUTPUT
+         L     R3,8(R1)           POINTER TO RECORD INFO LIST
+         L     R4,4(R3)           LENGTH OF LINE TO PRINT
+         L     R5,0(R3)           PTR LINE TO PRINT
+         CLC   =C'IDC3012I',1(R5) IF MSGID FOR "DATASET NOT
+         BNE   PASTDSNC             CATALOGUED",
+         L     R7,0(,R1)              THEN SET MASK SO THAT CCFDELET
+         MVI   3(R7),X'00'              WILL RETURN A CC OF 0
+         MVI   7(R7),24                   AND ICARDAR OFFSET TO EOF
+         B     PASTUNIT           RETURN TO MAINLINE PROCESSING OF LINE
+         SPACE
+PASTDSNC EQU   *                  PAST DATA SET NOT CATALOGUED
+         CLC   =C'IKJ56232I D',1(R5) IF MSGID FOR DATASET NOT
+         BNE   PASTDSNF             FOUND ON VOLUME INDICATED,
+         L     R7,0(,R1)              THEN SET MASK SO THAT CCFDELET
+         MVI   3(R7),X'00'              WILL RETURN A CC OF 0
+         MVI   7(R7),12                   AND ICARDAR INDEX TO DEL STMT
+         MVC   DNSCR,=C'NSCR'               AND PLUG IN NOSCRATCH PARM
+         B     PASTUNIT           RETURN TO MAINLINE PROCESSING OF LINE
+         SPACE
+PASTDSNF EQU   *                  PAST DATA SET NOT FOUND
+         CLC   =C'DEVTYPE',37(R5) IF LINE DESCRIBING VOLSER AND DEVT
+         BNE   PASTUNIT             FOUND,
+         CLI   56(R5),C'8'        AND IF UNIT IS
+         BNE   PASTUNIT             TAPE,
+         CLC   =C'MIGRAT',26(R5)  AND IF VOLSER NOT EQUAL TO
+         BE    PASTUNIT             "MIGRAT",
+         MVC   DNSCR,=C'NSCR'         PLUG NOSCRATCH PARM INTO DELETE
+         SPACE
+PASTUNIT EQU   *                  PAST MASK SET TO 0
+         LA    R6,4(,R4)          COMPUTE AND
+         STH   R6,OUTBUF            STORE LENGTH FIELD OF RDW
+         BCTR  R4,0               LENGTH -1 FOR USE IN MVC INSTRUCTION
+EXMOVE   EX    R4,MOVEREC         MOVE DATA INTO OUTPUT RECORD.
+         PUT   SYSPRINT,OUTBUF
+         B     OROUTEND
+MOVEREC  MVC   OUTREC(0),0(R5)    EXECUTED FROM LOCATION EXMOVE.
+         EJECT
+***********************************************************************
+* HERE UPON COMPLETION OF SYSOUT REQUEST FROM IDCAMS                  *
+***********************************************************************
+OROUTEND EQU   *
+         XR    R15,R15            0 RETURN CODE BACK TO IDCAMS
+         L     R13,4(R13)         RESTORE SAVE AREA ADDRESS
+         RETURN (14,12),RC=(15)   RETURN TO CALLER
+         DROP  R12
+         EJECT
+SAVEAREO DS    18F                SAVE AREA FOR CCFDELET ROUTINE
+         SPACE 2
+* FIRST CARD PASSED TO IDCAMS. IT HOLDS COMMAND TO LISTC THE DATA SET.
+LSYSINCD DC    CL80' '
+         ORG   LSYSINCD
+         DC    C' LISTC ENT('
+LDSNAME  DC    CL44' '      THE NAME OF THE DATASET WILL GO HERE.
+         DC    C') VOL    '
+         ORG
+         SPACE 2
+* 2ND CARD PASSED TO IDCAMS. IT HOLDS COMMAND TO DELETE THE DATA SET.
+DSYSINCD DC    CL80' '
+         ORG   DSYSINCD
+         DC    C' DELETE ('
+DDSNAME  DC    CL44' '      THE NAME OF THE DATASET WILL GO HERE.
+         DC    C')        '                                             /*/*
+         ORG   DSYSINCD+68
+DNSCR    DS    CL4                NOSCRATCH PARM PLUGGED IN IF TAPE
+         ORG
+SYSIN    DCB   DDNAME=SYSIN,MACRF=GL,DSORG=PS,EODAD=EOF
+SYSPRINT DCB   DDNAME=SYSPRINT,BLKSIZE=141,RECFM=VBA,LRECL=137,        X
+               DSORG=PS,MACRF=PM
+DYNAFLAG DC    X'00'              SET TO 01 IF SYSPRINT DYNALLOCED
+OUTBUF   DS    0H                 ASSEMBLE-OUTPUT-RECORD AREA
+OUTLNTH  DS    H                  RECORD LENGTH (RDW + DATA)
+         DC    X'0000'            END OF RDW
+OUTREC   DS    CL133              THE DATA PART OF THE RECORD
+         LTORG
+         EJECT
+         IHAPSA
+         IEFZB4D0
+         IEFZB4D2
+         END   CCFDELET

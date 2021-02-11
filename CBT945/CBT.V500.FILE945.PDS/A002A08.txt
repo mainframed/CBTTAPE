@@ -1,0 +1,1328 @@
+SQL queries for VSAM catalog information
+
+To analyse changes in performance of a VSAM file over time
+necessarily involves wrestling with LISTCAT printouts and
+recording the information of interest (eg CI splits).  The
+clerical effort involved is often discouraging and error-prone.  I
+have written an extract program (VRECORD) to write all
+LISTCAT information for VSAM datasets to a VSAM work
+file.  The work file is then used to load the LISTCAT
+information to an SQL table using the standard SQL table load
+utility.  One of the fields in the work file record is the system
+date, so SQL queries can be written that track file behaviour
+over time.
+
+Having LISTCAT information available in SQL format would
+allow a VSAM exception reporting system to be quickly
+written as a set of ISQL queries.  More elaborate SQL batch or
+on-line report applications could include:
+
+o      Graphs/bar charts
+
+o      Reports on 'ineffective' CI Free Space (ie where %CI Free
+      Space is less than the record size)
+
+o      Reports on clusters that vary from installation standards
+
+o      STRNO, BUFNI, BUFND, SHAREOPTIONS
+
+o      Programs which produce replacement IDCAMS and JCL
+      statements for clusters with unsatisfactory parameters.
+      Perhaps these programs could be a mandatory VSAM
+      definition interface for application programmers.
+
+Simple ISQL queries can give very useful information quickly.
+The following query, for instance, would list Control Interval
+split behaviour over time:
+
+     SELECT CLUSTER, CATALOG, CISPLIT, PCTCI,
+            UPDATES, INSERTS, RDATE
+     FROM VSAMINFO         /* VSAM info table name */
+     WHERE
+     OBJECT = 'K'          /* KSDS only */
+     AND CLUSTER = 'MY.CLUSTER'
+     AND CISPLIT > 0
+     ORDER BY CISPLIT;     /* In severity order */
+
+To list where updates are causing too many Control Interval
+splits:
+
+     SELECT CLUSTER, CATALOG, CISPLIT, UPDATES, PCTCI, RDATE
+     FROM VSAMINFO
+     WHERE
+     OBJECT = 'K'
+     AND CLUSTER = 'MY.CLUSTER'
+     AND (UPDATE > CISPLIT) < 10
+     ORDER BY CISPLIT;
+
+To list inactive clusters or alternate indexes:
+
+     SELECT CLUSTER, CATALOG, OBJECT, RDATE
+     FROM VSAMINFO
+     WHERE
+     OBJECT = 'K' OR OBJECT = 'A'    /* KSDS or AIX */
+     AND RETRIEVES = 0
+     ORDER BY CLUSTER;
+
+To list clusters or alternate indexes with possible space
+problems for a given date:
+
+     SELECT CLUSTER, CATALOG, OBJECT, RDATE, FREEBYTE, EXTENTS
+     FROM VSAMINFO
+     WHERE OBJECT = 'K' OR OBJECT = 'A'
+     WHERE EXTENTS > 5
+     OR FREEBYTE < 100000
+     AND RDATE = '27/10/90';
+     ORDER BY CLUSTER;
+
+To plot EXCPs against retrieves for KSDSs over time for a
+given catalog:
+
+     SELECT CLUSTER, CATALOG, RETRIEVES, EXCP, RDATE
+     FROM VSAMINFO
+     WHERE OBJECT = 'K'
+     AND CATALOG = 'MY.USER.CATALOG'
+     AND RETRIEVES > 0
+     ORDER BY EXCP;
+
+VRECORD was assembled using the structured programming
+macros IF, ENDIF, DO, ENDDO etc.  These make the
+program logic much clearer.  If you do not have these macros,
+replace them with standard Assembler constructs.  The
+program was written for VSE/VSAM 1.3.0, VSE/SP 2.1.4 - if
+you have a different release (or use FBA devices), you may
+need to check it for correct operation.  All flag fields and
+numeric fields in the catalog records are converted to
+alphameric fields in the work file record, simplifying the load
+to the SQL table.
+
+ TITLE 'VRECORD - PROGRAM TO EXTRACT LISTCAT INFO TO WORK FILE'
+*  REFERENCE : VSE/VSAM LOGIC, VOLUME 1 LY24-5191-2
+* REQUIRED JCL
+* // JOB LISTJOB
+* /*
+* /* DEFINE THE WORK FILE
+* // EXEC IDCAMS,SIZE=AUTO
+*    DELETE WORK.FILE CLUSTER CAT(WORK.CATALOG)
+*     DEFINE CLUSTER (          -
+*          NAME (WORK.FILE)     -
+*          NONINDEXED           -
+*          CISZ(4096)           -
+*          RECORDSIZE(460 460)) -
+*          CATALOG(WORK.CATALOG)
+*     IF LASTCC NE 0 THEN CANCEL JOB
+* /*
+* /* WRITE ALL THE CATALOG INFO TO THE WORK FILE
+* // LIBDEF *,SEARCH=LIB.SUBLIB
+* // DLBL CFILE,'WORK.FILE',,VSAM,BUFSP=40960
+* // EXEC VRECORD,SIZE=AUTO
+* /*
+* // IF $RC NE 0 THEN
+* // GOTO $EOJ
+* /*
+* /* IF ALL OK, LOAD WORK FILE TO SQL TABLE
+* /*
+* /*
+* /&
+*
+         EJECT
+* LOGIC OVERVIEW :
+* OPEN PRINT, WORK FILE (VSAM ESDS)
+* GET STORAGE FOR USERCATALOG TABLE
+* DO UNTIL EOF ON MASTERCATALOG
+*    IF USERCATALOG RECORD, SAVE NAME & ACB ADDRESS IN TABLE
+* ENDDO
+* DO UNTIL END OF USERCATALOG TABLE
+*    POINT READ RPL TO CURRENT USERCAT ENTRY
+*    DO UNTIL EOF
+*       IF CLUSTER/AIX RECORD, SAVE NAME & CINO IN CLUSTER TABLE
+*    ENDDO
+*    SORT CLUSTER TABLE IN NAME SEQUENCE
+*    DO UNTIL END OF CLUSTER TABLE
+*       READ CLUSTER'S CATALOG RECORD (KEY = CINO)
+*       DO UNTIL END OF ASSOCIATED RECORD PTRS
+*          READ ASSOCIATED DATA RECORD
+*          POINT TO AMDSB (STATS BLOCK) WITHIN RECORD
+*          GET DETAILS
+*          IF KSDS OR AIX
+*             READ ASSOCIATED INDEX RECORD
+*             PRINT DETAILS                                             ........
+*          ENDIF
+*          WRITE DETAILS TO WORK FILE     ........
+*       ENDDO
+*    ENDDO
+*    PRINT COMPLETION MSGS
+* ENDDO
+         EJECT
+*   REGISTER USAGE
+*
+*   R1-R2  WORK
+*   R3  -  BASE REG FOR RECORD DSECTS
+*   R4  -  WORK
+*   R5  -  PRINT BUFFER PTR
+*   R6-R7  WORK
+*   R8  -  CATALOG TABLE PTR
+*   R9  -  NOT USED
+*   R10 -  LINK REGISTER
+*   R11,R12 -  PROGRAM BASE
+*   R13 -  VSAM SAVE AREA PTR
+         EJECT
+         PRINT NOGEN
+VRECORD    CSECT
+         BALR  R11,0               R11 = PROGRAM BASE
+         USING *,R11,R12           SET PROGRAM BASE REGS R11, R12
+         LA    R12,1(R11)
+         LA    R12,4095(R12)
+         LA    R13,VSAMSAVE        R13 => VSAM SAVE AREA
+* GET SYSTEM DATE AND TIMESTAMP
+         COMRG REG=1               GET SUPERVISOR COMMS ADDRESS
+         MVC   SYSDATE(L'SYSDATE),0(R1)      GET DATE
+* OPEN PRINT FILE, GETMAIN WORKING STORAGE
+         OPEN  PRINTFL             OPEN PRINT FILE
+         BAL   R10,GETMAIN         GETMAIN WORKAREAS
+* OPEN CLUSTER INFO FILE
+         MVC   OPERATN,=CL8'OPEN'
+         OPEN  CACB
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* READ MASTER CATALOG, THEN READ EACH CATALOG IN THE MASTER CATALOG
+         BAL   R10,MASTCAT         READ MASTER CATALOG
+         BAL   R10,USERCAT         READ USER CATALOGS
+RECDEXIT EQU   *                   EXIT POINT
+         BAL   R10,PRINT
+         IF    (OC,PROGRET,PROGRET,Z)
+         MVC   0(17,R5),=CL17'NORMAL COMPLETION'
+         BAL   R10,PRINT
+         MVC   0(14,R5),=CL14'OUTPUT RECORDS'
+         LA    R5,15(R5)
+         L     R1,RCOUNT
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT
+         ENDIF
+         CLOSE CACB                CLOSE OUTPUT FILE
+         CLOSE PRINTFL             CLOSE PRINT FILE
+         XR    R15,R15
+         ICM   R15,B'0001',PROGRET  SET PROGRAM RETCODE
+         EOJ   RC=(15)
+         EJECT
+* GETMAIN WORKAREAS
+GETMAIN  DS    0H
+         ST    R10,GETSAV1
+         L     R0,CSIZE            R0 = SIZE OF CATALOG TABLE
+         GETVIS                    , ISSUE GETMAIN
+         IF    (LTR,R15,R15,NZ)    IF GETMAIN FAILED
+         B     BADMAIN             HANDLE ERROR
+         ENDIF
+         ST    R1,CATTAB
+         L     R0,CLSIZE           R0 = SIZE OF CLUSTER TABLE
+         GETVIS                    , ISSUE GETMAIN
+         IF    (LTR,R15,R15,NZ)    IF GETMAIN FAILED
+         B     BADMAIN             HANDLE ERROR
+         ENDIF
+         ST    R1,CLUSTAB
+         L     R10,GETSAV1
+         BR    R10
+GETSAV1  DS    F
+BADMAIN  DS    0H                  ERROR EXIT
+         ST    R15,PROGRET         SAVE RETCODE
+         MVC   PRTBUF+1(20),=CL20'** GETMAIN FAILED **'
+         BAL   R10,PRINT           NOTIFY &
+         B     RECDEXIT            EXIT
+         EJECT
+* MASTCAT - READ MASTER CATALOG TO GET USER CATALOG NAMES
+MASTCAT  DS    0H
+         ST    R10,MASSAV1
+* GET MASTER CATALOG ACB ADDRESS
+         LA    R2,=CL44'VSAM.MASTER.CATALOG'    FILE NAME
+         LA    R6,SHOWAREA         R6  => VSAM WORKAREA
+         USING WORKAREA,R6
+         MVC   AREALEN,=AL2(SHOWLEN)  SET LENGTH OF WORK AREA
+         MVC   OPERATN,=CL8'SHOWCAT'
+         SHOWCAT NAME=(2),AREA=(6)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* SET MASTER CATALOG ACB ADDRESS IN RPL
+         L     R2,CATACB
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPLA,ACB=(2)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* WIPE CATALOG TABLE CLEAN BEFORE USE
+         L     R2,CATTAB           GET TABLE ADDRESS
+         L     R3,CSIZE            GET TABLE SIZE
+         XR    R4,R4
+         XR    R5,R5
+         MVCL  R2,R4
+         L     R7,CATTAB           R7 => CATALOG TABLE
+         USING CATSECT,R7
+         LA    R6,MAXCATS          R6 = MAX. ENTRIES
+         DO    INF                 DO UNTIL EOF
+         MVC   OPERATN,=CL8'GET'
+         GET   RPL=CATRPLA         READ A RECORD
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     MASTEOF             IF ANY ERROR, TREAT AS EOF
+         ENDIF
+         L     R3,RECBUFA          R3 => RECORD BUFFER
+         USING DATREC,R3
+         IF    (CLI,0(R3),NE,X'00')        DON'T GO PAST LO KEY RANGE
+         B     MASTEOF
+         ENDIF
+         IF    (CLI,ENTYPE,EQ,C'U'),AND,   IF USERCATALOG ENTRY        +
+               (CLC,NAME(L'NAME),NE,=CL44'VSAM.MASTER.CATALOG')
+         MVC   PRTBUF+1(L'NAME),NAME
+         BAL   R10,PRINT
+         MVC   UNAME,NAME
+         LA    R2,NAME
+         BAL   R10,SHOWCAT             GET ACB
+         ST    R2,UACB                 SAVE IT IN TABLE
+         LA    R7,ULEN(R7)             BUMP TABLE PTR
+         ENDIF
+         ENDDO
+         DROP  R3,R6,R7
+MASTEOF  EQU   *
+         L     R10,MASSAV1
+         BR    R10
+MASSAV1  DS    F
+         EJECT
+* USERCAT - FOR EACH USER CATALOG ENTRY IN CATALOG TABLE, SAVE ALL
+* CLUSTER/AIX NAMES IN CLUSTER PROCESSING TABLE
+USERCAT  DS    0H
+         ST    R10,USESAV1
+         L     R3,CATTAB           R3 => CATALOG NAME/ACB TABLE
+         USING CATSECT,R3
+         LA    R4,MAXCATS          R4 =  MAX. NO. OF ENTRIES
+* CHANGE READ MODE TO DIRECT, KEYED - PARTIAL KEY ON CI NO.
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPLA,OPTCD=(KEY,DIR,NUP,MVE,GEN),KEYLEN=4
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* DO UNTIL LAST VALID ENTRY IN USER CATALOG TABLE
+         DO    FROM=(R4)
+         DOEXIT (OC,UNAME,UNAME,Z)
+* WIPE CLUSTER TABLE BEFORE USE
+         L     R6,CLUSTAB           GET TABLE ADDRESS
+         L     R7,CLSIZE            GET TABLE SIZE
+         XR    R8,R8
+         XR    R9,R9
+         MVCL  R6,R8
+         L     R7,CLUSTAB           R7 => CLUSTER TABLE
+         USING CLSECT,R7
+* SET HEADER = USER CATALOG NAME
+         MVC   HNAME(L'UNAME),UNAME        SET CATALOG NAME
+* SET ACB ADDRESS FOR THIS USERCATALOG IN RPLS A & B
+         L     R2,UACB             PLUG IN ACB ADDRESS FOR RPL
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPLA,ACB=(2)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* READ USER CATALOG UNTIL EOF, PRINTING DETAILS FOR EACH CLUSTER
+         XC    CINO,CINO           START CI = 0
+         DO    INF                 DO UNTIL EOF
+         MVC   OPERATN,=CL8'GET'
+         GET   RPL=CATRPLA         READ A RECORD
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     CATEOF              IF ANY ERROR, TREAT AS EOF
+         ENDIF
+         LA    R2,RECBUFA          R2 => CATALOG RECORD
+         USING CLUSTREC,R2
+         IF    (CLC,CNAME,NE,UNAME)        IF NOT CAT'S CLUSTER ENTRY
+         IF    (CLI,CENTYPE,EQ,C'C'),OR,   IF CLUSTER ENTRY            +
+               (CLI,CENTYPE,EQ,C'G')       OR AIX ENTRY
+         BAL   R10,POST                    POST ENTRY TO TABLE
+         ENDIF
+         ENDIF
+         LA    R1,1                   BUMP CINO
+         A     R1,CINOF
+         ST    R1,CINOF
+         IF    (CLC,CINOF(1),GT,=XL1'00')   DON'T GO PAST LO KEY RANGE
+         B     CATEOF
+         ENDIF
+         ENDDO
+CATEOF   EQU   *
+* USE DIFFERENT BUFFER FOR CLUSTER READS
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPLA,AREA=RECBUFB
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+         BAL   R10,CLUSTER            PROCESS CLUSTER TABLE
+* RESET TO BUFFER 'A' FOR CATALOG READS
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPLA,AREA=RECBUFA
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+         LA    R3,ULEN(R3)        BUMP CATALOG TABLE PTR
+         ENDDO
+         DROP  R2,R3,R7
+* RESET COUNTS
+         XC    ACOUNT,ACOUNT
+         XC    CCOUNT,CCOUNT
+         L     R10,USESAV1
+         BR    R10
+ACOUNT   DS    F
+CCOUNT   DS    F
+USESAV1  DS    F
+HNAME    DC    CL44' '
+CLC1     CLC   0(0,R1),0(R2)
+         EJECT
+* POST ENTRIES TO CLUSTER TABLE
+POST     DS    0H
+         ST    R10,POSSAV1
+         USING CLSECT,R7
+         USING CLUSTREC,R2
+* BUMP CLUSTER/AIX COUNTS
+         IF    (CLI,CENTYPE,EQ,C'G')
+         LA    R1,1
+         A     R1,ACOUNT
+         ST    R1,ACOUNT           BUMP AIX COUNT
+         ELSE
+         LA    R1,1
+         A     R1,CCOUNT
+         ST    R1,CCOUNT           BUMP CLUSTER COUNT
+         ENDIF
+         MVC   CLNAME,CNAME                FILL IN TABLE ENTRY
+         MVC   CLCINO,CINO
+         ST    R7,CLTABEND                 R7 => CURRENT LAST ENTRY
+         LA    R7,CLLEN(R7)                BUMP TABLE PTR
+         DROP  R2,R7
+         L     R10,POSSAV1
+         BR    R10
+POSSAV1  DS    F
+CLTABEND DS    F
+         EJECT
+* CLUSTER - RECORD DETAILS OF CLUSTER RECORDS
+CLUSTER  DS    0H
+         ST    R10,CLUSAV1
+         STM   R1,R6,CLUSAV2
+* DON'T PROCESS IF NO CLUSTERS
+         L     R1,ACOUNT
+         A     R1,CCOUNT
+         IF    (LTR,R1,R1,NZ)      IF +VE ENTRIES
+* BUBBLE SORT CLUSTER TABLE BY NAME
+         L     R1,CLTABEND         SET R1 => LAST ENTRY
+         DO    INF                 DO UNTIL SORTED
+         L     R7,CLUSTAB          R7 => CLUSTER TABLE
+         XR    R2,R2               RESET SWAP FLAG
+         DO    INF                 DO WHILE NOT LAST ENTRY
+         DOEXIT (CR,R7,GE,R1)
+         IF    (CLC,0(L'CLNAME,R7),GT,CLLEN(R7))  IF ENTRY N > N + 1
+         MVC   SORTWK(CLLEN),CLLEN(R7)         SWAP THEM
+         MVC   CLLEN(CLLEN,R7),0(R7)
+         MVC   0(CLLEN,R7),SORTWK
+         LA    R2,1                             SET SWAP FLAG
+         ENDIF
+         LA    R7,CLLEN(R7)                     BUMP TABLE PTR
+         ENDDO
+         DOEXIT (LTR,R2,R2,Z)      EXIT IF NO SWAPS
+         S     R1,=AL4(CLLEN)      ELSE DECR. END ADDRESS
+         ENDDO
+         L     R7,CLUSTAB             R7 => CLUSTER TABLE
+         USING CLSECT,R7
+         L     R6,ACOUNT
+         A     R6,CCOUNT
+         DO    FROM=(R6)              DO UNTIL LAST ENTRY
+         MVC   CINO,CLCINO            GET CI NO
+         BAL   R10,RECGET             READ CLUSTER RECORD
+         LA    R3,RECBUFB             R3 => CATALOG RECORD
+         USING CLUSTREC,R3
+* SET OUTPUT RECORD TO NUMERIC '0'
+* (PC DOWNLOAD CLIPS OFF TRAILING BLANKS)
+         MVI   FREC,C'0'
+         MVI   FREC2,C'0'
+         MVC   FREC+1(FREC1LEN-1),FREC
+         MVC   FREC2+1(FREC2LEN-1),FREC2
+* GET CATALOG, CLUSTER NAME
+         MVC   FCATNAME,HNAME             CATALOG NAME
+         MVC   FNAME,CNAME                CLUSTER/AIX NAME
+* CREATION & EXPIRY DATES
+         MVC   FCREATE,=XL5'2020202020'
+         ED    FCREATE,CDSETCRD           CREATION DATE
+         IF    (CLI,FCREATE,EQ,X'20')     IF NO DATE
+         MVC   FCREATE,=CL5'00000'        THEN ZEROS
+         ENDIF
+         MVC   FEXPIRY,=XL5'2020202020'
+         ED    FEXPIRY,CDSETEXD           EXPIRY DATE
+         IF    (CLI,FEXPIRY,EQ,X'20')     IF NO DATE
+         MVC   FEXPIRY,=CL5'00000'        THEN ZEROS
+         ENDIF
+         IF    (CLI,CENTYPE,EQ,C'G')      IF AIX
+         MVI   OBJECT,C'A'                 FLAG IT
+         OI    FLAG1,AIXON                 FLAG IT
+         IF    (TM,CATTR,UPGRADE,O)
+         MVI   FUPGRADE,C'U'
+         ELSE
+         MVI   FUPGRADE,C'N'
+         ENDIF
+         ELSE
+         NI    FLAG1,255-AIXON            RESET AIX FLAG
+         ENDIF
+         IF    (CLI,COWNERID,LT,C'A'),OR,                              +
+               (CLI,COWNERID,GT,C'Z')
+         MVC   FOWNER(8),=CL8'(NULL)'
+         ELSE
+         MVC   FOWNER(8),COWNERID
+         ENDIF
+* POINT TO FIRST GROUP OCCURRENCE IN RECORD
+         XR    R1,R1
+         ICM   R1,B'0001',CGOPNO
+         IF    (LTR,R1,R1,P)      IF ANY GO'S
+         LA    R8,CGOPNO+1        POINT TO START OF GOP'S
+         DO    FROM=(R1)          DO UNTIL END OF GOP'S
+         LA    R8,GOPLEN(R8)      POINT TO NEXT GOP
+         ENDDO
+         USING ASSOC,R8
+* PROCESS DATA (& INDEX) GROUP OCCURRENCES
+         MVC   CINO,ACINOD
+         MVC   INDCI,ACINOI
+         BAL   R10,DATA
+         IF    (TM,FLAG1,INDX,O)
+         MVC   CINO,INDCI
+         BAL   R10,INDEX
+         ELSE                                   IF NOT INDEX
+         MVI   FINAME,C' '
+         MVC   FINAME+1(L'FINAME-1),FINAME      INDEX NAME IS BLANK
+         ENDIF
+         ENDIF                     ENDIF - +VE GO'S
+         LA    R7,CLLEN(R7)        BUMP CLUSTER TABLE PTR
+         DOEXIT (CLI,0(R7),EQ,X'00')   EXIT IF LAST ENTRY PROCESSED
+* WRITE CLUSTER/AIX RECORD TO CLUSTER RECORDS FILE
+         STM   R2,R3,WSAVE
+         LA    R2,FREC+FRECLEN-1   POINT TO END OF RECORD
+         LA    R3,FRECLEN
+         DO    FROM=(R3)
+         DOEXIT (CLI,0(R2),NE,C' ')  DOEXIT AT 1ST NON-BLANK
+         IF    (CLI,0(R2),EQ,C' ')   IF BLANK
+         MVI   0(R2),C'0'            REPLACE BY C'0'
+         ENDIF
+         BCTR  R2,0                  DECR PTR
+         ENDDO
+         LM    R2,R3,WSAVE
+         MVC   RDATE,SYSDATE       SAVE DATE
+         MVC   OPERATN,=CL8'PUT'
+         PUT   RPL=CRPL            WRITE TO CLUSTER RECORD FILE
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+         LA    R1,1                BUMP OUTPUT COUNT
+         A     R1,RCOUNT
+         ST    R1,RCOUNT
+         ENDDO
+         ENDIF                     ENDIF - ANY CLUSTERS ?
+         DROP  R3,R7,R8
+         LM    R1,R6,CLUSAV2
+         L     R10,CLUSAV1
+         BR    R10
+CLUSAV1  DS    F
+CLUSAV2  DS    6F
+WSAVE    DS    2F
+RCOUNT   DS    F                   OUTPUT RECORD COUNT
+SORTWK   DS    CL47                SORT WORK FIELD
+INDCI    DS    XL3
+         EJECT
+* AMDPOS - POINT TO AMSDB WITHIN DATA OR INDEX RECORD
+* INPUT  - R4 => RECORD
+* OUTPUT - R3 => AMSDB
+AMDPOS   DS    0H
+         ST    R10,AMDSAV1
+         USING DATREC,R4
+         XR    R1,R1
+         ICM   R1,B'0001',GOPNO
+         IF    (LTR,R1,R1,P)      IF ANY GO'S
+         LA    R3,GOPNO+1         POINT TO START OF GOP'S
+         USING GOPREC,R3
+         LR    R10,R1
+         DO    FROM=(R10)         DO UNTIL END OF GOP'S
+         LA    R3,GOPLEN(R3)      POINT TO NEXT GOP
+         ENDDO
+         ELSE
+         MVC   PRTBUF+1(32),=CL32'** NO GRP OCCURRENCES FOR RECORD'
+         BAL   R10,PRINT
+         ENDIF
+         LA    R3,2(R3)           POINT PAST GO CONTROL BYTES
+* VALIDATE AMSDB
+         DROP  R3
+         USING AMSDB,R3
+         IF    (TM,AMSDBID,AMID,Z)
+         MVC   PRTBUF+1(19),=CL19'** INVALID AMSDB **'
+         BAL   R10,PRINT
+         B     BADRET
+         ENDIF
+         DROP  R3,R4
+         L     R10,AMDSAV1
+         BR    R10
+AMDSAV1  DS    F
+         EJECT
+* INDEX  - RECORD DETAILS OF CLUSTER'S INDEX RECORD
+* INPUT  - CINO OF INDEX RECORD
+INDEX    DS    0H
+         ST    R10,INDSAV1
+         BAL   R10,RECGET          READ GO RECORD (RETURN ADDR IN R1)
+         LA    R4,RECBUFB
+         USING DATREC,R4
+         MVC   FINAME,NAME         GET INDEX NAME
+* POINT TO AMSDB GROUP OCCURRENCE IN INDEX RECORD
+         BAL   R10,AMDPOS          R3 => AMSDB
+         USING AMSDB,R3
+         ICM   R1,B'1111',AMDCINV      CISZ
+         BAL   R10,CONVERTF
+         MVC   FICISZ(L'FICISZ),WORK15+L'WORK15-L'FICISZ
+         IF    (TM,FLAG1,NOALLOC,Z)               IF NOT NO-ALLOC
+         ICM   R1,B'1111',AMDCINV                     GET INDEX CISZ
+         BAL   R10,CONVERTF
+         MVC   FICISZ(L'FICISZ),WORK15+L'WORK15-L'FICISZ
+         ENDIF
+         L     R10,INDSAV1
+         BR    R10
+INDSAV1  DS    F
+         EJECT
+* DATA   - RECORD DETAILS OF CLUSTER'S DATA RECORD
+* INPUT  - CINO OF DATA RECORD
+DATA     DS    0H
+         ST    R10,DATSAV1
+         STM   R2,R7,DATSAV2
+         BAL   R10,RECGET          READ GO RECORD (RETURN ADDR IN R1)
+         LA    R4,RECBUFB
+         USING DATREC,R4
+* POINT TO AMSDB GROUP OCCURRENCE IN DATA RECORD
+         BAL   R10,AMDPOS                R3 => AMSDB
+         USING AMSDB,R3
+* FLAG IF FILE OPEN
+         IF    (TM,OPENIND,OPEN,O)
+         OI    FLAG1,OPEN1
+         ELSE
+         NI    FLAG1,255-OPEN1
+         ENDIF
+         MVC   FDNAME,NAME               DATA NAME
+* GET ATTRIBUTES
+         IF    (TM,AMDATTR1,AMDDST,O)    IF INDEXED
+         OI    FLAG1,INDX                FLAG IT
+         IF    (TM,FLAG1,AIXON,Z)        IF NOT AIX
+         MVI   OBJECT,C'K'                FLAG IT
+         ENDIF
+         XR    R1,R1
+         ICM   R1,B'0011',AMDKEYLN       KEYLENGTH
+         BAL   R10,CONVERTF
+         MVC   FKEYLEN(L'FKEYLEN),WORK15+L'WORK15-L'FKEYLEN
+         XR    R1,R1
+         ICM   R1,B'0011',AMDRKP         KEY OFFSET
+         BAL   R10,CONVERTF
+         MVC   FRKP(L'FRKP),WORK15+L'WORK15-L'FRKP
+         IF    (TM,AMDATTR1,AMDSDT,O)    IMBED
+         MVI   FIMBED,C'I'
+         ELSE
+         MVI   FIMBED,C'N'
+         ENDIF
+         IF    (TM,AMDATTR1,AMDREPL,O)
+         MVI   FREPL,C'R'
+         ELSE
+         MVI   FREPL,C'N'
+         ENDIF
+         ELSE                            ELSE - NOT INDEXED
+         NI    FLAG1,255-INDX            FLAG IT
+         IF    (TM,AMDATTR1,AMDRRDS,O)
+         MVI   OBJECT,C'R'                RRDS
+         ELSE
+         IF    (TM,AMDATTR1,AMDNCAFT,O)
+         MVI   OBJECT,C'S'                ESDS-SAM
+         ELSE
+         MVI   OBJECT,C'E'                ESDS
+         ENDIF
+         ENDIF
+         ENDIF
+         IF    (TM,AMDATTR1,AMDSPAN,O)
+         MVI   FSPANNED,C'S'
+         ELSE
+         MVI   FSPANNED,C'N'
+         ENDIF
+         IF    (TM,ATTR1,SPEED,O)
+         MVI   FSPEED,C'S'
+         ELSE
+         MVI   FSPEED,C'R'
+         ENDIF
+         IF    (TM,ATTR2,NOALLOC,O)
+         MVI   FALLOC,C'N'
+         OI    FLAG1,NOALLOC                      FLAG TYPE
+         ELSE
+         NI    FLAG1,255-NOALLOC
+         IF    (TM,ATTR1,UNIQUE,O)
+         MVI   FUNIQUE,C'U'
+         ELSE
+         MVI   FUNIQUE,C'N'
+         ENDIF
+         ENDIF
+         IF    (TM,ATTR1,REUSE,O)
+         MVI   FREUSE,C'R'
+         ELSE
+         MVI   FREUSE,C'N'
+         ENDIF
+         IF    (TM,ATTR1,ERASE,O)
+         MVI   FERASE,C'E'
+         ELSE
+         MVI   FERASE,C'N'
+         ENDIF
+         IF    (TM,AMDATTR1,AMDWCK,O)
+         MVI   FWRT,C'W'
+         ELSE
+         MVI   FWRT,C'N'
+         ENDIF
+         IF    (TM,ATTR2,SHR4,O)            SHARE OPTIONS
+         MVI   FSHARE,C'1'
+         ELSE
+         IF    (TM,ATTR2,SHR2,O)
+         MVI   FSHARE,C'2'
+         ELSE
+         IF    (TM,ATTR2,SHR3,O)
+         MVI   FSHARE,C'3'
+         ELSE
+         MVI   FSHARE,C'4'
+         ENDIF
+         ENDIF
+         ENDIF
+         IF    (TM,FLAG1,AIXON,O)          IF AIX
+         IF    (TM,AMDATTR3,UNIQUE,O)      IF UNIQUE
+         MVI   FUNIQUE,C'U'
+         ELSE
+         MVI   FUNIQUE,C'N'
+         ENDIF
+         ENDIF
+         IF    (TM,SPACOPTN,CYLS,O)
+         MVI   FALLOC,C'C'                 ALLOC IN CYLS
+         ELSE
+         IF    (TM,SPACOPTN,TRACKS,O)
+         MVI   FALLOC,C'T'                 ALLOC IN TRKS
+         ELSE
+         MVI   FALLOC,C'B'                 ALLOC IN BLKS
+         ENDIF
+         ENDIF
+         XR    R1,R1
+         ICM   R1,B'0111',PRIMSPAC           PRIMARY ALLOCATION
+         BAL   R10,CONVERTF
+         MVC   FPRIME(L'FPRIME),WORK15+L'WORK15-L'FPRIME
+         LA    R5,20(R5)
+         XR    R1,R1
+         ICM   R1,B'0111',SCONSPAC           SECONDARY ALLOCATION
+         BAL   R10,CONVERTF
+         MVC   FSECOND(L'FSECOND),WORK15+L'WORK15-L'FSECOND
+         ICM   R1,B'1111',LRECL                  AVERAGE RECSZ
+         BAL   R10,CONVERTF
+         MVC   FAVERAGE,WORK15
+         MVC   FAVERAGE(L'FAVERAGE),WORK15+L'WORK15-L'FAVERAGE
+         ICM   R1,B'1111',AMDLRECL               MAXIMUM RECSZ
+         BAL   R10,CONVERTF
+         MVC   FMAX(L'FMAX),WORK15+L'WORK15-L'FMAX
+         IF    (CLC,LRECL,EQ,AMDLRECL)           FLAG IF FIXED LENGTH
+         OI    FLAG1,FIXED
+         MVI   FFIXED,C'F'
+         ELSE
+         MVI   FFIXED,C'V'
+         NI    FLAG1,255-FIXED
+         ENDIF
+         ICM   R1,B'1111',AMDCINV                    DATA CISZ
+         BAL   R10,CONVERTF
+         MVC   FDCISZ(L'FDCISZ),WORK15+L'WORK15-L'FDCISZ
+         IF    (TM,FLAG1,INDX,O)                 IF INDEXED
+         XR    R1,R1
+         ICM   R1,B'0001',AMDPCTCI               % FREE CI
+         BAL   R10,CONVERTF
+         MVC   FPCTCI(L'FPCTCI),WORK15+L'WORK15-L'FPCTCI
+         XR    R1,R1
+         ICM   R1,B'0001',AMDPCTCA               % FREE CA
+         BAL   R10,CONVERTF
+         MVC   FPCTCA(L'FPCTCA),WORK15+L'WORK15-L'FPCTCA
+         XR    R1,R1
+         ICM   R1,B'0011',AMDNEXT                NO. OF EXTENTS
+         BAL   R10,CONVERTF
+         MVC   FEXT(L'FEXT),WORK15+L'WORK15-L'FEXT
+         L     R1,AMDNLR                          NO. OF LOGICAL RECS
+         BAL   R10,CONVERTF
+         MVC   FNLR(L'FNLR),WORK15+L'WORK15-L'FNLR
+         L     R1,AMDDELR                         NO. OF DELETES
+         BAL   R10,CONVERTF
+         MVC   FDELR(L'FDELR),WORK15+L'WORK15-L'FDELR
+         L     R1,AMDIREC                         NO. OF INSERTS
+         BAL   R10,CONVERTF
+         MVC   FIREC(L'FIREC),WORK15+L'WORK15-L'FIREC
+         L     R1,AMDUPR                          NO. OF UPDATES
+         BAL   R10,CONVERTF
+         MVC   FUPDR(L'FUPDR),WORK15+L'WORK15-L'FUPDR
+         L     R1,AMDRETR                         NO. OF RETRIEVES
+         BAL   R10,CONVERTF
+         MVC   FRETR(L'FRETR),WORK15+L'WORK15-L'RETR
+         L     R1,AMDASPA                         BYTES FREE SPACE
+         BAL   R10,CONVERTF
+         MVC   FASPA(L'FASPA),WORK15+L'WORK15-L'FASPA
+         L     R1,AMDEXCP                         NO. OF EXCPS
+         BAL   R10,CONVERTF
+         MVC   FEXCP(L'FEXCP),WORK15+L'WORK15-L'FEXCP
+         ENDIF                                    ENDIF - KSDS ?
+         DROP  R4
+         LM    R2,R7,DATSAV2
+         L     R10,DATSAV1
+         BR    R10
+DATSAV1  DS    F
+DATSAV2  DS    6F
+FLAG1    DC    XL1'00'              FLAG VALUES
+FIXED    EQU   X'80'                FIXED LENGTH
+OPEN1    EQU   X'40'                OPEN
+AIXON    EQU   X'20'                AIX
+*NOALLOC EQU   X'08'                (NOALLOC)
+INDX     EQU   X'04'                INDEXED
+         EJECT
+* PRINT - PRINT RTN, CLEARS BUFFER AFTER PRINT
+* OUTPUT - R5 => PRTBUF+1
+PRINT    DS    0H
+         ST    R10,PRISAV1
+         ST    R1,PRISAV2
+         PUT   PRINTFL
+         MVI   PRTBUF,NEWLINE                 RESET CTL CHAR
+         MVC   PRTBUF+1(PRTLEN-1),PRTBUF      CLEAR PRINT BUFFER
+         LA    R5,PRTBUF+1         R5 => START OF PRINT BUFFER
+         L     R1,PRISAV2
+         L     R10,PRISAV1
+         BR    R10                 RETURN
+         EJECT
+         BR    R10                 RETURN
+PRISAV1  DS    F
+PRISAV2  DS    F
+PRTBUF   DC    CL132' '              PRINT BUFFER
+PRTLEN   EQU   *-PRTBUF              PRINT BUFFER LENGTH
+NEWLINE  EQU   C' '                  NEW LINE PRT CTL CHAR
+NEWLINE2 EQU   C'0'                  NEW LINE PRT CTL CHAR (SPACE 2)
+NEWPAGE  EQU   C'1'                  PRINT CTL CHAR FOR NEW PAGE
+* RECGET - READ CLUSTER'S DATA & CI RECORDS
+* INPUT  - CINO    - CI NO.
+* OUTPUT - RECBUFB (RECORD BUFFER)
+RECGET   DS    0H
+         ST    R10,RECSAV1
+         MVC   OPERATN,=CL8'GET'
+         GET   RPL=CATRPLA         READ A RECORD
+* IF MISSING GROUP OCCURENCE, MUST BE SERIOUS PROBLEM WITH CLUSTER'S
+* CATALOG RECORD. FLAG AND BAIL OUT.
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         L     R1,CINOF
+     MVC  PRTBUF+1(38),=CL38'MISSING GROUP OCCURRENCE AT CI NO (DEC)'
+         LA    R5,PRTBUF+1+38
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT
+         B     BADRET              BAIL OUT
+         ENDIF
+         L     R10,RECSAV1
+         BR    R10
+RECSAV1  DS    F
+         EJECT
+* SHOWCAT - GET ACB ADDRESS USING FILE NAME
+* INPUT  - R2 = FILE NAME
+* OUTPUT - R2 = ACB ADDRESS
+SHOWCAT  DS    0H
+         ST    R10,SHOSAV1
+         LA    R6,SHOWAREA         R6  => VSAM WORKAREA
+         USING WORKAREA,R6
+         MVC   AREALEN,=AL2(SHOWLEN)  SET LENGTH OF WORK AREA
+         MVC   OPERATN,=CL8'SHOWCAT'
+         SHOWCAT NAME=(2),CATDSN=(2),AREA=(6)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+         L     R2,CATACB           GET ACB ADDRESS
+         DROP  R6
+         L     R10,SHOSAV1
+         BR    R10
+SHOSAV1  DS    F
+         EJECT
+* HEADER - PRINT PAGE HEADER
+HEADER   DS    0H                    PRINT HEADING
+         ST    R10,HEASAV1
+         ST    R5,HEASAV2
+         ST    R1,HEASAV3
+         MVI   PRTBUF,NEWPAGE
+         MVC   PRTBUF+48(27),=CL27'*** RECORD LISTCAT INFO ***'
+         MVC   PRTBUF+80(8),SYSDATE
+         MVC   PRTBUF+122(4),=CL4'PAGE'
+         LA    R5,PRTBUF+127
+         LH    R1,PAGENO
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT
+         MVC   PRTBUF+60(L'HNAME),HNAME
+         BAL   R10,PRINT
+         LA    R1,1                  BUMP PAGE COUNT
+         AH    R1,PAGENO
+         STH   R1,PAGENO
+         L     R5,HEASAV2
+         L     R1,HEASAV3
+         L     R10,HEASAV1
+         BR    R10
+HEASAV1  DS    F
+HEASAV2  DS    F
+HEASAV3  DS    F
+PAGENO   DC    H'1'
+SYSDATE  DC    CL8' '                SYSTEM DATE
+         EJECT
+* BADRET - TEST VSAM RETCODE
+* INPUT - R15
+BADRET   DS    0H
+* SAVE RETCODE, SET UP VSAM SAVE AREA FIELD
+         ST    R15,SAVER15         SAVE R15
+         BAL   R10,PRINT           SPACE 1
+* PRINT HEADING
+         MVC   0(16,R5),=CL16'** VSAM ERROR **'
+         MVC   16+4(8,R5),OPERATN   IDENTIFY VSAM OPERATION
+         BAL   R10,PRINT           ERROR MESSAGE HEADER
+* PRINT R15 VALUE
+         L     R1,SAVER15          GET R15 VALUE
+         MVC   0(16,R5),=CL16'R15 (DECIMAL) = '
+         LA    R5,16(R5)
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT           PRINT R15 VALUE
+* IF OPEN ERROR FOR CLUSTER RECORD FILE, GET ERROR CODE
+         IF    (CLC,OPERATN,EQ,=CL8'OPEN')
+         MVC   0(17,R5),=CL17'OPEN ERROR CODE ='
+         LA    R5,18(R5)
+         SHOWCB ACB=CACB,AREA=SHOWAREA,LENGTH=4,FIELDS=ERROR
+         L     R1,SHOWAREA
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT           PRINT ERROR CODE
+         ENDIF
+* IF SHOWCAT, SHOW NAME
+         IF    (CLC,OPERATN,EQ,=CL8'SHOWCAT')
+         MVC   5(44,R5),0(R2)
+         BAL   R10,PRINT
+         ELSE
+* IF 'GET', GET FEEDBACK CODE
+         IF    (CLC,OPERATN,EQ,=CL8'GET')
+         SHOWCB RPL=CATRPLA,AREA=SHOWAREA,LENGTH=72,FIELDS=FDBK
+         L     R1,SHOWAREA
+         MVC   5(24,R5),=CL24'VSAM ERROR CODE (DEC) = '
+         LA    R5,29(R5)
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT           PRINT ERROR CODE
+         ELSE
+* IF SHOWCB, GET ERROR CODE IN R0
+         IF    (CLC,OPERATN,EQ,=CL8'SHOWCB')
+         LR    R1,R0
+         MVC   5(24,R5),=CL24'VSAM ERROR CODE (DEC) = '
+         LA    R5,29(R5)
+         BAL   R10,CONVERTP
+         BAL   R10,PRINT           PRINT ERROR CODE
+         ENDIF
+         ENDIF
+         ENDIF
+* EXIT
+         MVC   PROGRET(1),SAVER15+3   SET PROGRAM RETCODE
+         B     RECDEXIT               END IT ALL
+SAVER15  DS    F
+OPERATN  DC    CL8' '                VSAM OPERATION BEING PERFORMED
+PROGRET  DC    XL1'00'               PROGRAM RETCODE
+RETCODE  DC    F'0'                  VSAM RETCODE
+VSAMSAVE DC    18F'0'                VSAM SAVE AREA FOR SHOWCB
+         EJECT
+* CONVERTF - CONVERT BINARY TO PRINTABLE DECIMAL NO.
+*            FOR MOVE TO CLUSTER FILE BUFFER
+* INPUT  - R1
+* OUTPUT - WORK15 (15 BYTES)
+CONVERTF DS    0H
+         ST    R10,FSAV1             SAVE RETURN ADDRESS
+         STM   R2,R3,FSAV2
+         XC    WORKD,WORKD         CLEAR WORK FIELD
+         CVD   R1,WORKD            PUT INTO DW FIELD
+         MVC   WORK15,EDIT2        PUT IN EDIT PATTERN
+         ED    WORK15,WORKD        EDIT RESULT
+         LA    R2,WORK15
+         LA    R3,L'WORK15
+         DO    FROM=(R3)
+         IF    (CLI,0(R2),EQ,X'20')
+         MVI   0(R2),C'0'
+         ENDIF
+         LA    R2,1(R2)
+         ENDDO
+         L     R10,FSAV1
+         LM    R2,R3,FSAV2
+         BR    R10
+FSAV1    DS    F
+FSAV2    DS    2F
+EDIT2    DC    XL15'202020202020202020202020202020'   EDIT PATTERN
+         EJECT
+* CONVERTP - CONVERT BINARY TO PRINTABLE DECIMAL NO. AND
+*            MOVE TO PRINT BUFFER, AND PLUG IN BRACKETS.
+* INPUT  - R1 (NUMBER TO PRINT)
+*        - R5    (ADDRESS OF PRINT BUFFER)
+* OUTPUT - WORK15 (15 BYTES)
+*        - R5    (ADDRESS OF PRINT BUFFER JUST PAST CLOSING BRACKET)
+CONVERTP DS    0H
+         ST    R10,CONSAV1         SAVE RETURN ADDRESS
+         ST    R2,CONSAV2
+         XC    WORKD,WORKD         CLEAR WORK FIELD
+         CVD   R1,WORKD            PUT INTO DW FIELD
+         MVC   WORK15,EDIT1        PUT IN EDIT PATTERN
+         LA    R1,WORK15+L'WORK15-1   AT LEAST PRINT LAST 0
+         EDMK  WORK15,WORKD        EDIT RESULT INTO WORK15
+         LA    R2,WORK15+L'WORK15
+         SR    R2,R1               R2 = LENGTH
+         BCTR  R2,0                ADJUST FOR EXECUTE
+         IF    (LTR,R2,R2,M)       MUST BE AT LEAST 0
+         XR    R2,R2
+         ENDIF
+         MVI   0(R5),C'('          PLUG IN OPENING BRACKET
+         LA    R5,1(R5)            POINT PAST BRACKET
+         EX    R2,MVC1             MOVE RESULT TO PRINT BUFFER
+         AR    R5,R2               POINT PAST PRINT
+         MVI   1(R5),C')'          PLUG IN FINAL BRACKET
+         LA    R5,2(R5)
+         L     R2,CONSAV2
+         L     R10,CONSAV1         RESTORE RETURN ADDRESS
+         BR    R10                 RETURN
+CONSAV1  DS    F
+CONSAV2  DS    F
+WORK15   DC    CL15' '
+WORKD    DC    D'0'
+EDIT1    DC    XL15'202020202020202020202020202120'   EDIT PATTERN
+MVC1     MVC   0(0,R5),0(R1)
+         EJECT
+DATAAREA DS    0F
+         LTORG
+         EJECT
+* REGISTER EQUATES
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+* DTF'S, ACB'S ETC.
+PRINTFL  DTFPR DEVADDR=SYSLST,     PRINT FILE DTF                      +
+               DEVICE=1403,                                            +
+               BLKSIZE=132,                                            +
+               CTLCHR=ASA,                                             +
+               IOAREA1=PRTBUF,                                         +
+               RECFORM=FIXUNB
+         DS    0F
+RECBUFA  DS    CL505                    RECORD BUFFER 'A'
+RECLEN   EQU   *-RECBUFA
+         DS    0F
+RECBUFB  DS    CL505                    RECORD BUFFER 'B'
+* CATALOG SEQ READ RPL (ACB ADDRESS IS PLUGGED IN BY THE PROGRAM)
+CINOF    DC    F'0'
+         ORG   CINOF+1
+CINO     DS    XL3
+CATRPLA  RPL   AREA=RECBUFA,                                           +
+               ARG=CINOF,                                              +
+               AREALEN=505,                                            +
+               OPTCD=(ADR,SEQ,NUP,LOC),                                +
+               RECLEN=505               MAX. RECLEN
+* CLUSTER RECORD FILE ACB
+         DS    0F
+CACB     ACB   DDNAME=CFILE,MACRF=(ADR,SEQ,OUT)
+CRPL     RPL   ACB=CACB,                                               +
+               AREA=FREC,               OUTPUT BUFFER ADDRESS          +
+               AREALEN=460,                                            +
+               OPTCD=(ADR,SEQ,MVE),                                    +
+               RECLEN=460
+         DS    0F
+SHOWAREA DS    CL72                    SHOWCAT WORK AREA
+SHOWLEN  EQU   72
+CATTAB   DC    AL4(0)                  ADDR OF USER CATALOG TABLE
+MAXCATS  EQU   100
+CSIZE    DC    F'4400'                 TABLE SIZE = MAXCATS X 44
+CLUSTAB  DC    AL4(0)                  ADDR OF CLUSTER TABLE
+MAXCLUST EQU   1000                    MAXIMUM CLUSTERS ALLOWED
+CLSIZE   DC    F'47000'                TABLE SIZE = MAXCLUST X 47
+        EJECT
+* CLUSTER INFO FILE RECORD
+* NOTE THAT THE CLUSTER INFO FILE RECORD IS ALL IN CHARACTER FORMAT
+* TO SIMPLIFY CODING FOR SQL LOAD
+FREC     DS    0F
+FCATNAME DS    CL44                    CATALOG NAME
+FNAME    DS    CL44                    CLUSTER/AIX NAME
+RDATE    DS    CL8                     DATE
+FDNAME   DS    CL44                    CLUSTER/AIX DATA NAME
+FINAME   DS    CL44                    CLUSTER/AIX INDEX NAME
+FREC1LEN EQU   *-FREC                  LENGTH OF RECORD PART 1
+FREC2    EQU   *
+FOWNER   DS    CL8                     OWNER
+FCREATE  DS    CL5                     CREATION DATE (YDD)
+FEXPIRY  DS    CL5                     EXPIRY DATE (YDD)
+FSPEED   DS    CL1                     'S' OR 'R'
+FUNIQUE  DS    CL1                     'U' OR 'N' UNIQUE KEYS (IF AIX)
+FREUSE   DS    CL1                     'R' OR 'N'
+FERASE   DS    CL1                     'E' OR 'N'
+OBJECT   DS    CL1                     'K' (KSDS) 'R' (RRDS) 'E' (ESDS)
+****                                   'S' (SAM-ESDS) OR 'A' (AIX)
+FSHARE   DS    CL1                     SHR(1 OR 2 OR 3 OR 4)
+FUPGRADE DS    CL1                     'U' OR 'N' UPGRADE (IF AIX)
+FALLOC   DS    CL1                     ALLOC TYPE 'C' (CYLS) 'T' TRKS
+FWRT     DS    CL1                     'W' WRITECHECK ELSE 'N'
+FIMBED   DS    CL1                     IMBED 'I' ELSE 'N'
+FSPANNED DS    CL1                     SPANNED 'S' ELSE 'N'
+FREPL    DS    CL1                     REPLICATE 'R' ELSE 'N'
+FFIXED   DS    CL1                     FIXED LENGTH 'F' ELSE 'V'
+* NUMERIC FIELDS
+FDCISZ   DS    CL5                     DATA CISZ
+FICISZ   DS    CL5                     INDEX CISZ
+FPRIME   DS    CL8                     PRIMARY ALLOCATION
+FSECOND  DS    CL8                     SECONDARY ALLOCATION
+FAVERAGE DS    CL5                     AVERAGE RECORD LENGTH
+FMAX     DS    CL5                     AVERAGE RECORD LENGTH
+FRKP     DS    CL5                     RELATIVE KEY POSITION
+FKEYLEN  DS    CL3                     KEY LENGTH
+FEXT     DS    CL3                     NO. OF EXTENTS
+FNLR     DS    CL8                     NO. OF LOGICAL RECORDS
+FDELR    DS    CL8                     NO. OF DELETES
+FIREC    DS    CL8                     NO. OF INSERTS
+FUPR     DS    CL8                     NO. OF UPDATES
+FRETR    DS    CL8                     MO. OF RECORDS RETRIEVED
+FASPA    DS    CL8                     NO. OF BYTES FREE SPACE
+FEXCP    DS    CL8                     NO. EXCP'S
+FPCTCA   DS    CL3                     CA % FREE
+FPCTCI   DS    CL3                     CI % FREE
+FRECLEN  EQU   *-FREC                  TOTAL LENGTH OF RECORD
+FREC2LEN EQU   *-FREC2                 LENGTH OF RECORDPART 2
+* USER CATALOG TABLE DSECT
+CATSECT  DSECT
+UACB     DS    F                       ACB
+UNAME    DS    CL44                    USERCATALOG NAME
+ULEN     EQU   *-UACB                  ENTRY LENGTH
+* CLUSTER TABLE DSECT
+CLSECT   DSECT
+CLNAME   DS    CL44                    CLUSTER/AIX NAME
+CLCINO   DS    CL3                     CI NO OF CLUSTER RECORD
+CLLEN    EQU   *-CLNAME                ENTRY LENGTH
+WORKAREA DSECT
+AREALEN  DS    AL2                     LENGTH OF WORKAREA
+WORKLEN  DS    AL2                     RETURNED LENGTH OF WORKAREA
+CATACB   DS    F                       ADDRESS OF MASTCAT ACB
+CTYPE    DS    CL1                     TYPE ( = 'C' FOR MASTCAT)
+         DS    XL1                     RESERVED
+NOPAIRS  DS    AL2                     NO. OF PAIRS OF FIELDS
+FTYPE    DS    CL1                     FIRST COMPONENT TYPE
+CINVNO   DS    XL3                     FIRST CI NO.
+         EJECT
+* CLUSTER RECORD DSECT
+CLUSTREC DSECT
+CKEY     DS    CL44                    KEY
+         ORG   CKEY
+         DS    XL1                     BINARY ZEROS
+CENTIDNO DS    XL3                     CI NO OF ENTRY
+CRELIND  DS    XL1                     RELEASE INDICATOR
+CCRAVOL  DS    CL6                     CRA VOLSER
+CCRAIDNO DS    XL3                     CRA CI NO
+CCRADEVT DS    CL4                     CRA DEVICE TYPE
+         DS    XL26                    BINARY ZEROS
+CENTYPE  DS    CL1                     'C' FOR CLUSTER
+CRRECLEN DS    XL2                     RECORD LENGTH
+         DS    XL1                     ALWAYS ZERO
+CFIXLEN  DS    XL1                     LENGTH OF FIXED LENGTH FIELDS
+CNAME    DS    CL44                    ENTRY NAME
+COWNERID DS    CL8                     OWNER
+CDSETCRD DS    PL3                     CREATION DATE (YDD)
+CDSETEXD DS    PL3                     EXPIRY DATE (YDD)
+CATTR    DS    XL1                     AIX ATTRIBUTE FLAG IF AIX
+UPGRADE  EQU   X'80'                   UPGRADE (AIX)
+AIXGOPNO DS    XL1                     NO. OF GRP OCCURENCE PTRS IF AIX
+         ORG   AIXGOPNO
+CEXTPTR  DS    XL5                     POINTER TO EXTENSION RECORD
+**                                     (ZERO IF NONE)
+CGOPNO   DS    XL1                     NO. OF GROUP OCCURRENCE PTRS
+         DS    0C                      SEE GOPREC DSECT
+        EJECT
+* DATA/INDEX RECORD DSECT
+DATREC   DSECT
+KEY      DS    CL44                    KEY
+         ORG   KEY
+         DS    XL1                     BINARY ZEROS
+ENTIDNO  DS    XL3                     CI NO OF ENTRY
+RELIND   DS    XL1                     RELEASE INDICATOR
+CRAVOL   DS    CL6                     CRA VOLSER
+CRAIDNO  DS    XL3                     CRA CI NO
+CRADEVT  DS    CL4                     CRA DEVICE TYPE
+         DS    XL26                    BINARY ZEROS
+ENTYPE   DS    CL1                     'D' FOR DATA, 'I' FOR INDEX
+RRECLEN  DS    XL2                     RECORD LENGTH
+         DS    XL1                     ALWAYS ZERO
+FIXLEN   DS    XL1                     LENGTH OF FIXED LENGTH FIELDS
+NAME     DS    CL44                    ENTRY NAME
+OWNERID  DS    CL8                     OWNER
+DSETCRDT DS    PL3                     CREATION DATE (YDD)
+DSETEXDT DS    PL3                     EXPIRY DATE (YDD)
+ATTR1    DS    XL1                     ATTRIBUTES
+SPEED    EQU   X'80'   1... ....       SPEED
+UNIQUE   EQU   X'40'   .1.. ....       UNIQUE
+REUSE    EQU   X'20'   ..1. ....       REUSE
+ERASE    EQU   X'10'   ...1 ....       ERASE
+RECOVER  EQU   X'08'   .... 1...       RECOVERABLE CATALOG
+NOUPDATE EQU   X'04'   .... .1..       UPDATE INHIBITED
+EXPIND   EQU   X'02'   .... ..1.       TEMPORARILY EXPORTED
+***                    .... ...X       RESERVED FOR OS/VSAM
+ATTR2    DS    XL1                     ATTRIBUTES (DATASHARING)
+**                     00XX XXXX       SHR(1)
+SHR2     EQU   X'40'   01XX XXXX       SHR(2)
+SHR3     EQU   X'80'   10XX XXXX       SHR(3)
+SHR4     EQU   X'C0'   11XX XXXX       SHR(4)
+NOALLOC  EQU   X'08'   .... 1...       NO-ALLOCATION CLUSTER
+NOUSE    EQU   X'01'   .... ...1       DATASET NOT USABLE
+**                     .... .XX.       RESERVED
+OPENIND  DS    XL1                     OPEN FLAG
+OPEN     EQU   X'80'                   DATA SET OPEN FOR OUTPUT
+BUFSIZE  DS    XL4                     MINIMUM BUFFERSIZE
+PRIMSPAC DS    XL3                     PRIMARY ALLOCATION
+SCONSPAC DS    XL3                     SECONDARY ALLOCATION
+SPACOPTN DS    XL1                     SPACE OPTIONS FLAGS
+TRACKS   EQU   X'80'   10XX XXXX       TRACKS
+CYLS     EQU   X'C0'   11XX XXXX       CYLINDERS
+SECPRIM  EQU   X'20'   ...0 0000       SECONDARY SPACE CLASS = PRIMARY
+SEC0     EQU   X'10'   ...1 0000       SECONDARY IS CLASS 0
+CLASS0   EQU   X'00'   XXXX X000       CLASS 0 SPACE
+CLASS1   EQU   X'01'   XXXX X001       CLASS 1 SPACE
+CLASS2   EQU   X'02'   XXXX X010       CLASS 2 SPACE
+CLASS3   EQU   X'03'   XXXX X011       CLASS 3 SPACE
+CLASS4   EQU   X'04'   XXXX X100       CLASS 4 SPACE
+CLASS5   EQU   X'05'   XXXX X101       CLASS 5 SPACE
+CLASS6   EQU   X'06'   XXXX X110       CLASS 6 SPACE
+CLASS7   EQU   X'07'   XXXX X111       CLASS 7 SPACE
+HURBADS  DS    CL4                     HIGH USED RBA
+HARBADS  DS    CL4                     HIGH ALLOC RBA
+LRECL    DS    CL4                     LRECL FOR DATA, X'FF'S FOR IDX
+USERINFO DS    CL2                     USER INFO FOR ISAM INTERFACE
+EXCPEXIT DS    CL8                     NAME OF EXCEPTION EXIT
+EXTPTR   DS    XL5                     POINTER TO EXTENSION RECORD
+**                                     (ZERO IF NONE)
+GOPNO    DS    XL1                     NO. OF GROUP OCCURRENCE PTRS
+         DS    0C                      SEE GOPREC DSECT
+        EJECT
+* AMSDB - ACCESS METHOD DATA STATS BLOCK
+AMSDB    DSECT
+AMSDBID  DS    XL1                     IDENTIFIER
+AMID     EQU   X'60'
+AMDATTR1 DS    XL1                     ATTRIBUTES
+AMDDST   EQU   X'80'   1... ....       KSDS
+AMDWCK   EQU   X'40'   .1.. ....       WRITECHECK
+AMDSDT   EQU   X'20'   ..1. ....       IMBED
+AMDREPL  EQU   X'10'   ...1 ....       REPLICATE
+AMDORDER EQU   X'08'   .... 1...       ORDERED
+AMDRANGE EQU   X'04'   .... .1..       FILE HAS KEYRANGES
+AMDRRDS  EQU   X'02'   .... ..1.       RRDS
+AMDSPAN  EQU   X'01'   .... ...1       SPANNED
+AMDLEN   DS    XL2                     LENGTH OF THIS BLOCK
+AMDNEST  DS    XL2                     NO. OF ENTRIES IN INDEX SECTION
+         ORG   AMDNEST                 (EXCEPT IF DATA RECD OF AIX)
+AMDAXRKP DS    XL2                     RELATIVE KEY POSITION IF AIX
+AMDRKP   DS    XL2                     RELATIVE KEY POSITION
+AMDKEYLN DS    XL2                     KEY LENGTH
+AMDPCTCA DS    XL1                     CA FREE % (UNLESS SAM ESDS)
+         ORG   AMDPCTCA
+AMDRCFRM DS    XL1                     SAM ESDS ATTRIBUTES
+AMDIMPFD EQU   X'80'   1... ....       IMPLICIT DEFINE
+**       EQU   X'40'   .1.. ....
+AMDNCIFT EQU   X'20'   ..1. ....       NO-CIFORMAT
+AMDNCAFT EQU   X'10'   ...1 ....       NO-CAFORMAT (SAM ESDS)
+**       EQU   X'08'   .... 1...       ORDERED
+AMDSBLKD EQU   X'04'   .... .1..       BLOCKED RECORDS
+AMDSVAR  EQU   X'02'   .... ..1.       VARIABLE LENGTH
+AMDSFIXD EQU   X'01'   .... ...1       FIXED LENGTH
+AMDPCTCI DS    XL1                     CI FREE %
+AMDCIPCA DS    XL2                     CIS PER CA
+AMDFSCA  DS    XL2                     FREE CIS PER CA
+AMDFSCI  DS    XL4                     FREE BYTES PER CI
+AMDCINV  DS    XL4                     CISIZE
+AMDLRECL DS    XL4                     MAX. RECSZ
+AMDHLRBA DS    XL4                     RBA OF HIGH LEVEL INDEX RECORD
+         ORG   AMDHLRBA
+AMDNSLOT DS    XL4                     NO. OF RELATIVE RECORD SLOTS
+         ORG   AMDHLRBA
+AMDBLREC DS    XL4                     SAM LRECL FOR FB SAM ESDS
+AMDSSRBA DS    XL4                     RBA OF 1ST SEQUENCE SET RECORD
+         ORG   AMDSSRBA
+AMDMAXRR DS    XL4                     MAX. RELATIVE RECORD NO.
+AMDPARDB DS    XL4                     POINTER TO 1ST ARDB
+AMDATTR3 DS    XL1                     ATTRIBUTES
+AMDUNQ   EQU   X'80'   1... ....       NON-UNIQUE KEYS IN AIX
+*******  EQU   X'00'   .... ....       UNIQUE KEYS IN AIX
+         DS    XL7                     RESERVED
+* STATISTICS
+AMDSTAT  DS    0C                      STATISTICS
+AMDSTMST DS    XL8                     SYSTEM TIME STAMP
+AMDSTAT1 DS    0C
+AMDNIL  DS    XL2                      NO. OF INDEX LEVELS
+AMDNEDB DS    XL2                      NO. OF EDB'S
+        ORG   AMDNEDB
+AMDNEXT DS    XL2                      NO. OF EXTENTS
+AMDNLR  DS    XL4                      NO. OF LOGICAL RECORDS
+AMDDELR DS    XL4                      NO. OF DELETED RECORDS
+AMDIREC DS    XL4                      NO. OF INSERTED RECORDS
+AMDUPR  DS    XL4                      NO. OF UPDATED RECORDS
+AMDRETR DS    XL4                      NO. OF RETRIEVED RECORDS
+AMDASPA DS    XL4                      BYTES FREE SPACE IN DATA SET
+AMDNCIS DS    XL4                      NO. OF CI SPLITS
+AMDNCAS DS    XL4                      NO. OF CA SPLITS
+AMDEXCP DS    XL4                      EXCPS
+        EJECT
+* GROUP OCCURENCE DSECTS
+GOPREC   DSECT                         GO PTRS
+GROUP0   DS    CL5                     REPEATED 'GOPNO' TIMES
+         ORG   GROUP0
+         DS    XL1                     RESERVED
+GPTR     DS    XL2                     CI NO OF EXTENSION RECORD
+*                                      (IF GRPFLAG = B'10XXXXXX')
+*                                      ELSE DISP FROM GROUP0
+*                                      (IF GRPFLAG = B'00XXXXXX')
+*                                      ELSE DELETED GROUP
+*                                      (IF GRPFLAG = B'01XXXXXX')
+GRPFLAG  DS    XL1
+AMSDBTYP EQU   X'01'                   AMSDB POINTER
+GSEQNO   DS    XL1                     SEQUENCE NO. OF GROUP
+GOPLEN   EQU   *-GROUP0                LENGTH OF GROUP OCCURRENCE PTR
+* THIS DSECT ASSUMES THAT FIRST TWO GROUP OCCURRENCES FOR A CLUSTER
+* WILL ALWAYS BE THE DATA & INDEX GROUP OCCURRENCES.
+ASSOC    DSECT                         ASSOCIATION GRP OCCURRENCE
+ANO      DS    XL1                     NO. OF FIELDS
+ADISPD   DS    XL1                     DISP TO 1ST VAR LENGTH FIELD
+ATYPED   DS    XL1                     TYPE
+ACINOD   DS    XL3                     CONTROL INTERVAL NO. (DATA)
+ALEN     EQU   *-ANO                   LENGTH FOR DATA OR INDEX
+ANOI     DS    XL1
+ADISPI   DS    XL1
+ATYPEI   DS    XL1
+ACINOI   DS    XL3                     CONTROL INTERVAL NO. (INDEX)
+VOLREC   DSECT                         VOLUME INFO GROUP OCCURRENCE
+VCOUNT   DS    XL1                     NO. OF VARIABLE FIELDS
+VDISP    DS    XL1                     DISP TO 1ST VARIABLE FIELD
+VTYPE    DS    CL4                     DEVICE TYPE
+VOLSER   DS    CL6                     VOL SER
+VSEQ     DS    XL2                     FILE SEQ NO. (USED FOR TAPES)
+VOLFLG   DS    XL1                     VOLUME FLAGS
+PRIME    EQU   X'80'   1... ....       PRIME VOLUME
+CANDIDAT EQU   X'40'   .1.. ....       CANDIDATE VOLUME
+OVERFLOW EQU   X'20'   ..1. ....       OVERFLOW VOLUME
+VEXTNO   DS    XL1                     NO. OF EXTENTS ON THIS VOLUME
+HKRBA    DS    XL4                     HI-KEY RBA
+VHURBA   DS    XL4                     HI-USED RBA
+VHARBA   DS    XL4                     HI-ALLOC RBA
+PHYBLKSZ DS    XL4                     PHYSICAL BLOCK SIZE
+NOBLKTRK DS    XL2                     BLKS / TRK
+NOTRKAU  DS    XL2                     TRKS / CA
+ITYPEXT  DS    XL1                     FLAG
+DSDIRSN  DS    XL2                     DATA SET DIRECTORY SEQ NO.
+* FOLLOWING FIELDS REPEAT
+VARFLD   DS    0C                      VARIABLE
+VARLEN   DS    XL2                     FIELD LENGTH
+* (IF THIS FIELD IS 0 THEN LENGTH IS 2)
+*VARDATA DS    (VARIABLE)
+         END
+
+David Roth
+Systems Programmer (Australia)
+

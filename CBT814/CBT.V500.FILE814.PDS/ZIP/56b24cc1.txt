@@ -1,0 +1,260 @@
+SYSLOG message splitting
+
+In MVS, single line console message can be issued which can
+be up to 126 characters in length. When the message exceeds
+the physical line length of the console on which it is being
+displayed, MVS splits the message and wraps the remainder
+around onto a second line, as seen when looking at the MVS
+SYSLOG. This makes it hard to process SYSLOG
+programatically to analyse message traffic as well as making it
+more difficult for console automation tools to deal with these
+long messages.
+
+To solve this problem, I have written an MVS Message
+Processing Facility (MPF) exit which can be invoked on a
+message-by-message basis to remedy the problem. The exit is
+enabled by placing entries in the appropriate
+SYS1.PARMLIB(MPFLSTxx) member using the following
+syntax:
+
+      MSG001I,SUP(YES),RETAIN(NO),USEREXIT(SPLITMSG)
+
+This entry says suppress the message from the console, do not
+retain the message in the Action Message Retention Facility
+(AMRF), and invoke user exit SPLITMSG to examine and/or
+modify the message. You might wish to use different values for
+the SUP and RETAIN fields, however. Once the MPFLSTxx
+member is changed, the new values can be processed by
+issuing the MVS T MPF=xx command. It would probably not
+be a very good idea to enable the exit for all WTOs, since not
+all are suitable for processing by SPLITMSG. It would also
+add more overhead to your system since every WTO would be
+checked by the exit. Also not suitable are single-line WTOs
+which contain column-dependent data since the exit will
+dynamically determine a split point which will most likely
+throw off any column alignments.
+
+The basic function of this exit is to split single-line WTOs over
+68 bytes in length into a Multi-Line WTO (MLWTO). The
+second line of the MLWTO will start with the message-id
+found on the first line of the original message immediately
+followed by an indication of it being a continued WTO, shown
+as (C). The following is an example of what the resulting
+MLWTO will look like:
+
+      MSG001I THIS IS AN EXAMPLE OF A VERY LONG WTO SPLIT INTO TWO PIECES
+      MSG001I(C) BY THE SPLITMSG PROGRAM WITH CONTINUATION
+
+The program ensures that only single-line WTOs greater than
+68 bytes in length will be processed. The program does not
+check for, nor is there any way that I know of checking, the
+fact that the message being processed is using any extended
+WTO features (eg 4-byte console-id, system name, extended
+routing codes, etc) which are available in MVS/SP Version
+3.1.3 and above. It must be the user's responsibility to ensure
+these are not used or not required since these fields are not
+duplicated in the MLWTO built by the SPLITMSG program.
+SPLITMSG does check for any duplicates and any standard
+fields allowed on a WTO macro (console routing,
+unconditional queueing, broadcasting, etc).
+
+To use the program, it must be assembled and linked into a
+LINKLIST library. The MVS F LLA,REFRESH command
+must be issued to have the new SPLITMSG program
+recognized by the LINKLIST Look Aside facility, then the T
+MPF=xx command may be issued to enable the exit. It should
+be noted that MPF appears to use the directed load option of
+the MVS LOAD macro to load the exit into storage and checks
+that the program has been link-edited as re-entrant, so be sure
+to include the RENT option when the program in linked into
+your LINKLIST library.
+
+A point of interest in the program is the way it determines the
+point at which to split a message. The split location is
+controlled by the &MAXLEN Assembler SET symbol. This
+value is used throughout the program to make it easily
+modifiable. The point of interest is the use of the MVCIN and
+TRT instructions to determine the split point. MVCIN is a
+relatively new instruction in the MVS/XA and MVS/ESA
+instruction sets. MVCIN moves bytes starting from the end of
+operand 1 in reverse order to the location specified by operand
+2 (labelled REVBUFF). The TRT instruction is then used to
+determine how far in from REVBUFF the first blank occurs:
+register 1 from the TRT contains the offset in REVBUFF
+where the blank was found. Some simple calculations are
+performed to determine the sizes of the two parts of the new
+MLWTO message segments. This takes far fewer instructions
+than coding the usual loop which adds one to an index and
+compares the byte being pointed to for a blank using the BCT
+instruction to increment the index. While the MVCIN/TRT
+method takes more time to understand and code, it is much
+more efficient than the BCT/loop method.
+
+SPLITMSG CSECT                         ESTABLISH CSECT
+SPLITMSG AMODE 31
+SPLITMSG RMODE 24
+&MAXLEN  SETA  68                      ESTABLISH MESSAGE SPLIT LENGTH
+         SAVE  (14,12),,SPLITMSG-&SYSDATE
+*        REGS  , PROVIDE SOME REGISTER EQUATES
+*R2      USED BY TRT
+*R3      A(CTXT)
+*R4      A(CTXTTXPJ)
+*R10     A(WPL SEGMENT)
+*R11     A(WPL)
+*R12     A(PROGRAM)
+         LR    R12,R15                 LOAD R12 W/EPA ADDRESS
+         USING SPLITMSG,R12            ESTABLISH ADDRESSABLITY
+         L     R3,0(,R1)               LOAD A(CTXT USER EXIT PLIST)
+         USING CTXT,R3                 ESTABLISH ADDRESSABILITY
+         CLC   CTXTACRN,CTXTICAT       IS IT A VALID CTXT EYECATCHER
+         BNE   RETURN                  NO, GO RETURN
+         L     R4,CTXTTXPJ             LOAD A(TEXT OF MAJOR)-CTXTATTR
+         USING CTXTATTR,R4             ESTABLISH ADDRESSABILITY
+         TM    CTXTTFB1,CTXTTFSL       IS THIS A SINGLE-LINE MESSAGE
+         BNO   RETURN                  NO, GO RETURN
+         LH    R14,CTXTTLEN            LOAD LENGTH OF MESSAGE TEXT
+         CH    R14,H126                IS LENGTH GT THAN WTO ALLOWS
+         BH    RETURN                  YES, RETURN & LET SVC 35 HANDLE
+         CH    R14,H&MAXLEN            IS IT GT THAN SIZE WE WANT
+         BNH   RETURN                  NO, GO RETURN
+*** CHECK IF THIS CTXT IS USING ANY EXTENDED FEATURES (4 BYTE CONSOLE
+*** ID, SYSNAME, ETC.) AND IF SO, THEN GET OUT
+         GETMAIN RU,LV=WORKLEN SP=229  GETMAIN WORKAREA
+         ST    R13,4(R1)               ST CALLERS S/A ADDR IN MY S/A
+         ST    R1,8(R13)               ST MY S/A ADDR IN CALLERS S/A
+         LR    R13,R1                  LOAD ADDR OF MY S/A IN R13
+         USING WORKAREA,R13            ESTABLISH ADDRESSABILITY
+         TRT   CTXTTMSG(10),BLANKTAB   SCAN FOR A BLANK IN 1ST 10 BYTES
+         BZ    FREESTOR                IF NOT FOUND, LET MSG GO AS IS
+         LA    R15,CTXTTMSG            LOAD A(MESSAGE ID START)
+         SR    R1,R15                  SUBTRACT OFFSET BY TRT
+         ST    R1,MSGIDLEN             SAVE LENGTH(MESSAGE ID)
+         LA    R11,WTOAREA             LOAD A(NEW WTO AREA-WPL)
+         USING WPL,R11                 ESTABLISH ADDRESSABILITY
+         XC    WPL,WPL                 CLEAR WTO PLIST AREA
+         MVI   MSGID,X'40'             CLEAR MESSAGE ID AREA
+         MVC   MSGID+1(15),MSGID       CLEAR MESSAGE ID AREA
+         EX    R1,MSGIDMVC             EX MVC OF MSGID TO PART 1
+**     ( MVC   MSGID(0),CTXTTMSG )     EX INSTRUCTION-MOVE MSGID
+         L     R15,MSGIDLEN            LOAD LENGTH(MESSAGE ID)
+         LA    R15,MSGCONTL(,R15)      ADD LENGTH(MSG CONTINUATION)
+         ST    R15,MSGIDLN2            STORE LENGTH(MSGID + MSG CONT.)
+         LA    R15,MSGID               LOAD A(MESSAGE ID)
+         A     R15,MSGIDLEN            ADD LENGTH(MESSAGE ID)
+         MVC   0(MSGCONTL,R15),MSGCONT MOVE MSG CONT AFTER MESSAGE ID
+         LA    R15,CTXTTMSG            LOAD A(MESSAGE)
+         LH    R14,H&MAXLEN            LOAD LENGTH(MESSAGE)
+         AR    R15,R14                 POINT TO END OF MESSAGE
+         MVCIN REVBUFF,0(R15)          MOVE INVERSE FIRST PART OF MSG
+         TRT   REVBUFF,BLANKTAB        SCAN REVERSE FOR NON-BLANK
+         BZ    FREESTOR                IF NONE FOUND, LET MSG GO AS IS
+         LA    R15,REVBUFF+L'REVBUFF-1 LOAD A(REVERSE BUFFER END - 1)
+         SR    R15,R1                  SUBTRACT REVERSED SPLIT POINT
+         ST    R15,SPLITLOC            STORE SPLIT POINT
+         EX    R15,MSGMVC1             MOVE FIRST PART OF MSG TO WPL
+**     ( MVC   WPLTXT(0),CTXTTMSG )    EX INSTRUCTION-MOVE MSG PART 1
+         LA    R1,5(,R15)              ADD 4(+1 FOR BCTR) FOR TEXTLEN
+         STH   R1,WPLLGH               STORE LENGTH IN WPL
+         XC    WPLMCSF,WPLMCSF         CLEAR FLAGS
+CHKCTXT1 TM    CTXTSFB1,CTXTSQPC       QUEUE TO PARTICULAR CONSOLE
+         BZ    CHKCTXT2                NO, GO CHECK NEXT FLAG
+         OI    WPLMCSF1,WPLMCSFB       ELSE TURN ON IN WPL
+CHKCTXT2 TM    CTXTSFB1,CTXTSRSP       IS THIS A COMMAND RESPONSE
+         BZ    CHKCTXT3                NO, GO CHECK NEXT FLAG
+         OI    WPLMCSF1,WPLMCSFC       ELSE TURN ON IN WPL
+CHKCTXT3 TM    CTXTSFB1,CTXTSBCA       BROADCAST TO ACTIVE CONSOLES
+         BZ    CHKCTXT4                NO, GO CHECK NEXT FLAG
+         OI    WPLMCSF1,WPLMCSFF       ELSE TURN ON IN WPL
+CHKCTXT4 TM    CTXTSFB1,CTXTSQUN       QUEUE UNCONDITIONAL TO CONSOLE
+         BZ    CHKCTXT5                NO, GO CHECK NEXT FLAG
+         OI    WPLMCSF1,WPLMCSFH       ELSE TURN ON ON WPL
+CHKCTXT5 TM    CTXTSFB1,CTXTSNHC       NO HARDCOPY
+         BZ    CHKCONT                 NO, CONTINUE W/REST OF CHECKING
+         OI    WPLMCSF2,WPLMCSFN       ELSE TURN ON IN WPL
+CHKCONT  OI    WPLMCSF2,WPLMCSFJ       TURN ON MLWTO INDICATOR
+         LR    R10,R11                 LOAD A(WPL)
+         AH    R10,WPLLGH              ADD OFFSET TO NEXT SECTION
+         CLC   CTXTRCLN,F0             ANY ROUTE CODES
+         BE    CHKDESC1                NO, GO CHECK DESC CODES
+         B     HAVECODE                ELSE GO TURN ON ROUT/DESC FLAG
+CHKDESC1 CLC   CTXTDCLN,F0             ANY DESCRIPTOR CODES
+         BE    BLDMLWTO                NO, GO BUILD MLWTO SECTION
+HAVECODE OI    WPLMCSF1,WPLMCSFA       ELSE, TURN ON ROUT/DESC FLAG
+         L     R15,CTXTRCP             LOAD A(ROUTE CODES)
+         USING CTXTROUT,R15            ESTABLISH ADDRESSABILITY
+         MVC   WPLROUT-WPLFLGS(2,R10),CTXTR001 MOVE ROUTE CODES
+         L     R15,CTXTDCP             LOAD A(DESC CODES)
+         USING CTXTDESC,R15            ESTABLISH ADDRESSABILITY
+         MVC   WPLDESC-WPLFLGS(2,R10),CTXTDC1 MOVE DESC CODES
+         LA    R10,4(,R10)             BUMP PAST ROUTE/DESC CODES
+BLDMLWTO OI    CTXTRFB2,CTXTRDTM       SET TO DELETE OLD MESSAGE
+         OI    CTXTERF3,CTXTESJL       SET TO DELETE OLD MESSAGE
+         OI    WPLLTF1-WPLLTF(R10),WPLLTFC SHOW THIS IS A DATA LINE
+         MVI   WPLLINES-WPLLTF(R10),X'02' STORE TEXT LINE COUNT IN WPL
+         LA    R10,4(,R10)             POINT TO SECOND HALF
+         L     R15,MSGIDLN2            LOAD LENGTH(MSGID + CONT CHAR)
+         BCTR  R15,R0                  DECREMENT FOR EXECUTE
+         EX    R15,MSGIDMV2            MOVE MSGID/CONT CHAR TO WPL
+**     ( MVC   WPLMLTXT-WPLML(0,R10),MSGID ) EX INST-MOVE MSGID/CONT
+         LH    R15,CTXTTLEN            LOAD LENGTH(ORIGINAL MESSAGE)
+         S     R15,SPLITLOC            SUBTRACT LENGTH(MESSAGE PART 2)
+         BCTR  R15,R0                  DECREMENT FOR EXTRA BLANK
+         LA    R14,CTXTTMSG            LOAD A(ORIGINAL MESSAGE)
+         A     R14,SPLITLOC            ADD OFFSET TO SPLIT POINT
+         LA    R14,1(,R14)             INCREMENT FOR EXTRA BLANK
+         LA    R1,WPLMLTXT-WPLML(,R10) LOAD A(WPL MESSAGE PART 2)
+         A     R1,MSGIDLN2             ADD LENGTH(MSGID + CONT CHAR)
+         EX    R15,MSGMVC2             MOVE 2ND PART OF MESSAGE TO WPL
+**     ( MVC   0(0,R1),0(R14) )        EX INSTRUCTION-MOVE MSG PART 2
+         LH    R15,CTXTTLEN            LOAD LENGTH(ORIGINAL MESSAGE)
+         S     R15,SPLITLOC            SUBTRACT SPLIT POINT
+         A     R15,MSGIDLN2            ADD LENGTH(MSGID + CONT CHAR)
+         LA    R15,3(,R15)             ADD LENGTH(HEADER INFO)
+         STH   R15,WPLML-WPLML(R10)    STORE LENGTH
+         OI    WPLMLLT1-WPLML(R10),WPLMLLTC+WPLMLLTD SET DATA+END LINE
+         SR    R0,R0                   CLEAR FOR WTO W/O A CONSOLE ID
+         TM    CTXTSFB1,CTXTSQPC+CTXTSQUN GOING TO A CONSOLE
+         BZ    DOSVC                   NO
+         L     R15,CTXTCIDP            LOAD A(CONSOLE ID)
+         SR    R14,R14                 CLEAR REGISTER
+         IC    R14,1(,R15)             GET CONSOLE ID
+         LR    R0,R14                  PUT CONSOLE ID IN REG0
+DOSVC    LA    R1,WTOAREA              LOAD A(REVISED WTO)
+         SVC   35                      ISSUE REVISED WTO
+FREESTOR LR    R1,R13                  LOAD R1 W/A(SAVEAREA)
+         L     R13,4(,R13)             LOAD R13 W/ADDR OF CALLERS S/A
+         FREEMAIN RU,LV=WORKLEN,A=(1) SP=229 FREEMAIN WORKAREA
+RETURN   RETURN (14,12)                RETURN TO OS WITH RETCODE=0
+F0       DC    F'0'                    COMPARE VALUE
+H2       DC    H'2'                    COMPARE VALUE
+H&MAXLEN DC    H'&MAXLEN'              MAXIMUM WTO LENGTH WE ACCEPT
+H126     DC    H'126'                  MAXIMUM WTO LENGTH SVC35 ACCEPTS
+BLANKTAB DC    256X'00'                BLANK SCAN TABLE
+         ORG   BLANKTAB+X'40'          SET LOC COUNTER TO X'40' OFFSET
+         DC    X'FF'                   TURN ON BYTE AT OFFSET X'40'
+         ORG   ,                       RESET LOCATION COUNTER
+MSGCONT  DC    C'(C) '                 MESSAGE CONTINUATION CHARACTER
+MSGCONTL EQU   *-MSGCONT               LENGTH(MESSAGE CONTINUATION)
+CTXTICAT DC    C'CTXT'                 CTXT EYECATCHER
+MSGIDMVC MVC   MSGID(0),CTXTTMSG       EXEC INSTRUCTION-MVC MSGID
+MSGMVC1  MVC   WPLTXT(0),CTXTTMSG      EXEC INSTRUCTION-MVC MSG PART1
+MSGMVC2  MVC   0(0,R1),0(R14)          EX INSTRUCTION-MOVE MSG PART 2
+MSGIDMV2 MVC   WPLMLTXT-WPLML(0,R10),MSGID EX INST-MOVE MSGID/CONT CHAR
+WORKAREA DSECT                         WORK AREA
+SAVEAREA DS    18F                     O/S SAVEAREA (FIRST IN WORKAREA)
+SPLITLOC DS    F                       MESSAGE SPLIT LOCATION
+MSGIDLEN DS    F                       LENGTH(MSGID)
+MSGIDLN2 DS    F                       LENGTH(MSGID+MSG CONTINUATION)
+*SGIDEND DS    F                       A(MSGID END)
+MSGID    DS    CL16                    MESSAGE ID AND CONTINUATION
+WTOAREA  DS    CL256                   AREA FOR WTO PLIST
+REVBUFF  DS    CL(&MAXLEN+1)           AREA FOR MESSAGE REVERSAL(MVCIN)
+REVBUFFL EQU   *-REVBUFF               LENGTH(REVERSED BUFFER)
+WORKLEN  EQU   *-WORKAREA              LENGTH(WORK AREA)
+         IEZVX100                      CTXT EXIT PARAMETER LIST
+         IEZWPL                        WTO PARAMETER LIST
+         END
+
+
+                                                                  c Xephon 1992
+

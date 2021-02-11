@@ -1,0 +1,10 @@
+
+## $$$$READ.txt
+```
+The contents of this PDS are:
+
+   $DOC     - short documentation on the exec and zstart
+   $CHANGES - Change History
+   ZSTART   - the rexx code with imbedded panels
+```
+

@@ -1,0 +1,396 @@
+ Problems with PVM
+When we converted our VM/HPO system to XA we found that the toggling of the
+TEST/NORMAL switch no longer resets you from a Dialled VTAM session.  IBM's
+answer was to use PVM.
+We decided on the following, so that by logging on to our application, L VMDROP,
+from VTAM, the terminal would be reset.  (MVS is MVS/SP.)  We added a couple of
+features to enable MODIFY and STOP commands.  The MODIFY allows the dynamic re-
+definition of the Local 3270 table.
+NB As this program uses privileged functions, it must reside in an authorised
+library.
+    TITLE 'DROP PROGRAM. VTAM APPLICATION PROGRAM TO ISSUE CP RESET'
+*********************************************************************
+*        THE PURPOSE OF THIS VTAM APPLICATION PROGRAM IS TO RESET
+*        VTAM OPERATED TERMINALS IN A VM ENVIRONMENT.
+*        WHEN A TERMINAL ATTEMPTS TO LOGON TO THIS APPLICATION
+*        PROGRAM, THE PROGRAM CHECKS A TABLE IT BUILDS BASED ON
+*        THE LOCAL VTAM 3270 TABLE TO ENSURE THAT IT'S A LOCALLY
+*        ATTACHED 327X SCREEN.
+*        THE PROGRAM THEN ISSUES A CLSDST MACRO TO REJECT THE LOGON.
+*        AFTER ONE SECOND, THE PROGRAM ISSUES A CP COMMAND TO
+*        'RESET CUA' WHERE CUA IS THE ADDRESS OF THE TERMINAL
+*        ATTEMPTING THE LOGON. THIS RESETS THE TERMINAL BACK TO
+*        CONTROL BY VM.
+*********************************************************************
+         EJECT
+VMDROP  CSECT
+         USING *,R15                ESTABLISH ADDRESSABILITY
+         USING WEB,R9
+         SAVE  (14,12),,*           SAVE MVS REGISTERS
+         LA    R12,VMSAVE           POINT TO NEW SAVE AREA
+         ST    R13,4(R12)           CHAIN SAVE AREAS
+         ST    R12,8(R13)                 TOGETHER
+         LR    R13,R12              POINT TO CORRECT AREA
+         DROP  R15
+         BALR  R12,0
+         USING PROG,R12
+PROG     DS    0H
+         MODESET MODE=SUP                GET INTO SUPERVISOR STATE
+         STIDP CPUID                     SAVE THE CPU ID.
+         MODESET MODE=PROB               GET OUT OF SUPERVISOR STATE
+         CLI   CPUID,X'FF'               RUNNING UNDER VM ?
+         BE    CPUOK                     YES - THATS GOOD
+*                                        NO - THEN TELL OPERATOR & END
+         WTO   'VMD001I  THIS IS NOT A VM BASED SYSTEM - PROGRAM ENDS'
+         B     EOJ
+CPUOK    DS    0H
+*   ENABLE COMMUNICATION WITH VTAM
+MODIFY   EXTRACT XTCTAREA,FIELDS=COMM
+         L     R5,COMMA
+         LA    R5,4(,R5)
+         L     R11,0(,R5)
+         QEDIT ORIGIN=(R5),BLOCK=(R11)
+         QEDIT ORIGIN=(R5),CIBCTR=5
+         SPACE
+         L     R6,COMMA
+         MVC   COMMAECB,0(R6)
+*   BUILD A TABLE BASED ON THE LOCAL 3270 TABLE
+         BAL   R8,PACMAN
+         SLR   R15,R15             CLEAR R15
+         LA    R8,6                LOAD OPEN RETRY COUNT
+OPEN     OPEN  ACB                 OPEN THE ACB TO TALK WITH VTAM
+         LTR   R15,R15             TEST RETURN CODE
+         BZ    OPENOK              ZERO, OPEN IS OK
+         B     DPCENDCR
+         DC    C'VMDROP &SYSDATE &SYSTIME'
+DPCENDCR DS    0H
+          SPACE 2
+         LA    R3,ACB               ADDRESS ACB
+         USING IFGACB,R3
+         CLI   ACBOFLGS,ACBOVINA    VTAM NOT READY?
+         BNE   BOMB                 NO, SOME OTHER ERROR. BOMB
+         DROP R3
+         SPACE 2
+*   YES, WAIT 30 SECONDS AND TRY AGAIN.
+         WTO 'CMD0021  WAITING FOR VTAM TO BECOME ACTIVE'
+         STIMER WAIT,BINTVL=TIME30 WAIT FOR 30 SECONDS
+         SPACE 2
+         BCT   R8,OPEN              REDUCE COUNT, AND RETRY
+         SPACE 2
+COMB     DS    0H
+         WTO   'VMD003E UNABLE TO OPEN VMDROP ACB'
+         L     R13,4(R13)
+         RETURN (14,12),,RC=4       VTAM NOT GENED
+         SPACE 3
+OPENOK   SLR   R15,R15              CLEAR R15
+         SETLOGON RPL=RPL,OPTCD=START ALLOW APPLICATION PROGRAMS
+*                                   TO ATTEMPT LOGON
+         LTR   R15,R15              TEST RETURN CODE
+         BZ    WAIT                 ZERO, OPEN IS OK
+         SPACE 2
+         STM   R14,R13,ABSAVE
+         WTO   'VMD004E VMDROP SETLOGON FAILED'
+         ABEND 1800,DUMP
+ABSAVE   DS    16F
+         SPACE 3
+*                  REQUESTING LOGON.
+         SPACE
+WAIT     WAIT ECBLIST=WAITLIST,LONG=YES         WAIT
+         SPACE 3
+*   AN EVENT HAS COMPLETED. CHECK WHICH ONE.
+         TM    TPENDECB,X'40'      HAS TPEND EXIT BEEN ENTERED?
+         BO    CLOSEACB            YES, GO CLOSE PROGRAM
+         L     R8,COMMAECB         NO, POINT TO COMS AREA
+         TM    0(R8),X'40'         IS ONE FOR YOU
+         BO    MODSTOP             YEP, GO AND CHECK IT OUT
+*   NO, MUST BE A LOGON REQUEST.
+         XC    LOGECB,LOGECB            CLEAR OUT THE ECB
+         L     R9,WEBROOT
+NEXTWEB  EQU   *
+         LTR   R9,R9                 DO WE HAVE A WEB ?
+         BZ    WEBLOGIC                NO - THEN WE DO HAVE A PROBLEM
+         TM    WEBFLAGS,WEBFREE        YES - IS THIS ONE TO BE FREED
+         BO    WEBIGN                    YES - IGNORE IT THEN
+         TM    WEBFLAGS,WEBPROC          NO - IS IT TO BE PROCESSED?
+         BO    PROCWEB                     YES - THEN DO IT.
+WEBLOGIC EQU   *                           NO - ANOTHER PROBLEM
+         STM   R14,R13,ABSAVE
+         ABEND 1801,DUMP
+WEBIGN   DS    0H
+         L     R9,WEBNEXT               GET THE NEXT WEB IN CHAIN
+         B     NEXTWEB                    AND TRY AGAIN.
+*   WAIT ONE SECOND AND THEN ISSUE CP CALL.
+PROCWEB  DS    0H
+         STIMER WAIT,BINTVL=TIME01  WAIT FOR 01 SECOND
+*   TIME HAS COMPLETED, VTAM SHOULD HAVE SENT MSG10 TO THE
+*   NON-EXISTENT SESSION.
+*   CALL CP TO RESET THE TERMINAL
+         MODESET MODE=SUP
+         LRA   R1,WEBCMD            POINT TO CP COMMAND
+         LA    R2,9                 LOAD THE COMMAND LENGTH
+         DC    X'83',X'12',XL2'8'   DIAGNOSE FOR "CP RESET"
+         MODESET MODE=PROB
+          OI    WEBFLAGS,WEBFREE     FREE THE WEB LATER
+         SPACE 2
+*   JOB COMPLETED, RETURN TO WAIT.
+         B     WAIT
+         SPACE 3
+*   SOMEONE HAS ISSUED A STOP OR MODIFY. THE ONLY MODIFY
+*   WE ACCEPT IS TO RELOAD 3270 TABLE
+MODSTOP  L     R3,COMMA             POINT TO ADDRESS OF COMS AREA
+         L     R3,4(,R3)            CIB ADDRESS
+         CLI   4(R3),X'40'          IS IT A STOP
+         BE    CLOSDOWN               YES  SHUT IT DOWN
+         CLI   4(R3),X'44'          IS IT A MODIFY
+         BNE   YETAGAIN               NO  GO SEND A MESSAGE, FREE CIB
+         CLC   16(6,R3),=C'RELOAD'    YES  IS IT A RELOAD
+         BNE   TRYAGAIN                      NO  MESSAGE AND FREE
+         WTO   'VMD0008A VMDROP ACKNOWLEDGES RELOAD COMMAND'
+         FREEMAIN EU,LV=700,A=TERMTAB   FREE L3270 TABLE STORAGE
+         SLR   R15,R15
+         CLOSE ACB                  CLOSE ACB
+         LTR   R15,R15              TEST RETURN CODE
+         BZ    CPUOK                ZERO, GO AND BUILD TABLE AGAIN
+         SPACE 2
+         L     R13,4(R13)
+         RETURN (14,12),,RC=12      CLOSE ACB FAILED
+YETAGAIN WTO   'VMD0009E VMDROP DOES NOT ACKNOWLEDGE COMMAND'
+         B     CLEARIT
+TRYAGAIN WTO   'VMD0010E VMDROP DOES NOT ACKNOWLEDGE COMMAND'
+CLEARIT  L     R5,COMMA             THIS BIT JUST FREES THE
+         LA    R5,4(,R5)             THE CIB SO ANOTHER COMMAND
+         L     R11,0(,R5)             CAN BE ISSUED
+         QEDIT ORIGIN=(R5),BLOCK=(R11)
+         B     WAIT                 GO WAIT AGAIN
+CLOSDOWN WTO   'VMD0011A VMDROP ACKNOWLEDGES STOP COMMAND'
+CLOSEACB SLR   R15,R15
+         CLOSE ACB                  CLOSE ACB
+         LTR   R15,R15              TEST RETURN CODE
+         BZ    EOJ                  ZERO, END OF JOB.
+         SPACE 2
+         L      R13,4(R13)
+         RETURN (14,12),,RC=12      CLOSE ACB FAILED
+EOJ      L      R13,4(R13)
+         RETURN (14,12),,RC=0       ALL'S WELL THAT ENDS WELL
+         EJECT
+*   BUILD OWN TABLE FROM VTAM 3270 TABLE
+PACMAN   DS    0H
+         GETMAIN EU,LV=700,A=TERMTAB GET SOME STORAGE
+*                                   7 BYTES X 100 ENTRIES WILL DO
+         L     R11,TERMTAB         STORE ADDRESS OF STORAGE IN R11
+OPENIT   DS    0H
+         OPEN  (PACPARM,(INPUT))   PACPARM IS L3270 TABLE
+READIT   GET   PACPARM,INCNTL      READ A RECORD
+GOFORT   EQU   *                   GO FOR IT
+         LA    R5,INCNTL           GET A RECORD
+         CLI   0(R5),C'*'          IS FIRST BYTE OF RECORD A *
+         BE    READIT              YES; GET ANOTHER RECORD
+         LA    R5,9(R5)            POINT TO LOCAL MACRO WOULD BE
+         CLC   0(5,R5),=C'LOCAL'   IS IT LOCAL, THE START OF AN ENTRY
+         BE    TERMID                YES; GO GET A TERMID
+         CLI   R11,C'0'              NO ; CHECK IF WE HAVE A TERMID
+         BNE   CUADDR                   YES; GO GET A CUADDR
+         B     READIT                   NO ; GO GET ANOTHER RECORD
+TERMID   DS    0H
+         CLI   R11,C'0'              CHECK HERE FOR TERMID
+         BNE   GETTIT                  NO ; GO GET IT
+         L     R11,TERMTAB             YES; FAULTY SO CLEAR IT
+GETTIT   LA    R5,INCNTL             BACK TO START OF RECORD
+          CLI   0(R5),C '             IS FIRST BYTE A BLANK
+         BE    READIT                  YES; FAULTY GO READ AGAIN
+         MVC   0(4,R11),0(R5)        MOVE TERMID INTO STORAGE
+         LA    R11,4(R11)            BUMP POINTER ALONG
+CUADDR   EQU   *                     LETS LOOK FOR A CUADDR
+         LA    R5,INCNTL             BACK TO START OF RECORD
+         LA    R5,14(R5)             START LOOKING ABOUT HERE
+         LA    R10,58                LOOK ABOUT 58 BYTES WORTH
+LOOPY    DS    0H
+*        CLC   0(7,R5),=CL7'CUADDR=' LOOK FOR CUADDR
+         BE    ENDLOOPY             FOUND IT GO SAVE IT
+         LA    R5,1(R5)             MOVE 1 BYTE ALONG
+         BCT   R10,LOOPY            DECREMENT R10 BY 1 GO LOOPY
+         B     READIT               R10 = 0 READ ANOTHER RECORD
+ENDLOOPY DS    0H
+         LA    R5,7(R5)             POINT TO WHAT CUADDR = 'S
+         MVC   0(3,R11),0(R5)       SAVE THE CUA
+         LA    R11,3(R11)           BUMP POINTER ALONG AGAIN
+         B     READIT               READ YET ANOTHER RECORD
+FINISH   DS    0H                   TABLE ALL READ
+         MVC   0(2,R11),=X'FFFF'    PUT SOME F'S AT END
+         CLOSE PACPARM              CLOSE PARM FILE TABLE
+         BR    R8                   GO BACK
+*   THE END OF THIS BIT
+         EJECT
+*   LOGON EXIT.
+         SPACE 3
+         DROP  R12
+LOGONEX  DS    0H
+         USING *,R15
+         L     R12,BASEREG          LOAD OLD BASE REGISTER
+         DROP  R15
+         USING PROG,R12             USE OLD BASE REGISTER
+         LA    R13,LOGONSVE         POINT TO SAVE AREA
+         ST    R14,R14LOGON         SAVE REG14
+         LA    R8,RPL               SETUP BASE REGISTER FOR RPL
+         L     R4,4(R1)             POINT TO SYMBOLIC LU NAME
+         LA    R7,NIB               SETUP BASE REGISTER FOR NIB
+         USING IFGRPL,R8
+         USING ISTDNIB,R7
+         MVC   NIBSYM,0(R4)         MOVE LU NAME TO NIB
+         MVC   NIBUSER,0(R4)
+         MVC   RPLUSFLD,0(R4)
+         NI    FNDIND,255-X'80'          INDICATE NOT FOUND YET
+         L     R2,TERMTAB                ADDRESS THE LU TERMINAL TABLE
+NEXTENT  EQU   *
+         CLI   0(R2),X'FF'           ARE WE AT THE END OF THE TABLE?
+         BE    TNOTFND                   YES - THIS TERM WASN'T FOUND
+         CLC   0(4,R2),NIBSYM            NO  - IS IT THIS ENTRY ?
+         BE    TFOUND                      YES - I HAVE YOU NOW .....
+         LA    R2,7(R2)                    NO  - THEN TRY THE ..
+         B     NEXTENT
+TFOUND   DS    0H
+*  GE THE STORAGE FOR A WEB
+         GETMAIN R,LV=WEBLEN
+         LR    R9,R1                    SET UP THE ADDRESS
+         MVC   WEB(WEBLEN),WEBDUMMY     SET UP A DUMMY WEB
+         MVC   WEBCUA,4(R2)             SET UP THE CUA IN THIS NEW WEB
+         BAL   R14,WEBMNGR              ASK THE WEB MANAGER TO QUEUE I
+         OI    FNDIND,X'80'             IND THAT WE HAVE CREATED A WEB
+         B     CLOSEDST
+TNOTFND  DS    0H
+         MVC   TERMLUID,NIBSYM          MOVE THE LU INTO THE WTO
+NTERMWTO WTO   'VMD005I TERMINAL LU=XXXX FAILED TABLE SEARCH'
+TERMLUID EQU   NTERMWTO+28,4
+         DROP  R8
+          DROP  R7
+         SPACE 3
+CLOSEDST SR    R15,R15              CLEAR R15
+         CLSDST RPL=RPL,OPTCD=SYN   REJECT LOGON
+*   THE SESSION IS NOW CLOSED (SYNCHRONOUSLY)
+         TM    FNDIND,X'80'         HAVE WE BUILT A WEB ?
+         BNO   LOGONRET                NO - DONT CALL MAINLINE RESET
+         SPACE 2
+         POST LOGECB                NOTIFY MAINLINE OF ACTION
+LOGONRET EQU   *
+         L     R14,R14LOGON         LOAD RETURN ADDRESS
+         BR    R14                  RETURN TO VTAM
+VMDROP   TITLE ' - THE WEB QUEUE MANAGER               '
+WEBMNGR  DS    0H
+         ST    R9,QWEB                 SAVE THE WEB ADDRESS
+         LA    R9,WEBROOT
+NWEBQ    EQU   *
+         OC    WEBNEXT,WEBNEXT
+         BZ    QUEUEIT
+         LR    R6,R9
+         L     R9,WEBNEXT
+         TM    WEBFLAGS,WEBFREE
+         BO    FREEIT
+         B     NWEBQ
+FREEIT   DS    0H
+         MVC   0(4,R6),WEBNEXT          DEQUEUE THE WEB
+*                                        & FREE IT .....
+         FREEMAIN R,A=(R9),LV=WEBLEN
+         LR    R9,R6
+         B     NWEBQ
+QUEUEIT  DS    0H
+         MVC   WEBNEXT,QWEB             SAVE THE NEW WEB ADDRESS
+         L     R9,QWEB                  POINT BACK AT THE WEB
+         BR    R14                      THEN RETURN TO CALLER
+*   TITLE   - THE TPEND EXIT ROUTINE
+         SPACE 3
+         DROP  R12
+TPENDEX  DS    0H
+         USING *,R15
+         L     R12,BASEREG          LOAD OLD BASE REGISTER
+         DROP  R15
+         USING PROG,R12             USE OLD BASE REGISTER
+         LA    R13,TPENDSVE         POINT TO REGISTER SAVE AREA
+         ST    R14,R14TPEND         SAVE REG14
+         POST  TPENDECB             POST TPEND ECB
+         WTO   'VMD006I TPEND ENTERED'
+         L     R14,R14TPEND         LOAD RETURN ADDRESS
+         BR    R14  RETURN TO VTAM.
+         EJECT
+*   LERAD EXIT
+*   IN CASE OF ANY LOGIC ERRORS, SAVE REGISTERS AND DUMP.
+LERADEX  DS    0H
+         USING *,R15
+         STM   R0,R15,ABENDSV       SAVE REGISTERS
+         L     R13,4(R13)
+         RETURN (14,12),,RC=16      LERAD ENTERED
+         SPACE 3
+         DC    C'ABEND SAVE AREA'
+ABENDSV  DC    18F'0'
+         EJECT
+*   VTAM MACROS AND CONTROL BLOCKS
+         DC    C'ACB'
+ACB      ACB   AM=VTAM, APPLID=APPLID,EXLST=EXLST
+         SPACE 3
+         DC    C'EXLST'
+EXLST    EXLST AM=VTAM,LOGON=LOGONEX,TPEND=TPENDEX,LERAD=LERADEX
+          SPACE 3
+         DC    C'RPL'
+RPL      RPL   AM=VTAM,ACB=ACB,NIB=NIB,AREA=LOGONMSA,                *
+               AREALEN=20,OPTCD=(SYN)
+         SPACE 3
+         DC    C'NIB'
+NIB      NIB
+         SPACE 3
+FNDIND   DC    B'00'
+QWEB     DC    A(0)
+APPLID   DC    AL1(8),CL8'VMDROP'
+LOGONMSA DC    CL20' '
+LOGECB   DC    F'0'
+TPENDECB DC    F'0'
+TIME01   DC    F'0100'              1 SECOND TIMER
+TIME30   DC    F'3000'              30 SECOND TIMER
+BASEREG  DC    A(PROG)              BASE REGISTER CONTENTS
+CPUID    DC    D'0'
+R14LOGON DC    F'0'
+LOGONSVE DC    18F'0'
+R14TPEND DC    F'0'
+TPENDSVE DC    18F'0'
+VMSAVE   DC    18F'0'
+WAITLIST DC    A(LOGECB)
+COMMAECB DC    A(0)
+         DC    XL1'80',AL3(TPENDECB)
+WEBROOT  DC    A(0)                     THE BASE OF ALL WEBS
+*   THE DUMMY WEB - USED TO INITIALISE REAL WEBS.
+WEBDUMMY DC    A(0)
+         DC    B'00000001'
+         DC    C'RESET '
+PACPARM  DCB   DSORG=PS,MACRF=GM,DDNAME=PACPARM,EODAD=FINISH
+TERMTAB  DC    F'0'
+INCNTL   DS    CL80
+XTCTAREA DS    0F
+COMMA    DS    F
+         DC    C'CUA'
+* REGISTERS R0-R15 HERE
+         EJECT
+WEB      DSECT
+WEBNEXT  DC    A(0)                 THE NEXT WEB IN QUEUE
+WEBFLAGS DC    B'00'                INDICATOR FLAGS
+WEBPROC  EQU   B'00000001'          WEB TO BE PROCESSED
+WEBFREE  EQU   B'00000010'          WEB TO BE FREED
+WEBCMD   DC    C'RESET'             WEB COMMAND
+WEBCUA   DC    C'CUA'               WEB CUA
+WEBLEN   EQU   *-WEB                THE WEB LENGTH
+         SPACE 3
+         PRINT NOGEN
+         IFGRPL AM=VTAM
+         ISTDNIB
+         IFGACB AM=VTAM
+         DSECT
+         IEZCOM
+         DSECT
+         IEZCIB
+         END
+The Started Task that we bring up at VTAM initialisation time.
+//VMDROP PROC
+//STEP1 EXEC PGM=VMDROP,TIME=1440
+//STEPLIB DD DSN=TEST.LOADLIB,DISP=SHR
+//PACPARM DD DSN=SYS1.VTAMLST(L3270DV),DISP=SHR
+*Where L3270DV is our local development 3270 table
+I Williamson
+Systems programmer
+Trusteebank Computers Ltd (New Zealand)

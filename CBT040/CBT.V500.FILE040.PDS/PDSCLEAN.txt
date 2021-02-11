@@ -1,0 +1,453 @@
+         TITLE 'PDSCLEAN'
+PDSCLEAN CSECT
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        THE FUNCTION OF THIS PROGRAM IS TO REINITIALIZE ONE OR MORE  *
+*        PARTITION DATA SETS.  BY REINITIALIZE IT IS MEANT THAT THE   *
+*        DIRECTORY BLOCKS WILL BE REWRITTEN TO ZEROS AND              *
+*        THE NEXT AVAILABLE POINTER RESET TO START                    *
+*        OF DIRECTORY.  ALSO THE NEXT AVAILABLE DATA AREA             *
+*        POINTER IS RESET TO FOLLOW DIRECTORY AREA.                   *
+*                                                                     *
+*        ALL DD STATEMENTS THAT BEGIN WITH 'CLEAN'                    *
+*        WILL BE CANDIDATES FOR CLEANING.  DUMMY DD                   *
+*        STATEMENTS WILL BE BYPASSED.                                 *
+*                                                                     *
+*        THE NUMBER OF DIRECTORY BLOCKS CAN BE INCREASED OR DECREASED *
+*        BY RESPECIFYING IN JCL     I.E.   SPACE=(CYL,(1,,5))         *
+*        *                                                            *
+*        THE ADVANTAGE OF THIS METHOD IS THAT THE DATA SET            *
+*        DOES NOT HAVE TO BE SCRATCHED AND REALLOCATED THEREBY        *
+*        PRESERVING THE ALLOCATED AREA.                               *
+*        *                                                            *
+*        SAMPLE JCL                                                   *
+*        //S1 EXEC PGM=PDSCLEAN                                       *
+*        //CLEAN1 DD DSN=PDSTEST1.DISP=OLD                            *
+*        //CLEAN2 DD DSN=PDSTEST2,DISP=OLD,SPACE=(CYL,(1,,56)         *
+*        *                                                            *
+*        NOTE THAT CLEAN2 DD STATEMENT CHANGES # OF DIR BLKS TO 56    *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        EQUATES                                                      *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+         REGS
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        HOUSEKEEPING                                                 *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+         SAVE (14,12),,PDSCLEAN*&SYSDATE*&SYSTIME
+         LR    R12,R15             ENTRY ADR TO BASE REG
+         USING PDSCLEAN,R12        PGM BASE
+         ST    R13,SAVEAREA+4      CHAIN NEW SAVE BACKWARD
+         LR    R2,R13              TEMP HOLD OLD SAVE AREA POINTER
+         LA    R13,SAVEAREA        PGM SAVEAREA IN REG 13
+         ST    R13,8(R2)           CHAIN OLD SAVE FORWARD
+         L     R1,0(R1)            PICK UP ADDRESS OF PARM FIELD
+         ST    R1,PARMADDR         SAVE PARM ADDRESS
+         EXTRACT TIOT,FIELDS=TIOT  GET ADDRESS OF TIOT
+         L     R2,TIOT             LOAD ADDRESS OF TIOT IN REG2
+         LA    R2,24(R2)           SKIP TO DD ENTRIES
+         ST    R2,NEXTDD           SAVE FIRST DD TO INITIALIZE LOOP
+         LA    R6,EXCPDCB
+         USING IHADCB,R6
+         L     R5,16          CVT ADDR
+         USING CVT,R5         ADDRESSABILITY
+         TITLE 'PDSCLEAN - SCAN TIOT'
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        SCAN TIOT FOR DDNAMES 'CLEANXXX' WHERE X CAN BE ANYTHING     *
+*        WHEN FINDING ONE TAKE OFF TO SCRUB IT CLEAN                  *
+*        WHEN HITTING END OF TIOT GO TO END OF JOB                    *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+TIOTLOOP EQU   *
+         L     R2,NEXTDD           PICK UP CURRENT DD
+         SR    R3,R3               CLEAR REG3
+         IC    R3,0(R2)            DETERMINE IF END OF TIOT
+         LTR   R3,R3               END OF TIOT?
+         BZ    RETURN0             GO TO EOJ NORMAL
+         LA    R1,0(R2,R3)         ADDR OF NEXT TIOT
+         ST    R1,NEXTDD           SAVE
+         CLC   4(5,R2),=C'CLEAN'   IS THIS A VALID DD ENTRY
+         BNE   TIOTLOOP            NO -- SKIP IT
+         MVC   DDNAME(8),4(R2)     SAVE DDNAME
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        PROCESS A DD ENTRY                                           *
+*        THE NAME IS TAKEN FROM DDNAME                                *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+         MVC   DCBDDNAM,DDNAME MOVE CURRENT DDNAME TO DCB
+         RDJFCB ((R6))             READ IN JFCB
+         LTR   R15,R15             TEST FOR GOOD READ
+         BNZ   JFCBERR             SHOULD NEVER HAPPEN
+         CLC   =C'NULLFILE',JFCB   CHECK FOR DUMMY
+         BE    TIOTLOOP            GO TO NEXT DD STATEMENT
+         BAL   R14,BLDIOB          RE-INITIALIZE IOB
+         MVI   CTR,X'01'           RECORD 1
+         MVI   CTKL,X'08'          8   BYTE KEY/BLOCK
+         MVC   CTDL,=H'256'        256 BYTES/DIRECTORY BLOCK
+         BAL   R14,BALFACT         GET FACTORS FOR TRACK BALANCING
+         OI    JFCB+52,X'02'       DO NOT MERGE DCB INTO JFCB
+         SR    R4,R4               CLEAR REG4
+         ICM   R4,B'0111',JFCB+160 PICK DIRECTORY # IF IN JCL
+         BNZ   REWRITE             USE NUMBER SPECIFIED IN JCL
+         TITLE 'PDSCLEAN - COUNT DIRECTORY BLOCKS IN OLD FILE'
+         OPEN  ((R6)),TYPE=J  OPEN TO READ DIRECTORY
+         TM    DCBOFLGS,X'10'     CHECK FOR GOOD OPEN
+         BZ    OPENERR        SHOULD NOT BE
+         MVC   IOBSTART,=AL3(READCCW)
+GETLOOP  EQU   *
+         BAL   R14,DOIO       GET NEXT DIR BLK
+         B     *+4(R15)       CHECK RETURN CODE
+         B     *+8            0 -- OK
+         B     CLOSEIN        4 -- I/O ERROR - TREAT AS EOF
+         CLI   CTKL,X'08'     CORRECT KEY LENGTH
+         BNE   CLOSEIN        NO -- TREAT AS EOF
+         CLC   CTDL,=H'0'     EOF DATA LENGTH
+         BE    CLOSEIN        YES
+         CLC   CTDL,=H'256'   REC TOO LONG
+         BH    CLOSEIN        YES -- TREAT AS EOF
+         LA    R4,1(R4)            COUNT THE DIRECTORY BLOCKS
+         BAL   R14,BUMPTTRN   BUMP TO NEXT REC
+         B     GETLOOP             READ TO EOF ON DIRECTORY
+CLOSEIN  CLOSE ((R6))
+         TITLE 'PDSCLEAN - WRITE NEW DIRECTORY'
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        R4 CONTAINS THE NUMBER OF DIRECTORY BLOCKS TO BE WRITTEN     *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+REWRITE  EQU   *
+         C     R4,=A(0)       ANY DIR BLKS
+         BE    DIRCTERR       NO -- RC=4
+         OPEN  ((R6),OUTPUT),TYPE=J OPEN TO WRITE NEW DIR BLKS
+         TM    DCBOFLGS,X'10'     CHECK FOR GOOD OPEN
+         BZ    OPENERR             SHOULD NOT BE
+         XC    DCBTRBAL,DCBTRBAL  CLEAR TRACK BALANCE FIELD
+         BAL   R14,BLDIOB     RE-INITIALIZE IOB
+         MVC   IOBSTART,=AL3(WRITECCW)
+         MVC   KEY,=XL8'FFFFFFFFFFFFFFFF'
+         XC    DATA,DATA
+         MVC   DATA(10),=XL10'000EFFFFFFFFFFFFFFFF'
+         MVI   CTKL,X'08'
+         MVC   CTDL,=H'256'
+PUTLOOP  EQU   *
+         BAL   R14,DOIO       WRITE NEXT DIR BLK
+         B     *+4(R15)       CHECK RETURN CODE
+         B     *+8            0 -- OK
+         B     WRITEERR       4 -- I/O ERROR
+         BAL   R14,UPDDCB     UPDATE DCB FIELDS
+         XC    KEY,KEY
+         XC    DATA,DATA
+         BAL   R14,BUMPTTRN   BUMP TO NEXT REC
+         BCT   R4,PUTLOOP          KEEP GOING
+         MVC   IOBSTART,=AL3(EOFCCW)
+         MVI   CTKL,X'00'     ZERO KEY LEN FOR EOF REC
+         MVC   CTDL,=H'0'     ZERO DATA LEN FOR EOF REC
+         BAL   R14,DOIO       WRITE EOF REC
+         B     *+4(R15)       CHECK RETURN CODE
+         B     *+8            0 -- OK
+         B     EOFERR         4 -- I/O ERROR
+         BAL   R14,UPDDCB     UPDATE DCB
+         CLOSE ((R6))
+         MVC   MSG+17(44),JFCB     MOVE IN DSN INTO MSG
+         WTO   MF=(E,MSG)          WRITE MSG TO JCL
+         B     TIOTLOOP
+         TITLE 'PDSCLEAN - END OF JOB LOGIC'
+RETURN0  EQU   *
+         SR    R15,R15        0 RETURN CODE
+RETURN   L     R13,SAVEAREA+4
+         RETURN (14,12),RC=(15)
+         TITLE 'PDSCLEAN - ERROR LOGIC'
+         PUSH  PRINT
+         PRINT NOGEN
+DOIOERR  EQU   *
+         WTO   'TTR TRANSLATE FAILURE',                                X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+WRITEERR EQU   *
+         WTO   'I/O ERROR WRITING THE DIRECTORY',                      X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+EOFERR   EQU   *
+         WTO   'I/O ERROR WRITING DIRECTORY EOF',                      X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+JFCBERR  EQU   *
+         WTO   'ERROR READING JFCB',                                   X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+OPENERR  EQU   *
+         WTO   'ERROR OPENING FILE',                                   X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+DIRCTERR EQU   *
+         WTO   'NO DIRECTORY BLOCKS',                                  X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+DEVDAERR EQU   *
+         WTO   'DEVICE TYPE NOT DISK',                                 X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+BALERR   EQU   *
+         WTO   'TRACK BALANCE ERROR',                                  X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+CAPERR   EQU   *
+         WTO   'TRACK CAPACITY ERROR',                                 X
+               ROUTCDE=2,DESC=7
+         B     ABEND
+ABEND    EQU   *
+         ABEND 1000,DUMP
+         POP   PRINT
+         TITLE 'BLDIOB'
+BLDIOB   EQU   *
+         XC    EXCPIOB,EXCPIOB  CLEAR
+         MVI   IOBFLAG1,X'C2'
+         MVC   IOBDCBPT,=AL3(EXCPDCB)
+         MVC   IOBECBPT,=AL3(EXCPECB)
+         MVC   TTRN,=X'00000100'  FIRST REC
+         BR    R14
+         TITLE 'DOIO'
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING CODE USES THE ROUTINE CVTPCNVT FROM THE CVT    *
+*        DOCUMENTED IN THE VS1 DATA MANAGMENT FOR SYSTEMS PROGRAMMERS *
+*        IN THE XDAP SECTION.  A CRITICAL SECTION EXTENDS FROM THE    *
+*        CNOP INSTRUCTION THRU THE LABEL DOIOCONT.  EXTREME CARE      *
+*        SHOULD BE EXERCISED WHEN MODIFYING THIS SECTION.             *
+*                                                                     *
+*        CVTPCNVT REGISTER USAGE:                                     *
+*              R0             TTRN TO BE CONVERTED                    *
+*              R1             DEB ADDR                                *
+*              R2             ADDR OF MBBCCHHR TO BE COMPUTED         *
+*              R3 - R8        UNCHANGED                               *
+*              R9 - R13       ***** DESTROYED *****                   *
+*              R14            RETURN ADDR                             *
+*              R15            ENTRY POINT/RETURN CODE FOR CVTPCNVT    *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+DOIO     EQU   *
+         ST    R14,DOIOR14    SAVE RETURN ADDR
+         L     R0,TTRN
+         SR    R1,R1
+         ICM   R1,7,DCBDEBA
+         LA    R2,IOBSEEK
+         STM   R9,R13,DOIOSAVE
+         L     R15,CVTPCNVT
+         CNOP  2,4            START OF CRITICAL SECTION
+         BALR  R14,R15
+         LM    R9,R13,8(R14)
+         B     DOIOCONT
+DOIOSAVE DS    5F
+DOIOCONT EQU   *              END OF CRITICAL SECTION
+         B     *+4(R15)       CHECK RETURN CODE
+         B     *+8            0 -- OK
+         B     DOIOERR        4 -- ERROR - CONVERT FAILED
+         MVC   IDCC,IOBCC     SEARCH CC
+         MVC   IDHH,IOBHH     SEARCH HH
+         SR    R1,R1          CLEAR
+         IC    R1,TTRNR       POST REC NUMBER
+         BCTR  R1,0           LESS 1 FOR SEARCH
+         STC   R1,IDR         POST SEARCH R
+         MVC   CTCC,IOBCC
+         MVC   CTHH,IOBHH
+         MVC   CTR,IOBR
+         XC    EXCPECB,EXCPECB  CLEAR
+         EXCP  EXCPIOB
+         WAIT  ECB=EXCPECB
+         L     R14,DOIOR14    REPOST RETURN ADDR
+         SR    R15,R15        0 RETURN CODE
+         CLI   EXCPECB,X'7F' I/O OK
+         BER   R14            YES
+         LA    R15,4          I/O ERROR RETURN CODE
+         BR    R14            RETURN
+         TITLE 'PDSCLEAN - BUMP TTRN TO NEXT REC'
+BUMPTTRN EQU   *
+         SR    R1,R1          CLEAR
+         IC    R1,TTRNR       PICK UP REC NUMBER
+         LA    R1,1(R1)       BUMP
+         CH    R1,RECMAX      TOO MANY
+         BNH   BUMPEND        NO
+         LH    R1,TTRNTT      PICK UP TRACK NUMBER
+         LA    R1,1(R1)       BUMP
+         STH   R1,TTRNTT      POST NEW TRACK NUMBER
+         LA    R1,1           RESET REC NUMBER
+BUMPEND  EQU   *
+         STC   R1,TTRNR       POST NEW REC NUMBER
+         BR    R14            EXIT
+         TITLE 'PDSCLEAN - COMPUTE TRACK BALANCE FACTORS'
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE USES THE DEVTYPE AND TRKCALC MACROS WHICH       *
+*        ARE DOCUMENTED IN IBM OS/VS2 SYSTEM PROGRAMMING LIBRARY      *
+*                              DATA MANAGEMENT                        *
+*        DEVTYPE GETS THE DEVICE TYPE, TRACK PER CYLINDER AND         *
+*        CYLINDERS PER VOLUME.                                        *
+*                                                                     *
+*        TRKCALC FUNCTN=TRKCAP CALCULATES THE TRACK CAPACITY          *
+*           FOR A DIRECT ACCESS DEVICE.                               *
+*                                                                     *
+*        TRKCALC FUNCTN=TRKBAL CALCULATES THE NEW TRACK BALANCE.      *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+BALFACT  EQU   *              COMPUTE TRACK BALANCE FACTORS
+         ST    R14,BALFR14    SAVE RETURN ADDR
+         DEVTYPE DDNAME,DEVCHAR,DEVTAB,RPS
+         CLI   DEVUCBCL,X'20' IS DEVICE CLASS DASD
+         BNE   DEVDAERR       NO  - ABEND
+         SPACE 2
+         TRKCALC FUNCTN=TRKCAP,  GET TRACK CAPACITY IN RECORDS         *
+               TYPE=DEVUCBTY,    USE CURRENT DEVICE TYPE               *
+               RKDD=CTRKDD,      USE STARTING ADDRESS                  *
+               MF=(E,STAR),      USE STAR LIST                         *
+               REGSAVE=YES       RESTORE REGISTERS
+         LTR   R15,R15           IF ERROR
+         BNZ   CAPERR               ABEND
+         STH   R0,RECMAX         SET MAXIMUM RECORD
+         L     R14,BALFR14       GET RETURN ADDR
+         BR    R14               RETURN
+         TITLE 'PDSCLEAN - UPDATE DCBTRBAL AND DCBFDAD'
+UPDDCB   EQU   *
+         MVC   DCBFDAD,IOBSEEK  POST FULL ADDR OF LAST REC
+         TRKCALC FUNCTN=TRKBAL,    CALCULATE TRACK BALANCE             *
+               TYPE=DEVUCBTY,      USE CURRENT DEVICE TYPE             *
+               BALANCE=DCBTRBAL,   OLD BALANCE FROM DCB                *
+               RKDD=CTRKDD,        USE CURRENT RECORD ADDRESS          *
+               MF=(E,STAR),        USE STAR LIST                       *
+               REGSAVE=YES         RESET REGISTERS
+         LTR    R15,R15           IF OVERFLOW
+         BNZ    BALERR               ABEND
+         STH    R0,DCBTRBAL       RESET DCB TRACK BALANCE
+         BR     R14               RETURN
+         LTORG
+         TITLE 'PDSCLEAN - DATA AREAS'
+SAVEAREA DS    18F
+READCCW  CCW   X'31',IDSEARCH,X'40',5      SEARCH CHAIN
+         CCW   X'08',*-8,0,0               TIC
+         CCW   X'1E',COUNT,X'20',8+8+256   READ COUNT KEY DATA
+WRITECCW CCW   X'31',IDSEARCH,X'40',5      SEARCH CHAIN
+         CCW   X'08',*-8,0,0               TIC
+         CCW   X'1D',COUNT,X'20',8+8+256   WRITE COUNT KEY DATA
+EOFCCW   CCW   X'31',IDSEARCH,X'40',5      SEARCH CHAIN
+         CCW   X'08',*-8,0,0               TIC
+         CCW   X'1D',COUNT,X'20',8         WRITE COUNT KEY DATA
+PARMADDR DC    F'0'
+EXCPECB  DS    F
+DOIOR14  DS    F
+BALFR14  DS    F
+TIOT     DC    F'0'
+NEXTDD   DC    F'0'
+RECMAX   DS    H
+TBKOV    DS    H
+TBNKOV   DS    H
+TBCAP    DS    H
+TTRN     DS    0F
+TTRNTT   DS    XL2
+TTRNR    DS    X
+TTRNN    DS    X
+DDNAME   DC    CL8'        '
+IDSEARCH DS    0XL5
+IDCC     DS    XL2
+IDHH     DS    XL2
+IDR      DS    X
+DEVCHAR  DS    6F
+         ORG DEVCHAR
+DEVTYPE  DS    0F                  UCB TYPE FLAGS
+DEVUCBMD DS    XL1                     MODEL
+DEVUCBOP DS    XL1                     OPTION
+DEVUCBCL DS    XL1                     CLASS  X'20' IS DASD
+DEVUCBTY DS    X                       DEVICE TYPE
+DEVBLK   DS    F
+DEVCYL   DS    H
+DEVTRK   DS    H
+DEVTRLEN DS    H
+DEVOV2   DS    0XL2
+DEVOV11  DS    X
+DEVOV12  DS    X
+DEVOVN   DS    X
+DEVOPT   DS    X
+DEVFMT2  EQU   X'08'
+DEVTOL   DS    H
+DEVR0OVH DS    H
+DEVSECT  DS    X
+DEVSECTD DS    X
+STAR     TRKCALC MF=D              TRKCALC LIST WITH LABELS
+         DS    0D
+COUNT    DS    0CL8                SEEK ADDRESS
+CTCC     DS    XL2                    CYLINDER ADDRESS
+CTHH     DS    XL2                    HEAD     ADDRESS
+CTRKDD   DS    0XL4                   TRKCALC DATA
+CTR      DS    X                         RECORD NUMBER
+CTKL     DS    X                         KEY LENGTH
+CTDL     DS    XL2                       DATA LENGTH
+KEY      DS    XL8                 KEY
+DATA     DS    XL256               DATA
+JFCBLIST DC    0F'0',XL1'87',AL3(JFCB)
+JFCB     DC    XL176'00'
+MSG WTO 'PDSCLEANED -                                              ',  *
+               MF=L,ROUTCDE=2,DESC=7
+         DS    0D
+EXCPIOB  DS    0CL40
+IOBFLAG1 DS    X
+IOBFLAG2 DS    X
+IOBSENS0 DS    X
+IOBSENS1 DS    X
+IOBECBCC DS    X
+IOBECBPT DS    AL3
+IOBFLAG3 DS    X
+IOBCSW   DS    XL7
+IOBSIOCC DS    X
+IOBSTART DS    AL3
+         DS    X              RESERVED
+IOBDCBPT DS    AL3
+IOBRESTR DS    X
+         DS    XL3            IOBRESTR+1
+IOBINCAM DS    XL2
+IOBERRCT DS    XL2
+IOBSEEK  DS    0XL8
+IOBM     DS    X
+IOBBB    DS    XL2
+IOBCC    DS    XL2
+IOBHH    DS    XL2
+IOBR     DS    X
+         EJECT
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        DCB'S                                                        *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+         PRINT NOGEN
+EXCPDCB  DCB   DDNAME=XXXXXXXX,                                        *
+               DEVD=DA,                                                *
+               DSORG=PO,                                               *
+               EXLST=JFCBLIST,                                         *
+               MACRF=E
+         TITLE 'DSECTS'
+         DCBD  DSORG=PO,DEVD=DA
+CVT      DSECT
+         CVT
+         END

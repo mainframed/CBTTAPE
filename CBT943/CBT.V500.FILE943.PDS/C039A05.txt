@@ -1,0 +1,198 @@
+ CICS looping task detection
+I have implemented the following program in a CICS 1.7 MVS/XA environment to
+test for long running or looping programs.  The idea is to wake up every 15
+minutes or so and scan the active and suspended chain to gather all the task
+numbers; then to read a temporary storage queue that contains task numbers from
+the last time the program ran, and combine them into one array.  The program
+then does a sort into ascending sequence so it can test for duplicates.  The
+next action taken can be to send a simple log message or, more drastically, to
+issue a purge command through CEMT to force the task out.  The program runs out
+of the PLT and starts itself up at some realistic interval.  When it is executed
+initially it just writes the temporary storage queue and starts itself up again.
+What this is intended to prevent is a situation where an on-line program takes
+on the characteristics of a batch program and runs long enough to span two
+journal switches.  This condition is extremely unpleasant as it requires some
+journal back-up manipulation and considerable time to restart CICS if the start
+of task record is on a journal that has been over-written and, hence, backed up
+to tape.  By first implementing the program to run in message mode only, then in
+fail mode or purge mode after a determination is made as to which tasks violate
+the rules, it is possible to prevent this journal span from ever happening.  The
+interval used to test with might be 5 minutes at first, then tuned based on how
+many violators are found.  Some tasks legitimately run for a long time and can
+be coded as TignoreU in the program.
+TSLOOP   TITLE 'TSLOOPDT - DETECT LOOPING TRANSACTIONS'
+***  MODULE NAME:  TSLOOPDT                                        ***
+***  MODULE TYPE:  CICS PROGRAM INVOKED BY PLT                     ***
+***  FUNCTION:     SCAN THE ACTIVE AND SUSPENDED TASK CHAINS TO    ***
+***                LOOK FOR A TASK THAT HAS BEEN AROUND FOR A      ***
+***                LONG TIME AND TAKE SOME CORRECTIVE ACTIONS      ***
+***  LANGUAGE:     ASSEMBLER (COMMAND LEVEL CICS)                  ***
+***  ATTRIBUTES:   QUASI-REENTRANT                                 ***
+***  EXITS:        RETURN TO CICS                                  ***
+***  LINKS:        CICS MANAGEMENT SERVICES VIA 'EXEC CICS' CALLS  ***
+DCACBAR  EQU   R7
+DFHEISTG DSECT
+TABTNO   DS    CL900
+TABTIN   DS    CL900
+TEMP     DS    PL3
+CHAR5    DS    CL5
+WORK     DS    CL70
+CEMTCMD  DS    CL27
+DT8      DS    CL8
+TM8      DS    CL8
+TIMEDBL  DS    D
+CSAADDR  EQU   10
+         COPY  DFHCSADS
+         DFHTCA CICSYST=YES
+         COPY  DFHDCADS
+TSLOOPDT DFHEIENT CODEREG=(4)
+*         THIS IS THE 1.7 LOOP DETECTION PROGRAM
+         B     START
+         DC    CL16'TSLOOPDT'
+         DC    CL16'&SYSDATE'
+         DC    CL16'&SYSTIME'
+START    EXEC  CICS HANDLE CONDITION ERROR(RETURN)
+         EXEC  CICS ADDRESS CSA(CSAADDR)
+         USING DFHCSADS,R10               ADDR CSA
+         L     DCACBAR,CSAACTBA           ACTIVE BEG. ADDR
+         LA    R8,TABTNO                  POINT TO TABLE
+CHSACTV  LA    1,CSAACTOF                 SEE IF WE ARE DONE
+         CR    1,DCACBAR                  WITH ACTIVE CHAIN
+         BE    *+16                       JUMP TO SUS LIST
+         BAL   14,CHSTSK                  CHECK THE TASK
+         L     DCACBAR,DCAKCBA            CHAIN TO NEXT
+         B     CHSACTV                    LOOP BACK
+         L     DCACBAR,CSASUSBA           POINT TO SUS LIST
+CHSSUS   LA    1,CSASUSOF                 SEE IF WE ARE
+          CR    1,DCACBAR                  DONE WITH SUS CHAIN
+         BE    *+16                       JUMP AROUND
+         BAL   14,CHSTSK                  CHECK THE TASK
+         L     DCACBAR,DCAKCBA            CHAIN TO NEXT
+         B     CHSSUS                     LOOP BACK
+         MVC   0(3,R8),PZERO              PLUG TABLE WITH ZERO
+         B     CHASDONE                   DONE WITH CHASE
+CHSTSK   USING DFHDCADS,DCACBAR           ADDR DISP CONTROL AREA
+         L     R3,DCATCAA                 LOAD R3 WITH TCA ADDR
+         L     R3,TCASYAA-DFHTCADS(3)     POINT TO USER PART
+         DROP  TCACBAR                    UNHOOK TCA
+         USING DFHSYTCA,R3                HOOK TO R3
+         CLC   TCAKCOID,=C'JNL2'          IGNORE SOME
+         BER   R14
+         CLC   TCAKCOID,=C'CVST'          SPECIFIC TASK ID'S
+         BER   R14
+         CLC   TCAKCOID,=C'CSNC'          THAT ARE ALWAYS
+         BER   R14
+         CLC   TCAKCOID,=C'CSSY'          PRESENT
+         BER   R14
+         CLC   TCAKCOID,=X'D1D1D100'      THIS IS FOR JJJ
+         BER   R14
+         TM    TCAKCTTA+2,X'0C'           CHECK FOR VALID TASKNO
+         BNOR  R14                        TO ELIMINATE TCP
+         MVC   0(3,R8),TCAKCTTA           STORE TASK NUMBER
+         AH    R8,=H'3'                   BUMP POINTER
+         BR    R14
+CHASDONE EXEC  CICS HANDLE CONDITION QIDERR(ALLDUN3)
+         EXEC  CICS READQ  QUEUE('TSLOOPDT') LENGTH(L900)              X
+                    INTO(TABTIN)
+         EXEC  CICS DELETEQ QUEUE('TSLOOPDT')
+         MVI   SW,X'FF'                   SWITCH SAYS WE DID A READQ
+ALLDUN3  EXEC  CICS WRITEQ QUEUE('TSLOOPDT') LENGTH(900)               X
+                    FROM(TABTNO)
+         CLI   SW,X'FF'                   CHECK IF READQ WAS GOOD
+         BNE   OUTAHERE                   JUST START AND RETURN
+         BAL   2,CHKDUPS                  LOOK FOR DUPLICATES
+*              SET INTERVAL TO DESIRED VALUE - 5 MINUTES OR SO
+OUTAHERE EXEC  CICS START TRANSID('TSLD') INTERVAL(000500)
+RETURN   EXEC  CICS RETURN
+CHKDUPS  LA    R5,TABTIN                  POINT TO TS TABLE JUST READ
+MVCAPP   MVC   0(3,R8),0(R5)              APPEND CONTENTS TO CURR TABLE
+         AH    R5,=H'3'                   ADD 3 FOR PL3 TASK NUMBER
+         AH    R8,=H'3'                   ADD 3 FOR PL3 TASK NUMBER
+         CP    0(3,R5),PZERO              SEE IF WE ARE AT THE END
+         BE    APPDUN                     GET OUT AT END OF TABLE
+         B     MVCAPP                     LOOP BACK AND DO IT AGAIN
+*                                      SORT THE TABLE TO ASCENDING SEQ
+APPDUN   MVC   0(3,R8),PZERO              PLUG TABLE WITH PACKED ZERO
+         LA    R5,TABTNO                  POINT TO FRONT OF TABLE
+         LA    R6,TABTNO                  USE ANOTHER REG FOR COMPARE
+         AH    R6,=H'3'                   KEEP R6 ONE PAST R5
+         CP    0(3,R6),PZERO              END OF TABLE
+         BE    ALLDUN                     JUMP TO NEXT SECTION
+COMPRR   CP    0(3,R5),0(3,R6)            COMPARE
+         BL    BUMPR6                     IF R5 LESS THAN R6 BRANCH
+         MVC   TEMP,0(R5)                 MOVE R5 VALUE TO HOLD
+         MVC   0(3,R5),0(R6)              MOVE R6 VALUE TO R5
+         MVC   0(3,R6),TEMP               MOVE HOLD TO R6
+BUMPR6   AH    R6,=H'3'                   INCREMENT R6 BY ONE
+         CP    0(3,R6),PZERO              SEE IF WE ARE AT THE END
+         BE    BUMPR5                     ENDED A PASS - DO IT AGAIN
+         B     COMPRR                     GO BACK AND COMPARE THE NEXT
+BUMPR5   AH    R5,=H'3'                   INCREMENT R5
+         CP    0(3,R5),PZERO              PROTECTION
+         BE    ALLDUN                     IF R5 IS ZERO WE ARE DONE
+          LA    R6,0(,R5)                  RESET R6
+         AH    R6,=H'3'                   POINT ONE PAST R5
+         CP    0(3,R6),PZERO              ARE WE AT THE END
+         BE    ALLDUN                     GET OUT
+         B     COMPRR                     COMPARE AGAIN
+ALLDUN   LA    R8,TABTNO                  POINT TO FULL TABLE
+         LA    R5,TABTNO                  OLD AND NEW COMBINED
+         AH    R8,=H'3'                   R8 IS ONE PAST R5
+COMPR2   CP    0(3,R5),0(3,R8)            ARE THEY EQUAL
+         BL    BR5                        NOT, SO BUMP THEM
+         BAL   11,WRTCSMT                 WE HAVE A DUP
+         AH    R5,=H'6'                   POSITION TWO AHEAD
+         AH    R8,=H'6'                   FOR BOTH REGS
+         CP    0(3,R5),PZERO              SEE IF WE ARE AT THE END
+         BE    ITSOK                      NO DUPS FOUND
+         CP    0(3,R8),PZERO              JUST TO BE SURE
+         BE    ITSOK                      NO DUPS FOUND
+BR5      AH    R5,=H'3'                   INCREMENT R5
+BR8      AH    R8,=H'3'                   INCREMENT R8
+         CP    0(3,R8),PZERO              CHECK FOR END
+         BE    ITSOK                      NO DUPS
+         B     COMPR2                     GO BACK AND COMPARE AGAIN
+ITSOK    BR    R2                         SEND US BACK
+WRTCSMT  EXEC  CICS ASKTIME ABSTIME(TIMEDBL)
+         EXEC  CICS FORMATTIME ABSTIME(TIMEDBL) TIME(TM8) TIMESEP(':') X
+                                                DATE(DT8) DATESEP('/')
+         UNPK  CHAR5,0(3,R5)              UNPACK TASKNO
+         OI    CHAR5+4,X'F0'              FIX THE SIGN
+         MVI   WORK,X'40'                 BLANK THE WORK FIELD
+         MVC   WORK+1(L'WORK-1),WORK      FINISH IT OUT
+         MVC   WORK,=C'TASK NUMBER        MIGHT BE IN A LOOP  TIME -XX:X
+               XX:XX  DATE - XX/XX/XX'
+         MVC   WORK+12(5),CHAR5           MOVE IN TASKNO
+         MVC   WORK+45(8),TM8             MOVE IN EDITTED TIME
+         MVC   WORK+62(8),DT8             MOVE IN EDITTED DATE
+         EXEC  CICS WRITEQ TD QUEUE('CSMT')   LENGTH(70) FROM(WORK)
+*              IF PURGE IS TO BE DONE, TAKE OUT COMMENTS
+*        MVC   CEMTCMD,=C'SET TASK(     ) FORCEPURGE'
+*        MVC   CEMTCMD+9(5),CHAR5
+*        EXEC  CICS LINK PROGRAM('DFHEMTP') COMMAREA(CEMTCMD),         X
+*              LENGTH(27)
+*        MVI   WORK,X'40'                 BLANK THE WORK FIELD
+*        MVC   WORK+1(L'WORK-1),WORK      FINISH IT OUT
+*        MVC   WORK,=C'IT HAS BEEN TERMINATED'
+*        EXEC  CICS WRITEQ TD QUEUE('CSMT')  LENGTH(22) FROM(WORK)
+         BR    R11                        TAKE US BACK
+PZERO    DC    PL3'0'
+L900     DC    H'900'
+SW       DC    X'00'
+         LTORG
+         END
+
+
+Robert Buckley
+Senior Systems Programmer
+Wal-Mart Stores Inc (USA)     ) Xephon 1989
+
+
+
+
+
+
+
+
+
+

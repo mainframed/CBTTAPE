@@ -1,0 +1,839 @@
+*PROCESS USING(WARN(15))
+         ACONTROL CPAT(NOSYSL,NOCASE)
+NIMESTA  TITLE 'SUBAGENT AND SUBTASK ESTAE ROUTINE   BY M.SCHMUTZOK'
+***********************************************************************
+*                                                                     *
+* MODULE NAME = NIMESTA                                               *
+*                                                                     *
+* DESCRIPTIVE NAME = Agent and subtask ESTAE routine.                 *
+*                                                                     *
+* FUNCTION = This module is used to debug agent and subtask abends.   *
+*                                                                     *
+*                                                                     *
+*    REGISTER CONVENTIONS = R0-R1  =   Parameter/work                 *
+*                           R11    =   SEWA address for this ABEND    *
+*                           R12    =   Code base register             *
+*                           R13    =   Save area address              *
+*                           R14    =   Linkage                        *
+*                           R15    =   Linkage, return codes          *
+*                                                                     *
+* MODULE TYPE = Procedure ( CSECT type )                              *
+*                                                                     *
+*    MODULE SIZE = See the NIMESTL equate at the end of NIMESTA       *
+*                                                                     *
+*    ATTRIBUTES = Reentrant (Key Zero storage)                        *
+*                                                                     *
+*               = AMODE 24 for the agent, AMODE 24 or 31 for the      *
+*                 subtasks (depending on AMODE of the subtask at the  *
+*                 time the ESTAE was established).  Control blocks    *
+*                 will not be RMODE 31 unless the entry AMODE is 31.  *
+*                                                                     *
+*               = RMODE 24                                            *
+*                                                                     *
+* ENTRY POINT = NIMESTA                                               *
+*                                                                     *
+*    PURPOSE = Provide basic ESTAE SNAP support for the agent and     *
+*              sub tasks.                                             *
+*                                                                     *
+*    LINKAGE = SYNCH from RTM due to agent or subtask abend           *
+*                                                                     *
+*    INPUT = SDWA, plus AGCB (agent) or STCB (subtask) in SDWAPARM    *
+*                                                                     *
+*    OUTPUT = Error analysis messages, an SDUMP, a WTOR to hold up    *
+*             messages and prevent the agent and/or subtask address   *
+*             space from ending until debugging can be done,          *
+*             eventually percolation (always).                        *
+*                                                                     *
+*    EXIT-NORMAL = Percolate                                          *
+*                                                                     *
+*    EXIT-ERROR = None                                                *
+*                                                                     *
+* EXTERNAL REFERENCES = See below                                     *
+*                                                                     *
+*    ROUTINES = None                                                  *
+*                                                                     *
+*    DATA AREAS = See mapping macros expanded below                   *
+*                                                                     *
+*    CONTROL BLOCKS = See mapping macros expanded below               *
+*                                                                     *
+* TABLES = None                                                       *
+*                                                                     *
+* MACROS = MVS  - DOM, FREEMAIN, GETMAIN, (IEFJSSIB), (IEFJSSOB),     *
+*                 IEZWPL, IHASDWA, SDUMP, SETRP, WAIT, WTO, WTOR      *
+*                                                                     *
+* MACROS = agent/sub task - NIMSEWA (inline), NIMAGCB                 *
+*                                                                     *
+***********************************************************************
+         TITLE 'General ESTAE/recovery processing comment block'
+***********************************************************************
+*                                                                     *
+*        This module is part of an MVS SNMP agent.                    *
+*                                                                     *
+*        Both the agent and each sub task point to this module as     *
+*        their ESTAE routine. This module does not recover from       *
+*        ABENDS. It purposely issues many in order to stop the task,  *
+*        not recover from ABENDs, but purposely issues many           *
+*        get a snapshot of the situation, allow debugging, etc.       *
+*                                                                     *
+*        The structure of the module, with a separate task            *
+*        per sub task and some 'watching' for the loss of sub tasks   *
+*        in the agent is suitable for repetitive testing. If the      *
+*        agent or a sub task ABENDs, the messages from this ESTAE     *
+*        routine, along with other tools while this ESTAE has its     *
+*        WTOR outstanding, can be used to do some debugging.          *
+*        Afterward, the sub task will end and the agent will          *
+*        cleanup and will end itself.                                 *
+*                                                                     *
+*        This ESTAE routine simply does the following:                *
+*                                                                     *
+*          - Allocates a work area (SEWA) for reentrant use.          *
+*          - Analyzes the error (mostly from the SDWA).               *
+*          - Issues an non-scrollable message about the ABEND.        *
+*          - Takes an SVC dump, and reports on its success.           *
+*          - Issues non-scrollable info messages about the error      *
+*            instruction, PSW, and error registers.  All values are   *
+*            from the agent/subtask's RB level, not necessarily the   *
+*            actual ABENDing instruction (e.g. a GETMAIN SVC is       *
+*            reported, versus the instruction deep within the SVC).   *
+*          - A WTOR is issued to hold up processing to allow          *
+*            debugging.                                               *
+*          - If the WTOR response indicates so, the info messages are *
+*            DOM'ed and re-displayed, either for the last-RB info,    *
+*            or for the time-of-error instruction, PSW, and regs.     *
+*          - After the WTOR, all outstanding messages are DOMed.      *
+*          - The SEWA is FREEMAINed, and the ESTAE percolates.        *
+*                                                                     *
+***********************************************************************
+         TITLE 'ESTAE entry point from RTM'
+***********************************************************************
+*                                                                     *
+*        This is the NIMESTA entry point. The agent or a subtask      *
+*        may have ended, and RTM entered NIMESTA via SYNCH.           *
+*                                                                     *
+*        No assumptions are made about R15 on entry.  We may or may   *
+*        not have an SDWA and its associated save area and error      *
+*        information (normally there WILL be an SDWA).                *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         PRINT ON,GEN,NODATA
+         SPACE 1
+NIMESTA  CSECT ,                   Establish the Csect
+         SPACE 1
+         BALR  R12,0               Establishing general
+         USING *,R12                   program addressability
+         SPACE 1
+         B     NIME010             Bypass the prolog information
+         SPACE 1
+NIMESTA  MODID BRANCH=NO           Est. module identification
+         TITLE 'Find the SDWA (if any), ABEND and reason codes'
+***********************************************************************
+*                                                                     *
+*        See if the SDWA is available.  If so:                        *
+*                                                                     *
+*          - save the registers in the save area provided by the      *
+*            system (register 13) if the SDWA was provided            *
+*          - get the ABEND completion code, and the reason code       *
+*          - set R10 to the SDWA address, rather than zero            *
+*                                                                     *
+*        Otherwise:                                                   *
+*                                                                     *
+*          - get the ABEND code from R1, and use a zero reason code   *
+*          - set R10 to zero, rather than an SDWA address             *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         USING SDWA,R10            Establish SDWA addressability
+         SPACE 1
+NIME010  DS    0H
+         C     R0,NOMEMRY          Do we have the SDWA around ...
+         BE    NIME020              No, skip the store of registers
+         SPACE 1
+         STM   R14,R12,12(R13)     Have SDWA, save registors
+         LR    R10,R1              Get A(SDWA) into R10
+         L     R8,SDWAABCC         Get ABEND completion code in R8
+         L     R5,SDWAPARM         Get A(passed parm list) in R5
+         ICM   R7,B'1111',SDWAXPAD Get addr of the SDWAPTRS area
+         BZ    NIME030              None there, R7 reason code zero
+         ICM   R7,B'1111',SDWASRVP-SDWAPTRS(R7)  Get SDWARC1 area addr
+         BZ    NIME030                            None, R7 reason zero
+         L     R7,SDWACRC-SDWARC1(,R7)           Get ABEND reason code
+         B     NIME030                            and go get the parms
+         SPACE 1
+NIME020  DS    0H
+         SLR   R10,R10             Show that the SDWA is not around
+         LR    R8,R1               Get ABEND completion code in R8
+         LR    R5,R2               Get A(passed parm list)
+         SLR   R7,R7               Set a zero reason code
+         SPACE 1
+NIME030  DS    0H
+         LR    R9,R14              Save R14 from destruction
+         SPACE 1
+         DROP  R10                 Drop SDWA addressability
+         TITLE 'GETMAIN an ESTAE work area (SEWA)'
+***********************************************************************
+*                                                                     *
+*        Allocate a work area for this ESTAE routine call.  This      *
+*        area is necessary to allow NIMESTA to remain reentrant.      *
+*                                                                     *
+*        The GETMAIN is performed unconditionally.  If it fails,      *
+*        this ESTAE routine will terminate, but that is reasonable    *
+*        since the routine is for debug snaps only, not recovery.     *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         USING SEWA,R11            Establish SEWA addressability
+         SPACE 1
+         GETMAIN R,LV=SEWALEN,SP=230,LOC=BELOW    Get a work area
+         SPACE 1
+         LR    R11,R1              Establish work area address
+         LR    R2,R11              Zero
+         LA    R3,SEWALEN           the
+         SLR   R15,R15               new
+         MVCL  R2,R14                 SEWA
+         SPACE 1
+         MVC   SEWAID,=C'SEWA'     Set the control block ID
+         ST    R8,SEWACODE         Save the completion code and
+         ST    R7,SEWAREAS          the reason code
+         TITLE 'Analyze the ABEND code, format the first (ABEND) messagC
+               e'
+***********************************************************************
+*                                                                     *
+*        Determine if the ABEND is a SYSTEM or USER ABEND, and the    *
+*        agent or subtask that failed. Build the first WTO message    *
+*        with this information to inform the operator of the ABEND.   *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         MVC   SEWAWTO1(ESTAEM1L),ESTAEM1  Copy the WPL for message 1
+         LA    R3,SEWAWTO1                 Point to the message WPL
+         SPACE 1
+         N     R8,SYSMASK                  Is this a system ABEND ...
+         BNZ   NIME040                      Yes, go process as such
+         SPACE 1
+         MVC   ESTAEM1T(6,R3),XUSER        User ABEND, copy ABEND code
+         L     R8,USERMASK                 Get mask for User ABEND code
+         N     R8,SEWACODE                  and clear other nibbles
+         SPACE 1
+         CVD   R8,SEWADWD                  Convert User code to decimal
+         UNPK  SEWABCDE(4),SEWADWD+5(3)     and unpack the PD result
+         OI    SEWABCDE+3,X'F0'            Make last digit printable
+         B     NIME050                     Go complete the ABEND WTO
+         SPACE 1
+NIME040  DS    0H
+         MVC   ESTAEM1T(6,R3),XSYSTEM      System ABEND, copy ABEND cde
+         UNPK  SEWABCDE(3),SEWACODE+1(2)   Unpack the completion code
+         OI    SEWABCDE+2,X'F0'            Turn on the zone digit
+         TR    SEWABCDE(3),HEXTAB          Translate to printable hex
+         SPACE 1
+NIME050  DS    0H
+         MVC   ESTAEM1C(4,R3),SEWABCDE     Move ABEND code to message
+         UNPK  ESTAEM1R(9,R3),SEWAREAS(5)  Unpack the reason code
+         MVI   ESTAEM1R+8(R3),C' '          and fix the last digit
+         SPACE 1
+         CLC   0(4,R5),=C'AGCB'            Agent or subtask....
+         BE    NIME060                      agent, go get agent name
+         USING STCB,R5                     Set up STCB addressability
+         MVC   ESTAEM1N(8,R3),STCBMN-STCB(R5) Save subtask name in MSG
+         MVC   SEWAAGCB,STCBAGCB           Save agent AGCB address
+         OI    STCBFLG1,STCB1ABE           Indicate the subtask
+         OI    SEWAFLG1,SEWA1SUB            is ABENDing
+         B     NIME070                     Go issue the ABEND WTO
+         DROP  R5                          Drop STCB addressability
+         SPACE 1
+NIME060  DS    0H
+         USING AGCB,R5                     Set up AGCB addressability
+         MVC   ESTAEM1N(8,R3),AGCBMN-AGCB(R5) Save agent name in MSG
+         ST    R5,SEWAAGCB                 Save agent AGCB address
+         OI    AGCBFLG1,AGCB1ABE           Indicate agent ABENDing
+         DROP  R5
+         TITLE 'Issue the first (ABEND) message, issue an SVC dump (SDUC
+               MP)'
+***********************************************************************
+*                                                                     *
+*        Issue the first message to notify the operator of the ABEND. *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME070  DS    0H
+         WTO   MF=(E,SEWAWTO1)     Issue ABEND message to operator
+         ST    R1,SEWADID1         Save the DOM ID for message 1
+         SPACE 1
+         L     R1,SEWAAGCB                 Get agent AGCB addr
+         TM    SEWAFLG1,SEWA1SUB           Is this an subtask ABENDing
+         BNO   NIME080                      No, go issue the SDUMP
+         MVI   SEWARESP,C'P'               Fake percolate rep
+         TM    STCBFLG1-STCB(R1),STCB1ABE  Did agent already ABEND ...
+         BO    NIME230                      Yes, skip most NIME logic
+         EJECT
+***********************************************************************
+*                                                                     *
+*        Issue an SDUMP macro to get an SVC dump.                     *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME080  DS    0H
+         MVC   SEWASDT+1(L'ESTAEM1D),ESTAEM1D(R3)  Copy the dump title
+         MVI   SEWASDT,L'ESTAEM1D                   and set its length
+         MVC   SEWAMPL(NIMEDPLL),NIMEDPL           Copy SDUMP parm list
+         SPACE 1
+         SDUMP HDRAD=SEWASDT,MF=(E,SEWAMPL)        Issue the SDUMP
+         SPACE 1
+         B     NIME090             Check the SDUMP return code
+         SPACE 1
+NIMEDPL  SDUMP HDRAD=*-*,SDATA=(RGN,CSA,LPA,SQA,TRT),QUIESCE=YES,MF=L
+NIMEDPLL EQU   *-NIMEDPL           Length of SDUMP parm list
+         TITLE 'Issue the SDUMP success or failure message to the operaC
+               tor'
+***********************************************************************
+*                                                                     *
+*        Determine if the SVC dump completed successfully.  Either    *
+*        way, let the operator know about the SDUMP status after      *
+*        issuing the first formatted ABEND message.                   *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         USING SDWA,R10            Est SDWA addressability
+         SPACE 1
+NIME090  DS    0H
+         LTR   R15,R15             Was a complete dump taken ...
+         BNZ   NIME100              No, go write bad-dump WTO
+         LA    R2,ESTAEM2           Yes, then dump was successful
+         B     NIME110             Go output dump information WTO
+         SPACE 1
+NIME100  DS    0H
+         MVC   SEWAMPL(ESTAEM3L),ESTAEM3     Copy bad-dump WPL
+         LA    R2,SEWAMPL                    Point to the WPL
+         CVD   R15,SEWADWD                   Convert retcode to decimal
+         UNPK  ESTAEM3C(4,R2),SEWADWD+5(3)   Unpack PD return code
+         OI    ESTAEM3C+3(R2),X'F0'          Make last digit printable
+         SPACE 1
+         LTR   R10,R10             Is there an SDWA ...
+         BZ    NIME110              No, no reason code
+         ICM   R1,B'1111',SDWAXPAD Get addr of SDWAPTRS area
+         BZ    NIME110              None there, no reason code
+         ICM   R1,B'1111',SDWASRVP-SDWAPTRS(R1)  Get SDWARC1
+         BZ    NIME110                            None, no rc
+         SLR   R15,R15             Pick up the reason code
+         IC    R15,SDWASDRC-SDWARC1(,R1) from the SDWA and
+         CVD   R15,SEWADWD                convert to decimal
+         UNPK  ESTAEM3R(4,R2),SEWADWD+5(3)   Unpack PD reason
+         OI    ESTAEM3R+3(R2),X'F0'          Fix last digit
+         SPACE 1
+NIME110  DS    0H
+         WTO   MF=(E,(2))          Issue a message about the SVC DUMP
+         ST    R1,SEWADID2         Save the DOM ID for MSG 2 or 3
+         TITLE 'Collect last-RB or time-of-error PSW, registers, etc frC
+               om the SDWA'
+***********************************************************************
+*                                                                     *
+*        This code begins the logic to display the messages about     *
+*        the error.  It might be executed more than once, being       *
+*        looped back upon after the end-of-ESTAE WTOR.                *
+*                                                                     *
+*        Either the last-RB or the time-of-error information about    *
+*        the problem are to be displayed.  The first entry into this  *
+*        code does not have SEWA1TOE on, so the last-RB information   *
+*        is to be displayed.  Later cases may have it on.             *
+*                                                                     *
+*        The appropriate information from the SDWA is collected here. *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME120  DS    0H
+         LTR   R10,R10             Was SDWA acquired for us...
+         BZ    NIME210              No, just WTOR/exit then
+         SPACE 1
+         TM    SEWAFLG1,SEWA1TOE   Use time-of-error SDWA?
+         BO    NIME130              Yes, go copy those values
+         SPACE 1
+         MVC   SEWAEC,SDWAEC2      Copy
+         MVC   SEWAINC,SDWAINC2     last-RB
+         MVC   SEWAILC,SDWAILC2      PSW,
+         MVC   SEWAICD,SDWAICD2       codes,
+         LA    R1,SDWASRSV             and
+         ST    R1,SEWAREGS              registers
+         MVI   SEWAMIDC,C'0'       Indicate use NIME40x msgs
+         MVC   SEWAMTYP,=C'LRB'    Indicate info type
+         B     NIME140             Go issue the messages
+         SPACE 1
+NIME130  DS    0H
+         MVC   SEWAEC,SDWAEC1      Copy
+         MVC   SEWAINC,SDWAINC1     time-of-error
+         MVC   SEWAILC,SDWAILC1      PSW,
+         MVC   SEWAICD,SDWAICD1       codes,
+         LA    R1,SDWAGRSV             and
+         ST    R1,SEWAREGS              registers
+         MVC   SEWAMTYP,=C'TOE'    Indicate info type
+         MVI   SEWAMIDC,C'1'       Indicate use NIME41x msgs
+         SPACE 1
+         DROP  R10                 Drop SDWA addressability
+         TITLE 'Format and issue messages about the failing instructionC
+                and PSW'
+***********************************************************************
+*                                                                     *
+*        Format and issue a message about the failing instruction.    *
+*                                                                     *
+*        The default is for the instruction at the last interrupt     *
+*        for the agent or subask RB.  For example, if a GETMAIN SVC   *
+*        failed, the instruction shown will be the SVC itself, not    *
+*        the error instruction (e.g. an ABEND SVC) within GETMAIN.    *
+*                                                                     *
+*        If the SEWA1TOE flag is on, the time-of-error PSW will be    *
+*        used to find the instruction instead.                        *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME140  DS    0H
+         N     R12,=A(X'00FFFFFF') Clean up the base register
+         LA    R15,NIME150         Prepare for the BASSM
+         O     R15,=X'80000000'    Indicate AMODE=31
+         BASSM R4,R15              Set the AMODE, save current
+         SPACE 1
+NIME150  DS    0H
+         MVC   SEWAMPL(ESTAEM4L),ESTAEM4  Copy instruction WPL
+         LA    R2,SEWAMPL                  and point to the WPL
+         SPACE 1
+         L     R1,SEWAEC+4         Get PSW address at error
+         CLI   SEWAICD,X'10'       Decrement
+         BE    NIME160              PSW
+         CLI   SEWAICD,X'11'         by
+         BE    NIME160                ILC
+         SLR   R3,R3                   unless
+         IC    R3,SEWAILC               page-
+         SR    R1,R3                     fault
+         SPACE 1
+NIME160  DS    0H
+         LRA   R15,0(R1)           Valid instruction stor ...
+         BNZ   NIME180              no, skip format attempt
+         LRA   R15,6(R1)           Valid instruction stor ...
+         BNZ   NIME180              no, skip format attempt
+         SPACE 1
+         UNPK  ESTAEM4I(L'ESTAEM4I+1,R2),0(7,R1)  Format
+         TR    ESTAEM4I(,R2),HEXTAB                failing
+         MVI   ESTAEM4I+L'ESTAEM4I(R2),C' '         instruction
+         SPACE 1
+         LA    R15,NIME170         Prepare to BSM back
+         N     R4,=A(X'80000000')  Setup the AMODE bit in
+         OR    R15,R4               R15 to 'pop' the AMODE
+         BSM   R0,R15              BSM to reset the AMODE
+         SPACE 1
+NIME170  DS    0H
+         SLR   R1,R1               Use
+         IC    R1,SEWAILC           ILC for
+         ALR   R1,R1                 length of
+         LA    R1,ESTAEM4I(R1,R2)     instruction
+         MVC   0(8,R1),BLANKS          display
+         EJECT ,
+         MVC   ESTAEMMI(,R2),SEWAMIDC  Set up the msg id and
+         MVC   ESTAEMMT(,R2),SEWAMTYP   the msg info type
+         SPACE 1
+         WTO   MF=(E,(2))          Issue failing instruction message
+         ST    R1,SEWADID4         Save the DOM ID for MSG 4
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        Format and issue a message showing the error PSW.            *
+*                                                                     *
+*        The PSW used from the SDWA might be from the last interrupt  *
+*        for the agent or subtask RB. For example, if a GETMAIN SVC   *
+*        failed, the PSW shown will be from the time of the SVC       *
+*        issuance, not from the time of the error within the SVC.     *
+*                                                                     *
+*        However, if SEWA1TOE is on, the display here will be of the  *
+*        PSW (etc) from the time of error.                            *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME180  DS    0H
+         MVC   SEWAMPL(ESTAEM5L),ESTAEM5    Copy the PSW WPL
+         LA    R2,SEWAMPL                   Point to the WPL
+         SPACE 1
+         UNPK  ESTAEM5A(9,R2),SEWAEC(5)     Format
+         UNPK  ESTAEM5B(9,R2),SEWAEC+4(5)    left and
+         TR    ESTAEM5A(,R2),HEXTAB           right
+         TR    ESTAEM5B(,R2),HEXTAB            halves of
+         MVI   ESTAEM5A+L'ESTAEM5A(R2),C' '     PSW at time
+         MVI   ESTAEM5B+L'ESTAEM5B(R2),C' '      of ABEND
+         SPACE 1
+         MVC   ESTAEM5C(,R2),SEWAILC        Format
+         OI    ESTAEM5C(R2),X'F0'            ILC
+         UNPK  ESTAEM5D(3,R2),SEWAINC(2)    Format
+         TR    ESTAEM5D(,R2),HEXTAB          interrupt
+         MVI   ESTAEM5D+2(R2),C' '            code
+         SPACE 1
+         MVC   ESTAEMMI(,R2),SEWAMIDC  Set up the msg id and
+         MVC   ESTAEMMT(,R2),SEWAMTYP   the msg info type
+         SPACE 1
+         WTO   MF=(E,(2))          Issue the PSW message to operator
+         ST    R1,SEWADID5         Save the DOM ID for MSG 5
+         TITLE 'Format and issue messages showing the registers at the C
+               time of error'
+***********************************************************************
+*                                                                     *
+*        Format and issue messages in a grid that display the         *
+*        contents of the registers at the time of error.              *
+*                                                                     *
+*        As with the failing instruction and PSW, the register values *
+*        displayed will be from the agent or subask RB level's last   *
+*        interrupt, not from the lowest RB level at the time of the   *
+*        error (e.g. not from the ABEND issuance within an SVC).      *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         MVC   SEWAMPL(ESTAEM6L),ESTAEM6     Copy the register WPL
+         LA    R2,SEWAMPL                    Point to the WPL
+         SPACE 1
+         L     R3,SEWAREGS         Point to register values
+         LA    R4,4                Loop will type 4 lines
+         LA    R6,SEWADID6         Point to the 4 MSG-6 DOM IDs
+         SPACE 1
+NIME190  DS    0H
+         LA    R5,ESTAEM6C(,R2)    Point to the message area
+         LA    R7,4                Loop to type 4 regs per line
+         LA    R1,0(R4,R4)         Insert
+         LA    R1,REGNUMS-2(R1)     register
+         MVC   ESTAEM6S(,R2),0(R1)   number
+         SPACE 1
+NIME200  DS    0H
+         UNPK  0(9,R5),0(5,R3)     Edit
+         MVI   8(R5),C' '           next
+         TR    0(8,R5),HEXTAB        register
+         LA    R3,4(,R3)           Increment source pointer
+         LA    R5,9(,R5)           Increment target pointer
+         BCT   R7,NIME200          Loop for all 4 registers
+         SPACE 1
+         MVC   ESTAEMMI(,R2),SEWAMIDC  Set up the msg id and
+         MVC   ESTAEMMT(,R2),SEWAMTYP   the msg info type
+         SPACE 1
+         WTO   MF=(E,(2))          Issue a register message
+         SPACE 1
+         ST    R1,0(R6)            Save the DOM ID for this MSG 6
+         LA    R6,4(,R6)           Increment the DOM ID pointer
+         BCT   R4,NIME190          Loop for all 4 lines
+         TITLE 'Issue a WTOR to allow storage viewing, debugging'
+***********************************************************************
+*                                                                     *
+*        Now a WTOR is issued to stop the agent and sub task          *
+*        address space from terminating before the operator has a     *
+*        chance to debug, look at storage via VM/CP or other          *
+*        methods, etc.                                                *
+*                                                                     *
+*        The operator can respond "P" to cause the task to terminate. *
+*        Alternately, a (re)display of the last-RB (LRB) or the       *
+*        time-of-error (TOE) information can be requested.            *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME210  DS    0H
+         L     R1,SEWAAGCB                 Get the AGCB address
+         MVI   SEWARESP,C'P'               Fake percolate rep
+         SPACE 1
+         MVC   SEWAMPL(ESTAEM7L),ESTAEM7   Copy WTOR WPL to work area
+         LTR   R10,R10                     Is there an SDWA...
+         BNZ   NIME220                      Yes, skip recopy
+         MVC   SEWAMPL(ESTAEM8L),ESTAEM8   Copy limited WTOR
+NIME220  DS    0H
+         XC    SEWAECB,SEWAECB             Clear WTOR ECB
+         MVI   SEWARESP,X'00'              Clear response area
+         SPACE 1
+         WTOR  ,SEWARESP,,SEWAECB,MF=(E,SEWAMPL)  Issue holdup
+         SPACE 1
+         WAIT  ECB=SEWAECB         Wait for the WTOR response
+         TITLE 'Delete (DOM) the messages issued, allowing them to scroC
+               ll'
+***********************************************************************
+*                                                                     *
+*        The messages issued so far were non-scrollable action        *
+*        messages.  For the agent, they would be DOMed anyway         *
+*        now that the agent address space is about to end.  However,  *
+*        they do not get DOMed automatically in the sub task case.    *
+*                                                                     *
+*        (Descriptor code 7 implies automatic DOMs at the end of      *
+*        a job-step task, not a daughter task like the sub tasks.)    *
+*                                                                     *
+*        If the task is about to end ("P" response) then,             *
+*        run though all the DOM ids for the messages issued so        *
+*        far, and DOM the messages.  If a re-display of the error     *
+*        information is to be done, only DOM those messages and       *
+*        loop back to perform the (re)display.                        *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NIME230  DS    0H
+         CLI   SEWARESP,C'P'       Valid reply, percolate ...
+         BNE   NIME240              No, go try R and E
+         LA    R2,SEWADIDS         Point to DOM IDs in SEWA
+         LA    R3,SEWADIDN          and get the count of them
+         B     NIME250             Go DOM all ids and exit
+         SPACE 1
+NIME240  DS    0H
+         LA    R2,SEWADII1         Point to SEWA info DOM ids
+         LA    R3,SEWADIIN          and get the count of them
+         OI    SEWAFLG1,SEWA1TOE   Assume time-of-error
+         CLC   SEWARESP(3),=C'TOE' Valid reply, time-of-err...
+         BE    NIME250              Yes, go DOM some, loop
+         NI    SEWAFLG1,255-SEWA1TOE     Turn of assumption
+         CLC   SEWARESP(3),=C'LRB' Valid reply, last-RB ...
+         BNE   NIME210              No, ask WTOR again
+         SPACE 1
+NIME250  DS    0H
+         ICM   R1,B'1111',0(R2)    Get the next DOM ID
+         BZ    NIME260              none there, skip the DOM
+         SPACE 1
+         DOM   MSG=(1)             Delete the operator message
+         XC    0(4,R2),0(R2)       Zero the DOM ID field
+         SPACE 1
+NIME260  DS    0H
+         LA    R2,4(,R2)           Point to the next DOM ID
+         BCT   R3,NIME250          Loop to process all DOMs
+         SPACE 1
+         CLI   SEWARESP,C'P'       Is this percolate case ...
+         BNE   NIME120              No, loop for R and E cases
+         SPACE 1                                               @R03P877
+         TITLE 'FREEMAIN the SEWA and percolate to allow the task or adC
+                drspc to end'
+***********************************************************************
+*                                                                     *
+*        The NIMESTA work area (SEWA) is now FREEMAINED. Even though *
+*        this ESTAE did not recover, the address space may simply     *
+*        lose a subtask. Therefore storage cleanup is required.       *
+*                                                                     *
+*        Register 14 is restored and Register 15 set to zero, no      *
+*        matter what.  If RTM provided NIMESTA with an SDWA, then     *
+*        use the SETRP macro to percolate.  Otherwise use R14.        *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+         FREEMAIN RU,LV=SEWALEN,A=(11),SP=230    FREEMAIN the SEWA
+         SPACE 1
+         LTR   R10,R10             Was the SDWA acquired for us...
+         BZ    NIME270              No, just use RETURN then
+         SPACE 1
+         SETRP RC=0,WKAREA=(10)    Tell MVS to percolate
+         SPACE 1
+NIME270  DS    0H
+         LR    R14,R9              Restore register 14 and
+         SR    R15,R15              set R15 to 0 (see SPL)
+         BR    R14                 Let the TASK terminate
+         TITLE 'Data area'
+***********************************************************************
+*                                                                     *
+*        This is the general read-only data area for NIMESTA. Any     *
+*        data areas requiring changes must be in the SEWA.            *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+****  Data Fields necessary for determining/WTOing the ABEND code
+         SPACE 1
+         DS    0F
+HEXTAB   EQU   *-240               Table to fixup System ABEND code
+         DC    C'01234567'
+         DC    C'89ABCDEF'
+         DS    0F
+SYSMASK  DC    X'00FFF000'         Masks to determine if ABEND is
+USERMASK DC    X'00000FFF'          a System or User ABEND
+XSYSTEM  DC    CL6'SYSTEM'         Character statements of ABEND
+XUSER    DC    CL6' USER '          type for ABEND information WTO
+         SPACE 2
+****  MISCELLANEOUS DATA FIELDS
+         SPACE 1
+REGNUMS  DC    C'128 4 0 '         Register numbers
+BLANKS   DC    CL8' '              Blanks
+NOMEMRY  DC    F'12'               Code in R0 showing no SDWA
+         SPACE 2
+         LTORG ,                   Literal pool for NIMESTA
+         TITLE 'Message area'
+***********************************************************************
+*                                                                     *
+*        These messages are copied to the SEWA before issuing them    *
+*        so that NIMESTA can remain reentrant.                        *
+*                                                                     *
+*        All these messages contain descriptor codes 2 and 7.  Hence  *
+*        they will be highlighted and non-deletable until after the   *
+*        hold-up WTOR is responded to, at which time they are DOMed.  *
+*                                                                     *
+*        Note, these WPLs do not contain a WPX, and agent/subtask     *
+*        message routing is not supported for the ROUTCDEs.           *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+ESTAEM1  WTO   'NIME401E XXXXXXXX ABENDED, XXXXXX CODE=XXXX REASON=XXXXC
+               XXXX  ',ROUTCDE=(1,10),DESC=(2,7),MF=L
+         SPACE 1
+ESTAEM1N EQU   WPLTXT-WPL+9,8,C'C'  agent or subtask name
+ESTAEM1T EQU   WPLTXT-WPL+27,6,C'C'  ABEND type in the WTO
+ESTAEM1C EQU   WPLTXT-WPL+39,4,C'C'  ABEND code in the WTO
+ESTAEM1R EQU   WPLTXT-WPL+51,8,C'C'  Reason code in the WTO
+ESTAEM1D EQU   WPLTXT-WPL+9,56,C'C'  Title for SVC DUMP from WTO
+ESTAEM1L EQU   *-ESTAEM1             Length of message
+         SPACE 2
+ESTAEM2  WTO   'NIME402E NIMESTA AGT/SUB SVC DUMP COMPLETE',           C
+               ROUTCDE=(1,10),DESC=(2,7),MF=L
+         EJECT ,
+         SPACE 2
+ESTAEM3  WTO   'NIME403E AGT/SUB SVC DUMP FAILED, R15=XXXX, REASON=????C
+               ',ROUTCDE=(1,10),DESC=(2,7),MF=L
+         SPACE 1
+ESTAEM3C EQU   WPLTXT-WPL+38,4,C'C'  Bad return code from SDUMP
+ESTAEM3R EQU   WPLTXT-WPL+51,4,C'C'  Bad reason code
+ESTAEM3L EQU   *-ESTAEM3           Length of message
+         SPACE 2
+ESTAEM4  WTO   'NIME4x4E LRB FAILING INSTR WAS ************        ',  C
+               MF=L,ROUTCDE=(1,10),DESC=(2,7)     msg 404/414
+         SPACE 1
+ESTAEMMI EQU   WPLTXT-WPL+5,1      Spot for variable msg id
+ESTAEMMT EQU   WPLTXT-WPL+9,3      Spot for variable msg type
+ESTAEM4I EQU   WPLTXT-WPL+31,12    Failing instruction
+ESTAEM4L EQU   *-ESTAEM4           Length of message
+         SPACE 2
+ESTAEM5  WTO   'NIME4x5E LRB PSW  = ******** ******** ILC = *  IC = ** C
+               ',MF=L,ROUTCDE=(1,10),DESC=(2,7)   msg 405/415
+         SPACE 1
+ESTAEM5A EQU   WPLTXT-WPL+20,8     ABEND PSW (left half)
+ESTAEM5B EQU   WPLTXT-WPL+29,8     ABEND PSW (right half)
+ESTAEM5C EQU   WPLTXT-WPL+44,1     ABEND instruction length, Halfwords
+ESTAEM5D EQU   WPLTXT-WPL+52,2     Interrupt code
+ESTAEM5L EQU   *-ESTAEM5           Length of message
+         EJECT ,
+         SPACE 2
+ESTAEM6  WTO   'NIME4x6E LRB R**  = ******** ******** ******** ********C
+                ',MF=L,ROUTCDE=(1,10),DESC=(2,7)  msg 406/416
+         SPACE 1
+ESTAEM6S EQU   WPLTXT-WPL+14,2     Starting register number, this line
+ESTAEM6C EQU   WPLTXT-WPL+20,4*9   Register contents
+ESTAEM6L EQU   *-ESTAEM6           Length of message
+         SPACE 2
+ESTAEM7  WTOR  'NIME407R REPLY "P" WHEN NIMESTA MAY PERCOLATE, OR  "TOEC
+               " (TIME-OF-ERROR) OR "LRB" (LAST-RB) FOR ERROR INFO RE-DC
+               ISPLAY',*-*,3,*-*,ROUTCDE=(1,10),DESC=(2),MF=L
+ESTAEM7L EQU   *-ESTAEM7           Length of WTOR
+         SPACE 2
+ESTAEM8  WTOR  'NIME408R REPLY "P" WHEN NIMESTA MAY PERCOLATE',        C
+               *-*,1,*-*,ROUTCDE=(1,10),DESC=(2),MF=L
+ESTAEM8L EQU   *-ESTAEM8           Length of WTOR
+         TITLE 'Dsect mappings -- General MVS control blocks'
+NIMESTA CSECT ,                    Re-establish the Csect
+         SPACE 1
+R0       EQU   0                   Register
+R1       EQU   1                     equates
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         SPACE 1
+         PRINT NOGEN,NODATA
+         SPACE 1
+         IHASDWA DSECT=YES         Generate MVS SDWA Dsect
+         IEZWPL ,                  Generate MVS WPL Dsect
+         SPACE 1
+         PRINT GEN,NODATA
+         TITLE 'Dsect mappings -- Sub task control block'
+         NIMSTCB ,                 Generate subtask STCB Dsect
+         TITLE 'Dsect mappings -- ESTAE work area (SEWA)'
+***********************************************************************
+*                                                                     *
+*        SEWA  - ESTAE Work Area                                      *
+*                                                                     *
+*  FUNCTION:                                                          *
+*                                                                     *
+*        Provide a work area for the NIMESTA routine. The SEWA is     *
+*        used mostly to keep NIMESTA reentrant.                       *
+*                                                                     *
+* USED BY:                                                            *
+*                                                                     *
+*        NIMESTA During ABEND processing for NIMAGENT or NIMxxxx.     *
+*                                                                     *
+*        CREATED BY: NIMESTA         FREED BY: NIMESTA                *
+*                                                                     *
+*        SUBPOOL: 230                KEY: 0                           *
+*                                                                     *
+*        SIZE: See SEWALEN                                            *
+*                                                                     *
+*        POINTED TO BY:  R11 during NIMESTA processing                *
+*                                                                     *
+*        FREQUENCY:  One SEWA is in existance during the ABEND of     *
+*                    the agent or sub task                            *
+*                                                                     *
+*        RESIDENCY:  VIRTUAL - Below the 16M line                     *
+*                    REAL - Below the 16M line                        *
+*                                                                     *
+*        SERIALIZATION:  No special processing                        *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+SEWA     DSECT ,                   Dsect for ESTAE work area
+         SPACE 1
+SEWAID   DC    CL4'SEWA'           Control block ID
+SEWAAGCB DS    A                   Address of the agent AGCB
+SEWACODE DS    F                   ABEND completion code from SDWA
+SEWAREAS DS    F                   ABEND reason code from SDWA
+SEWADWD  DS    D                   Double word for CVD, UNPK
+SEWABCDE DS    CL4                 Bytes for EBCDIC ABEND code
+SEWAECB  DS    F                   ECB for WTOR
+SEWARESP DS    CL8                 WTOR response area
+SEWAFLG1 DS    X                   General flag byte
+SEWA1SUB EQU   B'10000000'          FSA (vs FSS) is ABENDing
+SEWA1TOE EQU   B'01000000'          Display time-of-error info
+         DS    3X                  Reserved for future use
+         SPACE 1
+SEWAEC   DS    CL(L'SDWAEC2)       Copy of SDWAEC1 or EC2
+SEWAINC  DS    CL(L'SDWAINC2)      Copy of SDWAINC1 or INC2
+SEWAILC  DS    CL(L'SDWAILC2)      Copy of SDWAILC1 or ILC2
+SEWAICD  DS    CL(L'SDWAICD2)      Copy of SDWAICD1 or ICD2
+SEWAMIDC DS    CL1                 '0' or '1', for NIME4xY msg
+SEWAMTYP DS    CL3                 'LRB' or 'TOE' msg type
+SEWAREGS DS    A                   Address of SDWAGRSV or SRSV
+         EJECT ,
+SEWADIDS DS    0F                  Beginning of the message DOM IDs
+SEWADID1 DS    F                    DOM ID for msg 1
+SEWADID2 DS    F                    DOM ID for msg 2 or 3
+SEWADII1 DS    0F                  -> Start of error info ids
+SEWADID4 DS    F                    DOM ID for msg 4
+SEWADID5 DS    F                    DOM ID for msg 5
+SEWADID6 DS    4F                   DOM IDs for the 4 msg 6's
+SEWADIIN EQU   (*-SEWADII1)/4      Number of info msg DOM IDs
+SEWADIDN EQU   (*-SEWADIDS)/4      Number of message DOM IDs
+         SPACE 2
+SEWAMPL  DS    0D                  Parm list area for MVS services
+         SPACE 1
+         ORG   SEWAMPL             ORG back for WPL
+         WTO   '1234567890123456789012345678901234567890123456789012345C
+               67890123456789012345678901234567890123456789012345678901C
+               234567890',                                             C
+               ROUTCDE=2,DESC=(2,7),MF=L
+         SPACE 2
+         ORG   SEWAMPL             ORG back for WTOR WPL
+         WTOR  '1234567890123456789012345678901234567890123456789012345C
+               67890123456789012345678901234567890123456789012345678901C
+               234567890',                                             C
+               *-*,1,*-*,ROUTCDE=(1,10),DESC=(2),MF=L
+         EJECT ,
+         ORG   SEWAMPL             ORG back for SDUMP, SDUMP title
+         SDUMP HDRAD=*-*,SDATA=(RGN,CSA,LPA,SQA,TRT),QUIESCE=YES,MF=L
+SEWASDT  DC    AL1(100),CL100' '   Maximum length SVC DUMP title
+         SPACE 2
+         ORG   ,                   ORG to end of SEWA
+         DS    0D                  Pad general work area
+SEWAMPLL EQU   *-SEWAMPL           Length of parm list area
+         SPACE 2
+SEWAWTO1 DS    CL(SEWAMPLL)        Space for special WTO 1
+         SPACE 1
+SEWALEN  EQU   *-SEWA              Length of SEWA work area
+         TITLE 'Dsect mappings -- Agent control block (AGCB)'
+         NIMAGCB ,                 Generate agent AGCB Dsect
+         SPACE 3
+NIMESTA CSECT ,                    Re-establish the Csect
+         SPACE 1
+NIMESTL  EQU   *-NIMESTA           Length of this module
+         END   ,                   END OF NIMESTA

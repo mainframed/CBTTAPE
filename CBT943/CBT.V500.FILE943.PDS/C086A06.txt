@@ -1,0 +1,380 @@
+Faster CICS shut-down
+
+
+THE PROBLEM
+
+With the introduction of 'open on first access', CICS start-up
+times were dramatically reduced. However, CICS shut-down
+still has to close and de-allocate all VSAM files: with hundreds
+or thousands of files, this can take half an hour or more. With
+the pressure to reduce the batch window to an absolute
+minimum or to minimize the outage time to cycle CICS at
+other times, this is clearly time wasted. Some files are used
+only at start-up and many files may not have been accessed for
+several hours prior to shut-down. In our case, some CICS
+systems are closed in the middle of the night when there is little
+user activity.
+
+
+THE SOLUTION
+
+It occurred to me, why not stagger the file close/de-allocates so
+that, come shut-down time, only recently accessed files are still open?
+
+Here is the software that was developed. Although developed
+at CICS 2.1.2, this code uses standard command-level code
+and should need little modification for Version 3. It is based
+around a table of open files. The main component is some code
+in the CICS file control exits XFCIN/XFCOUT which sets a
+flag in the table whenever a file is accessed. The process is
+instigated by a PLTPI program, SYOC, which issues a start for
+an asynchronous transaction one hour later.
+
+SYOC, on its first invocation, builds the initial table of open
+files. It then enables the file control exits and issues a start for
+itself one hour later. Once the table is built, the file control
+exits flag used files.
+
+When SYOC runs after another hour it will find which files
+have not been accessed and close them. It will then build a new
+table for the next hour. This process continues until shut-down.
+There is a ten-second delay between file closes to avoid
+affecting response. Any files closed in this way will re-open if
+accessed by any application subsequently.
+
+The file check program and open file table reside above the 16-
+megabyte line and the exit (which must reside below the line -
+IBM restriction) switches to 31-bit mode when it needs to
+access the table.
+
+The code which executes in the exit has been made as efficient
+as possible as it is executed on every file I/O. The table is
+searched using a binary search algorithm. The exit does not
+need to calculate the offsets for the next table entry as these are
+pre-coded in the table. The initial entry point to the table search
+is set, depending on the length of the table (eg although the
+table is 1023 entries long, if there are only 63 entries the search
+begins at entry 32).
+
+The one-hour cycle time and the initial start from the PLT
+could be modified to suit individual systems' needs. Closing
+files too frequently will impact smooth response. The initial
+start could be delayed until, say, 10 hours, so files start closing
+after normal working hours.
+
+The benefits gained from this software will vary in individual
+environ-ments but for large VSAM users the time saved can be
+very significant.
+
+
+CICS TABLE OR RDO ENTRIES - PROGRAMS
+
+SYOPNEX,RES=YES,ASSEMBLER       (AMODE 24)
+SYOPNTB,RES=YES,ASSEMBLER       (RMODE ANY)
+SYOPNCK,ASSEMBLER               (RMODE ANY)
+
+
+CICS TABLE OR RDO ENTRIES - TRANSACTION
+
+SYOC,PRIORITY=250,TRANSEC=1,EXTSEC=NO,PROGRAM=SYOPNCK
+
+
+CODE NEEDED IN A PLT START-UP PROGRAM
+
+*   START SYOC AFTER 1 HOUR IF IT EXISTS IN THIS REIGON
+       EXEC CICS IGNORE CONDITION TRANSIDERR
+       EXEC CICS START TRANSID ('SYOC') INTERVAL(10000)
+
+
+EXIT PROGRAM USED TO FLAG USED FILES
+
+         TITLE 'SYOPNEX - XFCIN AND XFCOUT EXIT PROGRAM'
+         GBLB  &MVS811
+         GBLB  &DFHAM31
+&MVS811  SETB  1
+*  DESCRIPTION : THIS PROGRAM WILL SET A FLAG IN THE TABLE PROGRAM
+*                SYOPNTB WHEN A FILE IS ACCESSED.
+*                SEE THE COMMENTS IN SYOPNTB FOR ITS STRUCTURE.
+*                SEE THE COMMENTS IN SYOPNCK FOR HOW THE TABLE IS
+*                INITIALIZED AND REFRESHED.
+SAVER13  EQU   2
+WORKREG  EQU   7
+TABPTR   EQU   8
+FCTPTR   EQU   9
+BASE     EQU   10
+CSABAR   EQU   13
+         COPY  DFHCSADS
+         ...
+CSAOPPTR DS    F                      CWA FIELD
+         ...
+         DFHUEXIT TYPE=EP
+SYOPNEX  CSECT
+         SAVE  (14,12)
+         USING DFHUEPAR,R1
+         USING SYOPNEX,BASE
+         USING DFHCSADS,CSABAR
+         LR    BASE,R15
+         LR    SAVER13,R13
+         L     CSABAR,UEPCSA
+         L     TABPTR,CSAOPPTR        POINT TO OPEN FILES TABLE
+         LTR   TABPTR,TABPTR
+         BZ    RETURN                 EXIT IF NOT INITIALIZED
+*        Switch to AMODE 31 to access storage above the line
+         DFHAM TYPE=SWITCH,AM=31,REGS=(0,14)
+A000     DS    0H
+         AH    TABPTR,0(TABPTR)
+A005     DS    0H
+         CLC   4(8,TABPTR),0(FCTPTR)  MATCH ON FILEID ?
+         BE    A020
+         CLC   0(2,TABPTR),=X'FFFF'   END OF SEARCH ?
+         BE    A030
+         CLC   4(8,TABPTR),0(FCTPTR)  NEXT SEARCH UP OR DOWN ?
+         BL    A000
+         SH    TABPTR,0(TABPTR)
+         B     A005
+A020     DS    0H
+         MVI   12(TABPTR)X'FF'        SET USED SWITCH
+A030     DS    0H
+*        Switch back to AMODE 24
+         DFHAM TYPE=SWITCH,AM=24,REGS=(0,14)
+RETURN   DS    0H
+         LR    R13,SAVER13
+         RETURN (14,12)
+         LTORG
+         END
+
+
+PROGRAM TO CLOSE UNUSED FILES AND BUILD MONITOR TABLE
+
+SYOPNCK  RMODE ANY
+         TITLE 'SYOPNCK  - CLOSE UNUSED FILES'
+*  DESCRIPTION : THE OBJECT OF THIS PROGRAM IS TO SPEED UP SHUTDOWN.
+*                IT IS SCHEDULED AT PLTPI TIME TO RUN AFTER 60 MINUTES.
+*                ON ITS FIRST INVOCATION IT JUST LOADS THE OPEN FILES
+*                TABLE SYOPNTB AND SETS A CWA POINTER TO THIS TABLE.
+*                EXITS XFCIN/XFCOUT WILL SET THE FLAG FOR FILES USED.
+*                SUBSEQUENT INVOCATIONS WILL CAUSE FILES THAT HAVE
+*                NOT BEEN ACCESSED FOR AN HOUR TO BE CLOSED.
+OFFSET   EQU   5
+FILECNT  EQU   6
+FILETAB  EQU   7
+DATAREG  EQU   8       DATA REGISTER
+EIBREG   EQU   9       EIB REGISTER
+BASE     EQU   10      PROGRAM BASE REGISTER
+CWAPTR   EQU   11      CWA ADDRESS
+CWAUSER  DSECT
+         USING *,CWAPTR
+         ...
+CSAOPPTR DS    F                      CWA FIELD
+         ...
+DFHEISTG DSECT
+INQRESP  DS    F
+INQOPEN  DS    F
+INQFILE  DS    CL8
+SYOPNCK  DFHEIENT CODEREG=(BASE),EIBREG=(EIBREG),DATAREG=(DATAREG)
+         B     A000
+         DC    CL12'PROGRAM ID: '
+         DC    CL8'SYOPNCK'             NAME OF CONTROL SECTION
+         DC    CL4';   '
+         DC    CL24'ASSEMBLY TIME AND DATE;'
+         DC    CL8'&SYSTIME'
+         DC    CL8'&SYSTIME'
+*  THIS SECTION SETS CSOOPPTR TO POINT TO THE LOAD MODULE
+*  TABLE SYOPTNTB IF NOT ALREADY SET
+A000     DS    0H
+         CLI   EIBTRMID,X'00'             PREVENT TERMINAL INVOCATION
+         BNE   A050
+       EXEC CICS ADDRESS CWA(CWAPTR)
+         CLC   CSAOPPTR,=X'00000000'      CWA UNINITIALIZED ?
+         BNE   A010                       CHECK FILE USE
+       EXEC CICS LOAD PROGRAM('SYOPNTB') SET(FILETAB)
+         ST    FILETAB,CSAOPPTR           STORE ANCHOR ADDRESS
+         B     A020                       BUILD OPEN FILE TABLE
+*  THIS SECTION CHECKS THE TABLE OF OPEN FILES AND CLOSES
+*  ANY FILES WHICH HAVE NOT BEEN ACCESSED
+A010     DS    0H
+*  PUT OUT MESSAGE TO CSMT LOG - SCANNING FOR UNUSED FILES
+       EXEC  CICS WRITEQ TD                                            X
+               QUEUE('CSMT')                                           X
+               FROM(MESSAG1)                                           X
+               LENGTH(34)
+         L     FILETAB,CSAOPPTR
+         LA    FILETAB,6(FILETAB)         POINT TO FIRST ENTRY
+A012     DS    0H
+         CLC   0(8,FILETAB),=X'FFFFFFFFFFFFFFFF' END OF ENTRIES
+         BNE   A014
+*  PUT OUT MESSAGE TO CSMT LOG - END OF SCAN
+       EXEC  CICS WRITEQ TD                                            X
+               QUEUE('CSMT')                                           X
+               FROM(MESSAG3)                                           X
+               LENGTH(34)
+         B     A020
+A014     DS    0H
+         CLI   8(FILETAB),X'FF'           FILE USED SO IGNORE
+         BE    A016
+         MVC   INQFILE,0(FILETAB)
+       EXEC  CICS SET FILE(INQFILE) CLOSED
+       EXEC  CICS SET FILE(INQFILE) ENABLED
+*  WAIT 10 SECONDS TO STAGGER FILE CLOSES AND AVOID AFFECTING RESPONSE
+       EXEC  CICS DELAY INTERVAL(10)
+A016     DS    0H
+         LA    FILETAB,16(FILETAB)        ACCESS NEXT ENTRY
+         B     A012
+*  THIS SECTION BUILDS THE TABLE OF OPEN FILES
+A020     DS    0H
+*  DISABLE EXITS DURING FILE BUILD
+       EXEC CICS IGNORE CONDITION INVEXITREQ
+       EXEC CICS DISABLE EXITALL PROGRAM('SYOPNEX')
+       EXEC CICS INQUIRE FILE START
+         L     FILETAB,CSAOPPTR           RESET POINTER
+         LA    FILETAB,6(FILETAB)         POINT TO FIRST ENTRY
+         XR    FILECNT,FILECNT            ZERO FILE COUNT
+A022     DS    0H
+       EXEC  CICS INQUIRE FILE(INQFILE) NEXT RESP(INQRESP)             X
+               OPENSTATUS(INQOPEN)
+         CLC   INQRESP,DFHRESP(END)       END OF FCT ENTRIES ?
+         BE    A028
+         CLC   INQOPEN,DFHVALUE(OPEN)     ONLY OPEN FILES
+         BNE   A022                       (WILL ALSO IGNORE REMOTES)
+         MVC   0(8,FILETAB),INQFILE
+         MVI   8(FILETAB),X'00'
+         LA    FILETAB,16(FILETAB)
+         LA    FILECNT,1(FILECNT)
+         CH    FILECNT,=H'1022'            LIMIT OF 1022 OPEN FILES
+         BNL   A026                        IGNORE REMAINING FILES
+         B     A022
+A026     DS    0H
+*  PUT OUT MESSAGE TO CSMT LOG - TABLE LIMIT EXCEEDED
+       EXEC  CICS WRITEQ TD                                            X
+               QUEUE('CSMT')                                           X
+               FROM(MESSAG2)                                           X
+               LENGTH(34)
+A028     DS    0H
+       EXEC  CICS INQUIRE FILE END
+A030     DS    0H
+         CLC   0(8,FILETAB),=X'FFFFFFFFFFFFFFFF'
+         BE    A032
+         MVC   0(8,FILETAB),=X'FFFFFFFFFFFFFFFF'   RESET PREVIOUSLY
+         MVI   8(FILETAB),X'00'                    USED ENTRIES
+         LA    FILETAB,16(FILETAB)
+         B     A030
+*  THIS SECTION SETS THE 2 BYTE ENTRY POINT OFFSET INTO THE
+*  OPEN FILE TABLE, THIS IS TO MINIMIZE THE SEARCH LENGTH WITHIN
+*  THE FILE CONTROL EXITS. SEE COMMENTS IN SYOPNTB.
+A032     DS    0H
+         LTR   FILECNT,FILECNT             HANDLE NO FILES
+         BZ    A040
+         LH    OFFSET,=H'512'              SET DEFAULT OFFSET
+A034     DS    0H                          INTO FILE TABLE
+         CR    OFFSET,FILECNT
+         BNH   A036
+         SRL   OFFSET,X'01'                DIVIDE BY TWO
+         B     A034
+A036     DS    0H
+         BCTR  OFFSET,0                    SUBTRACT ONE
+         SLL   OFFSET,X'04'                MULTIPLY BY SIXTEEN
+         LA    OFFSET,2(OFFSET)            ADD TWO
+         L     FILETAB,CSAOPPTR            RESET POINTER
+         STH   OFFSET,0(FILETAB)           STORE ENTRY POINT
+*  ENABLE EXITS
+       EXEC CICS IGNORE CONDITION INVEXITREQ
+       EXEC CICS ENABLE EXIT('XFCIN') PROGRAM('SYOPNEX')
+       EXEC CICS ENABLE EXIT('XFCOUT') PROGRAM('SYOPNEX') START
+A040     DS    0H
+*  RUN AGAIN IN SIXTY MINUTES
+       EXEC  CICS START TRANSID('SYOC') INTERVAL(10000)
+A050     DS    0H
+       EXEC  CICS RETURN
+* CONSTANTS
+MESSAG1  DC    CL34'SYOPNCK SCANNING FOR UNUSED FILES '
+MESSAG2  DC    CL34'SYOPNCK TABLE LIMIT EXCEEDED      '
+MESSAG3  DC    CL34'SYOPNCK SCANNING COMPLETE         '
+         LTORG
+         END   SYOPNCK
+
+
+TABLE FORMAT FOR MONITOR TABLE
+
+The table shown here only has 31 entries. The real table should
+have 1023 entries. To create the entire table, duplicate the 31
+entries and add a 32nd entry with the first two bytes set to
+X'0100', duplicate it again, setting entry 64 to X'0200',
+duplicate it again setting entry 128 to X'0400', repeat setting
+entry 256 to X'0800', repeat once more setting entry 512 to
+X'1000'. If you wish to handle more than 1023 files, you
+continue expanding the table in the same way up to a maximum
+of 8K files. Above 1023 files the statement in SYOPNCK:
+
+         LH    OFFSET,=H'512'              SET DEFAULT OFFSET
+
+should be changed to:
+
+         LH    OFFSET,=H'1024' OR H'2048' OR H'4096' AS APPROPRIATE
+
+
+SYOPNTB SOURCE CODE
+
+SYOPNTB  RMODE ANY
+SYOPNTB  CSECT
+*  THIS TABLE IS USED TO STORE A LIST OF OPEN FILES
+*  IT IS USED BY SYOPNCK AND SYOPNEX.
+*  THE TABLE IS ACCESSED BY A BINARY CHOP.
+*  THE FIRST TWO BYTES INDICATE THE INITIAL ENTRY POINT.
+*    FOR 512-1023 ENTRIES THIS WILL POINT TO THE 512TH ENTRY
+*    FOR 256 -511 ENTRIES THIS WILL POINT TO THE 256TH ENTRY
+*    FOR 128 -255 ENTRIES THIS WILL POINT TO THE 128TH ENTRY
+*    FOR 64  -127 ENTRIES THIS WILL POINT TO THE  64TH ENTRY
+*    FOR 32  - 63 ENTRIES THIS WILL POINT TO THE  32ND ENTRY
+*    FOR 16  - 31 ENTRIES THIS WILL POINT TO THE  16TH ENTRY
+*    FOR 8   - 15 ENTRIES THIS WILL POINT TO THE   8TH ENTRY
+*    FOR 4   -  7 ENTRIES THIS WILL POINT TO THE   4TH ENTRY
+*    FOR 2   -  3 ENTRIES THIS WILL POINT TO THE   2ND ENTRY
+*    FOR 0   -  1 ENTRY   THIS WILL POINT TO THE   1ST ENTRY
+* EACH ENTRY HAS THE FORMAT : -
+*        DC    X'AAAA',X'BBBB',X'CCCCCCCCCCCCCCCC',X'DDEEEEEE'
+* WHERE AAAA IS THE OFFSET FORWARDS AND BACKWARDS TO THE NEXT SEARCH
+* ENTRY, CCCCCCCCCCCCCCCC IS THE FILEID, DD IS X'00', IF THE FILE HAS
+* NOT BEEN ACCESSED AND X'FF' IF IT HAS. IF AAAA IS 'FFFF' YOU ARE AT
+* THE END OF THE SEARCH.
+*     BBBB AND EEEEEE ARE CURRENTLY UNUSED
+* THE ENTRIES ARE 16 BYTES LONG FOR EASE OF PROGRAMMING AND FUTURE
+* ENHANCEMENTS
+         DC    H'0002'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0020',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0040',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0020',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0080',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0020',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0040',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0020',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'0010',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         DC    X'FFFF',X'0000',X'FFFFFFFFFFFFFFFF',H'0',H'0'
+         END
+
+
+M J Masters
+Senior Systems Programmer
+Citibank NA (UK)
+

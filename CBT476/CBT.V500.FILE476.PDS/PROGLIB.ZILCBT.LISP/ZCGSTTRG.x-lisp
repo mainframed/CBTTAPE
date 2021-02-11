@@ -1,0 +1,748 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "SET-TARGET"
+;
+; This handles values returned by function calls or evaluations.
+;
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 03/28/88 - SUBSUMED-GOTO broken off into separately compiled        *
+;*            function ZCGSGOTO, so that ZCGIMEMQ can call it too.     *
+;* 04/01/88 - Bug in GOTOSAMELABEL fixed that caused erroneously       *
+;*            dropped code in things like (RETURN (AND P (GO L))).     *
+;* 04/06/88 - Support for GO tag optimization.                         *
+;* 04/07/88 - Support for GO and RETURN out of UNWIND-PROTECT.         *
+;* 04/29/88 - Support for CSETNIL conditional lambda arg initializing. *
+;* 05/02/88 - Support for (GONIL tag) and (GONOTNIL tag) where tag is  *
+;*            a GO tag or RETURN target.                               *
+;* 06/07/88 - Support for VALUES and TAGBODY.                          *
+;* 06/10/88 - Support MULTIPLE-VALUE-LIST, MULTIPLE-VALUE-BIND, THROW. *
+;* 06/23/88 - Support for PROG and RETURN removed.  Of course, there   *
+;*            is still support for GO and RETURN-FROM out of contours. *
+;* 10/20/88 - Fix failure to release registers in THROW code gen.      *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(defun zcgsttrg (r s)
+ (cond
+  ((null s)       (when r (zcgrels r))); Throw value away if NIL
+  ((eq s 't)      (set-t r)           ); Return with value in \15
+  ((atom s)       (zerror "Unknown target type passed to ZCGSTTRG" s))
+  (t
+   (let (((s1 s2) s))
+    (case s1
+          (arg    (set-arg r s2))    ; Store into arg cell on stack
+          (catch  (set-catch r s2))  ; Build catch frame and store
+          (uwp    (set-uwp r s2))    ; Store in UNWIND-PROTECT frame
+          ((gonil gonotnil goto)
+                  (set-p r s))       ; Test CC, branch on cond to label
+          (mvlist (set-mvlist r s2)) ; Generate list of multiple values
+          (mvbind (set-mvbind r s2)) ; Generate bind of multiple values
+          (throw  (set-throw  r s2)) ; Do stuff for THROW
+          (t
+           (zerror "Unknown target type passed to ZCGSTTRG" s)))))))
+
+;**********************************************************************
+;*  This loads the value into register 15 to return it to the caller. *
+;**********************************************************************
+
+(defun set-t (r)
+ (or (eq r '\15)
+     (zcgemit 2 () "LR" `("15," ,r) "Set return value."))
+ (zcgrels r)
+)
+
+;**********************************************************************
+;*  This stores the value into the current UNWIND-PROTECT frame to be *
+;*  held across the execution of the cleanup forms.                   *
+;*  Note that the frame is unhooked but NOT unstacked.                *
+;**********************************************************************
+
+(defun set-uwp (r l1)
+;
+; As part of the process of unstacking the UNWIND/PROTECT frame,
+; pop the argument stack.
+;
+ (let ((c (cadr pdmax))
+       (xs (car special-asaved))
+       (xf (car fluid-asaved)))
+  (unless (and xs (eq (car xs) 'uwp) (eql (cdr xs) c))
+          (cterpri) (princ "PDMAX=") (prin1 pdmax) (terpri)
+          (zerror "ZCGSTTRG found non-UWP thing on SPECIAL-ASAVED" xs))
+  (unless (and xf (eq (car xf) 'uwp) (eql (cdr xs) c))
+          (zerror "ZCGSTTRG found non-UWP thing on FLUID-ASAVED" xf))
+  (setq special-asaved (cdr special-asaved)
+       fluid-asaved (cdr fluid-asaved))
+;
+; The following NOP is purely for support of multiple values,
+; as an indicator to the multiple value support code that the value
+; being returned might be being requested by someone that is expecting
+; multiple values.
+
+  (zcgemit 4 () "NOP" (get l1 'uwplabel) "(For multiple value support)")
+
+  (zcgemit 4 () "ST" `(,r "," ,(+ c 32) "(,11)")
+                                      "Save return value in UWP frame.")
+  (zcgemit 0 l1 "DS" "0H"                     "Start of cleanup forms.")
+  (zcgemit 4 () "L" `("14," ,c "(,11)")
+                                            "Get previous catch frame.")
+  (zcgemit 4 () "ST" "14,ZLCCATCH"         "Restore catch environment.")
+
+  (zcgbase name nil) ; Reload extra base registers if required.
+
+  (zcgrels r)
+ )
+)
+
+;***********************************************************************
+;*                                                                     *
+;*     This stores the value into the stack as a function argument.    *
+;*                                                                     *
+;* New support for FUNCALL hacking:  The value of n is normally a      *
+;* plain and simple argument number.  However, with this new support   *
+;* it may be a list.  For example:                                     *
+;*                                                                     *
+;* (arg 5) - the old way, store value into argument 5 of a call frame  *
+;*                                                                     *
+;* (arg (5 zilxfun)) - the new way, store value into argument 5 of a   *
+;*                     call frame being built for function ZILXFUN.    *
+;*                                                                     *
+;* (arg (1 #.zdef))  - the new way, load register 1 with the arg.      *
+;*                                                                     *
+;***********************************************************************
+
+(defun set-arg (r x)
+ (prog (o m n f nextpcode)
+       (if (consp x)
+           (desetq (n f) x)       ; (arg (n funcname))
+           (setq n x f nil))      ; (arg n)
+  (setq nextpcode (car restofit))
+  (if (and (eq (car nextpcode) 'inline)
+           (not (and (eq (cadr nextpcode) 'values)
+                     (not (eql (caddr nextpcode) 1)))))
+   then
+    (or lastarg
+        (setq lastarg (if (eq r '\0) (zcggtreg) r)))
+    (unless (eq r lastarg)
+            (zcgemit 2() "LR" `(,lastarg "," ,r) `("Set argument " ,n))
+            (zcgrels r))
+   else
+   if   (eq f zdef)
+   then
+        (unless (eq r '\1)
+                (zcgresv '\1)
+                (zcgemit 4 () "L" `("1," ,r) "Load into register 1.")
+                (zcgrels r)
+        )
+   else
+    (setq lastarg nil)
+    (setq o (+ (* (1- n) 4) (car argbase)))
+                          ; Determine the stack offset of this argument.
+    (setq pdmax (cons (setq m (+ (car pdmax) 4)) (cdr pdmax)))
+                        ; Increment the top element of stack PDMAX by 4
+    (if (> m stackmax)
+        (setq stackmax m))  ; and reset the high water mark accordingly.
+
+    (unless (or (null r) (and (eq f 'zilxfun) (< n 5)))
+            ; If R is null, skip store.  Also,
+            ; skip store for fake FUNCALL args 1-4.
+            (zcgemit 4() "ST" `(,r "," ,o "(,11)")
+                                          `("Store into argument " ,n)))
+
+    (when r (zcgrels r))
+   endif)))
+
+;**********************************************************************
+;*     This creates a catch frame and stores the value therein.       *
+;**********************************************************************
+
+(defun set-catch (r l) ; L is the CATCH/THROW label.
+ (prog (
+        c   ; the current stack location where the CATCH frame will go
+        n   ; the new stack location following the CATCH frame
+       )
+
+       (setq c (car pdmax))        ; Catch frame goes here on stack.
+       (setq n (+ c 28))           ; Bump stack past catch frame.
+;
+; Generate code to build the catch frame.
+;
+       (zcgemit 4 () "L"  "14,ZLCCATCH"       "Get active catch frame.")
+       (zcgemit 4 () "ST" `("14," ,c "(,11)") "Store into catch frame.")
+       (zcgemit 4 () "ST" `(,r "," ,(+ c 24) "(,11)")
+                                          "Store tag into catch frame.")
+       (zcgrels r)
+
+       (zcgemit 4 () "L"  "14,ZLCSALST"            "Get special ALIST.")
+       (zcgemit 4 () "L"  "15,ZLCFALST"            "Get lexical ALIST.")
+       (zcgemit 4 () "STM" `("11,15," ,(+ c 4) "(11)")
+                                              "Store into catch frame.")
+       (zcgemit 4 () "LA" `("14," ,l)         "Get throw target label.")
+       (zcgemit 4 () "ST" `("14," ,(+ c 12) "(,11)")
+                                              "Store into catch frame.")
+       (zcgemit 4 () "LA" `("14," ,c "(,11)")
+                                         "Load address of catch frame.")
+       (zcgemit 4 () "ST" "14,ZLCCATCH"      "Make active catch frame.")
+;
+; Push catch frame space on the stack.
+;
+       (push n pdmax)          ; Stack height.
+       (if (> n stackmax)
+           (setq stackmax n))  ; High water mark.
+;
+; Add a catch identifier to the saved-bindings-to-undo stacks.
+;
+       (let ((x (cons 'catch c)))
+            (push x special-asaved)
+            (push x fluid-asaved))    ; Push catch frame location.
+ )
+)
+
+;**********************************************************************
+;*     This generates a list of multiple values.                      *
+;**********************************************************************
+
+(defun set-mvlist (r l &aux (tl (gensym)) c l2)
+
+ (setq pdmax (cdr pdmax))    ; Pop the stack slot pushed by MVINIT.
+ (setq c (car pdmax))        ; Stack location of m.v. slot.
+
+ (setq l2 (cadr (zcgsgoto `(goto ,l)))) ; Subsume the exit label.
+ (putprop l t 'referenced)              ; Insure it gets generated.
+ (putprop l2 t 'referenced)             ; Insure it gets generated.
+
+;
+; Generate code to check for multiple values and build them if not.
+;
+ (unless (eq r '\15)
+  (zcgrels r)
+  (zcgresv '\15)
+  (zcgemit 2 () "LR" `("15," ,r)          "Load value into register." ))
+
+ (zcgemit 4 () "C" `("11," ,c "(,11)")    "If multiple values returned")
+ (zcgemit 4 () "BE" tl                    "then..."                    )
+ (zcgemit 4 () "L"  `("15," ,c "(,11)")  "load pointer to values list")
+ (zcgemit 4 () "B"  l2                    "Else no multiple values..." )
+ (zcgresv '\1)
+ (zcgresv '\2)
+ (zcgresv '\14)
+ (zcgemit 2 tl "LR" "1,15"                "Arg 1 to CONS = the value"  )
+ (zcgemit 4 () "L"  "15,ZLCCONS"          "Get address of ZILCONS"     )
+ (zcgemit 2 () "LR" "2,10"                "Arg 2 to CONS = NIL"        )
+ (zcgemit 2 () "BALR" "14,15"             "Call ZILCONS for list of 1" )
+ (zcgrels '\1)
+ (zcgrels '\2)
+ (zcgrels '\14)
+ (zcgrels '\15)
+
+)
+
+;**********************************************************************
+;*     This stores multiple values on the stack for M-V-BIND.         *
+;**********************************************************************
+
+(defun set-mvbind (r (n1 . n2) &aux c m (tl (gensym)))
+ ; n1 is the number of multiple values being requested.
+ ; n2 is the number of stack slots to be used, which may be greater
+ ;    if destructuring is involved.
+ (cond
+  ((zerop n2)
+   (setq c (car pdmax))        ; Stack location of m.v. slot.
+   (push c argbase)            ; Base for arguments
+   (push c pdmax)              ; Base for stack control
+  )
+  (t
+   (setq pdmax (cdr pdmax))    ; Pop the stack slot pushed by MVINIT.
+   (setq c (car pdmax))        ; Bottom of multiple value stack slots.
+   (setq m (+ c (* 4 n2)))     ; Top of multiple value stack slots.
+   (push c argbase)            ; Base for arguments
+   (push m pdmax)              ; Base for stack control
+   (if (> m stackmax)
+       (setq stackmax m))      ; Reset high water mark
+
+
+   (zcgemit 4 () "NOP" `(,n1 "(11,0)")    "Show MULTIPLE-VALUE-BIND."  )
+   (zcgemit 4 () "C" `("11," ,c "(,11)")  "If multiple values returned")
+   (zcgemit 4 () "BNE" tl                 "then values set. Else..."   )
+   (zcgemit 4 () "ST" `(,r "," ,c "(,11)") "Ret = first multiple value")
+   (do ((i 2 (1+ i))
+        (o (+ c 4) (+ o 4))
+       )
+       ((> i n1))
+     (zcgemit 4 () "ST" `("10," ,o "(,11)") `("NIL = multiple value ",i))
+   )
+   (zcgemit 0 tl "DS" "0H"                nil                          )
+   (zcgrels r)
+  )))
+
+
+;**********************************************************************
+;*     This processes the THROW special form.                         *
+;**********************************************************************
+
+(defun set-throw (r s)
+ (case s
+       ((tag)    (set-throw-tag  r))
+       ((form)   (set-throw-form r))
+       (t        (zerror "Bad thing passed to ZCGSTTRG" `(throw ,s)))))
+
+(defun set-throw-tag (r)
+ (let* ((c (car pdmax))
+        (m (+ 4 c))
+       )
+  (push m pdmax)              ; Base for stack control
+  (if (> m stackmax)
+      (setq stackmax m))      ; Reset high water mark
+  (zcgemit 4 () "ST" `(,r "," ,c "(,11)")        "Store THROW tag.")
+  (zcgrels r)
+ )
+)
+
+(defun set-throw-form (r)
+ (unless (eq r '\15)
+  (zcgemit 2 () "LR" `("15," ,r) "Load into register.")
+  (zcgrels r)
+  (setq r (zcgresv '\15))
+ )
+ (setq pdmax (cdr pdmax))    ; Pop stack.
+ (zcgresv '\1)
+ (zcgresv '\2)
+ (zcgresv '\14)
+ (zcgemit 4 () "NOP" "0(11,8)"          "(for multiple value support)")
+ (zcgemit 4 () "L"   `("1," ,(car pdmax) "(,11)")
+                                        "Load THROW tag.")
+ (zcgemit 2 () "LR"  "2,15"             "Load THROW form.")
+ (zcgemit 4 () "L"   "15,ZLCTHROW"      "Get address of ZILTHROW.")
+ (zcgemit 2 () "BR"  "15"               "Branch to ZILTHROW to throw.")
+ (zcgrels '\1)
+ (zcgrels '\2)
+ (zcgrels '\14)
+ (zcgrels r)
+)
+
+;**********************************************************************
+;*     Functions related to generating branching code                 *
+;**********************************************************************
+
+(defun set-p (r s) ; R = register, S = (condition label)
+;
+; Generate code for conditional or unconditional branching.
+; This handles both predicative and non-predicative cases.
+;
+ (prog (c g rr z szz fzz cur cf tl tag temp)
+;
+; Special handling for predicative MEMQ - branching was done previously
+;
+  (when (eq cc 'memq)
+        (setq cc nil)
+        (return nil))
+;
+; Make a copy of the (condition label) so that it can be updated
+; destructively in case it has to be, and to include a third field
+; to hold a possible temporary label.
+;
+  (setq s (list (car s) (cadr s) nil))
+;
+; The following code determines if we are branching outside of a
+; binding environment (e.g. GO or RETURN-FROM out of a LAMBDA).  If so,
+; we generate code to restore the alist to its previous state before
+; doing any branching.  Note that if the label to which we are
+; branching does its own alist restoration, we don't need to do this.
+;
+; If the label is a RETURN-FROM label, it will have a CURALIST property
+; of its own.  If it is a GO label, it will have a PROGEXIT property
+; pointing to the RETURN-FROM label which has the CURALIST property.
+;
+  (setq g (cadr s)
+        cur         ; a dotted pair.
+          (cond
+           ((get g 'curalist))
+           ((setq cur (get g 'progexit)) (get cur 'curalist))))
+;
+; If CUR is non-NIL, that means that we are branching to a point
+; outside of the current contour.  This may involve one or more of
+; the following:
+;
+;  *  Unstacking a CATCH frame
+;  *  Restoring a special ALIST
+;  *  Restoring a lexical ALIST
+;  *  Processing an UNWIND-PROTECT cleanup form
+;      (which includes unstacking the UNWIND-PROTECT frame)
+;
+; To do this properly, we CDR through SPECIAL-ASAVED and FLUID-ASAVED
+; (in parallel) until we hit the sublist EQ to CUR.  Each entry along
+; the way tells us what we have to do:
+;
+; SPECIAL-ASAVED: (SALIST ___)  ===> restore a special ALIST pointer
+; FLUID-ASAVED:   (FALIST ___)  ===> restore a lexical ALIST pointer
+;
+; SPECIAL-ASAVED: (CATCH  ___)  ===> unstack a CATCH frame
+; FLUID-ASAVED must be the same.
+;
+; SPECIAL-ASAVED: (UWP    ___)  ===> process an UNWIND-PROTECT cleanup
+; FLUID-ASAVED must be the same.
+;
+; As it turns out, we don't have to perform the indicated activity
+; at each layer.  We can unstack/restore the last pointer or frame
+; with the same results.  HOWEVER, if we encounter a UWP, we must
+; cash in all our chips and unstack/restore everything so far, so
+; that the cleanup code can execute properly.
+;
+  (when cur
+   (do (
+        (sal special-asaved  (cdr sal))
+        (fal fluid-asaved    (cdr fal))
+        (x)
+       )
+       ((eq sal (car cur))
+        (unless (eq fal (cdr cur))
+                (zerror "SPECIAL-ASAVED and FLUID-ASAVED mismatch" cur))
+       )
+        (when (eq fal (cdr cur))
+              (zerror "FLUID-ASAVED and SPECIAL-ASAVED mismatch" cur))
+        (when (setq x (car sal))
+              (case (car x)
+                    (salist (setq szz (cdr x)))
+                    (catch  (setq cf  (cdr x)))
+                    (uwp    (when cf  (unstack-catch-stuff  cf  r s))
+                            (when fzz (unstack-falist-stuff fzz r s))
+                            (when szz (unstack-salist-stuff szz r s))
+                            (unstack-uwp-stuff (cdr x) r s)
+                            (setq szz nil fzz nil cf nil))
+                    (t (zerror "Bad thing on SPECIAL-ASAVED" x))))
+        (when (setq x (car fal))
+              (case (car x)
+                    (falist (setq fzz (cdr x)))
+                    (catch  (comment do nothing - handled by sal))
+                    (uwp    (comment do nothing - handled by sal))
+                    (t (zerror "Bad thing on FLUID-ASAVED" x))))
+   )
+  )
+
+;
+; If variable bindings need to be unstacked, and this is not a branch
+; to a label that already does its own unbinding, generate code to
+; restore variable bindings to the state they are in at the destination.
+;
+  (when (and fzz (null (get g 'popfalist)))
+   (unstack-falist-stuff fzz r s))
+  (when (and szz (null (get g 'popsalist)))
+   (unstack-salist-stuff szz r s))
+;
+; If catch frames need to be unstacked, and this is not a branch
+; to a label that already does its own unwinding, generate code to
+; restore the catch environment to the state it was in at destination.
+;
+  (when (and cf (null (get g 'catch)))
+   (unstack-catch-stuff cf r s))
+;
+; At this point, if the original S was (GONIL tag) or (GONOTNIL tag),
+; and tag was a label for which any unstacking stuff was done, S has
+; been altered to be (GOTO tag <gensym>), where <gensym> is the
+; temporary label needed to effect the conversion to GOTO.
+;
+  (setq temp (caddr s))
+;
+; Extract the "subsumed" GOTO - i.e. try to optimize out chained GOTO's.
+;
+; C is the condition:  GOTO, GONIL, GONOTNIL
+; G is the goto-label
+;
+  (desetq (c g) (zcgsgoto s))     ; Get the "subsumed-goto" target.
+
+  (when debug
+        (cterpri)
+        (princ "Dump of original branch label ")
+        (prin1 (cadr s))
+        (terpri)
+        (prin1 (plist (cadr s)))
+        (terpri)
+        (prin1 s)
+        (princ " subsumed to: ") (prin1 c) (princ " ") (princ g)
+        (terpri)
+        (princ "Dump of subsumed branch label ")
+        (prin1 g)
+        (terpri)
+        (prin1 (plist g))
+        (terpri)
+        (terpri)
+  )
+
+  (setq rr (get g 'register))     ; Get register associated with label.
+  (putprop g t 'referenced)       ; Insure that the label code exists.
+
+;
+; Insure that the current value is in the proper register.
+; It should already be there in most cases.  However...
+;
+  (when r
+     (if rr
+      then
+       (and (neq rr r)             ; If different paths put value in
+            (or                    ; different registers, and the value
+                (get g 'rettarg)   ; is going to be used by the code
+                (get g 'vartarg))  ; (not just test for NIL) - then...
+            (zcgemit 2 () "LR" `(,rr "," ,r) "Load into register."))
+      else (setq rr (putprop g r 'register))
+      endif
+     )
+     (zcgrels r))
+
+;
+; If the place we'd fall thru to if we deleted the GOTO is the same
+; as the place we're going to (as determined by GOTOSAMELABEL),
+; then we can suppress the superfluous branch instruction.
+;
+
+ (setq z (gotosamelabel g restofit))
+ (when debug
+       (cterpri)
+       (prin1 g) (princ " gotosamelabel as: ") (prin1 z) (terpri)
+       (princ "CC=") (prin1 cc) (terpri)
+       (terpri)
+ )
+ (when (eq z g)
+       (putprop g t 'referenced) ; mark so its own code gets gen'd
+       (return nil))             ; quit without doing any more
+;
+; Otherwise you need the GOTO.
+;
+ (setq tag (get g 'gotag))
+;
+; Generate unconditional or conditional branch.
+;
+ (case c
+  ((goto)
+   (zcgemit 4 () "B" g (if tag
+                           `("Go to " ,(substr (tostring tag) 1 30))
+                           "Branch.")))
+  (otherwise
+   (gen-branch-on-condition c g r tag)))
+;
+; If a temporary label was generated, process it.
+;
+ (when temp (zcgemit 0 temp "DS" "0H" nil))
+ )
+)
+
+;======================================================================
+
+(defun unstack-catch-stuff (f r s)
+ (maybe-conditional-go r s)
+ (zcgemit 4 () "L" `("14," ,f "(,11)")    "Get previous catch frame.")
+ (zcgemit 4 () "ST" "14,ZLCCATCH"        "Restore catch environment.")
+)
+
+(defun unstack-falist-stuff (f r s)
+ (maybe-conditional-go r s)
+ (zcgemit 4 () "L" `("14," ,f "(,11)")  "Load stacked alist pointer.")
+ (zcgemit 4 () "ST" "14,ZLCFALST"            "Restore lexical alist.")
+)
+
+(defun unstack-salist-stuff (f r s)
+ (maybe-conditional-go r s)
+ (zcgemit 4 () "L" `("14," ,f "(,11)")  "Load stacked alist pointer.")
+ (zcgemit 4 () "ST" "14,ZLCSALST"            "Restore special alist.")
+)
+
+(defun unstack-uwp-stuff (f r s)
+ (maybe-conditional-go r s)
+ (let ((l (gensym)))
+  (when r
+   (zcgemit 4 () "NOP" l                 "(for multiple value support)")
+   (zcgemit 4 () "ST" `(,r "," ,(+ f 32) "(,11)") "Store passed value.")
+  )
+  (zcgemit 4 () "LA"  `("14," ,l)     "Address to return from cleanup.")
+  (zcgemit 4 () "L"   `("15," ,(+ f 28) "(,11)")  "Address of cleanup.")
+  (zcgemit 4 () "ST"  `("14," ,(+ f 12) "(,11)")"Store return address.")
+  (zcgemit 2 () "BR"  "15"                   "Go execute cleanup code.")
+  (zcgemit 0 l  "DS"  "0H"                                          nil)
+  (when r
+   (zcgemit 4 () "L"  `(,r "," ,(+ f 32) "(,11)")      "Restore value.")
+  )
+ )
+)
+
+;======================================================================
+
+;
+; In the case of (GONIL tag) or (GONOTNIL tag), where tag is a label
+; that has stuff that needs to be unstacked, the code needs to be
+; compiled somewhat differently.  Like this:
+;
+; In the case of (GONIL tag), it is compiled as if it were
+;
+;  (GONOTNIL temp)
+;  -do unstack stuff-
+;  (GOTO tag)
+;  (LABEL temp)
+;
+; In the case of (GONOTNIL tag), it is compiled as if it were
+;
+;  (GONIL temp)
+;  -do unstack stuff-
+;  (GOTO tag)
+;  (LABEL temp)
+;
+; This function implements this by being called the first time
+; something needs to be unstacked, altering the contents of
+; S from (GONIL/GONOTNIL something NIL) to (GOTO something <gensym>),
+; and generating the code that would normally be generated for a
+; GONOTNIL or GONIL using that temporary gensym label.
+;
+(defun maybe-conditional-go (r s &aux c g newgo newtag)
+ (setq newgo (cdr (assq (car s) '((gonil . gonotnil)
+                                  (gonotnil . gonil)))))
+ (cond
+  (newgo
+   (setf (car s) 'goto)
+   (setq newtag (setf (caddr s) (gensym)))
+   ;;; Subsume the GOTO to the temporary label (won't do much).
+   (desetq (c g) (zcgsgoto (list newgo newtag)))
+   (gen-branch-on-condition c g r nil)
+  )
+ )
+)
+
+;======================================================================
+
+(defun gen-branch-on-condition (c g r tag &aux tl)
+ ;
+ ; If non-predicative code, generate condition code test.
+ ; (If predicative code, the test was generated in the inline code.)
+ ;
+ (when (null cc)
+       (zcgemit 2 () "CR" `(,r ",10") "Test value for NIL."))
+ ;
+ ; Process the back end of a condition test.
+ ;
+ (when (cc-extendedp cc)
+  (unless (eq (cc-out-logic cc) c)
+          (setq tl (gensym)))
+  (zcgemit 4 () (cc-out-op cc) (or tl g)     "Partial condition test.")
+  (apply #'zcgemit (cc-emit-code cc))
+ )
+ (if (eq c 'gonotnil)
+     (zcgemit 4 () (or (cc-true-op cc) "BNE") g
+                                    (if tag
+                                        `("If true (not NIL), go to "
+                                          ,(substr (tostring tag) 1 11))
+                                        "If true (not NIL), branch."))
+     (zcgemit 4 () (or (cc-false-op cc) "BE") g
+                                    (if tag
+                                        `("If false (NIL), go to "
+                                          ,(substr (tostring tag) 1 14))
+                                        "If false (NIL), branch."))
+ )
+
+ (when tl (zcgemit 0 tl "DS" "0H" nil))
+
+ (setq cc nil)        ; Reset in case mutated by inline code generator
+)
+
+;======================================================================
+
+;**********************************************************************
+;
+; "SUBSUMED-GOTO" has been moved to ZCGSGOTO.
+;
+;**********************************************************************
+;
+; "GOTOSAMELABEL"
+;
+; This determines whether a situation exists where a GOTO is followed
+; immediately by the label to which it refers.
+; This might take the following form (let L = the GOTO label):
+;
+;    (... (GOTO L))
+;    (LABEL X NIL (GOTO Y))
+;    (LABEL Y NIL (GOTO L))
+;    (LABEL L ...)
+;
+;  with no intervening code between the labels.
+;
+;  G is the GOTO label to be checked.
+;  R represents the remainder of the compiled code body.
+;
+;  Note that the label involved must be marked referenced since it
+;  will be "fallen through" to, even though it may not get used as
+;  a label per se.
+;
+;**********************************************************************
+
+(defun gotosamelabel (g r)
+ (prog (a)
+  (or g (return nil))                ; If null "label" passed, then ().
+  (when (get '*zilco* 'nogotosamelabel)
+        (return nil))                ; If suppressing this optimization,
+                                     ; then ().
+  (setq a (car r))                   ; The statement we're looking at
+  (or a (return nil))                ; (if there is one) must be...
+                                     ; a label - we skip over things
+                                     ; that don't generate any code
+  (when (memq (car a) '(endprog endlam endtag endblock))
+        (return (gotosamelabel g (cdr r))))
+  (or (eq (car a) 'label) (return nil))
+    ;
+    ; If (GOTO X; LABEL X...), then if (LABEL X) goes to some Y and that
+    ; is a "clean" GOTO (no intervening code), then we can continue
+    ; analysis with Y - otherwise just say that X is the return value.
+    ;
+    ; If (GOTO X; LABEL Y...), then if the GOTO were deleted we'd fall
+    ; thru to wherever (LABEL Y) fell thru to, which may be NIL but
+    ; might just possibly also be X, so we have to check it out.
+    ;
+    ; Continue tracking down the GOTO/LABEL statements as long as they
+    ; follow one another, until NIL is returned.  Then, if we have a
+    ; situation at the current level like (GOTO X) / (LABEL X ...),
+    ; we can say that the first statement would fall thru to X if the
+    ; second statement went nowhere, else would fall thru to the same
+    ; place the second statement falls thru to.  If we have something
+    ; like (GOTO X) / (LABEL Y ...) then the first statement would
+    ; fall thru to wherever the second one falls thru to, which may
+    ; be NIL.
+    ;
+    ; 04/01/88 - Bug fix:  (LABEL NIL ...) must be checked for, since
+    ;            its presence means that an unconditional GO throws
+    ;            everything off, so NIL must be returned.
+    ;
+
+  (return
+          (or (gotosamelabel (nothing-but-goto a) (cdr r))
+              (if (eq (cadr a) g) g nil)))))
+
+(defun nothing-but-goto (x)         ; Returns a GOTO label if...
+ (let* (((l v s) (cdr x)))
+  (if (and l                        ; the label has a name (not NIL) and
+           (null v)                 ; there's nothing that forces
+           (null (get l 'popsalist)); code to be generated for it
+           (null (get l 'popfalist)); (either specially or lexically)
+           (null (get l 'catch))    ; (e.g. SETQ, ALIST, CATCH) and
+           (not (atom s))           ; if it itself GOTO's some following
+           (eq (car s) 'goto)       ; label in a similar manner and
+           (null (get (cadr s) 'gotag)) ; that label isn't a GO tag.
+      )
+   then (cadr s)                    ; then return that GOTO label
+   else nil                         ; else return nil
+  )
+ )
+)
+

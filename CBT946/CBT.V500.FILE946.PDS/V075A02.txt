@@ -1,0 +1,529 @@
+A poor man's performance monitor
+
+This EXEC is useful for those installations that do not use a
+formal performance monitor. It is designed to be run in a
+dedicated service machine where it periodically executes
+standard CP commands, reformats the response, and saves the
+resulting information in a simple CMS file which can be
+examined with XEDIT or any other CMS facility. It creates
+one record every time it executes.
+
+At our installation, we have an official performance monitor
+but find this EXEC to be a useful supplement to it. Its
+collection of high-level statistics and placement in a single
+CMS file make it quick and easy to access.
+
+The EXEC will run under VM/SP, HPO, or VM/XA. It is a
+not-so-poor substitute for VMAP. It periodically issues
+INDICATE and other commands and writes its findings to a
+file named INDIMON LOG. It uses no parameters. It is
+terminated by entering anything at the console and replying
+with YES. It requires privilege class E.
+
+This EXEC may also be used while XEDITing the INDIMON
+LOG file. If invoked under XEDIT, it thus functions like an
+XEDIT macro. It is invoked as follows:
+
+      INDIMON PEAK
+
+which shows only those lines that fall during peak hours (08:00
+to 10:00 am);
+
+      INDIMON yymmdd
+
+which shows only those lines that fall on the specified date.
+
+/*                  Monitor the System Using INDICATE                 */
+/*  Preliminaries                                                     */
+SUBCOM 'XEDIT'
+if rc = 0 then
+   signal xedit_functions
+address COMMAND
+hpo   = cplevel('HPO')
+vm_xa = cplevel('XA')
+operator_knows_about_it = 0
+disk_util       = a_disk_full()                    /*  initial value  */
+log_fileid      = 'INDIMON LOG A1'
+min_ppg_percent = 80
+network_max     = 1900                /*  should be < VTAM's MAXCONN  */
+prev_min        = 'initial'
+wakeup_interval_during_peak = '+00:05:00'
+wakeup_interval_off_peak    = '+00:15:00'
+if vm_xa then
+   log_lrecl = 132
+else
+   log_lrecl = 120
+diskw_log = 'EXECIO 1 DISKW' log_fileid '0 F' log_lrecl '(STRING'
+ESTATE log_fileid
+if rc = 28 then
+   if vm_xa then do
+      diskw_log '                  ---In Queue---   Load     ',
+                                        'Sto Ste -------Users-------' ,
+         '-Expan- -Xstore- --Paging- -----MDC---- ------States %------'
+      diskw_log 'YYMMDD HHMMSS CPU Q0 Q1 Q2 Q3 Qn En ng Dorm rag  al ',
+                                                'Logn Dial  Net Nnew' ,
+         ' Q2  Q3 Mig Page DASD Totl Read Writ  % EX IO PG PS Rn -- ??'
+      diskw_log '------ ------ --- -- -- -- -- -- -- -- ---- --- ---',
+                                               ' ---- ---- ---- ----' ,
+         '--- --- --- ---- ---- ---- ---- ---- -- -- -- -- -- -- -- --'
+      end
+   else do
+      diskw_log '                                                     ',
+                                                 '-----Users----     ' ,
+         '    ------------ Queue Status ------------     '
+      diskw_log 'YYMMDD HHMMSS CPU Q1 Q2 Q3 Stg Exp Swap Page Stl Lod',
+                                                ' Logn  Net Nnew Sysp' ,
+         'Xpg DF EX IO IP IS NP NS PG PS Rx SW -- ?? PPG%'
+      diskw_log '------ ------ --- -- -- -- --- --- ---- ---- --- ',
+                                             '--- ---- ---- ---- ----' ,
+         '--- -- -- -- -- -- -- -- -- -- -- -- -- -- ----'
+      end
+/*  OK now - Let's get down to work                                   */
+say 'Now monitoring INDICATE activity on' date('U') time()
+signal on halt
+do main_loop = 1     /*  until ended by the operator using END or HI  */
+   x = a_disk_full()
+   if x > 80 & x ¬= disk_util then do
+      call inform 'The A disk is' x'% full'
+      disk_util = x
+      end
+   /*  Extract information using the relevant CP commands             */
+   parse value diag(08,'QUERY USERS') with ,
+      users . dialed . net .   /*  nnnn USERS, nnnn DIALED, nnnn NET  */
+   if net > network_max then          /*  should be < VTAM's MAXCONN  */
+      call inform 'There are now' net 'network users - Do you want to' ,
+         'increase VTAM''s MAXCONN value?'
+   parse value time() with hh 3 4 mm 6 7 ss
+   this_min = hh * 60 + mm + ss / 60
+                                /*  number of minutes since midnight  */
+   if prev_min = 'initial' then
+      net_new = copies(' ',4)
+   else do
+      if this_min < prev_min then                    /*  date change  */
+         x = 24 * 60 - prev_min + this_min
+                                          /*  minutes since prev_min  */
+      else
+         x = this_min - prev_min          /*  minutes since prev_min  */
+      x = (net - prev_net) / x      /* new net log-on rate per minute */
+      if x >= 99.5 | x <= -9.5 then         /*  too big for format()  */
+         net_new = right(format(x,9,0),4)
+         /*  Round to an integer and keep as many digits as possible  */
+      else
+         net_new = format(x,2,1)
+      end
+   prev_min = this_min
+   prev_net = net
+   /*  Variables q1, q2 and q3 will be set twice below, once by
+       get_queue_counts and once by indicate_load_xx.  The record
+       will be written using the second set.  Either value could be
+       used; I don't think it makes much difference.                  */
+   call get_queue_counts
+   if vm_xa then do
+      call indicate_load_xa
+      call build_record_xa
+      end
+   else do
+      call indicate_load_sp
+      call query_srm_pgmact_sp
+      /*  On our system we have special techniques for getting the
+          next two pieces of information                              */
+      system_pages   = '----'
+      extended_pages = '---'
+      call build_record_sp
+      end
+   /*  Write the record                                               */
+   diskw_log x
+   /*  It might seem extreme to FINIS every file on the A disk every
+       time a record is written.  But we have had problems several
+       times where one or more day's data has been lost.
+       This occurred even when the above EXECIO included a FINIS.
+       It now seems likely that the "lost" data was, in fact,
+       never written because some unknown force caused INDIMON
+       to get hung up.  However, in case this explanation is
+       incorrect and the problem really has something to do with I/O
+       the following FINIS should circumvent the problem until it can
+       be properly resolved.                                          */
+   FINIS '* * A'
+   EXECIO '1 CP (VAR Y STRING QUERY VIRTUAL CONSOLE'
+                                             /*  CONS 009 ON cuu ...  */
+   if word(y,3) ¬= 'DISCONNECTED' then
+      say left(x,79)
+   /*  Wait a while before we do this again                           */
+   do forever             /*  until a good wakeup reason comes along  */
+      hh = time('H')
+      if left(date('W'),1) = 'S' | ,          /*  Saturday or Sunday  */
+         hh < 07 | hh > 10 then               /*  outside prime time  */
+         x = wakeup_interval_off_peak
+      else
+         x = wakeup_interval_during_peak
+      WAKEUP x '(CONS QUIET'
+      select
+         when rc = 2 then              /*  time interval has expired  */
+            leave
+         when rc = 6 then do                     /*  console command  */
+            if queued() = 0 & externals() = 0 then
+               /*  Although this seems to make no sense, it may
+                   occur with the first AUTOLOG after an IPL of CP    */
+               call inform 'False WAKEUP RC' rc
+            else do
+               pull x
+               if x = 'END' then
+                  leave main_loop
+               say '"' || x || '" input ignored'
+               do forever
+                       /*  until the operator gives a valid response  */
+                  say 'Do you want to end?'
+                  pull x
+                  if x = 'YES' then
+                     leave main_loop
+                  if x = 'NO' then
+                     leave
+               end   /*  forever  */
+               end   /*  else do  */
+            end
+         otherwise
+            say 'Unexpected return code' rc 'from WAKEUP'
+            say 'Now SLEEPing for 5 minutes'
+            CP 'SLEEP 5 MIN'            /*  Force some kind of delay  */
+            leave                            /*  Attempt to continue  */
+      end   /* select */
+   end                                               /*  WAKEUP loop  */
+end                                                    /*  main loop  */
+/*  That's all folks                                                  */
+halt:
+say 'INDIMON is now ending'
+exit 0
+/*  ----------------------------------------------------------------  */
+/*              Functions Performed Under XEDIT                       */
+/*  ----------------------------------------------------------------  */
+xedit_functions:
+address XEDIT
+arg function .
+select
+   when function = 'PEAK' then
+      signal xedit_peak
+   when length(function) = 6 & datatype(function,'W') then
+                                                /*  yymmdd I presume  */
+      signal xedit_date
+   otherwise
+      EMSG 'Invalid INDIMON function'
+      exit 1
+end   /*  select  */
+
+/*  Show only one particular date                                     */
+xedit_date:
+EXTRACT '/COLUMN/ZONE/'
+ZONE '1 6'
+ALL '/'function'/'
+ZONE zone.1 zone.2             /*  Restore the original ZONE setting  */
+CLOCATE ':'column.1     /*  ... and the COLUMN pointer since it might */
+                        /* have been moved by the above ZONE commands */
+call show_headings      /*  Add the line which contains the headings  */
+exit 0
+/*  Show only the peak hours                                          */
+xedit_peak:
+SET 'DISPLAY 0 *'     /*  Process all lines (and do so without having */
+                      /*  to mess with the SCOPE setting)             */
+':0 SET SELECT 0 *'                /*  Make all lines nondisplayable  */
+TOP
+do forever                                             /*  until EOF  */
+   '+1 EXTRACT /CURLINE/EOF/'
+   if eof.1 = 'ON' then
+      leave
+   x = substr(curline.3,8,6)                                /*  time  */
+   select
+      when ¬ datatype(x,'W') then  /*  blank line, heading or dashes  */
+         nop                                /*  Leave it undisplayed  */
+      when x >= 080000 & x <= 100000 then  /*  within the peak hours  */
+         SET 'SELECT 1 1'                             /*  Display it  */
+      otherwise
+         nop                                /*  Leave it undisplayed  */
+   end   /*  select  */
+end
+SET 'DISPLAY 1 1'         /*  Display only lines which were included  */
+call show_headings      /*  Add the line which contains the headings  */
+exit 0
+/*  ----------------------------------------------------------------  */
+/*                         Subroutines                                */
+/*  ----------------------------------------------------------------  */
+/*  Determine how full the A disk is                                  */
+a_disk_full:
+QUERY 'DISK A (STACK LIFO'                            /*  Can't fail  */
+pull 57 per_cent 59
+pull .                                       /*  Ignore the headings  */
+return per_cent
+/*  Build the record to be logged under VM/SP or HPO                  */
+build_record_sp:
+parse value time() with hh ':' mm ':' ss
+x = right(date('S'),6)      ,                              /*   1- 6  */
+    hh || mm || ss          ,                              /*   8-13  */
+    right(cpu_pct,3)        ,                              /*  15-17  */
+    right2(q1)              ,                              /*  19-20  */
+    right2(q2)              ,                              /*  22-23  */
+    right(q3,2)             ,                              /*  25-26  */
+    right3(storage_util)    ,                              /*  28-30  */
+    right3(expan)           ,                              /*  32-34  */
+    right4(swap_rate)       ,                              /*  36-39  */
+    right4(page_rate)       ,                              /*  41-44  */
+    right3(steal_pct)       ,                              /*  46-48  */
+    right3(load_pct)        ,                              /*  50-52  */
+    right(users,4)          ,                              /*  54-57  */
+    right(net,4)            ,                              /*  59-62  */
+          net_new           ,                              /*  64-67  */
+    right(system_pages,4)   ,                              /*  69-72  */
+    right(extended_pages,3)                                /*  74-76  */
+x = x ,
+    status(status.DF)       ,                              /*  78-79  */
+    status(status.EX)       ,                              /*  81-82  */
+    status(status.IO)       ,                              /*  84-85  */
+    status(status.IP)       ,                              /*  86-88  */
+    status(status.IS)       ,                              /*  90-91  */
+    status(status.NP)       ,                              /*  93-94  */
+    status(status.NS)       ,                              /*  96-97  */
+    status(status.PG)       ,                              /*  99-100 */
+    status(status.PS)       ,                              /* 102-103 */
+    status(status.RN)       ,                              /* 105-106 */
+    status(status.SW)       ,                              /* 108-109 */
+    status(status.__)       ,                              /* 111-112 */
+    status(status.??) ||    ,                              /* 114-115 */
+    right(ppg_percent,5)                                   /* 116-120 */
+return
+/*  Build the record to be logged under VM/XA                         */
+build_record_xa:
+parse value time() with hh ':' mm ':' ss
+total_page_rate = xstore_page_rate + paging_rate   /*  xstore + DASD  */
+x = right(date('S'),6)          ,
+    hh || mm || ss              ,
+    right3(cpu_pct)             ,
+    right2(q0)                  ,                       /*  In Queue  */
+    right2(q1)                  ,
+    right2(q2)                  ,
+    right2(q3)                  ,
+    right(q0+q1+q2+q3,2)        ,
+    right(e1+e2+e3,2)           ,
+    right(total_loading,2)      ,
+    right4(dormant_users)       ,
+    right3(storage_pct)         ,
+    right3(steal_rate)
+x = x ,
+    right4(users)               ,                          /*  Users  */
+    right4(dialed)              ,
+    right4(net)                 ,
+           net_new              ,
+    right3(expan_q2)            ,                          /*  Expan  */
+    right3(expan_q3)            ,
+    right3(xstore_migrate_rate) ,                          /*  Xstor  */
+    right4(xstore_page_rate)    ,
+    right4(paging_rate)         ,
+    right4(total_page_rate)     ,
+    right4(mdc_read_rate)       ,                            /*  MDC  */
+    right4(mdc_write_rate)      ,
+    right2(mdc_hit_ratio)
+x = x ,
+    status(status.EX) ,                            /*  Status Counts  */
+    status(status.IO) ,
+    status(status.PG) ,
+    status(status.PS) ,
+    status(status.RN) ,
+    status(status.__) ,
+    status(status.??)
+return
+/*  Determine the level of CP                                         */
+cplevel:
+arg field
+EXECIO '1 CP (VAR X STRING QUERY CPLEVEL'             /*  can't fail  */
+if field = 'HPO' then return pos('HPO',x) > 0
+if field = 'XA'  then return left(x,8) = 'VM/XA SP'
+return '?'
+/*  Count the numbers in each of the various queues and determine
+    how many users have each of the various status codes              */
+get_queue_counts:
+e_any = 0                                               /*  E1 E2 E3  */
+q0 = 0                                                /*  VM/XA only  */
+q1 = 0
+q2 = 0
+q3 = 0
+status. = 0
+strange_status_list = ''
+/*  Decode the output from INDICATE QUEUES.  VM/XA can have up to 2
+    users per line.  VM/SP and HPO can have up to 3 users per line.   */
+EXECIO '* CP (STEM X. STRING INDICATE QUEUES'     /*  can't fail now  */
+do i = 1 to x.0  /*  any number of lines with up to 3 users per line  */
+   if vm_xa then do
+      one_line = overlay('    ', x.i, 10)   /*  Ignore the MP fields  */
+      one_line = overlay('    ', one_line, 45)     /*  for each user  */
+      end
+   else
+      one_line = x.i
+   do until one_line = ''                 /*  up to 3 users per line  */
+      parse var one_line userid queue status storage one_line
+      select
+         when queue = 'Q0' then q0 = q0 + 1           /*  VM/XA only  */
+         when queue = 'Q1' then q1 = q1 + 1
+         when queue = 'Q2' then q2 = q2 + 1
+         when queue = 'Q3' then q3 = q3 + 1
+         when left(queue,1) = 'E' then
+            e_any = e_any + 1                           /*  E1 E2 E3  */
+         otherwise
+            nop            /*  Shouldn't we tell somebody about this  */
+      end   /*  select  */
+      parse var status status_1 2 status_2
+      select
+         when find('DF EX IO IP IS NP NS PG PS SW',status) > 0 then
+            status.status = status.status + 1
+         when status = '--' then
+                       /*  because status.-- cannot be used directly  */
+            status.__ = status.__ + 1
+         when status = 'RA' | status = 'RU' then    /*  VM/SP or HPO  */
+            status.RN = status.RN + 1
+         when status_1 = 'R' & verify(status_2,'0123456789') = 0 then
+                                               /*  Rnn  (VM/XA only)  */
+            status.RN = status.RN + 1
+         otherwise
+            status.?? = status.?? + 1
+            strange_status_list = strange_status_list status
+      end   /*  select  */
+   end   /*  each user  */
+end   /*  each line  */
+if strange_status_list ¬= '' then do
+   x = 'Unknown status codes:' strange_status_list
+   say x                    /*  Always show the current strange list  */
+   if ¬ operator_knows_about_it then do /*  only sees the first list  */
+      operator_knows_about_it = 1
+      call inform x
+          /*  will also be TYPEd (which is redundant) but who cares?  */
+      end
+   end
+qn_en_count = q0 + q1 + q2 + q3 + e_any
+return
+/*  Extract information from INDICATE LOAD under VM/SP or HPO         */
+indicate_load_sp:
+EXECIO '* CP (STEM X. STRING QUERY PROCESSR'
+if rc = 0 then do                                  /*  gotta be true  */
+   x1 = pos('ONLINE', x.1, 1)
+   x2 = pos('ONLINE', x.1, x1+1)
+   processors = (x1 > 0) + (x2 > 0)
+  /*  must be 1 or 2   A value of 0 indicates that I blew it somehow  */
+   end
+else                             /*  This will never happen will it?  */
+   processors = 0
+if processors = 0 then do
+   x = 'Unable to determine the number of processors - 1 assumed'
+   say x
+   CP 'MESSAGE OPERATOR INDIMON:' x
+   processors = 1
+   end
+EXECIO '2 CP (STEM X. STRING INDICATE LOAD'           /*  can't fail  */
+if processors = 1 then do
+ parse var x.1 09 cpu_pct 12 32 q1 34 39 q2 41 51 storage_util 54 63 expan 66
+   cpu_pct = cpu_pct + 0                    /*  Strip leading zeroes  */
+   end
+else do                                           /*  processors = 2  */
+   parse var x.1 09 cpu_0_pct 12 23 cpu_1_pct 26 32 q1 34 39 q2 41 51 ,
+   storage_util 54 63 expan 66     /*  Should q1 be at 32?  */
+   cpu_pct = format((cpu_0_pct+cpu_1_pct)/2,3,0)
+                  /*  The maximum value for an MP is 100% (not 200%)  */
+   end
+parse var x.2 08 page_rate 12 24 steal_pct 27 35 load_pct 38 50 swap_rate 54
+if ¬ hpo then
+   swap_rate = 0
+return
+/*  Extract information from INDICATE LOAD under VM/XA                */
+indicate_load_xa:
+EXECIO '* CP (STEM X. STRING INDICATE LOAD'           /*  can't fail  */
+parse var x.1 '-' cpu_pct '%'
+parse var x.2 '-' xstore_page_rate '/' '-' xstore_migrate_rate '/'
+parse var x.3 '-' mdc_read_rate '/' '-' mdc_write_rate '/' '-' mdc_hit_ratio '%'
+parse var x.4 '-' storage_pct '%' '-' paging_rate '/' '-' steal_rate '%'
+parse var x.5 '-' q0 '(' q0_loading ')' '-' dormant_users
+parse var x.6 '-' q1 '(' q1_loading ')'                ,
+                                               '-' e1 '(' e1_loading ')'
+parse var x.7 '-' q2 '(' q2_loading ')' '-' expan_q2 . '-' ,
+                                                   e2 '(' e2_loading ')'
+parse var x.8 '-' q3 '(' q3_loading ')' '-' expan_q3 . '-' e3 '(' e3_loading ')'
+total_loading = q0_loading + q1_loading + q2_loading + q3_loading ,
+                           + e1_loading + e2_loading + e3_loading
+return
+/*  Maybe some day we'll want to make use of the following data too   */
+do i = 10 to x.0             /*  one per processor  (Line 9 is null)  */
+   parse var x.i . x '-' cpu_pct.x '%'            /*  PROC nnnn-nnn%  */
+end
+/*  Inform OPERATOR about a serious problem                           */
+inform:
+parse arg the_message
+say time() the_message
+CP 'MESSAGE OPERATOR' the_message
+return
+/*  Extract information from QUERY SRM PGMACT under VM/SP or HPO      */
+query_srm_pgmact_sp:
+if hpo then do
+   pageout_rate_pg    = 0
+   pageout_rate_pp    = 0
+   pageout_rate_total = 0
+   ppg_percent        = '  ? '
+   EXECIO '* CP (STEM X. STRING QUERY SRM PGMACT'             /*  x.  */
+   if rc = 0 then do
+      do i = 2 to x.0                          /*  Skip the headings  */
+         parse var x.i 1 level 6 1 type nn 6 x 7 pct_full pct_total ,
+            overflow_rate '/SEC' migr_rate '/SEC' paging_rate '/SEC' ,
+            pct_page_rate_total .
+         if x ¬= ':' then do
+            say 'Unexpected output from QUERY SRM PGMACT:' x.i
+            leave
+            end
+         if type = 'PG' then
+            pageout_rate_pg    = pageout_rate_pg    + overflow_rate
+         if type = 'PP' then
+            pageout_rate_pp    = pageout_rate_pp    + overflow_rate
+         if type ¬= 'SW' then                     /*  PG or PM or PP  */
+            pageout_rate_total = pageout_rate_total + overflow_rate
+      end   /*  i  */
+      if pageout_rate_total > 0 then do
+      x = 100 * (pageout_rate_pg + pageout_rate_pp) / pageout_rate_total
+         ppg_percent = format(x,3,0)'%'
+                           /*  PP + PG (abbreviated to 3 characters)  */
+         if x < min_ppg_percent then do
+            EXECIO '0 CP (STRING QUERY USER PAGEMON'
+   /* Defer to PAGEMON which does a thorough job with paging problems */
+            if rc ¬= 0 then             /*  PAGEMON is not logged on  */
+            EXECIO '0 CP (STRING MESSAGE OPERATOR Pageouts to PP + PG' ,
+                  'are only' ppg_percent 'of all pageouts'
+            end   /*  PPG% < min  */
+         end   /*  pageouts > 0  */
+      end   /*  rc = 0  */
+   else
+      say 'EXECIO return code' rc 'from QUERY SRM PGMACT'
+   end   /*  HPO  */
+else
+   ppg_percent = ' n/a'
+return
+/*  Right justify a number with leading spaces                        */
+right2:
+arg number
+return right(number+0, 2)
+right3:
+arg number
+return right(number+0, 3)
+right4:
+arg number
+return right(number+0, 4)
+/*  Add the line which contains the headings to the display           */
+show_headings:
+PRESERVE
+SET 'SCOPE ALL'
+':2 SET SELECT 1 1'                        /*  Show the headings too  */
+RESTORE
+return
+/*  Convert a status count from a raw number to a percentage of the
+    number of in-queue users                                          */
+status:
+arg x                                                 /*  raw number  */
+x = x / qn_en_count * 100                             /*  percentage  */
+if x < 99.5 then       /*  Will fit in two bytes when rounded to ...  */
+   return right(format(x,3,0),2)           /*  a two "digit" integer  */
+return 99                          /*  Use 99 instead of 00 (or 100)  */
+
+Dave Fraatz
+Specialist
+3M (USA)
+

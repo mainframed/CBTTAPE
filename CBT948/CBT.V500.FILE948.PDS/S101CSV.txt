@@ -1,0 +1,931 @@
+/*REXX*/
+/* Input file : SMF extract sorted */
+/* This programs processes one Date/Lpar/SSID a time            */
+/* (at least in mode summary to calculate the accumulation)     */
+/* Decode  smf 101 records - written by Nguyen Duc Tuan */
+/*            Release 1.1  4 Jan 2016                   */
+/*            Release 1.2  11 Feb 16 add numeric digits */
+/*            Release 1.3  15 Jul 16 Possible to report a specific */
+/*                         ConnType (CICS, BATCH ..)               */
+/*                         z/OS 2.1 Read directly SMF records      */
+/*            Release 1.4  27 Jul 16 Commits, ABort, Start time    */
+/*            Release 1.5  07 Sep 16 Bug : Distributed Header not  */
+/*                         displayed in some cases                 */
+/*            Release 2.0  07 Sep 18 Bugs correction - DRDA records*/
+/*                         not selected                            */
+/*-----------------------------------------------------------------*/
+/* summary='Y'  produce report aggregated by plan,jobname, conntype*/
+/*              in dataset &HLQ.REPORTAS (short report)            */
+/* ConnSel='ALL' or CICS, BATCH, DRDA, ... any supported value     */
+/*              set by this program in function DSNDQWHC           */
+/* SmfOrig='B' Raw SMF dataset in input (from z/OS 2.1), allows    */
+/*             to read several SMF concatenated datasets in input  */
+/*             Otherwise the program expects a sorted SMF dataset  */
+/*             as seen with JCL101                                 */
+/*-----------------------------------------------------------------*/
+summary='N'
+arg ssid hlq SmfOrig ConnSel CorridSel
+if ConnSel='' then ConnSel='ALL'
+if CorridSel='' then CorridSel='ALL'
+say 'Processing for Subsys' ssid
+
+
+if SmfOrig <> 'B' then
+do
+    /* Input file : SMF extract sorted */
+    oufl = hlq || '.SMFEXTA.OUT'
+    address TSO
+    "ALLOC DD(INP) DS('"oufl"')    SHR REU bufno(20)"
+end
+
+/* Report dataset on output */
+oufl = "'" || hlq || '.reportA.' || ssid || "'"
+say oufl
+  "DELETE" oufl "PURGE"
+
+"ALLOC FI(OUFL) DA("oufl") NEW CATALOG REUSE" ,
+"LRECL(360) RECFM(V B) TRACKS SPACE(1000,900)"
+rcalloc = rc
+if rcalloc <> 0 then Do
+     say "**********************************************"
+     say "   Error allocating report file" rcalloc
+     say "   Abnormal end  "
+     say "**********************************************"
+     Exit 8
+end
+
+if summary='Y' then do
+  oufl = "'" || hlq || '.reportAS' || "'"
+  "DELETE" oufl "PURGE"
+  "ALLOC FI(OUFS) DA("oufl") NEW CATALOG REUSE" ,
+  "LRECL(400) RECFM(V B) TRACKS SPACE(250,250)"
+  rcalloc = rc
+  if rcalloc <> 0 then Do
+       say "**********************************************"
+       say "   Error allocating report summary file" rcalloc
+       say "   Abnormal end  "
+       say "**********************************************"
+       Exit 8
+  end
+end /* if summary */
+
+/* compteurs input/output */
+nbr_ifcid=0
+old_hnt=0    /* old header next type */
+reco= 0
+reci= 0
+recs= 0
+rupture = 0
+/* init valeurs rupture */
+if summary = 'Y' then call init_sum                                    d
+
+Call Write_Header
+
+/* START PROCESSING */
+Do Forever
+  /* LECTURE record SMF UN PAR UN */
+  "EXECIO 1 DISKR INP"
+  IF RC > 0 THEN DO
+            rcalloc=rc
+            if rc = 2 then
+              do
+                  SAY 'End of SMF dataset - input records' reci
+                  if summary='Y' then call write_summary
+              end
+            else
+              say 'Erreur de lecture fichier SMF' rc
+            LEAVE /* sortir de la boucle Do Forever */
+  END
+  PARSE PULL INPUT_REC
+  reci = reci+1
+  OFFSET = 1
+  CALL DSNDQWAS /* MAP SMF HEADER */
+  IF SM101RTY = 101 & SM101SSI = ssid   then
+  DO
+    recs=recs+1  /* compteurs records smf101*/
+    /*DSNDQWA0 MAP SELF-DEFINING SECT */
+    CALL DSNDQWA0 /* MAP SELF-DEFINING SECT */
+    OFFSET = QWA01PSO - 4 + 1
+    /* These headers are always present */
+    CALL DSNDQWHS /* MAP product section STANDARD HEADER */
+    CALL DSNDQWHC /* MAP CORRELATED HEADER, just after the standard*/
+                  /* header Product Section */
+
+    /* result is set in subroutine DSNDQWHC */
+    /* select to report only some type of records */
+    if result = 4 then iterate
+    /* Check all hearder type and process if possible */
+    /* Header type : QWHSTYP */
+    /*     1                  ..STANDARD HEADER         */
+    /*     2                  ..CORRELATION HEADER      */
+    /*     4                  ..TRACE HEADER            */
+    /*     8                  ..CPU HEADER              */
+    /*     16                 ..DISTRIBUTED HEADER      */
+    /*     32                 ..DATA SHARING HEADER     */
+    offset_header_next= offset_corr+QWHCLEN
+    /*init requester location */
+    QWHDRQNM=''
+    QWHDSVNM=''
+    QWHDPRID =''
+    /* ---------------------------------------*/
+    Do while offset_header_next  > 0
+        temp=offset_header_next+2 /*skip len*/
+        header_next_type= C2D(SUBSTR(INPUT_REC,temp,1))
+        offset_header = offset_header_next
+        offset_header_next=offset_header_next+ ,
+           C2D(SUBSTR(INPUT_REC,OFFSET_header_next,2))
+        Select
+             When header_next_type=16 then
+                  do
+                     /* distributed header */
+                     CALL DSNDQWHD
+                  end
+             When header_next_type=64 then
+                  do
+                    /*  no more headers behind*/
+                     offset_header_next=0
+                  end
+             Otherwise
+                  do
+                     /* try to avoid excessive displays */
+                     if   header_next_type <> old_hnt then
+                     do
+                       say 'header_next_type' header_next_type,
+                       'not processed yet by the current REX101'
+                       old_hnt= header_next_type
+                     end
+                  end
+        end   /* select */
+    end /* Do until */
+    /* pointeur vers accounting section DSNDQWAC */
+    OFFSET = QWA01R1O - 4 + 1
+    /* record  ifcid in this smf data */
+    call record_ifcid
+    Select
+         When ifcid = 3  Then
+              do
+                 /* general accounting data */
+                 CALL DSNDQWAC
+                 if rollup='1' then iterate
+                 /* sql stats */
+                 if QWA01R2O > 0 then do
+                            OFFSET = QWA01R2O - 4 + 1
+                            CALL DSNDQXST
+                           end
+                        else do
+                        /* pas de donn{es sql*/
+                           selects   =0
+                           inserts   =0
+                           updates   =0
+                           deletes   =0
+                           opens     =0
+                           fetchs    =0
+                        end
+                 /* s'il existe des donnees buffer, les chercher*/
+                 if QWA01R3O > 0 then do
+                            OFFSET = QWA01R3O - 4 + 1
+                            CALL DSNDQBAC
+                           end
+                        else do
+                        /* pas de donn{es buffer manager */
+                           getp      =0
+                           bufupd    =0
+                           syncio    =0
+                           syncwr    =0
+                           sprfreq   =0
+                           lprfreq   =0
+                           dprfreq   =0
+                           sio       =0
+                        end
+              end /* end when ifcid=3*/
+         When ifcid = 239 then /* package accounting data*/
+              do
+                 nop
+              end
+         Otherwise
+              do
+                 nop
+              end
+    end   /* select */
+    /* on part du principe que ifcid03 est le record accounting */
+    /* maitre , a voir si on commence a traiter les autres      */
+    if ifcid=3 then
+    do
+         CALL WRITE_REPORT
+    end
+  END /*    IF SM101RTY = 101  */
+END /* Do forever */
+"EXECIO 0 DISKW OUFS (STEM INL. FINIS"
+"EXECIO 0 DISKW OUFL (STEM INL. FINIS"
+"EXECIO 0 DISKR INP (STEM INL. FINIS"
+"EXECIO 0 DISKR INP (STEM INL. FINIS"
+"FREE DD(INP)"
+"FREE DD(OUFL)"
+"FREE DD(OUFS)"
+/* report ifcid read */
+call report_ifcid
+Say 'Output records : ' reco
+EXIT rcalloc
+
+
+/* decode smf header */
+DSNDQWAS:
+   OFFSET = OFFSET + 1
+   /* SM100RTY DS XL1 RECORD TYPE X'64' OR 101 */
+   SM101RTY = C2D(SUBSTR(INPUT_REC,OFFSET,1))
+   if sm101rty <> 101 then return;
+   OFFSET = OFFSET + 1
+
+   /* SM101TME DS XL4 TIME SMF MOVED RECORD */
+   SM101TME = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+   OFFSET = OFFSET + 4
+   CALL GET_FMT_TIME
+   field    = C2X(SUBSTR(INPUT_REC,OFFSET,4))
+     parse value field with 1 . 2 c 3 yy 5 ddd 8 .
+     if (c = 0) then
+       yyyy = '19'||yy
+     else
+       yyyy = '20'||yy
+   sm101dte    = yyyy||'.'||ddd
+   OFFSET = OFFSET + 4
+   /* smf id */
+   sm101sid = SUBSTR(INPUT_REC,OFFSET,4)
+   OFFSET = OFFSET + 4
+   /* SM100SSI DS CL4 SSID         */
+   sm101ssi = SUBSTR(INPUT_REC,OFFSET,4)
+   OFFSET = OFFSET + 10
+   /* TOTAL LENGTH = 28 */
+   RETURN
+
+DSNDQWA0: /* MAP SELF-DEFINING SECT */
+  /* QWA01PSO DS AL4 OFFSET TO THE PRODUCT SECTION */
+  QWA01PSO = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  OFFSET = OFFSET + 8
+  /* QWA01R1O DS AL4 OFFSET TO THE ACCOUNTING SECTION */
+  /* DSNDQWAC ACCOUNTING SECTION */
+  QWA01R1O = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  OFFSET = OFFSET + 8 /* 4+2+2 */
+  /* DSNDQXST RDS DATA : NB selects ... */
+  QWA01R2O = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  OFFSET = OFFSET + 8 /* 4+2+2 */
+  /* DSNDQBAC Buffer manager  */
+  QWA01R3O = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  offset = offset +6
+  nb_pools = C2D(SUBSTR(INPUT_REC,OFFSET,2))
+  /* DSNDQTXA Lock manager  */
+  /* DSNDQTXA Lock manager  */
+  /* DSNDQLAC DDF */
+  /* DSNDQMDA DDF DRDA > V2R3 */
+  /* DSNDQIFA IFI */
+  /* DSNDQWAR Rollup acct info */
+  /* DSNDQBGA GroupBuffer */
+  /* DSNDQTGA Global Locking */
+  /* DSNDQWDA DataSharing (pas encore utilise) */
+  /* DSNDQWAX Acctg overflow */
+  /* DSNDQ8AC Accelerator acctg */
+  /*OFFSET = OFFSET + 96  */
+  RETURN
+
+/* product section std header  */
+DSNDQWHS:
+  QWHSLEN = C2D(SUBSTR(INPUT_REC,OFFSET,2))
+  OFFSET = OFFSET + 4
+  /*  QWHSIID DS XL2 IFCID */
+  QWHSIID = C2D(SUBSTR(INPUT_REC,OFFSET,2))
+  IFCID=QWHSIID
+  OFFSET = OFFSET + 3
+  /* release number */
+  QWHSRN = C2X(SUBSTR(INPUT_REC,OFFSET,1))
+  OFFSET = OFFSET + 5
+  /*if QWHSRN= 'B1' then say 'DB2 V11' */
+  /* QWHSSSID DS CL4 SUBSYSTEM NAME */
+  QWHSSSID = SUBSTR(INPUT_REC,OFFSET,4)
+  if QWHSRN= 'B1' then
+      OFFSET = OFFSET +  74
+  else offset = OFFSET +  104
+  RETURN
+
+/* correlation header */
+DSNDQWHC:
+  offset_corr=offset
+  QWHCLEN = C2D(SUBSTR(INPUT_REC,OFFSET,2))
+  OFFSET = OFFSET + 2
+  QWHCTYP = C2D(SUBSTR(INPUT_REC,OFFSET,1))
+  OFFSET = OFFSET + 2
+  /* authid */
+  QWHCAID      = SUBSTR(INPUT_REC,OFFSET,8)
+  OFFSET = OFFSET + 8
+  QWHCCV  = SUBSTR(INPUT_REC,OFFSET,12)
+  OFFSET = OFFSET + 12
+  /* Correlation ID selection */
+  if CorridSel <> 'ALL' & CorridSel <> qwhccv then return 4
+  /* QWHCCN DS CL8 CONNECTION NAME */
+  QWHCCN = SUBSTR(INPUT_REC,OFFSET,8)
+  OFFSET = OFFSET + 8
+  /* QWHCPLAN DS CL8 PLAN NAME */
+  QWHCPLAN = SUBSTR(INPUT_REC,OFFSET,8)
+  OFFSET = OFFSET + 8
+  /* QWHCOPID  initial  authid */
+  QWHCOPID  = SUBSTR(INPUT_REC,OFFSET,8)
+  OFFSET = OFFSET + 8
+  /* QWHCATYP  Type de connection*/
+  QWHCATYP  = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+      Select
+           When QWHCATYP  = 4  Then do
+                                        conntype='CICS'
+                                    end
+           When QWHCATYP  = 2  Then do
+                                        conntype='DB2CALL'
+                /* direct call inside program (used by sofware ..)*/
+                /* example BMC utilities */
+                                    end
+           When QWHCATYP  = 1  Then do
+                                        conntype='BATCH'
+                                    end
+           When QWHCATYP  = 3  Then do
+                                        conntype='DL1'
+                /* PGM=DFSRRC00,PARM='DLI,...' */
+                                    end
+           When QWHCATYP  = 5  Then do
+                                        conntype='IMSBMP'
+                                    end
+           When QWHCATYP  = 6  Then do
+                                        conntype='IMSMPP'
+                                    end
+           When QWHCATYP  = 8  Then do
+                                        conntype='DRDA'
+                                    end
+           When QWHCATYP  = 9  Then do
+                                        conntype='IMSCTR'
+                    /* not seen */
+                                    end
+           When QWHCATYP  = 10 Then do
+                                        conntype='IMSTRANBMP'
+                    /* not seen */
+                                    end
+           When QWHCATYP  = 11 Then do
+                                        conntype='DB2UTIL'
+                                    end
+           When QWHCATYP  = 12 Then do
+                                        conntype='RRSAF'
+                    /* not seen */
+                                    end
+           Otherwise      say 'QWHCATYP' QWHCATYP 'not processed'
+      end   /* select */
+
+  /* Connection Type selection */
+  if ConnSel <> 'ALL' & ConnSel <> Conntype then
+       return 4
+
+  if conntype = 'CICS' | conntype = 'DRDA' | conntype = 'IMSMPP'
+    then jobn= QWHCCN
+    else jobn = QWHCCV
+
+  OFFSET = OFFSET + 28
+  if conntype =  'DRDA' then
+  do
+    /* QWHCEUID  end userid */
+    QWHCEUID  = SUBSTR(INPUT_REC,OFFSET,16)
+    OFFSET = OFFSET + 48
+    /* QWHCEUWN  user workstation name */
+    QWHCEUWN  = SUBSTR(INPUT_REC,OFFSET,18)
+  end
+  else do
+    QWHCEUID  = ''
+    QWHCEUWN  = ''
+  end
+  RETURN 0
+
+
+DSNDQWHD: /* MAP distributed header */
+    offset= offset_header      + 4 /* skip len + type */
+    /* requester location */
+    QWHDRQNM = SUBSTR(INPUT_REC,OFFSET,16)
+    offset= offset + 24
+    QWHDSVNM = SUBSTR(INPUT_REC,OFFSET,16)
+    offset= offset + 16
+    QWHDPRID = SUBSTR(INPUT_REC,OFFSET,8)
+  return
+
+DSNDQWAC: /* MAP ACCOUNTING DATA SECTION */
+  /* QWACBSC DS XL8 CLASS 1 BEGINNING STORE CLOCK VALUE*/
+  NUMERIC DIGITS 30
+  QWACPCNT=c2d(SUBSTR(INPUT_REC,OFFSET+280,4))
+  QWACPACE=c2x(SUBSTR(INPUT_REC,OFFSET+288,4))
+  rollup='0'
+  /* conntype = DRDA the records are often marked as rollup */
+  if QWACPACE >'00000000' & conntype <> 'DRDA' then do
+                               rollup='1'
+                               return
+                             end
+  /* transform to local time value */
+  Clock = c2x(SUBSTR(INPUT_REC,offset,8))
+  call STCK2Local Clock
+  ThdStart= LocalTime
+  QWACBSC = C2X(SUBSTR(INPUT_REC,OFFSET,8)) /*CONVERT INTO HEX VALUE*/
+  QWACBSC = x2d(SUBSTR(QWACBSC,1,13)) /*ELIMINATE 1.5 BYTES */
+  OFFSET = OFFSET + 8
+  /* QWACESC DS XL8 CLASS 1 ENDING STORE CLOCK VALU */
+  QWACESC = C2X(SUBSTR(INPUT_REC,OFFSET,8)) /*CONVERT INTO HEX VALUE */
+  QWACESC = X2D(SUBSTR(QWACESC,1,13)) /*ELIMINATE 1.5 BYTES */
+  OFFSET = OFFSET + 8
+  ELAPSED_TIME = ( QWACESC - QWACBSC ) /1000000
+  if elapsed_time < 0 then
+      do
+         elapsed_time = QWACESC / 1000000
+      end
+  /* QWACBJST DS XL8 BEGINNING TCB CPU TIME FROM MVS (CLASS 1)*/
+  QWACBJST = C2X(SUBSTR(INPUT_REC,OFFSET,8)) /*CONVERT INTO HEX VALUE*/
+  QWACBJST = X2D(SUBSTR(QWACBJST,1,13)) /*ELIMINATE 1.5 BYTES */
+  OFFSET = OFFSET + 8
+  /* QWACEJST DS XL8 ENDING TCB CPU TIME IN ALL ENVIRONMENTS */
+  QWACEJST = C2X(SUBSTR(INPUT_REC,OFFSET,8)) /*CONVERT INTO HEX VALUE*/
+  QWACEJST = X2D(SUBSTR(QWACEJST,1,13)) /*ELIMINATE 1.5 BYTES */
+  TCB_TIME = (QWACEJST - QWACBJST)/1000000
+  OFFSET = OFFSET + 24
+  /* QWACRINV=X2D(SUBSTR(INPUT_REC,OFFSET,4) */
+  OFFSET = OFFSET + 20
+  QWACCOMM=C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  OFFSET = OFFSET + 4
+  QWACABRT=C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  OFFSET = OFFSET + 12
+  /* QWACAJST DB2 CPU en stck value */
+  /* attention : this is stck time , not local time | */
+  QWACAJST = C2X(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8
+  QWACAJST = X2D(SUBSTR(QWACAJST,1,13))
+  QWACAJST  = QWACAJST/1000000
+  /* Skip next 8   bytes */
+  offset=offset + 8
+  /* Wait I/O */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8
+  QWACAWTI=x_time(time8)
+  /* Wait local locks */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8 + 8
+  QWACAWTL=x_time(time8)
+  /* Wait other Read */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8
+  QWACAWTR=x_time(time8)
+  /* Wait other write*/
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8
+  QWACAWTW=x_time(time8)
+  /* Wait synch exec unit switch */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 8
+  QWACAWTE=x_time(time8)
+  /* Wait latch */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  offset=offset + 32
+  QWACAWLH=x_time(time8)
+  /* Wait write log  */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACAWLG=x_time(time8)
+  offset=offset + 12
+  /* Wait LOB materialization */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACALBW=x_time(time8)
+  offset=offset + 12
+  /* Wait Accel      */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACAACW=x_time(time8)
+  offset=offset + 8
+  /* Wait page latch      */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACAWTP=x_time(time8)
+  offset=offset + 16
+  /*QWACFLGS=c2d(SUBSTR(INPUT_REC,OFFSET,2))
+  say QWACFLGS
+  offset=offset + 4 */
+  /* Wait messages to others members */
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACAWTG=x_time(time8)
+  /* Wait global locks  */
+  offset=offset + 8
+  time8=c2x(SUBSTR(INPUT_REC,OFFSET,8))
+  QWACAWTJ=x_time(time8)
+  /* skip xx bytes */
+  offset=offset + 68
+  /* log records */
+  QWACLRN  = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+  offset=offset + 4
+  /* log bytes written */
+  QWACLRAB = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+  RETURN
+
+/* buffer manager data */
+DSNDQBAC:
+numeric digits 15
+  i = 0
+  getp=0
+  bufupd=0
+  syncio=0
+  syncwr=0
+  sprfreq=0
+  lprfreq=0
+  dprfreq=0
+  sio    =0
+  /* say 'buffer manager for plan' QWHCPLAN */
+  do until i= nb_pools
+     i = i+1
+     QBACPID   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     offset=offset + 4
+     QBACGET   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     offset=offset + 4
+     getp = getp+QBACGET
+     QBACSWS   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     BufUpd = BufUpd +QBACSWS
+     offset = offset + 8
+     QBACRIO   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     syncio = syncio+QBACRIO
+     offset = offset + 4
+     QBACSEQ   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     sprfreq = sprfreq+QBACSEQ
+     offset = offset + 4
+     QBACIMW   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     syncwr  = syncwr + QBACIMW
+     offset = offset + 4
+     QBACLPF   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     lprfreq = lprfreq+QBACLPF
+     offset = offset + 4
+     QBACDPF   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     dprfreq = dprfreq+QBACDPF
+     offset = offset + 24
+     QBACSIO   = C2D(SUBSTR(INPUT_REC,OFFSET,4))
+     sio     = sio    +QBACSIO
+     offset = offset + 8
+  /* say '      ',                                          */
+  /*     'buffer id' QBACPID 'gp:' QBACGET 'syncio' QBACRIO,*/
+  /*     'syncwr' QBACIMW  'SIO' QBACSIO                    */
+  end
+
+  return
+/* sql statements  */
+DSNDQXST:
+   selects   =0
+   inserts   =0
+   updates   =0
+   deletes   =0
+   opens     =0
+   fetchs    =0
+   offset=offset + 4
+   eye_catch = SUBSTR(INPUT_REC,OFFSET,4)
+   if eye_catch <> 'QXST' then
+           do
+              say 'QXST eye catcher not found at record' reci,
+                  ' offset' offset
+              exit 8
+           end
+   offset=offset + 4
+   selects   = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+   offset=offset + 8
+   inserts   = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+   offset=offset + 8
+   updates   = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+   offset=offset + 8
+   deletes   = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+   offset=offset + 24
+   opens     = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+   offset=offset + 136 /* 17*8*/
+   fetchs    = C2D(SUBSTR(INPUT_REC,OFFSET,8))
+  return
+
+GET_FMT_TIME:
+  RUN_HH = SM101TME % 360000
+  RUN_HH = RIGHT(RUN_HH,2,'0')
+  RUN_MIN = SM101TME % 6000 - RUN_HH*60
+  RUN_MIN = RIGHT(RUN_MIN,2,'0')
+  RUN_SEC = SM101TME % 100 - RUN_HH *3600 - RUN_MIN*60
+  RUN_SEC = RIGHT(RUN_SEC,2,'0')
+  RUN_FMT_TIME = RUN_HH||':'||RUN_MIN||':'||RUN_SEC
+RETURN
+
+write_header:
+  say 'file ' oufl     ' will be produced'
+  queue "Lpar,Ssid,Date,Time,ThdStart,Authid,Corrid,Connid,Plan,",
+        "OrigPrimAuth,Conntype,Elapsed,Cl1Cpu,Cl2Cpu,",
+        "Commit,Abort,LogRec,LogBytes,",
+        "WaitIO,WtLock,WtOthRd,WtOthWr,",
+        "WtSync,WtLatch,",
+        "WtWrLog,WtLob,WtAcc,WtPgLatch,WtMsg,WtGlLock,",
+        "Getp,SyncIo,BufUpd,SyncWr,SPrfReq,LPrfReq,DPrfReq,Sio,",
+        "Sels,Ins,Upd,Del,Open,Fetch,",
+        "ReqLoc,SrvName,SrvProdId,WrkSUser,WrkSNam"
+
+  "EXECIO" queued() "DISKW OUFL"
+
+  if summary='Y' then
+  do
+    say 'file ' oufs     ' will be produced'
+    queue "Lpar,Ssid,Date,Hour,Plan,Jobn,",
+           "Conntype,Occ,Cl1Cpu,Cl2Cpu,",
+           "Getp,SyncIo,BufUpd,SyncWr,SPrfReq,LPrfReq,DPrfReq,Sio,",
+           "Selects,Inserts,Updates,Deletes,Opens,Fetchs",
+
+    "EXECIO" queued() "DISKW OUFs"
+  end
+  return
+
+WRITE_REPORT:
+    reco= reco+ 1
+    /*rows in excel format */
+    queue sm101sid || ',' || sm101ssi || ','  ,
+    || sm101dte || ','   ,
+    || run_fmt_time || ','   ,
+    || ThdStart     || ','   ,
+    || strip(QWHCAID,'T')           || ','   ,
+    || strip(qwhccv,'T')            || ','   ,  /* CORRID*/
+    || strip(qwhccn,'T')            || ','   ,
+    || strip(qwhcplan,'T')          || ','   ,
+    || strip(qwhcopid,'T')          || ','   ,
+    || conntype          || ','   ,
+    || elapsed_time     || ','   ,
+    || tcb_time  || ','   ,
+    || QWACAJST  || ','   ,    /*cl2cpu*/
+    || QWACCOMM  || ','   ,    /*commits*/
+    || QWACABRT  || ','   ,    /*abort*/
+    || QWACLRN   || ','   ,    /*log records*/
+    || QWACLRAB  || ','   ,    /*log bytes  */
+    || format(QWACAWTI,6,0)|| ',' , /*wait io*/
+    || format(QWACAWTL,6,0)|| ',' , /*wait locks */
+    || format(QWACAWTR,6,0)|| ',' , /*wait oth. read */
+    || format(QWACAWTW,6,0)|| ',' , /*wait oth write */
+    || format(QWACAWTE,6,0)|| ',' , /*wait sync*/
+    || format(QWACAWLH,6,0)|| ',' , /*wait latch */
+    || format(QWACAWLG,6,0)|| ',' , /*wait log */
+    || format(QWACALBW,6,0)|| ',' , /*wait lob */
+    || format(QWACAACW,6,0)|| ',' , /*wait accelerator*/
+    || format(QWACAWTP,6,0)|| ',' , /*wait page latch */
+    || format(QWACAWTG,6,0)|| ',' , /*wait messages other members */
+    || format(QWACAWTJ,6,0)|| ',' , /*wait global locks */
+    || getp      || ','   ,
+    || syncio    || ','   ,
+    || BufUpd    || ','   ,
+    || syncwr    || ','   ,
+    || sprfreq   || ','   ,
+    || lprfreq   || ','   ,
+    || dprfreq   || ','   ,
+    || sio       || ','   ,
+    || selects   || ','   ,
+    || inserts   || ','   ,
+    || updates   || ','   ,
+    || deletes   || ','   ,
+    || opens     || ','   ,
+    || fetchs    || ','   ,
+    || strip(QWHDRQNM,'T')  || ','   ,
+    || strip(QWHDSVNM,'T')   || ','   ,
+    || strip(QWHDPRID,'T')   || ','   ,
+    || strip(QWHCEUID,'T')   || ','   ,
+    || strip(QWHCEUWN,'T')
+
+   "EXECIO" queued() "DISKW OUFL"
+
+   if QWHDRQNM > '' then do
+    /*  say 'ddf:' QWHDRQNM QWHDPRID qwhccv */
+   end
+   if summary='Y' then call process_summary
+return
+
+process_summary:
+   hour = left(run_fmt_time,2)
+   /* pas de rupture pour le 1er record lu */
+   if rupture = 0
+   then do
+       rupture=1
+       occ=0
+       s_hour=hour
+       s_qwhcplan=qwhcplan
+       s_jobn=jobn
+       s_conntype=conntype
+   end
+/* say 'test rupture'  reci */
+/* say s_hour hour          */
+/* say s_qwhcplan qwhcplan  */
+/* say s_jobn jobn          */
+/* say s_conntype conntype  */
+   /* detection rupture,declenche ecriture*/
+   if   hour <>  s_hour   | ,
+        conntype <> s_conntype | ,
+   strip(qwhcplan)||strip(jobn) <> strip(s_qwhcplan)||strip(s_jobn)
+   then do
+       call write_summary
+       sm_tcb_time  =  tcb_time
+       sm_QWACAJST  =  QWACAJST
+       sm_getp      =  getp
+       sm_BufUpd    =  BufUpd
+       sm_syncio    =  syncio
+       sm_syncwr    =  syncwr
+       sm_sprfreq   =  sprfreq
+       sm_lprfreq   =  lprfreq
+       sm_dprfreq   =  dprfreq
+       sm_sio       =  sio
+       sm_selects   =  selects
+       sm_inserts   =  inserts
+       sm_updates   =  updates
+       sm_deletes   =  deletes
+       sm_opens     =  opens
+       sm_fetchs    =  fetchs
+       occ=1
+
+   end
+   /*pas de rupture , on accumule les valeurs */
+   else do
+          sm_tcb_time  =  tcb_time + sm_tcb_time
+          sm_QWACAJST  =  QWACAJST + sm_QWACAJST
+          sm_getp      =  getp     + sm_getp
+          sm_BufUpd    =  BufUpd   + sm_BufUpd
+          sm_syncio    =  syncio   + sm_syncio
+          sm_syncwr    =  syncwr   + sm_syncwr
+          sm_sprfreq   =  sprfreq  + sm_sprfreq
+          sm_lprfreq   =  lprfreq  + sm_lprfreq
+          sm_dprfreq   =  dprfreq  + sm_dprfreq
+          sm_sio       =  sio      + sm_sio
+          sm_selects   =  selects  + sm_selects
+          sm_inserts   =  inserts  + sm_inserts
+          sm_updates   =  updates  + sm_updates
+          sm_deletes   =  deletes  + sm_deletes
+          sm_opens     =  opens    + sm_opens
+          sm_fetchs    =  fetchs   + sm_fetchs
+          occ = occ + 1
+   end/*pas de rupture , on accumule les valeurs */
+
+   /* dans tous les cas , on sauvegarde les valeurs */
+   /*s_sm101sid = sm101sid  */
+   /*s_sm101ssi = sm101ssi  */
+   /*s_sm101dte = sm101dte  */
+   hour = left(run_fmt_time,2)
+   s_hour = hour
+   s_run_fmt_time = run_fmt_time
+   s_qwhccv = qwhccv
+   s_qwhccn = qwhccn
+   s_qwhcplan =  qwhcplan
+   s_conntype = conntype
+   s_jobn  =jobn
+
+   return
+
+write_summary:
+     queue sm101sid || ',' || sm101ssi || ','  ,
+     || sm101dte || ','   ,
+     || s_hour || ','   ,
+     || s_qwhcplan               || ','   ,
+     || s_jobn                || ','   ,
+     || s_conntype          || ','   ,
+     || occ                 || ','   ,
+     || sm_tcb_time  || ','   ,
+     || sm_QWACAJST  || ','   ,    /*cl2cpu*/
+     || sm_getp      || ','   ,
+     || sm_syncio    || ','   ,
+     || sm_BufUpd    || ','   ,
+     || sm_syncwr    || ','   ,
+     || sm_sprfreq   || ','   ,
+     || sm_lprfreq   || ','   ,
+     || sm_dprfreq   || ','   ,
+     || sm_sio       || ','   ,
+     || sm_selects   || ','   ,
+     || sm_inserts   || ','   ,
+     || sm_updates   || ','   ,
+     || sm_deletes   || ','   ,
+     || sm_opens     || ','   ,
+     || sm_fetchs
+
+    "EXECIO" queued() "DISKW OUFS"
+   return
+
+init_sum:
+   sm_tcb_time = 0
+   sm_QWACAJST = 0
+   sm_getp     = 0
+   sm_BufUpd   = 0
+   sm_syncio   = 0
+   sm_syncwr   = 0
+   sm_sprfreq  = 0
+   sm_lprfreq  = 0
+   sm_dprfreq  = 0
+   sm_sio      = 0
+   sm_selects   =0
+   sm_inserts   =0
+   sm_updates   =0
+   sm_deletes   =0
+   sm_opens     =0
+   sm_fetchs    =0
+   return
+
+STCK2Local:
+    /* Store Clock Value Time to Local Time */
+    arg clock
+    clock = SPACE(clock,0)
+    cvt     = C2X(STORAGE(10,4))
+    cvttz_p = D2X(X2D(cvt) + X2D(130))
+    tzo     = STORAGE(cvttz_p,4)
+    tzo     = C2D(tzo,4)*1.048576
+    tzo     = (tzo+.5)%1
+    ndigits = MAX(6,1.2*LENGTH(clock)+1)%1
+    Numeric Digits ndigits
+    clock   = x2d(clock)*1.048576 / 16**(LENGTH(clock)-8)
+    clock   = clock + tzo
+    If clock < 0  Then Parse Value 0      0     ,
+                             With  clock  tzo
+    seconds = clock // (24*60*60)
+    hours   = RIGHT( seconds %3600    ,2,'0')
+    minutes = RIGHT((seconds//3600)%60,2,'0')
+    seconds = substr(TRANSLATE(FORMAT(seconds//60,2),'0',' '),1,2)
+    /* t1      = y'/'m'/'d hours':'minutes':'seconds   */
+    LocalTime=  hours':'minutes':'seconds
+    return
+record_ifcid:
+   found=0
+   do i = 1 to nbr_ifcid
+      if ifcid_st.i = ifcid then
+         do
+            found=1
+            ifcid_count.i=ifcid_count.i+1
+            leave
+         end
+   end
+   /* not found : add new ifcid to list*/
+   if found=0 then
+      do
+         nbr_ifcid = nbr_ifcid + 1
+         ifcid_st.nbr_ifcid = ifcid
+         ifcid_count.nbr_ifcid = 1
+      end
+   return
+report_ifcid:
+  say ' '
+  say 'List of IFCIDS read in this SMF file :' nbr_ifcid
+  say 'IFCID/Description/Count'
+  do i=1 to nbr_ifcid
+      Select
+           When ifcid_st.i = 03 then
+                      ifcid_desc='Gen. Accounting data - processed'
+           When ifcid_st.i = 04 then
+                      ifcid_desc='Trace stop'
+           When ifcid_st.i = 05 then
+                      ifcid_desc='Trace stop'
+           When ifcid_st.i = 22 then
+                      ifcid_desc='Mini Bind'
+           When ifcid_st.i = 53 then
+                      ifcid_desc='SQL Desc/Comm/Rollb/Remote Stmt'
+           When ifcid_st.i = 58 then
+                      ifcid_desc='End SQL'
+           When ifcid_st.i = 59 then
+                      ifcid_desc='Start Fetch'
+           When ifcid_st.i = 63 then
+                      ifcid_desc='SQL text'
+           When ifcid_st.i = 64 then
+                      ifcid_desc='Prepare Start'
+           When ifcid_st.i = 65 then
+                      ifcid_desc='Open cursor'
+           When ifcid_st.i = 66 then
+                      ifcid_desc='Close cursor'
+           When ifcid_st.i = 90 then
+                      ifcid_desc='Start Command'
+           When ifcid_st.i = 95 then
+                      ifcid_desc='Sort start'
+           When ifcid_st.i = 96 then
+                      ifcid_desc='Sort stop'
+           When ifcid_st.i = 105 then
+                      ifcid_desc='DBDID OBID translat'
+           When ifcid_st.i = 106 then
+                      ifcid_desc='System init parms'
+           When ifcid_st.i = 112 then
+                      ifcid_desc='Thread alloc'
+           When ifcid_st.i = 172 then
+                      ifcid_desc='DeadLock, timeout'
+           When ifcid_st.i = 173 then
+                      ifcid_desc='CL2 time'
+           When ifcid_st.i = 177 then
+                      ifcid_desc='Pkg alloc'
+           When ifcid_st.i = 196 then
+                      ifcid_desc='Timeout data'
+           When ifcid_st.i = 239 then
+                      ifcid_desc='Package Accounting data'
+           When ifcid_st.i = 254 then
+                      ifcid_desc='CF structure cache stats'
+           When ifcid_st.i = 258 then
+                      ifcid_desc='Dataset extend activity'
+           When ifcid_st.i = 313 then
+                      ifcid_desc='Uncomm. UR'
+           When ifcid_st.i = 337 then
+                      ifcid_desc='Lock Escalation'
+           When ifcid_st.i = 350 then
+                      ifcid_desc='SQL text'
+           When ifcid_st.i = 401 then
+                      ifcid_desc='Static SQL stats'
+           otherwise
+                      ifcid_desc='Unknow'
+
+      end   /* select */
+     say ifcid_st.i  ifcid_desc ifcid_count.i
+   end /* end do */
+   say ' '
+   return
+x_time:
+  arg time8
+  time8    = X2D(SUBSTR(time8,1,13))
+  time8     = time8/1000000
+  return time8

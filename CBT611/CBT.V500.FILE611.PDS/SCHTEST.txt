@@ -1,0 +1,715 @@
+/*REXX*/
+/*
+  Work Flow:
+  1. Submit the first job from the Base table.
+  2. Wait for the job to get completed.
+  3. Check for the status of completion of First job. If it is completed
+     sucessfully, then search in Trigger table for the jobs triggered by
+     this job. Submit all the jobs which are to be triggered.
+  4. All submitted jobs will update their status of completion
+     (ie 'C' for successful completion and 'A' for abend) in a job
+     status table.
+  5. The job status table is scanned for the completed jobs. If any job
+     is completed, the jobs which are to be triggered by this completed
+     job are searched in the Trigger table. If any jobs to be triggered
+     are present in the Trigger table, they are submitted in sequence.
+     If the completed job doesnot have any entry in the Trigger table,
+     it means that the next job is a dependent one. So the next job in
+     the Base table is taken.
+  6. If the job from Base table is a dependent job. The job is searched
+     in the dependent table. Based on the entries in the dependent table
+     the dependent job will wait for the completion of the jobs on which
+     it is dependent.
+  7. If all dependent jobs are completed successfully, the dependent job
+     is submitted.
+  8. The Job status table is again searched for completed jobs and steps
+     5 through 8 are performed.
+  9. When all the jobs are submitted, the program ends.
+ 10. In the case of abend in any job(ie if a status of 'A' is found in
+     Jobstatus table, the submission of all subsequent jobs are stopped
+     and the program is exited.
+ 11. In the case of an abend, user has to intervene and correct the
+     problematic job which will be displayed in the spool.
+ 12. The Submission of the jobs can be started from a particular job
+     by specifiying the restart parameter. This can be done as follows.
+
+       ISPSTART CMD(%SCHTEST  RESTART RESTARTJOB )
+*/
+Address ispexec
+Arg Restart rsrtjob
+"CONTROL ERRORS RETURN"
+
+/*Get the configuration information from inittool dataset*/
+Call inittool
+
+"VGET ( tabldsn ) ASIS"
+"VGET ( jcllib ) ASIS"
+
+"LIBDEF ISPTLIB DATASET ID('"tabldsn"') UNCOND"
+if rc \= 0 then do
+    say 'S-> LIBDEF failed on DD ISPTLIB. RC = ' rc
+    say "S-> Dataset name = '" tabldsn "'"
+    say 'S-> Terminating application'
+    exit
+end
+"LIBDEF ISPTABL DATASET ID('"tabldsn"') UNCOND"
+if rc \= 0 then do
+    say 'S-> LIBDEF failed on DD ISPTABL. RC = ' rc
+    say "S-> Dataset name = '" tabldsn "'"
+    say 'S-> Terminating application'
+    exit
+end
+
+/*Check whether Restart is specified*/
+
+If value(Restart) = 'RESTART' then do
+    Restart = 'Yes'
+    Say "I -> Restart is specified, restart jobname is "rsrtjob
+End
+Else do
+    Restart = 'No'
+End
+
+Say "I -> Preparing tables"
+Call Prepare_jobstatus_table
+Say "I -> Reading the Master Tables"
+basetbl = 'basetbl'
+"TBOPEN "basetbl "NOWRITE"
+orc = rc
+if orc \= 0 then do
+    say "S-> TBOPEN failed for table "basetbl".RC="rc
+    Say zerrlm
+    signal main_exit
+end
+trigtbl = 'trigtbl'
+"TBOPEN "trigtbl "NOWRITE"
+orc = rc
+if orc \= 0 then do
+    say "S-> TBOPEN failed for table "trigtbl".RC="rc
+    Say zerrlm
+    signal main_exit
+end
+depdtbl = 'depdtbl'
+"TBOPEN "depdtbl "NOWRITE"
+orc = rc
+if orc \= 0 then do
+    say "S-> TBOPEN failed for table "depdtbl".RC="rc
+    Say zerrlm
+    signal main_exit
+end
+"TBTOP "basetbl
+"TBSKIP "basetbl
+if rc \= 0 then do
+    say "S-> TBSKIP failed for table "jbsttbl".RC="rc
+    Say zerrlm
+    signal main_exit
+end
+else
+    Say "First job from base table " basjbnam
+
+/*Submit the first job from base table*/
+
+jbname = basjbnam
+If Restart = 'Yes' then do
+    Call Open_jobstatus_nowrite_jbscan
+    If jbname \= rsrtjob then do
+        runingjb = jbname
+        "TBSCAN "jbsttbl "ARGLIST(runingjb)"
+        Scanrc = rc
+        If Scanrc = 0 then do
+            Update_ind = 'C'
+            Call Update_jobstatus_x
+        End
+    End
+    Else do
+        Restart = 'No'
+        Call Submit_the_job
+    End
+End
+Else do
+    Call submit_the_job
+End
+
+/*Initialise switches*/
+
+Dummy_depd  = ''
+depd_sub_sw = 'N'
+jbsttbl = 'JBSTTBL'
+runingjb  = basjbnam
+jbstatus  = 'C'
+
+/*Scan for the status 'A' or 'C' of first job in jobstatus table*/
+
+Scanrc = 1
+Do While Scanrc /= 0
+    Call Open_jobstatus_nowrite
+    jbstatus = 'A'
+    "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+    Scanrc = rc
+    If Scanrc = 0 then do
+       Say "S -> First job has abended. Jobname "runingjb
+       Signal main_exit
+    End
+    "TBTOP "jbsttbl
+    jbstatus = 'M'
+    "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+    mscan = rc
+    If mscan = 0 then do
+        jbname = runingjb
+        Call Find_End
+        If y.2 = 'Y.2' then do
+            Say "S -> JCL ERROR or JOB CANCELLED.Quitting in first job",
+                                                   jbname
+            Signal main_exit
+        End
+        Else do
+           y.2 = 'Y.2'
+        End
+    End
+    "TBTOP "jbsttbl
+    jbstatus = 'C'
+    "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+    Scanrc = rc
+End
+scanrc = rc /*Scan success, proceed with processing the jobstatus*/
+
+/*Main Loop starts here. The Loop revolves around job status table
+  checking for any completed job(ie job with status 'C') based on which
+  further action is taken. In case an abend job is found(ie job with
+  status 'A') the Loop is exited without any further submission of jobs.
+*/
+ Do While scanrc = 0
+
+
+     Call Submit_from_trigger_table
+     /*Tscan1rc is non-zero. This means that the we have to search the
+       base table to find the next job, which will be a dependent job*/
+
+     If tscan1rc \= 0 & Dummy_depd = 'DUMMY' then do
+         "TBSKIP "basetbl
+         skiprc = rc
+         If skiprc = 8 then do
+             Say "I -> JOBs scheduled properly, good bye"
+             Signal main_exit
+         End
+     End
+
+
+     If tscan1rc \= 0 & Dummy_depd = '' then do
+        Rescan_sw = 0
+
+         /*Do a read next on the base table*/
+
+         "TBSKIP "basetbl
+         skiprc = rc
+         If skiprc = 0 then do
+             If strip(basjbnam) = 'DUMMY' then do
+                 Dummy_depd = 'DUMMY'
+                 Say "I -> No more Dependent jobs"
+             End
+         End
+         If skiprc = 8 then do
+             Say "I -> JOBs scheduled properly, good bye"
+             Signal main_exit
+         end
+
+         /*A status 'D' means the job is dependent one
+           Scan the dependent table*/
+
+         If jbfunc = 'D' & Dummy_depd = '' then do
+             "TBTOP "depdtbl
+             Say "I -> Dependent job name " basjbnam
+             srcjbnm = basjbnam
+             "TBSARG " depdtbl "NAMECOND(srcjbnm,EQ)"
+             "TBSCAN " depdtbl "ARGLIST(srcjbnm)"
+             depscanrc = rc
+             if depscanrc \= 0 then do
+                 Say "S -> TBSCAN error on tabl "depdtbl"rc"rc
+                 Say zerrlm
+                 Signal main_exit
+             end
+
+             /*Check for all the jobs in dependent table. The
+               dependent job has to be submitted only after all its
+               corresponding entries in dependent table(jobs) are over*/
+
+             Do While depscanrc = 0
+                runingjb = depdjbnm
+                Call Open_jobstatus_nowrite_jbscan
+                "TBSCAN  "jbsttbl "ARGLIST(runingjb)"
+                 statrc = rc
+
+                 /*Check whether the job is completed, if yes go ahead
+                   and update the jobstatus table with indicator as 'X'
+                   Remember that the main loop checks for the job status
+                   of 'C' for exit criteria
+
+                   JOBSTATUS 'M': A job with a job status 'M' denotes
+                   -------------
+                   that it has been submitted. Now if the job ends due
+                   to jcl error or it is cancelled, the job wouldnot be
+                   updating the job status table. So a check is made as
+                   to ascertain whether the job is active or not. For
+                   this the routine "JOBLIST" from CBT tape is used. If
+                   a job is submitted and if it is not active, then the
+                   scheduling is stopped with an appropriate error
+                   message.
+                 */
+
+                 Select
+                  When jbstatus = 'S' then do
+                      Call Open_jobstatus_nowrite
+                      jbstatus = 'M'
+                      "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+                      mscan = rc
+                      If mscan = 0 then do
+                          jbname = runingjb
+                          Call Find_End
+                          If y.2 = 'Y.2' then do
+                              Say "S -> JCL ERROR or JOB Cancelled ",
+                                  "..Quitting " jbname
+                              Signal main_exit
+                          End
+                          Else do
+                              y.2 = 'Y.2'
+                              "TBTOP "jbsttbl
+                              jbstatus = 'A'
+                              "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+                              ascanrc = rc
+                              If ascanrc = 0 then do
+                                  Say "S -> Abend in job "runingjb
+                                  Signal main_exit
+                              End
+                              "TBTOP "jbsttbl
+                              jbstatus = 'C'
+                              "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+                              scanrc = rc
+                              If scanrc = 0 then do
+                                  Call Submit_from_trigger_table
+                                  Rescan_sw = 1
+                              End
+                              Else do
+                                  Rescan_sw = 1
+                              End
+                          End
+                      End
+                  End
+                  When jbstatus = 'C' then do
+                      Say "I -> Dependent job "depdjbnm" completed"
+                      runingjb = depdjbnm
+                      Update_ind = 'X'
+                      Call Update_jobstatus_x
+                  End
+                  When jbstatus = 'A' then do
+                      Say "S -> Dependent job has abended "runingjb
+                      Signal main_exit
+                  End
+                  When jbstatus = 'X' then do
+                      Say "S -> Dependent job "depdjbnm " completed"
+                  End
+                  When jbstatus = 'M' then do
+                      jbname = depdjbnm
+                      Call Find_End
+                      If y.2 = 'Y.2' then do
+                          Say "S -> JCL ERROR or JOB CANCELLED",
+                          "..Quitting "jbname
+                          Signal main_exit
+                      End
+                      Else do
+                          y.2 = 'Y.2'
+                          Rescan_sw = 1
+                      End
+                  End
+                  Otherwise nop
+                 End
+                 "TBSCAN "depdtbl "ARGLIST(srcjbnm)"
+                 depscanrc = rc
+                 If depscanrc \= 0 & Rescan_sw > 0 then do
+                     Rescan_sw = 0
+                     "TBTOP "depdtbl
+                     "TBSCAN "depdtbl "ARGLIST(srcjbnm)"
+                     depscanrc = rc
+                 End
+             End
+
+             /*submit the dependent job*/
+
+             jbname = srcjbnm
+             If Restart = 'Yes' then do
+                 Call Open_jobstatus_nowrite_jbscan
+                 If jbname \= rsrtjob then do
+                     runingjb = jbname
+                     "TBSCAN "jbsttbl "ARGLIST(runingjb)"
+                     Scanrc = rc
+                     If Scanrc = 0 then do
+                         Update_ind = 'C'
+                         Call Update_jobstatus_x
+                     End
+                 End
+                 Else do
+                     Restart = 'No'
+                     Say "submitting depd jb " jbname
+                     Call Submit_the_job
+                 End
+             End
+             Else do
+                 Say "submitting depd jb " jbname
+                 Call submit_the_job
+             End
+
+             /*The following switch is set to 'Y' because when a
+               dependent job is submitted no job might be active*/
+
+             depd_sub_sw = 'Y'
+         End
+     End
+
+     Call Open_jobstatus_nowrite
+     jbstatus = 'A'
+     "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+     scanrc = rc
+     If Scanrc = 0 then do
+         Say "S -> job has abended " runingjb
+         Say zerrlm
+         Signal main_exit
+     End
+     "TBTOP   "jbsttbl
+     jbstatus = 'M'
+     "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+     mscan = rc
+     If mscan = 0 then do
+         jbname = runingjb
+         Call Find_End
+         If y.2 = 'Y.2' then do
+             Say "S -> JCL ERROR or JOB CANCELLED..Quitting "jbname
+             Signal main_exit
+         End
+         Else do
+             y.2 = 'Y.2'
+         End
+     End
+     "TBTOP   "jbsttbl
+     jbstatus = 'C'
+     "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+     Scanrc = rc
+     Scansrc = 1
+     if scanrc \= 0 then do
+         "TBTOP "jbsttbl
+         jbstatus = 'S'
+         "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+         scansrc = rc
+     end
+     If Scansrc = 0 then do
+         Scanrc = 1
+     End
+     Else do
+         Scanrc = 0
+     End
+     Do While scanrc \= 0
+         Call Wait_period 15
+         Call Open_jobstatus_nowrite
+         jbstatus = 'M'
+         "TBTOP "jbsttbl
+         "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+         mscan = rc
+         If mscan = 0 then do
+             jbname = runingjb
+             Call Find_End
+             If y.2 = 'Y.2' then do
+                 Say "S -> JCL ERROR or JOB CANCELLED..Quitting "jbname
+                 Signal main_exit
+             End
+             Else do
+                 y.2 = 'Y.2'
+             End
+         End
+         "TBTOP "jbsttbl
+         jbstatus = 'A'
+         "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+         if rc = 0 then do
+             Say "S -> Job has abended "runingjb
+             Say zerrlm
+             Signal main_exit
+         end
+         "TBTOP "jbsttbl
+         jbstatus = 'C'
+         "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+         scanrc = rc
+     End
+
+
+     /*check for dependent job submitted status*/
+
+     If depd_sub_sw = 'Y' then do
+         Do While scanrc \= 0
+             Call Wait_period 15
+             Call Open_jobstatus_nowrite
+             jbstatus = 'M'
+             "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+             mscan = rc
+             If mscan = 0 then do
+                 jbname = runingjb
+                 Call Find_End
+                 If y.2 = 'Y.2' then do
+                     Say "S -> JCL ERROR or JOB CANCELLED..Quitting ",
+                                                            jbname
+                     Signal main_exit
+                 End
+                 Else do
+                    y.2 = 'Y.2'
+                 End
+             End
+             "TBTOP   "jbsttbl
+             jbstatus = 'A'
+             "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+             Scanrc = rc
+             if Scanrc = 0 then do
+                 Say "S -> job has abended " runingjb
+                 Say zerrlm
+                 Signal main_exit
+             End
+             "TBTOP   "jbsttbl
+             jbstatus = 'C'
+             "TBSCAN "jbsttbl "ARGLIST(jbstatus)"
+             Scanrc = rc
+         End
+         depd_sub_sw   = 'N'
+     End
+ End
+/*Processing ended, go to exit*/
+Signal main_exit
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+/*Functions used in the program                                      */
+/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+Update_jobstatus_x:
+    "TBCLOSE "jbsttbl
+    "TBOPEN   "jbsttbl "WRITE"
+    openrc = rc
+
+    /*Check whether some other job has ENQ on the table, if so wait*/
+
+    Do While openrc = 12
+        Call Wait_period 15
+        "TBOPEN "jbsttbl "WRITE"
+        openrc = rc
+    End
+    "TBSARG " jbsttbl "NAMECOND(runingjb,EQ)"
+    "TBTOP    " jbsttbl
+    "TBSCAN   " jbsttbl "ARGLIST(runingjb)"
+
+    jbstatus = update_ind
+    /*Update the job status table with status of 'X'*/
+
+    "TBPUT   " jbsttbl
+    putrc = rc
+    if putrc \= 0 then do
+        Say "S -> TBPUT failed on table"jbsttbl
+        Say zerrlm
+        Signal main_exit
+    End
+    "TBCLOSE " jbsttbl
+    "TBOPEN   " jbsttbl "NOWRITE"
+Return
+Open_jobstatus_nowrite:
+    "TBCLOSE "jbsttbl
+    "TBOPEN  "jbsttbl "NOWRITE"
+    "TBTOP   "jbsttbl
+    "TBSARG  "jbsttbl "NAMECOND(jbstatus,EQ)"
+Return
+Open_jobstatus_nowrite_jbscan:
+    "TBCLOSE "jbsttbl
+    "TBOPEN "jbsttbl "NOWRITE"
+    "TBTOP "jbsttbl
+    "TBSARG "jbsttbl "NAMECOND(runingjb,EQ)"
+Return
+Prepare_jobstatus_table:
+    "TBCLOSE "jbsttbl
+    "TBOPEN   "jbsttbl "WRITE"
+    openrc = rc
+
+    if openrc \= 0 then do
+        Say "S -> TBOPEN failed on table"jbsttbl "rc " rc
+        Say zerrlm
+        Signal main_exit
+    End
+    "TBSARG " jbsttbl "NAMECOND(jbstatus,EQ)"
+    "TBTOP    " jbsttbl
+    jbstatus = 'A'
+    "TBSCAN   " jbsttbl "ARGLIST(jbstatus)"
+    ascanrc = rc
+
+    /*Update the job status table with status of 'S'*/
+    Do While ascanrc = 0
+        update_ind = 'S'
+        jbstatus = update_ind
+        "TBPUT   " jbsttbl
+        putrc = rc
+        If putrc = 8 then do
+            putrc = 0
+            "TBTOP "jbsttbl
+        End
+        if putrc \= 0 then do
+            Say "S -> TBPUT failed on table"jbsttbl "rc " rc
+            Say zerrlm
+            Signal main_exit
+        End
+        jbstatus = 'A'
+        "TBSCAN " jbsttbl "ARGLIST(jbstatus)"
+        ascanrc = rc
+    End
+    "TBTOP    " jbsttbl
+    jbstatus = 'C'
+    "TBSCAN   " jbsttbl "ARGLIST(jbstatus)"
+    ccscanrc = rc
+
+    /*Update the job status table with status of 'S'*/
+    Do While ccscanrc = 0
+        update_ind = 'S'
+        jbstatus = update_ind
+        "TBPUT   " jbsttbl
+        putrc = rc
+        If putrc = 8 then do
+            putrc = 0
+            "TBTOP "jbsttbl
+        End
+        if putrc \= 0 then do
+            Say "S -> TBPUT failed on table"jbsttbl "rc " rc
+            Say zerrlm
+            Signal main_exit
+        End
+        jbstatus = 'C'
+        "TBSCAN " jbsttbl "ARGLIST(jbstatus)"
+        ccscanrc = rc
+    End
+    "TBTOP    " jbsttbl
+    jbstatus = 'X'
+    "TBSCAN   " jbsttbl "ARGLIST(jbstatus)"
+    xscanrc = rc
+
+    /*Update the job status table with status of 'S'*/
+    Do While xscanrc = 0
+        update_ind = 'S'
+        jbstatus = update_ind
+        "TBPUT   " jbsttbl
+        putrc = rc
+        If putrc = 8 then do
+            putrc = 0
+            "TBTOP "jbsttbl
+        End
+        if putrc \= 0 then do
+            Say "S -> TBPUT failed on table"jbsttbl "rc " rc
+            Say zerrlm
+            Signal main_exit
+        End
+        jbstatus = 'X'
+        "TBSCAN " jbsttbl "ARGLIST(jbstatus)"
+        xscanrc = rc
+    End
+    "TBTOP    " jbsttbl
+    jbstatus = 'M'
+    "TBSCAN   " jbsttbl "ARGLIST(jbstatus)"
+    mscanrc = rc
+
+    /*Update the job status table with status of 'S'*/
+    Do While mscanrc = 0
+        update_ind = 'S'
+        jbstatus = update_ind
+        "TBPUT   " jbsttbl
+        putrc = rc
+        If putrc = 8 then do
+            putrc = 0
+            "TBTOP "jbsttbl
+        End
+        if putrc \= 0 then do
+            Say "S -> TBPUT failed on table"jbsttbl "rc " rc
+            Say zerrlm
+            Signal main_exit
+        End
+        jbstatus = 'M'
+        "TBSCAN " jbsttbl "ARGLIST(jbstatus)"
+        mscanrc = rc
+    End
+    "TBCLOSE " jbsttbl
+Return
+Submit_from_trigger_table:
+     trigjbnm = runingjb
+     "TBTOP  " trigtbl
+     "TBSARG " trigtbl "NAMECOND(trigjbnm,EQ)"
+     "TBSCAN " trigtbl "ARGLIST(trigjbnm)"
+     tscanrc  = rc
+
+     /*Function of tscan1rc. If the return code is non zero from the
+       first scan itself, then the next job is a dependent job.*/
+
+     tscan1rc = rc
+
+
+     /*If the completed job trigger any jobs, submit those in sequence
+     */
+
+     Do While tscanrc = 0
+         jbname = targjbnm
+         If Restart = 'Yes' then do
+             Call Open_jobstatus_nowrite_jbscan
+             If jbname \= rsrtjob then do
+                 runingjb = jbname
+                 "TBSCAN "jbsttbl "ARGLIST(runingjb)"
+                 Scanrc = rc
+                 If Scanrc = 0 then do
+                     Update_ind = 'C'
+                     Call Update_jobstatus_x
+                 End
+             End
+             Else do
+                 Restart = 'No'
+                 Say "submitting from trig table " jbname
+                 Call Submit_the_job
+             End
+         End
+         Else do
+             Say "submitting from trig table " jbname
+             Call submit_the_job
+         End
+         "TBSCAN "trigtbl "ARGLIST(trigjbnm)"
+         tscanrc = rc
+     End
+
+     /*As the completed job (with the status 'C' has triggered all its
+       jobs, we have to update its status to 'X'. This is to be done
+       as our loop exit criteria depends on a scan on job status 'C'*/
+
+     runingjb = trigjbnm
+     Update_ind = 'X'
+     Call Update_jobstatus_x
+Return
+Wait_period:
+    Arg seconds
+    Call syscalls('ON')
+    address syscall
+    "sleep "seconds
+    call syscalls('OFF')
+Return
+Submit_the_job:
+    address tso "submit '"jcllib"("jbname")'"
+    /*Once a job is submitted, update its status to 'M' in jobstatus
+      table. This is to findout whether a job has ended due to a
+      jcl error or the job was cancelled due to some reason
+    */
+    runingjb = jbname
+    Update_ind = 'M'
+    Call Update_jobstatus_x
+    Call Wait_period 2
+Return
+Find_end:
+x = outtrap(y.)
+    call joblist jbname
+x = outtrap(off)
+Return
+main_exit:
+"TBCLOSE "basetbl
+"TBCLOSE "trigtbl
+"TBCLOSE "depdtbl
+"TBCLOSE "jbsttbl
+"LIBDEF ISPTABL"
+"LIBDEF ISPTLIB"
+exit

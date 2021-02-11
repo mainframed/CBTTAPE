@@ -1,0 +1,750 @@
+Selection of index CI size
+
+The IBM VSE/VSAM Programmer's Reference states "Pick the
+smallest index CI you can". But it does not clearly explain
+why.  It seems to me that the reasoning is as follows.  The
+smaller the index Control Interval size, the more index records
+that can be held in a given amount of buffer space.  Therefore,
+the probability that a given index record is in memory will
+increase and fewer I/Os will be required to access the index -
+none if all index records can be held in memory.  (This
+reasoning does not apply to SHAREOPTIONS(4) files where
+the buffers are refreshed before every read.)
+
+The BUFFERSPACE buffer allocation algorithm used by
+VSAM for direct processing emphasizes this point.  Once the
+minimum allocation of data and index buffers is made (either
+by default or using BUFND and BUFNI), VSAM allocates the
+remaining buffer space to index CIs.  Therefore, the smaller
+the index CI size, the more buffers can be allocated to index
+records and the probability of index I/O is reduced.  This is an
+important consideration in storage-constrained systems since
+smaller index CI sizes will make more effective use of scarce
+buffer resources than larger CI sizes.  A further saving of
+resources (disk storage) can be made if all index records can be
+held in memory.  It is evident that IMBED (which uses an
+additional CI per CA) gives no performance advantage if no
+index I/O is necessary.
+
+But the index CI size cannot be set to the minimum size (512
+bytes) in all cases.  An index sequence set record (ie the lowest
+level of index) must be able to contain entries for all data
+Control Intervals in a given Control Area.  Since index Control
+Intervals cannot contain spanned index records, if the index
+Control Interval is too small, then VSAM will not fill all data
+CIs in the CA, but only as many as can be indexed by one
+index CI.  The unused data CI space cannot be used for CI/CA
+splits - it is simply unavailable.  Therefore too small an index
+CI size can result in huge amounts of wasted space.  It might
+be said that disk space is relatively cheap compared to memory
+resources.  But not just disk space is wasted.  Longer disk
+access time will be required to a read a given data record, since
+more arm movement is required for a more spread out dataset.
+Also, since each Control Area is effectively filled up well
+before a typical allocation of CA Free Space (say 10%), the
+specified CA Free Space will be ineffective.  Thus each CI
+split will result in a very I/O costly CA split.
+
+It follows that the effect of key compression is important, since
+it allows more entries per index record.  Key compression is
+the technique VSAM uses to attempt to maximize the number
+of entries in an index record.  Characters which are not
+necessary to distinguish a given key from adjacent keys are
+removed from the front and back of a key.  The greater the
+degree of key compression, the smaller the index CI size can
+be without causing wasted space.  (The mechanics of key
+compression for KSDS files was discussed in some detail in
+David Haines' article VSAM Tuning in Xephon's VSAM
+Yearbook 1989.)
+
+It is possible under the right conditions to compress some keys
+to less than half their original length (eg from 20-30 bytes to 8-
+9 bytes).  The degree of compression depends on the structure
+of the keys - some keys compress very poorly.  VSAM makes
+an estimate of key compression when a cluster or alternate
+index is DEFINEd and will override the specified index CI size
+if it is considered too small.  Since IDCAMS cannot know in
+advance what the actual key compression will be, the
+substituted value may be incorrect.  The correct key
+compression value can only be determined after the dataset is
+loaded.
+
+Dumping selected index records and determining the key
+compression ratio by hand may give a reasonable estimate.
+But it is better to automate the process.  The following program
+VKEYC reads all the index records of a KSDS or alternate
+index and calculates the key compression in each record.  At
+end-of-file, the average key compression is calculated and a
+minimum index CI size is recommended based on the formula:
+
+      Index CIsize > CIs per CA * compressed key length
+
+This minimum should then be rounded up to the next multiple
+of 512 (maximum index CI size is 8192).
+
+VKEYC is written for the VSE/VSAM environment.  The only
+part of the program that needs to be revised for the MVS
+environment (other than program prologue/epilogue) is that
+relating to catalog access (to determine CIs per CA), since
+VSE/VSAM catalogs and MVS catalogs have different
+formats.  Otherwise, the algorithm for determining key
+compression is the same.
+
+ TITLE 'VKEYC - PROGRAM TO ESTIMATE KEY COMPRESSION FOR VSE/VSAM KSDS'
+*   PROGRAM NAME - VKEYC
+*   FUNCTION     - ESTIMATE KEY COMPRESSION FOR VSAM KSDS
+*                  AND RECOMMEND MINIMUM INDEX CISIZE
+*   INPUT FILES  - VSAM FILE
+*   OUTPUT FILES - PRINT FILE
+* REQUIRED JCL
+* // JOB KEYJOB
+* // LIBDEF *,SEARCH=LIB.SUBLIB
+* // DLBL CFILE,'VSAM.CLUSTER',,VSAM,CAT=USERCAT
+* // DLBL IFILE,'VSAM.CLUSTER.INDEX',,VSAM,CAT=USERCAT,BUFSP=NNNNN
+* // EXEC VKEYC,SIZE=AUTO
+* /*
+* /&
+*
+         EJECT
+*   REGISTER USAGE
+*   R1-R6 - WORK REGISTERS
+*   R7  -  PRINT BUFFER PTR
+*   R8  -  2ND PROGRAM BASE
+*   R10 -  LINK REGISTER
+*   R13 -  VSAM SAVE AREA PTR
+         EJECT
+* PSEUDO-CODE OVERVIEW
+* OPEN PRINT FILE (FOR ERROR MESSAGES)
+* FIND ADDRESS OF CATALOG ACB (SHOWCAT FOR CLUSTER COMPONENT)
+* FIND CI ADDRESS OF DATA COMPONENT CATALOG RECORD
+* READ CATALOG RECORD TO FIND KEY LENGTH, CIS PER CA
+* OPEN INDEX COMPONENT (SEQ INPUT)
+* FIND INDEX CISIZE
+* DO UNTIL END-OF-FILE ON VSAM FILE
+*    READ RECORD
+*    IF READ ERROR
+*       NOTIFY FATAL ERROR
+*    ENDIF
+*    CALCULATE KEY COMPRESSION
+* ENDDO
+* CLOSE VSAM FILE
+* PRINT SUMMARY (AVERAGE KEY LENGTH ETC)
+* CLOSE PRINT FILE
+VKEYC    CSECT
+         BALR  R11,0
+         USING *,R11,R8            SET PROGRAM BASE REGS R11, R8
+         LA    R8,1(R11)
+         LA    R8,4095(R8)
+         EJECT
+         LA    R13,VSAMSAVE        R13 => VSAM SAVE AREA
+         XC    VSMARG,VSMARG       CLEAR DUMMY ARGUMENT
+* OPEN PRINT FILE
+         OPEN  PRINTFL             OPEN PRINT FILE
+* SPACE 2 LINES
+         MVI   PRTBUF,NEWLINE2     CTL CHAR
+         BAL   R10,PRINT           SPACE 2
+         LA    R7,PRTBUF+1         R7 => PRINT BUFFER + CTL CHR
+* FIND ADDRESS OF CATALOG ACB
+         MVC   OPERATN,=CL8'SHOWCAT' VSAM OPERATION ID
+         SHOWCAT DDNAME=CFILE,AREA=SHOWAREA
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              SOMETHING WRONG
+         ENDIF
+         IF    (CLI,TYPE,NE,C'C')
+         MVC   PRTBUF+1(27),=CL27'*** NOT A CLUSTER ENTRY ***'
+         BAL   R10,PRINT
+         B     EXIT
+         ENDIF
+* FIND CI OF DATA RECORD
+         LH    R1,NOOBJS           R1 = NO. OF ENTRIES
+         LA    R2,OBJTAB           R2 => OBJECT TABLE
+         DO    FROM=(R1)           DO UNTIL END OF TABLE
+         IF    (CLI,0(R2),EQ,C'D')       IF DATA ENTRY
+         MVC   INDEXCI(L'INDEXCI),1(R2)  GET CI NO.
+         B     ENDTAB                    END OF SEARCH
+         ENDIF
+         LA    R2,4(R2)            BUMP POINTER
+         ENDDO
+ENDTAB   DS    0H
+         IF    (OC,INDEXCI,INDEXCI,Z)
+         MVC   PRTBUF+1(29),=CL29'*** INVALID CATALOG ENTRY ***'
+         BAL   R10,PRINT
+         B     EXIT
+         ENDIF
+* READ CATALOG TO FIND FILE PARMS
+         BAL   R10,READCAT
+* OPEN INDEX COMPONENT
+         MVC   OPERATN,=CL8'OPEN'
+         OPEN  VSMACB              OPEN INDEX
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              SOMETHING WRONG
+         ENDIF
+* GET INDEX CONTROL INTERVAL SIZE
+         MVC   OPERATN,=CL8'SHOWCB'
+         SHOWCB ACB=VSMACB,AREA=CISZ,LENGTH=4,FIELDS=(CINV)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              SOMETHING WRONG
+         ENDIF
+         L     R1,CISZ
+         BAL   R10,CONVERTP        CONVERT TO PRINTABLE (DECIMAL)
+         MVC   PRTBUF+1(29),=CL29'CURRENT CONTROL INTERVAL SIZE'
+         MVC   PRTBUF+50(L'WORK6),WORK6
+         BAL   R10,PRINT
+* READ VSAM FILE UNTIL EOF
+         MVC   OPERATN,=CL8'GET'   VSAM OPERATION ID
+         DO    INF                 START READ LOOP
+         GET   RPL=VSMRPL          READ A RECORD
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     EOF                 ANY ERROR = EOF
+         ENDIF
+* CALCULATE KEY ENTRY LENGTH
+         BAL   R10,CALC
+* BUMP RECORD COUNT
+         LA    R5,1                BUMP RECORD COUNT
+         A     R5,RCOUNT
+         ST    R5,RCOUNT
+         ENDDO                     END READ LOOP
+* EOF PROCESSING - GIVE FINAL MSGS
+EOF      DS    0H                  EOF ADDRESS
+         L     R1,NOSEQS
+         BAL   R10,CONVERTP        CONVERT TO PRINTABLE (DECIMAL)
+         MVC   PRTBUF+1(33),=CL33'NO. OF SEQUENCE SET INDEX RECORDS'
+         MVC   PRTBUF+50(L'WORK6),WORK6
+         BAL   R10,PRINT
+         IF    (OC,NOSEQS,NOSEQS,NZ)   IF SEQ SET RECORDS > 0
+         L     R2,ENTLEN           GET TOTAL AVERAGE KEY ENTRY LENGTH
+         SRDA  R2,32(0)            SET UP R2/R3 FOR DIVIDE
+         D     R2,NOSEQS           TOTAL / NO RECORDS = AVERAGE
+         LR    R1,R3
+         BAL   R10,CONVERTP        CONVERT TO PRINTABLE (DECIMAL)
+         MVC   PRTBUF+1(19),=CL19'AVERAGE KEY LENGTH'
+         MVC   PRTBUF+50(L'WORK6),WORK6
+         BAL   R10,PRINT
+         M     R2,CICA             AVERAGE X CIS/CA = MIN. CI SIZE
+         LR    R1,R3
+         BAL   R10,CONVERTP        CONVERT TO PRINTABLE (DECIMAL)
+         MVC   PRTBUF+1(29),=CL29'MINIMUM CONTROL INTERVAL SIZE'
+         MVC   PRTBUF+50(L'WORK6),WORK6
+         BAL   R10,PRINT
+         ENDIF
+         BAL   R10,PRINT           SPACE 1
+         MVC   OPERATN,=CL8'CLOSE'
+         CLOSE VSMACB              CLOSE VSAM FILE
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              SOMETHING WRONG
+         ENDIF
+* PRINT TOTAL NO. RECORDS
+         L     R1,RCOUNT           GET RECORD COUNT
+         BAL   R10,CONVERTP        CONVERT TO PRINTABLE (DECIMAL)
+         MVC   PRTBUF+1(20),=CL20'NO. OF INDEX RECORDS'
+         MVC   PRTBUF+50(L'WORK6),WORK6        RECORD COUNT
+         BAL   R10,PRINT
+EXIT     DS    0H
+         CLOSE VSMACB              CLOSE VSAM FILE
+         CLOSE PRINTFL             CLOSE PRINT FILE
+         EOJ
+* SHOWCB, SHOWCAT WORK AREAS
+CISZ     DC    F'0'                INDEX CISZ
+CFILE    DC    CL7'CFILE'
+SHOWAREA DS    0F
+AREALEN  DC    H'200'
+WLEN     DS    H                   ACTUAL WORKAREA LENGTH
+CATACB   DS    F                   ADDR OF CATALOG ACB
+TYPE     DS    CL1
+FILL1    DS    XL1                 RESERVED
+NOOBJS   DS    XL2                 NO. OF ASSOCIATED OBJECTS
+OBJTAB   DS    0C
+OBJTYPE  DS    CL1
+OBJCI    DS    XL3
+         ORG   SHOWAREA+200
+OBJTABL  EQU   *-OBJTAB
+         EJECT
+* CALC - CALCULATE AVERAGE KEY ENTRY LENGTH IF SEQUENCE SET RECORD
+CALC     DS    0H
+         ST    R10,CSAVE1
+* DETERMINE BEGINNING ADDRESS OF 1ST KEY ENTRY
+         L     R7,BUFADDR
+         USING ISECT,R7
+         IF    (CLI,LEVEL,EQ,X'01')    IF SEQUENCE SET RECORD
+         XR    R2,R2
+         ICM   R2,B'0011',UNUSED   R2 = OFFSET OF START OF UNUSED SPACE
+         XR    R4,R4
+         ICM   R4,B'0011',ILEN     R4 = RECORD LENGTH
+         SR    R4,R2               R4 = SEARCH LENGTH
+         AR    R2,R7               R2 => START OF UNUSED DATA
+         DO    FROM=(R4)
+         DOEXIT (CLI,0(R2),NE,X'00')   STOP AT FIRST USED BYTE
+         LA    R2,1(R2)                ELSE BUMP PTR
+         ENDDO
+         SR    R2,R7
+         ST    R2,ADDR1            SAVE OFFSET OF 1ST KEY
+* DETERMINE NUMBER OF USED DATA CIS IN THE CA
+         IF    (LTR,R4,R4,NZ)       IF SOME USED
+         XR    R2,R2
+         ICM   R2,B'0011',UNUSED    UNUSED OFFSET
+         SH    R2,=AL2(IHDRLEN)     LESS HDR LEN = LEN OF FREE PTR LIST
+         SRDA  R2,32(0)             SET UP R2/R3 FOR DIVIDE
+         XR    R4,R4
+         ICM   R4,B'0001',VLEN      R4 = PTR LENGTH
+         IF    (LTR,R4,R4,NZ)       IF VALID LENGTH
+         DR    R2,R4                R3 = LEN OF PTR LIST / PTR LEN
+         L     R4,CICA              R4 = TOTAL CIS/CA
+         SR    R4,R3                TOTAL LESS UNUSED = USED
+         IF    (LTR,R4,R4,NZ)       IF USED > 0
+         ST    R4,USED              SAVE IT
+* CALCULATE SPACE USED BY KEY ENTRIES
+         XR    R2,R2
+         ICM   R2,B'0011',ILEN      R2 = RECORD LENGTH - OFFSET 1ST KEY
+         S     R2,ADDR1             (I.E. SPACE USED BY KEY ENTRIES)
+* GET AVERAGE KEY ENTRY LENGTH
+         SRDA  R2,32(0)             SET UP R2/R3 FOR DIVIDE
+         D     R2,USED              SPACE USED / USED CIS PER CA
+         A     R3,ENTLEN            ADD TO TOTAL
+         ST    R3,ENTLEN            ADD TO TOTAL
+         LA    R2,1
+         A     R2,NOSEQS            COUNT SSI RECORDS
+         ST    R2,NOSEQS
+         ENDIF
+         ENDIF
+         ENDIF
+         ENDIF
+         DROP  R7
+         L     R10,CSAVE1
+         BR    R10
+CSAVE1   DS    F
+ADDR1    DC    F'0'                ADDR OF 1ST KEY ENTRY
+USED     DC    F'0'                USED CIS/CA
+CICA     DC    F'0'                CIS/CA
+NOSEQS   DC    F'0'                NO. OF SEQUENCE SET RECORDS
+ENTLEN   DC    F'0'                TOTAL KEY ENTRY LENGTH
+         EJECT
+* READCAT - READ OWNING CATALOG TO FIND CIS/CA, KEY LENGTH
+READCAT  DS    0H
+         ST    R10,RDSAVE1
+* SET CATALOG ACB ADDRESS IN RPL
+         L     R2,CATACB
+         MVC   OPERATN,=CL8'MODCB'
+         MODCB RPL=CATRPL,ACB=(2)
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              HANDLE BAD RETCODE
+         ENDIF
+* READ CLUSTER'S CATALOG RECORD
+         USING DATREC,R3
+         MVC   OPERATN,=CL8'GET'
+         GET   RPL=CATRPL          READ A RECORD
+         IF    (LTR,R15,R15,NZ)    TEST VSAM RETCODE
+         B     BADRET              ERROR
+         ENDIF
+         LA    R3,RECBUF           R3 => RECORD BUFFER
+* POINT TO FIRST GROUP OCCURRENCE IN RECORD
+         XR    R1,R1
+         ICM   R1,B'0001',GOPNO
+         IF    (LTR,R1,R1,M),OR,  IF NO GROUP OCCURENCES               +
+               (LTR,R1,R1,Z)
+         MVC   PRTBUF+1(30),=CL30'*** INVALID CATALOG RECORD ***'
+         BAL   R10,PRINT
+         B     EXIT               EXIT
+         ENDIF
+         LA    R4,GOPNO+1         POINT TO START OF GOP'S
+         DO    FROM=(R1)          DO UNTIL END OF GOP'S
+         LA    R4,GOPLEN(R4)      POINT TO NEXT GOP
+         ENDDO
+         LA    R4,2(R4)           POINT PAST CONTROL BYTES
+* POINT TO AMSDB GROUP OCCURRENCE IN INDEX RECORD
+         USING AMSDB,R4
+* PRINT KEY LENGTH
+         XR    R1,R1
+         ICM   R1,B'0011',AMDKEYLN
+         BAL   R10,CONVERTP
+         MVC   PRTBUF+1(18),=CL18'DEFINED KEY LENGTH'
+         MVC   PRTBUF+50(L'WORK6),WORK6
+         BAL   R10,PRINT
+* SAVE NO. OF CONTROL INTERVALS PER CONTROL AREA
+         XR    R1,R1
+         ICM   R1,B'0011',AMDCIPCA
+         IF    (LTR,R1,R1,Z)
+         MVC   PRTBUF+1(20),=CL20'** INVALID CIS/CA **'
+         BAL   R10,PRINT
+         B     EXIT
+         ENDIF
+         ST    R1,CICA             SAVE CIS/CA
+         L     R10,RDSAVE1
+         BR    R10
+RDSAVE1  DS    F
+         DROP  R3,R4
+         EJECT
+* PRINT - PRINT RTN, CLEARS BUFFER AFTER PRINT
+PRINT    DS    0H
+         ST    R10,PRSAVE1
+         IF    (CLI,PRTBUF,NE,NEWLINE),AND,   IF INVALID CTL CHAR      +
+               (CLI,PRTBUF,NE,NEWPAGE),AND,                            +
+               (CLI,PRTBUF,NE,NEWLINE2)
+         MVI   PRTBUF,NEWLINE                 SET DEFAULT
+         ENDIF
+         PUT   PRINTFL
+         MVI   PRTBUF,NEWLINE                 RESET CTL CHAR
+         MVC   PRTBUF+1(L'PRTBUF-1),PRTBUF    CLEAR PRINT BUFFER
+         L     R10,PRSAVE1
+         BR    R10                 RETURN
+PRSAVE1  DS    F
+         EJECT
+* BADRET - TEST VSAM RETCODE
+* INPUT - R15
+BADRET   DS    0H
+* SAVE RETCODE, SET UP VSAM SAVE AREA FIELD
+         ST    R15,SAVER15         SAVE R15
+         BAL   R10,PRINT           SPACE 1
+* PRINT HEADING
+         LA    R5,4                FOR RETCODE TEST
+         LA    R4,PRTBUF+1         R4 = PRT BUFFER PTR (PAST CTL CHAR)
+         MVC   0(L'VSAMMSG,R4),VSAMMSG   'VSAM ERROR'
+         LA    R4,L'VSAMMSG+1(R4)  BUMP BUFFER PTR
+         MVC   0(L'OPERATN,R4),OPERATN   IDENTIFY VSAM OPERATION
+         BAL   R10,PRINT           ERROR MESSAGE HEADER
+* PRINT R15 VALUE
+         LA    R4,PRTBUF+1         R4 => PRINT BUFFER + CTL CHAR
+         MVC   0(L'HDR3,R4),HDR3   GET HEADER 3
+         LA    R4,L'HDR3(R4)       BUMP BUFFER PTR
+         MVC   WORK1,SAVER15       GET R15 VALUE
+         BAL   R10,CONVERT         CONVERT TO PRINTABLE HEX
+         MVC   0(L'WORK2,R4),WORK2  MOVE VALUE TO BUFFER
+         BAL   R10,PRINT           PRINT R15 VALUE
+* IF OPEN/CLOSE, TEST ACB FOR RETCODE
+         LA    R4,PRTBUF+1         R5 => PRT BUFFER PTR + CTL CHAR
+         IF    (CLC,OPERATN,EQ,=CL8'OPEN'),OR,    IF OPEN/CLOSE        +
+               (CLC,OPERATN,EQ,=CL8'CLOSE')
+         SHOWCB ACB=VSMACB,                                            +
+               AM=VSAM,                                                +
+               AREA=RETCODE,                                           +
+               LENGTH=4,                                               +
+               FIELDS=ERROR
+         MVC   WORK1,RETCODE       GET RETCODE
+         BAL   R10,CONVERT         CONVERT TO PRINTABLE HEX
+         LA    R4,PRTBUF+1         R4 => PRT BUFFER PTR + CTL CHAR
+         MVC   0(L'HDR1,R4),HDR1   GET HEADER 1
+         LA    R4,L'HDR1(R4)       BUMP BUFFER PTR
+         MVC   0(L'WORK2,R4),WORK2 MOVE VALUE TO BUFFER
+         LA    R4,L'WORK2+2(R4)    BUMP BUFFER PTR
+         BAL   R10,PRINT           PRINT ACB INFO
+         B     EXIT                END IT ALL
+         ENDIF
+* IF 'SHOWCB', GET ERROR CODE
+         IF    (CLC,OPERATN,EQ,=CL8'SHOWCB')     IF 'SHOWCB'
+         SHOWCB RPL=VSMRPL,        SHOWCB FOR RPL                      +
+               AM=VSAM,                                                +
+               AREA=RETCODE,                                           +
+               LENGTH=4,                                               +
+               FIELDS=FDBK
+         MVC   WORK1,RETCODE       GET RETCODE
+         BAL   R10,CONVERT         CONVERT TO PRINTABLE HEX
+         MVC   0(L'HDR5,R4),HDR5   GET HEADER 2
+         LA    R4,L'HDR5(R4)       BUMP BUFFER PTR
+         MVC   0(L'WORK2,R4),WORK2  MOVE VALUE TO BUFFER
+         BAL   R10,PRINT           PRINT RPL INFO
+         B     EXIT                END IT ALL
+         ENDIF
+* IF 'GET', GET FEEDBACK CODE
+         IF    (CLC,OPERATN,EQ,=CL8'GET')
+         SHOWCB RPL=CATRPL,AREA=CATSHOW,LENGTH=72,FIELDS=FDBK
+         L     R1,CATSHOW
+         BAL   R10,CONVERTP
+         MVC   PRTBUF+1(24),=CL24'VSAM ERROR CODE (DEC) = '
+         MVC   PRTBUF+1+24(L'WORK6),WORK6
+         BAL   R10,PRINT           PRINT ERROR CODE
+         BAL   R10,PRINT           PRINT A LINE
+         B     EXIT                END IT ALL
+         ENDIF
+* EXIT
+         B     EXIT                END IT ALL
+SAVER15  DC    F'0'                SAVE FIELD FOR R15
+CATSHOW  DS    CL72
+         EJECT
+* CONVERTP - CONVERT BINARY TO PRINTABLE DECIMAL NO.
+* INPUT  - R1
+* OUTPUT - WORK6 (11 BYTES)
+CONVERTP DS    0H
+         ST    R10,COSAVE1         SAVE RETURN ADDRESS
+         XC    WORK5,WORK5         CLEAR WORK FIELD
+         CVD   R1,WORK5            PUT INTO DW FIELD
+         MVC   WORK6,EDIT1         PUT IN EDIT PATTERN
+         ED    WORK6,WORK5         EDIT RESULT INTO WORK6
+         IF    (CLC,WORK6(L'WORK6),EQ,KBLANKS)  IF NO MESSAGES
+         MVI   WORK6+L'WORK6-1,C'0' SET TO ZERO
+         ENDIF
+         L     R10,COSAVE1
+         BR    R10                 RETURN
+COSAVE1  DS    F
+         EJECT
+* CONVERT - CONVERT TO PRINTABLE HEX
+* INPUT  - WORK1 (4 BYTES)
+* OUTPUT - WORK2 (10 BYTES)
+CONVERT  DS    0H
+         ST    R10,CONSAVE1        SAVE RETURN ADDRESS
+         XC    WORK2,WORK2         CLEAR WORK2 FIELD
+         UNPK  WORK2(9),WORK1(5)   UNPACK INPUT FLD
+         TR    WORK2(8),HEXTAB-240 CONVERT TO HEX
+         IF    (OC,WORK2,WORK2,NZ)  IF NOT CONTROL RECORD
+         LA    R5,L'WORK2-1        R5 = LENGTH WORK FIELD - 1
+         LA    R3,WORK2            R3 => WORK FIELD
+         DO    FROM=(R5)           DO UNTIL END OF FIELD
+         IF    (CLI,0(R3),EQ,X'00')   IF ZERO
+         MVI   0(R3),C' '          REPLACE BY BLANKS
+         ENDIF
+         LA    R3,1(R3)            BUMP PTR
+         ENDDO
+         ENDIF
+         L     R10,CONSAVE1        RESTORE RETURN ADDRESS
+         BR    R10                 RETURN
+CONSAVE1 DS    F
+         EJECT
+DATAAREA DS    0F
+         LTORG
+* REGISTER EQUATES
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+TRTAB    DC    X'FAFBFCFDFEFF'
+         ORG   TRTAB+240-193
+         DC    C'0123456789'
+RCOUNT   DC    F'0'                  RECORD COUNT
+OPERATN  DC    CL8' '                VSAM OPERATION BEING PERFORMED
+VSAMMSG  DC    C'VSAM ERROR FOR '    HEADER FOR VSAM ERROR MESSAGE
+VSAMSAVE DC    18F'0'                VSAM SAVE AREA FOR SHOWCB
+KBLANKS  DC    CL16' '
+WORK1    DC    F'0'                  WORK FIELD
+WORK2    DC    XL10'00000000000000000000'
+WORK3    DC    D'0'
+WORK5    DC    D'0'
+WORK6    DC    CL16' '
+EDIT1    DC    XL16'4B202020202020202020202020202020'   EDIT PATTERN
+         DS    0F
+PRTBUF   DC    CL132' '              PRINT BUFFER
+PRTLEN   EQU   *-PRTBUF              PRINT BUFFER LENGTH
+NEWLINE  EQU   C' '                  NEW LINE PRT CTL CHAR
+NEWLINE2 EQU   C'0'                  NEW LINE PRT CTL CHAR (SPACE 2)
+NEWPAGE  EQU   C'1'                  PRINT CTL CHAR FOR NEW PAGE
+RETCODE  DC    F'0'                  VSAM RETCODE
+HEXTAB   DC    C'0123456789ABCDEF'
+HDR1     DC    C'OPEN/CLOSE CODE = '
+         DS    0F
+HDR5     DC    C'REQUEST CODE = '
+         DS    0F
+HDR3     DC    C'R15 = '
+* DTF'S, ACB'S ETC.
+         DS    0F
+PRINTFL  DTFPR DEVADDR=SYSLST,     PRINT FILE DTF                      +
+               DEVICE=1403,                                            +
+               BLKSIZE=132,                                            +
+               CTLCHR=ASA,                                             +
+               IOAREA1=PRTBUF,                                         +
+               RECFORM=FIXUNB
+* CATALOG RPL (ACB ADDRESS IS PLUGGED IN BY THE PROGRAM)
+CATKEY   DC    X'00'
+INDEXCI  DC    XL3'000000'              SEARCH ARG = CI NO
+CATRPL   RPL   AM=VSAM,                                                +
+               AREA=RECBUF,                                            +
+               KEYLEN=4,                                               +
+               ARG=CATKEY,                                             +
+               AREALEN=505,                                            +
+               OPTCD=(KEY,DIR,NUP,MVE,GEN),                            +
+               RECLEN=505               MAX. RECLEN
+RECBUF   DS    CL505
+* VSAM ACB
+         DS    0F
+VSMACB   ACB   AM=VSAM,                                                +
+               DDNAME=IFILE,                                           +
+               MACRF=(ADR,SEQ,IN),                                     +
+               EXLST=VSMEXIT,                                          +
+               STRNO=1
+IFILE    DC    CL7'IFILE'
+VSMEXIT  DS    0H
+         EXLST AM=VSAM,                                                +
+               EODAD=EOF
+* VSAM RPL
+         DS    0F
+VSMARG   DS    CL40                DUMMY ARGUMENT (NOT USED)
+         DS    0F
+VSMRPL   RPL   ACB=VSMACB,                                             +
+               AM=VSAM,                                                +
+               AREA=BUFADDR,                                           +
+               ARG=VSMARG,                                             +
+               AREALEN=4,               LOCATE MODE - ONLY WANT ADDRESS+
+               OPTCD=(ADR,SEQ,NUP,LOC),                                +
+               RECLEN=16384             MAX. RECLEN
+BUFADDR  DS    F                     VSAM BUFFER ADDRESS (RETURNED)
+* DSECT FOR INDEX RECORD
+ISECT    DSECT
+IHDRLEN  EQU   24                    LENGTH OF INDEX RECORD HDR
+ILEN     DS    XL2                   RECORD LENGTH
+CTRLLEN  DS    XL1                   LENGTH OF CONTROL INFO
+VLEN     DS    XL1                   LENGTH OF VERTICAL PTR
+         ORG   ILEN+X'10'
+LEVEL    DS    XL1                   LEVEL NO. (X'01' = SEQUENCE SET)
+         DS    XL1
+UNUSED   DS    XL2                   OFFSET OF UNUSED DATA
+* CATALOG RECORD DSECT FOR DATA COMPONENT
+DATREC   DSECT
+KEY      DS    CL44                    KEY
+         ORG   KEY
+         DS    XL1                     BINARY ZEROES
+ENTIDNO  DS    XL3                     CI NO OF ENTRY
+RELIND   DS    XL1                     RELEASE INDICATOR
+CRAVOL   DS    CL6                     CRA VOLSER
+CRAIDNO  DS    XL3                     CRA CI NO
+CRADEVT  DS    CL4                     CRA DEVICE TYPE
+         DS    XL26                    BINARY ZEROES
+ENTYPE   DS    CL1                     'D' FOR DATA, 'I' FOR INDEX
+RRECLEN  DS    XL2                     RECORD LENGTH
+         DS    XL1                     ALWAYS ZERO
+FIXLEN   DS    XL1                     LENGTH OF FIXED LENGTH FIELDS
+NAME     DS    CL44                    ENTRY NAME
+OWNERID  DS    CL8                     OWNER
+DSETCRDT DS    PL3                     CREATION DATE (YDD)
+DSETEXDT DS    PL3                     EXPIRY DATE (YDD)
+ATTR1    DS    XL1                     ATTRIBUTES
+SPEED    EQU   X'80'   1... ....       SPEED
+UNIQUE   EQU   X'40'   .1.. ....       UNIQUE
+REUSE    EQU   X'20'   ..1. ....       REUSE
+ERASE    EQU   X'10'   ...1 ....       ERASE
+RECOVER  EQU   X'08'   .... 1...       RECOVERABLE CATALOG
+NOUPDATE EQU   X'04'   .... .1..       UPDATE INHIBITED
+EXPIND   EQU   X'02'   .... ..1.       TEMPORARILY EXPORTED
+***                    .... ...X       RESERVED FOR OS/VSAM
+ATTR2    DS    XL1                     ATTRIBUTES (DATASHARING)
+**                     00XX XXXX       SHR(1)
+SHR2     EQU   X'40'   01XX XXXX       SHR(2)
+SHR3     EQU   X'80'   10XX XXXX       SHR(3)
+SHR4     EQU   X'C0'   11XX XXXX       SHR(4)
+NOALLOC  EQU   X'08'   .... 1...       NO-ALLOCATION CLUSTER
+NOUSE    EQU   X'01'   .... ...1       DATASET NOT USEABLE
+**                     .... .XX.       RESERVED
+OPENIND  DS    XL1                     OPEN FLAG
+OPEN     EQU   X'80'                   DATA SET OPEN FOR OUTPUT
+BUFSIZE  DS    XL4                     MINIMUM BUFFERSIZE
+PRIMSPAC DS    XL3                     PRIMARY ALLOCATION
+SCONSPAC DS    XL3                     SECONDARY ALLOCATION
+SPACOPTN DS    XL1                     SPACE OPTIONS FLAGS
+TRACKS   EQU   X'80'   10XX XXXX       TRACKS
+CYLS     EQU   X'C0'   11XX XXXX       CYLINDERS
+SECPRIM  EQU   X'20'   ...0 0000       SECONDARY SPACE CLASS = PRIMARY
+SEC0     EQU   X'10'   ...1 0000       SECONDARY IS CLASS 0
+CLASS0   EQU   X'00'   XXXX X000       CLASS 0 SPACE
+CLASS1   EQU   X'01'   XXXX X001       CLASS 1 SPACE
+CLASS2   EQU   X'02'   XXXX X010       CLASS 2 SPACE
+CLASS3   EQU   X'03'   XXXX X011       CLASS 3 SPACE
+CLASS4   EQU   X'04'   XXXX X100       CLASS 4 SPACE
+CLASS5   EQU   X'05'   XXXX X101       CLASS 5 SPACE
+CLASS6   EQU   X'06'   XXXX X110       CLASS 6 SPACE
+CLASS7   EQU   X'07'   XXXX X111       CLASS 7 SPACE
+HURBADS  DS    CL4                     HIGH USED RBA
+HARBADS  DS    CL4                     HIGH ALLOC RBA
+LRECL    DS    CL4                     LRECL FOR DATA, X'FF'S FOR IDX
+USERINFO DS    CL2                     USER INFO FOR ISAM INTERFACE
+EXCPEXIT DS    CL8                     NAME OF EXCEPTION EXIT
+EXTPTR   DS    XL5                     POINTER TO EXTENSION RECORD
+**                                     (ZERO IF NONE)
+GOPNO    DS    XL1                     NO. OF GROUP OCCURENCE PTRS
+         DS    0C                      SEE GOPREC DSECT
+* GROUP OCCURENCE DSECTS
+GOPREC   DSECT                         GO PTRS
+GROUP0   DS    CL5                     REPEATED 'GOPNO' TIMES
+         ORG   GROUP0
+         DS    XL1                     RESERVED
+GPTR     DS    XL2                     CI NO OF EXTENSION RECORD
+*                                      (IF GRPFLAG = B'10XXXXXX')
+*                                      ELSE DISP FROM GROUP0
+*                                      (IF GRPFLAG = B'00XXXXXX')
+*                                      ELSE DELETED GROUP
+*                                      (IF GRPFLAG = B'01XXXXXX')
+GRPFLAG  DS    XL1
+AMSDBTYP EQU   X'01'                   AMSDB POINTER
+GSEQNO   DS    XL1                     SEQUENCE NO. OF GROUP
+GOPLEN   EQU   *-GROUP0                LENGTH OF GROUP OCCURENCE PTR
+* AMSDB - ACCESS METHOD DATA STATS BLOCK FOR CATALOG RECORD
+AMSDB    DSECT
+AMSDBID  DS    XL1                     IDENTIFIER
+AMID     EQU   X'60'
+AMDATTR1 DS    XL1                     ATTRIBUTES
+AMDDST   EQU   X'80'   1... ....       KSDS
+AMDWCK   EQU   X'40'   .1.. ....       WRITECHECK
+AMDSDT   EQU   X'20'   ..1. ....       IMBED
+AMDREPL  EQU   X'10'   ...1 ....       REPLICATE
+AMDORDER EQU   X'08'   .... 1...       ORDERED
+AMDRANGE EQU   X'04'   .... .1..       FILE HAS KEYRANGES
+AMDRRDS  EQU   X'02'   .... ..1.       RRDS
+AMDSPAN  EQU   X'01'   .... ...1       SPANNED
+AMDLEN   DS    XL2                     LENGTH OF THIS BLOCK
+AMDNEST  DS    XL2                     NO. OF ENTRIES IN INDEX SECTION
+         ORG   AMDNEST                 (EXCEPT IF DATA RECD OF AIX)
+AMDAXRKP DS    XL2                     RELATIVE KEY POSITION IF AIX
+AMDRKP   DS    XL2                     RELATIVE KEY POSITION
+AMDKEYLN DS    XL2                     KEY LENGTH
+AMDPCTCA DS    XL1                     CA FREE % (UNLESS SAM ESDS)
+         ORG   AMDPCTCA
+AMDRCFRM DS    XL1                     SAM ESDS ATTRIBUTES
+AMDIMPFD EQU   X'80'   1... ....       IMPLICIT DEFINE
+**       EQU   X'40'   .1.. ....
+AMDNCIFT EQU   X'20'   ..1. ....       NO-CIFORMAT
+AMDNCAFT EQU   X'10'   ...1 ....       NO-CAFORMAT (SAM ESDS)
+**       EQU   X'08'   .... 1...       ORDERED
+AMDSBLKD EQU   X'04'   .... .1..       BLOCKED RECORDS
+AMDSVAR  EQU   X'02'   .... ..1.       VARIABLE LENGTH
+AMDSFIXD EQU   X'01'   .... ...1       FIXED LENGTH
+AMDPCTCI DS    XL1                     CI FREE %
+AMDCIPCA DS    XL2                     CIS PER CA
+AMDFSCA  DS    XL2                     FREE CIS PER CA
+AMDFSCI  DS    XL4                     FREE BYTES PER CI
+AMDCINV  DS    XL4                     CISIZE
+AMDLRECL DS    XL4                     MAX. RECSZ
+AMDHLRBA DS    XL4                     RBA OF HIGH LEVEL INDEX RECORD
+         ORG   AMDHLRBA
+AMDNSLOT DS    XL4                     NO. OF RELATIVE RECORD SLOTS
+         ORG   AMDHLRBA
+AMDBLREC DS    XL4                     SAM LRECL FOR FB SAM ESDS
+AMDSSRBA DS    XL4                     RBA OF 1ST SEQUENCE SET RECORD
+         ORG   AMDSSRBA
+AMDMAXRR DS    XL4                     MAX. RELATIVE RECORD NO.
+AMDPARDB DS    XL4                     POINTER TO 1ST ARDB
+AMDATTR3 DS    XL1                     ATTRIBUTES
+AMDUNQ   EQU   X'80'   1... ....       NON-UNIQUE KEYS IN AIX
+*******  EQU   X'00'   .... ....       UNIQUE KEYS IN AIX
+         DS    XL7                     RESERVED
+* STATISTICS
+AMDSTAT  DS    0C                      STATISTICS
+AMDSTMST DS    XL8                     SYSTEM TIME STAMP
+AMDSTAT1 DS    0C
+AMDNIL  DS    XL2                     NO. OF INDEX LEVELS
+AMDNEDB DS    XL2                     NO. OF EDB'S
+        ORG   AMDNEDB
+AMDNEXT DS    XL2                     NO. OF EXTENTS
+AMDNLR  DS    XL4                     NO. OF LOGICAL RECORDS
+AMDDELR DS    XL4                     NO. OF DELETED RECORDS
+AMDIREC DS    XL4                     NO. OF INSERTED RECORDS
+AMDUPR  DS    XL4                     NO. OF UPDATED RECORDS
+AMDRETR DS    XL4                     NO. OF RETRIEVED RECORDS
+AMDASPA DS    XL4                     BYTES FREE SPACE IN DATA SET
+AMDNCIS DS    XL4                     NO. OF CI SPLITS
+AMDNCAS DS    XL4                     NO. OF CA SPLITS
+AMDEXCP DS    XL4                     EXCPS
+         END
+
+The equations used to calculate the average key entry length of
+a VSAM KSDS file were excerpted from the book VSAM
+Tuning and Advanced Topics by Michael D Sachais (Van
+Nostrand Reinhold Publishers, ISBN 0-442-31822-0).
+
+David Roth (Australia)
+

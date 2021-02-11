@@ -1,0 +1,679 @@
+         TITLE '*** PDSVUPDT: UPDATE SELECTED PDS MEMBERS ***'
+PDSVUPDT CSECT
+***********************************************************************
+* USES BPAM TO UPDATE SELECTED MEMBERS WITHIN A RECFM=VB PDS BY ADDING*
+* A CALL FOR THE CLISTMON PROGRAM.                                    *
+*                                                                     *
+* THE SYSIN FILE IS READ TO OBTAIN A MEMBER NAME. BLDL IS USED TO SEE *
+* IF THE MEMBER EXISTS. IF IT DOES, A NEW DIRECTORY ENTRY IS BUILT    *
+* USING DATA FROM THE CURRENT ENTRY AND OTHER DATA.                   *
+*                                                                     *
+* THE MEMBER IS READ AND COPIED TO THE OUTPUT PDS. TO DETERMINE WHERE *
+* TO WRITE THE INSERTED CALL FOR CLISTMON:                            *
+*   1) IF THE FIRST LINE IS A COMMENT (STARTS WITH /*) WHICH CONTAINS *
+*      THE WORD "REXX", THIS IS A REXX PROCEDURE. THE FIRST LINE IS   *
+*      WRITTEN TO THE OUTPUT, FOLLOWED BY THE CALL FOR CLISTMON.      *
+*   2) IF THE FIRST LINE IS A COMMENT THAT DOES NOT CONTAIN THE WORD  *
+*      WORD "REXX" THIS IS A CLIST. COMMENT LINES ARE COPIED FROM     *
+*      UNTIL THE FIRST NON-COMMENT IS FOUND. IF THE FIRST WORD ON THE *
+*      FIRST NON-COMMENT IS "PROC", THE COPYPROC ROUTINE IS CALLED TO *
+*      WRITE THE PROC STATEMENT AND ALL ITS CONTINUATION LINES TO     *
+*      THE OUTPUT MEMBER, THEN THE CALL FOR CLISTMON IS WRITTEN. IF   *
+*      THE FIRST NON-COMMENT LIN IS NOT A PROC STATEMENT, THE CALL FOR*
+*      CLISTMON IS WRITTEN IMMEDIATELY.                               *
+*   3) AFTER THE CALL FOR CLISTMON IS WRITTEN, ALL REMAINING LINES IN *
+*      THE INPUT MEMBER ARE COPIED DIRECTLY TO THE OUTPUT MEMBER.     *
+*   4) WHEN THE COPY IS COMPLETE, THE NEW DIRECTORY ENTRY IS WRITTEN  *
+*      USING A STOW MACRO. THE DIRECTORY ENTRY IS REPLACED IF THIS IS *
+*      AN EXISTING MEMBER, OTHERWISE IT IS ADDED.                     *
+*   5) PROCESSING ABOVE REPEATS UNTIL THE SYSIN FILE IS EXHAUSTED.    *
+*                                                                     *
+* AUTHOR R THORNTON AUGUST 1998                                       *
+***********************************************************************
+*
+***********************************************************************
+*        SAVE REGISTERS, SET UP BASE REGS, CHAIN SAVE AREAS           *
+***********************************************************************
+         USING PDSVUPDT,R3,R4
+         STM   R14,R12,12(R13)         SAVE CALLER'S REGS
+         LR    R3,R15                  SET UP BASE FIRST BASE REG
+         LA    R4,4095(R3)             SET UP SECOND
+         LA    R4,1(R4)                    BASE REGISTER
+         LA    R15,MYSAVE              POINT TO MY REGISTER SAVE AREA
+         ST    R15,8(R13)              SET LSA IN CALLER'S SAVE
+         ST    R13,4(R15)              SET HSA IN MY SAVE AREA
+         LR    R13,R15                 SET UP SAVE AREA POINTER
+         B     OPENS                   BRANCH AROUND CONSTANTS
+         DC    CL8'PDSVUPDT'           PROGRAM NAME IDENTIFIER
+         DC    CL8'&SYSDATE'           ASSEMBLY DATE
+         DC    CL8'&SYSTIME'           ASSEMBLY TIME
+MYSAVE   DS    18F                     MY REGISTER SAVE AREA
+***********************************************************************
+*        OPEN FILES                                                   *
+***********************************************************************
+OPENS    OPEN  (PDSOUT,OUTPUT,SYSPRINT,OUTPUT,SYSIN,,PDSIN) OPENS
+         TM    PDSOUT+36,X'50'         RECFM=VB?
+         BO    GETSTOR1                YES
+         WTO   'PDSOUT MUST HAVE RECFM=VB',ROUTCDE=11
+ABEND111 ABEND 111,DUMP                TERMINATE IN ERROR
+GETSTOR1 LH    R0,PDSOUT+62            GET BLKSIZE FROM THE OPEN DCB
+         STORAGE OBTAIN,LENGTH=(0)     GET STORAGE FOR 1 BLOCK
+         ST    R1,OUTBLKA              SAVE THE ADDRESS
+CHECKIN  TM    PDSIN+36,X'50'          RECFM=VB?
+         BO    GETSTOR2                YES
+         WTO   'PDSIN MUST HAVE RECFM=VB',ROUTCDE=11
+ABEND222 ABEND 222,DUMP                TERMINATE IN ERROR
+GETSTOR2 LH    R0,PDSIN+62             GET BLKSIZE FROM THE OPEN DCB
+         STORAGE OBTAIN,LENGTH=(0)     GET STORAGE FOR 1 BLOCK
+         ST    R1,INBLKA               SAVE THE ADDRESS
+INITLIZE STCK  DBLWD                   GET SYSTEM TOD CLOCK VALUE
+         STCKCONV STCKVAL=DBLWD,CONVVAL=DATETIME GET TIME&DATE
+         MVO   DATEPART,DATEPART       SHIFT DATE LEFT .5 BYTES
+         OI    DATEPART+3,X'0F'        SET PACKED DECIMAL SIGN
+         MVC   STOWCRDT,DATEPART       SET CREATION DATE
+         MVC   STOWCHDT,DATEPART       SET CHANGED DATE
+         MVC   STOWTIME,TIMEHH         SET CHANGED TIME HHMM
+         MVC   SAVESTLS,STOWLIST       SAVE DEFAULT STOW LIST
+***********************************************************************
+*             MAINLINE ROUTINE                                        *
+***********************************************************************
+MAINLINE BAS   R9,GETMEMNM             READ MEMBER NAME RECORD
+         BAS   R9,INITNEW              INITIALIZE FOR A NEW MEMBER
+         CLI   ERROR,1                 MEMBER FOUND IN PDSIN?
+         BE    MAINLINE                NO, SKIP IT
+         BAS   R9,COPYISRT             GO WRITE NEW MEMBER
+         BAS   R9,STOWIT               GO CREATE NEW DIRECTORY ENTRY
+         B     MAINLINE                LOOP TO PROCESS ALL MEMBERS
+***********************************************************************
+* INITNEW: INITIALIZE PROCESSING FOR A NEW MEMBER. A BLDL IS ISSUED   *
+* FOR THE PDSIN FILE. IF BLDL FAILS FOR PDSIN, A MESSAGE IS WRITTEN TO*
+* SYSPRINT, RC=4 IS SET, AND THE MEMBER IS SKIPPED. USERDATA FROM THE *
+* BLDL LIST IS SAVED. NEXT, BLDL IS ISSUED FOR PDSOUT. IF PDSOUT BLDL *
+* FAILS OR HAS NO STATS AND THE PDSIN BLDL HAD STATS, USE THE USERDATA*
+* FROM THE PDSIN FILE. BUILD A DIRECTORY ENTRY FOR THE NEW MEMBER     *
+* TO BE WRITTEN TO PDSOUT. ISSUE A FIND FOR PDSIN AND READ ITS FIRST  *
+* BLOCK. RESET FLAGS AND DATA RECORD ADDRESSES.                       *
+***********************************************************************
+INITNEW  ST    R9,IN9                  SAVE RETURN ADDRESS
+         MVI   ERROR,0                 CLEAR ERROR INDICATOR
+         MVC   STOWLIST(L'SAVESTLS),SAVESTLS START W/DEFAULT STOWLIST
+         MVC   STOWNAME,MEMBNAME       USE CONTROL CARD NAME
+         MVC   BLDLNAME,MEMBNAME       MEMBER NAME TO BLDL LIST
+         BLDL  PDSIN,BLDLIST           READ INPUT DIRECTORY ENTRY
+         LTR   R15,R15                 SUCCESSFUL?
+         BZ    INPTOK                  YES
+         MVI   ERROR,1                 INDICATE ERROR OCCURRED
+         MVC   RETCODE,F4              SET RC=4
+         MVC   PRTLINE+1(8),MEMBNAME   MEMBER NAME TO PRINT
+         MVC   PRTLINE+10(28),=CL28' NOT FOUND IN PDSIN, SKIPPED'
+         BAS   R9,PRINT                PRINT ERROR MESSAGE
+         B     INXIT                   AND EXIT
+INPTOK   MVC   INTTRC(3),BLDLTTR       SAVE PDSIN MEMBER TTR
+         MVC   BLDLU1,BLDLUDTA         SAVE USER DATA FROM DIR ENTRY
+         MVC   BLDLC1,BLDLC            SAVE USER DATA LENGTH
+         BLDL  PDSOUT,BLDLIST          READ DIRECTORY ENTRY
+         LTR   R15,R15                 SUCCESSFUL?
+         BNZ   INNEWENT                NO
+         MVI   EXIST,1                 YES, INDICATE EXISTING MEMBER
+         CLI   BLDLC,X'0F'             PDSOUT ENTRY CONTAINS STATS?
+         BE    INFORMAT                YES, USE PDSOUT
+         CLI   BLDLC1,X'0F'            NO, PDSIN DIRECTORY HAS STATS?
+         BNE   INFIND                  NO
+INUSEIN  MVC   BLDLUDTA(30),BLDLU1     YES, USE PDSIN USER DATA
+         B     INFORMAT                CONTINUE
+INNEWENT MVI   EXIST,0                 INDICATE NEW MEMBER
+         CLI   BLDLC1,X'0F'            PDSIN HAS STATS?
+         BE    INUSEIN                 YES, USE PDSIN USER DATA
+         B     INFIND                  GO ISSUE PDSIN FIND
+INFORMAT IC    R1,BLDLMLVL             INCREMENT
+         LA    R1,1(R1)                   MODIFICATION
+         STC   R1,STOWMLVL                   LEVEL
+         MVC   STOWCRDT,BLDLCRDT       ORIGINAL CREATION DATE
+         MVC   STOWINIT,BLDLINIT       ORIGINAL (INIT) SIZE
+         MVC   STOWSIZE,H0             RESET CURRENT SIZE
+INFIND   FIND  PDSIN,INTTRC,C          POSITION TO MEMBER IN PDSIN
+         LTR   R15,R15                 FIND SUCCESSFUL?
+         BZ    INREAD1                 YES
+         STM   R15,R1,SAVE3R           SAVE R15, R0, R1
+         MVC   BADFINDN,MEMBNAME       MEMBER NAME TO MESSAGE
+         LA    R1,BADFIND              POINT TO MESSAGE
+         SVC   35                      ISSUE WTO
+         ABEND 333,DUMP                TERMINATE IN ERROR
+INREAD1  MVI   EOF,0                   CLEAR ANY EOF INDICATION
+         MVI   COMMENT,0               CLEAR COMMENT FLAG
+         MVI   REXX,0                  CLEAR REXX FLAG
+         MVI   PROC,0                  CLEAR PROC FLAG
+         BAS   R9,READ                 READ FIRST BLOCK
+         L     R1,OUTBLKA              POINT TO OUTPUT BLOCK
+         MVC   0(4,R1),H4              ZERO OUT BDW
+         LA    R1,4(R1)                POINT TO FIRST RECORD AREA
+         ST    R1,CURROUT              POINT TO CURRENT OUTPUT AREA
+INXIT    L     R9,IN9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+***********************************************************************
+* READ THE CONTROL FILE TO OBTAIN MEMBER NAME TO BE USED              *
+***********************************************************************
+GETMEMNM GET   SYSIN,CTLREC            READ NEXT RECORD
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* COPYISRT: ON ENTRY, THE FIRST RECORD IN THE PDSIN FILE IS AVAILABLE.*
+* COPY INPUT MEMBER TO THE OUTPUT FILE, INSERTING A CALL FOR CLISTMON *
+* AFTER THE FIRST LINE IF IT IS A REXX PROCEDURE, AFTER THE PROC      *
+* STATEMENT IF IT IS A CLIST BEGINNING WITH A PROC STATEMENT, AFTER   *
+* THE ISREDIT STATEMENT IF IT IS AN EDIT MACRO, ELSE BEFORE THE FIRST *
+* NON-COMMENT STATEMENT.                                              *
+***********************************************************************
+COPYISRT ST    R9,CI9                  SAVE RETURN ADDRESS
+         BAS   R9,IDCOMNT              CHECK FOR COMMENT
+         CLI   COMMENT,1               IS IT A COMMENT?
+         BNE   NOTREXX                 NO
+         BAS   R9,IDREXX               CHECK FOR "REXX"
+         CLI   REXX,1                  THIS A REXX PROC?
+         BNE   NOTREXX                 NO
+         BAS   R9,REXXPROC             YES, GO PROCESS IT
+         B     CIXIT                   ALL THROUGH
+NOTREXX  BAS   R9,NONREXX              NO, PROCESS NON-REXX
+CIXIT    L     R9,CI9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* NONREXX: COPY LEADING COMMENT LINES TO OUTPUT. IF A PROC STATEMENT  *
+* FOLLOWS, COPY IT TO OUTPUT ALSO. WRITE THE CALL FOR CLISTMON, THEN  *
+* COPY REMAINING LINES TO OUTPUT.                                     *
+***********************************************************************
+NONREXX  ST    R9,NR9                  SAVE RETURN ADDRESS
+NRCKEOF  CLI   EOF,1                   END OF MEMBER?
+         BE    NRCOPY                  YES
+         CLI   COMMENT,0               GOT A COMMENT?
+         BE    NRNONCMT                NO
+         BAS   R9,PUTLINE              YES, WRITE IT TO PDSOUT
+         BAS   R9,GETLINE              READ NEXT LINE FROM PDSIN
+         BAS   R9,IDCOMNT              CHECK FOR COMMENT
+         B     NRCKEOF                 CONTINUE
+NRNONCMT BAS   R9,IDPROC               CHECK FOR PROC STATEMENT
+         CLI   PROC,1                  IS IT A PROC OR EDIT MACRO?
+         BNE   NRCOPY                  NO, GO COPY THE REST
+         BAS   R9,COPYPROC             COPY PROC STATEMENT
+NRCOPY   BAS   R9,PUTCALL              WRITE THE CALL FOR CLISTMON
+         BAS   R9,COPYREST             GO COPY THE REST TO PDSOUT
+NRXIT    L     R9,NR9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* REXXPROC: WRITE THE FIRST LINE TO OUTPUT, THEN WRITE THE CALL FOR   *
+* CLISTMON, THEN COPY THE REST FROM INPUT TO OUTPUT.                  *
+***********************************************************************
+REXXPROC ST    R9,RX9                  SAVE RETURN ADDRESS
+         BAS   R9,PUTLINE              WRITE THE REXX HEADER LINE
+         BAS   R9,PUTCALL              WRITE THE CALL FOR CLISTMON
+         BAS   R9,COPYREST             GO COPY THE REST
+RXXIT    L     R9,RX9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* IDCOMNT: CHECKS TO SEE IF THE CURRENT LINE IS A COMMENT.            *
+***********************************************************************
+IDCOMNT  MVI   COMMENT,0               RESET INDICATOR
+         CLI   EOF,1                   EOF ON PDSIN?
+         BER   R9                      YES, EXIT
+         L     R12,CURRIN              POINT TO CURRENT INPUT RECORD
+         LA    R1,4(R12)               POINT PAST RDW
+         AH    R12,0(R12)              POINT TO LAST POSSIBLE
+         SH    R12,H2                      "/*" LOCATION
+IDCSCAN  LR    R11,R12                 COMPUTE REMAINING
+         SR    R11,R1                     LENGTH CODE
+         BMR   R9                      EXIT IF END OF RECORD
+         CH    R11,H255                MORE THAN 256 BYTES REMAIN?
+         BNH   IDCSEX                  NO
+         LH    R11,H255                YES, SET TO 255
+IDCSEX   EX    R11,ICEX                LOCATE START OF LINE DATA
+         BNZ   IDCCLC                  NOTHING FOUND
+         CH    R11,H255                JUST SCANNED 256 BYTES?
+         BNE   IDSETCOM                NO, THEN ALL BLANK
+         LA    R1,256(R1)              YES, STEP OVER 256 BYTES
+         B     IDCSCAN                 AND CONTINUE SCAN
+IDCCLC   CLC   0(2,R1),=CL2'/*'        IS IT A COMMENT?
+         BNER  R9                      NO, EXIT
+IDSETCOM MVI   COMMENT,1               YES, SET COMMENT FLAG
+         BR    R9                      RETURN TO CALLER
+ICEX     TRT   0(1,R1),FINDSTRT        EXECUTED TRT
+***********************************************************************
+* IDREXX: CHECKS TO SEE IF THIS LINE CONTAINS "REXX"                  *
+***********************************************************************
+IDREXX   MVI   REXX,0                  RESET INDICATOR
+         CLI   EOF,1                   EOF ON PDSIN?
+         BER   R9                      YES, EXIT
+         L     R12,CURRIN              POINT TO CURRENT INPUT RECORD
+         LA    R1,4(R12)               POINT PAST RDW
+         AH    R12,0(R12)              POINT TO LAST POSSIBLE
+         SH    R12,H4                      "REXX" LOCATION
+IDRSCAN  LR    R11,R12                 COMPUTE REMAINING
+         SR    R11,R1                     LENGTH CODE
+         BMR   R9                      EXIT IF END OF RECORD
+         CH    R11,H255                MORE THAN 256 BYTES REMAIN?
+         BNH   IDRSEX                  NO
+         LH    R11,H255                YES, SET TO 255
+IDRSEX   EX    R11,IDEX                LOCATE NEXT "R"
+         BNZ   IDRCLC                  NOTHING FOUND
+         CH    R11,H255                JUST SCANNED 256 BYTES?
+         BNER  R9                      NO, THEN ALL THROUGH
+         LA    R1,256(R1)              YES, STEP OVER 256 BYTES
+         B     IDRSCAN                 AND CONTINUE SCAN
+IDRCLC   CLC   0(4,R1),=CL4'REXX'      IS IT "REXX"?
+         BE    IDSETFLG                YES, GO SET FLAG
+         CLC   0(4,R1),=XL4'9985A7A7'  IS IT L.C. "REXX"?
+         BE    IDSETFLG                YES, GO SET FLAG
+         LA    R1,1(R1)                NO, STEP PAST THE "R"
+         B     IDRSCAN                 CONTINUE IF MORE TO SCAN
+IDSETFLG MVI   REXX,1                  YES, SET COMMENT FLAG
+         BR    R9                      RETURN TO CALLER
+IDEX     TRT   0(1,R1),FINDR           EXECUTED TRT
+***********************************************************************
+* IDPROC: CHECKS TO SEE IF THIS LINE BEGINS WITH "PROC " OR "ISREDIT "*
+***********************************************************************
+IDPROC   MVI   PROC,0                  RESET INDICATOR
+         CLI   EOF,1                   EOF ON PDSIN?
+         BER   R9                      YES, EXIT
+         L     R12,CURRIN              POINT TO CURRENT INPUT RECORD
+         LA    R1,4(R12)               POINT PAST RDW
+         AH    R12,0(R12)              POINT TO LAST POSSIBLE
+         SH    R12,H5                      "PROC " LOCATION
+IDPSCAN  LR    R11,R12                 COMPUTE REMAINING
+         SR    R11,R1                     LENGTH CODE
+         BMR   R9                      EXIT IF END OF RECORD
+         CH    R11,H255                MORE THAN 256 BYTES REMAIN?
+         BNH   IDPSEX                  NO
+         LH    R11,H255                YES, SET TO 255
+IDPSEX   EX    R11,IPEX                LOCATE START OF LINE DATA
+         BNZ   IDPCLC                  NOTHING FOUND
+         CH    R11,H255                JUST SCANNED 256 BYTES?
+         BNER  R9                      NO, THEN ALL THROUGH
+         LA    R1,256(R1)              YES, STEP OVER 256 BYTES
+         B     IDPSCAN                 AND CONTINUE SCAN
+IDPCLC   CLC   0(5,R1),=CL5'PROC '     IS IT A PROC STATEMENT?
+         BE    IDSETP                  YES
+         CLC   0(5,R1),=XL5'9799968340' IS IT A L.C. PROC STATEMENT?
+         BE    IDSETP                  YES
+         CLC   0(8,R1),=CL8'ISREDIT '  IS IT AN ISREDIT STATEMENT?
+         BE    IDSETP                  YES
+         CLC   0(8,R1),=XL8'89A299858489A340' L.C. ISREDIT STATEMENT?
+         BE    IDSETP                  YES
+         B     IDXIT                   NO, EXIT
+IDSETP   MVI   PROC,1                  YES, SET PROC FLAG
+IDXIT    BR    R9                      RETURN TO CALLER
+IPEX     TRT   0(1,R1),FINDSTRT        EXECUTED TRT
+***********************************************************************
+* COPYPROC COPIES A PROC STATEMENT TO OUTPUT INCLUDING ALL CONTINUED  *
+* LINES                                                               *
+***********************************************************************
+COPYPROC ST    R9,CP9                  SAVE RETURN ADDRESS
+CPCKEOF  CLI   EOF,1                   END OF MEMBER?
+         BE    CPXIT                   YES, EXIT
+         L     R12,CURRIN              POINT TO CURRENT LINE
+         AH    R12,0(R12)                  END OF
+         BCTR  R12,0                            PDSIN RECORD
+CPFINDR  CLI   0(R12),C'0'             AT A DIGIT?
+         BL    CPNOTNUM                NO
+         CLI   0(R12),C'9'             AT A DIGIT?
+         BH    CPPUTLST                NO, AND NOT CONTINUATION
+CPBAKUP  BCT   R12,CPFINDR             BACK UP 1 AND CONTINUE
+CPNOTNUM CLI   0(R12),C' '             AT RIGHT END OF STATEMENT?
+         BE    CPBAKUP                 NO, CONTINUE
+         CLI   0(R12),C'-'             STATEMENT IS CONTINUED?
+         BE    CPPUT                   YES, GO WRITE LINE
+         CLI   0(R12),C'+'             STATEMENT IS CONTINUED?
+         BNE   CPPUTLST                YES, GO WRITE THE LINE
+CPPUT    BAS   R9,PUTLINE              WRITE PROC LINE
+         BAS   R9,GETLINE              GET NEXT PDSIN LINE
+         B     CPCKEOF                 AND GO CHECK IF CONTINUED
+CPPUTLST BAS   R9,PUTLINE              WRITE PROC LINE
+         BAS   R9,GETLINE              GET NEXT PDSIN LINE
+CPXIT    L     R9,CP9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* COPYREST ALL REMAINING LINES IN THE PDSIN MEMBER TO THE PDSOUT FILE *
+***********************************************************************
+COPYREST ST    R9,CR9                  SAVE RETURN ADDRESS
+CRCKEOF  CLI   EOF,1                   END OF MEMBER?
+         BE    CRXIT                   YES
+         BAS   R9,PUTLINE              YES, WRITE IT TO PDSOUT
+         BAS   R9,GETLINE              READ NEXT LINE FROM PDSIN
+         B     CRCKEOF                 CONTINUE
+CRXIT    L     R9,CR9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* PUTCALL WRITES THE CALL FOR CLISTMON TO THE PDSOUT FILE             *
+***********************************************************************
+PUTCALL  ST    R9,PC9                  SAVE RETURN ADDRESS
+         MVC   SAVECURR,CURRIN         SAVE CURRENT PDSIN REC ADDRESS
+         CLI   REXX,1                  THIS A REXX PROCEDURE?
+         BNE   PCCLIST                 NO
+         MVC   CURRIN,CMONREXA         MAKE REXX CALL RECORD CURRENT
+         MVC   CMONRNAM,MEMBNAME       MEMBER NAME TO CLISTMON REC
+         B     PCPUTIT                 GO WRITE THE RECORD
+PCCLIST  MVC   CURRIN,CMONCLSA         MAKE CLIST CALL RECORD CURRENT
+         MVC   CMONCNAM,MEMBNAME       MEMBER NAME TO CLISTMON REC
+PCPUTIT  BAS   R9,PUTLINE              WRITE THE RECORD
+         MVC   CURRIN,SAVECURR         RESTORE SAVED PDSIN REC ADDRESS
+PCXIT    L     R9,PC9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* GET A LINE FROM THE CURRENT BLOCK                                   *
+***********************************************************************
+GETLINE  ST    R9,GL9                  SAVE RETURN ADDRESS
+         L     R12,CURRIN              POINT TO CURRENT PDSIN RECORD
+         AH    R12,0(R12)              POINT TO NEXT RECORD
+         ST    R12,CURRIN              STORE NEW RECORD POINTER
+         C     R12,INENDA              IS THE BLOCK EXHAUSTED?
+         BL    GLXIT                   NO
+         BAS   R9,READ                 YES, READ ANOTHER BLOCK
+GLXIT    L     R9,GL9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* ADD A LINE TO THE CURRENT OUTPUT BLOCK                              *
+***********************************************************************
+PUTLINE  ST    R9,PL9                  SAVE RETURN ADDRESS
+PL2      L     R10,CURRIN              POINT TO RECORD TO BE WRITTEN
+         L     R8,OUTBLKA              POINT TO OUTPUT BLOCK
+         LH    R9,0(R10)               GET NEW RECORD LENGTH
+         CH    R9,PDSOUT+82            THIS RECORD > PSOUT LRECL?
+         BH    PLTOOLNG                YES
+         AH    R9,0(R8)                ADD TO CURRENT PDSOUT BLKSIZE
+         CH    R9,PDSOUT+62            WILL NEW REC FIT IN THIS BLOCK?
+         BNH   PLMOVE                  YES
+         CH    R8,H0                   CURRENT OUTPUT BLOCK IS EMPTY?
+         BE    PLTOOLNG                YES
+         BAS   R9,WRITE                NO, WRITE THIS BLOCK
+         B     PL2                     GO TRY NEW BLOCK
+PLTOOLNG MVC   RETCODE,F8              SET RETCODE=8
+         CLC   TOOLONGN,MEMBNAME       ALREADY WROTE MSG FOR THIS MBR?
+         BE    PLTRUNC                 YES
+         MVC   TOOLONGN,MEMBNAME       MEMBER NAME TO MESSAGE
+         MVC   PRTLINE,TOOLONG         MESSAGE TO PRINTLINE
+         BAS   R9,PRINT                PRINT MESSAGE
+PLTRUNC  LH    R9,PDSOUT+82            GET MAX LRECL FROM DCB
+         STH   R9,0(R8)                SET PDSOUT RDW LENGTH TO MAX
+         SH    R9,H4                   SUBTRACT 4 FOR BDW LENGTH
+         STH   R9,4(R8)                SET PDSOUT RECD 1 LENGTH MAX-4
+         SH    R9,H4                   SUBTRACT 4 FOR RDW LENGTH
+         LA    R8,8(R8)                STEP TO PDSOUT RECORD'S DATA
+         LA    R10,4(R10)              STEP TO PDSIN RECORD'S DATA
+         LR    R11,R9                  SEND LENGTH = TERGET LENGTH
+         MVCL  R8,R10                  MOVE PDSIN RECORD DATA TO PDSOUT
+         BAS   R9,WRITE                GO WRITE THE (FULL) BLOCK
+         B     PLXIT                   AND EXIT
+PLMOVE   STH   R9,0(R8)                UPDATE BDW LENGTH
+         LH    R9,0(R10)               GET RECORD LENGTH
+         LR    R11,R9                     IN SEND AND TARGET LENGTHS
+         L     R8,CURROUT              POINT TO OUTPUT RECORD AREA
+         MVCL  R8,R10                  MOVE PDSIN REC TO PDSOUT BLOCK
+         ST    R8,CURROUT              SET POINTER TO NEXT OUTPUT REC
+PLXIT    ICM   R9,3,STOWSIZE           ADD 1
+         LA    R9,1(R9)                  TO
+         STCM  R9,3,STOWSIZE               SIZE COUNTER
+         L     R9,PL9                  GET RETURN ADDRESS
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* WRITE A BLOCK TO THE PDSOUT FILE                                    *
+***********************************************************************
+WRITE    L     R12,OUTBLKA             POINT TO OUTPUT BLOCK
+         WRITE WRITDECB,SF,PDSOUT,(12) WRITE BLOCK TO OUTPUT
+         CHECK WRITDECB                AWAIT COMPLETION
+         L     R1,OUTBLKA              POINT TO OUTPUT BLOCK
+         MVC   0(4,R1),H4              ZERO OUT BDW
+         LA    R1,4(R1)                POINT TO FIRST RECORD AREA
+         ST    R1,CURROUT              POINT TO CURRENT OUTPUT AREA
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+* READ A BLOCK FROM THE PDSIN FILE                                    *
+***********************************************************************
+READ     L     R12,INBLKA              POINT TO INPUT BLOCK AREA
+         READ  READDECB,SF,PDSIN,(12)  READ BLOCK FROM INPUT
+         CHECK READDECB                AWAIT COMPLETION
+         L     R1,INBLKA               POINT TO INPUT BLOCK
+         LA    R1,4(R1)                POINT TO 1ST RECORD IN BLOCK
+         ST    R1,CURRIN               SAVE CURRENT RECORD POINTER
+         L     R1,INBLKA               POINT TO INPUT BLOCK
+         AH    R1,0(R1)                POINT TO END OF INPUT BLOCK
+         ST    R1,INENDA               SAVE BLOCK END ADDRESS
+         BR    R9                      RETURN TO CALLER
+EOFPDSIN MVI   EOF,1                   SET EOF FLAG
+         BR    R9                      RETURN TO CALLER
+***********************************************************************
+*             PRINT SUBROUTINE                                        *
+***********************************************************************
+PRINT    PUT   SYSPRINT,PRTLINE        WRITE PRINT LINE
+         MVC   PRTLINE,BLANKS          CLEAR PRINT LINE
+         BR    R9                      EXIT
+***********************************************************************
+* CREATE A DIRECTORY ENTRY FOR THIS NEW MEMBER USING THE STOW MACRO   *
+***********************************************************************
+STOWIT   ST    R9,ST9                  SAVE RETURN ADDRESS
+         L     R12,OUTBLKA             POINT TO OUTPUT BLOCK
+         CLC   0(2,R12),H4             ANYTHING LEFT TO BE WRITTEN?
+         BE    STEXIST                 NO
+         BAL   R9,WRITE                YES, GO WRITE BLOCK
+STEXIST  CLI   EXIST,1                 IS THERE AN EXISTING MEMBER?
+         BE    STOWREP                 YES
+         STOW  PDSOUT,STOWLIST,A       NO, ADD DIRECTORY ENTRY
+         LTR   R15,R15                 SUCCESSFUL?
+         BZ    STOWPRT                 YES, GO WRITE MESSAGE
+         B     STOWERRS                NO, ERROR
+STOWREP  STOW  PDSOUT,STOWLIST,R       REPLACE DIRECTORY ENTRY
+         LTR   R15,R15                 SUCCESSFUL?
+         BNZ   STOWERRS                YES, EXIT
+STOWPRT  MVC   STOWEDN,MEMBNAME        MEMBER NAME TO MESSAGE
+         MVC   PRTLINE,STOWED          MOVE MESSAGE TO PRINT
+         BAS   R9,PRINT                PRINT THE MESSAGE
+STXIT    L     R9,ST9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+STOWERRS STM   R15,R1,SAVE3R           SAVE R15, R0, R1
+         MVC   BADSTOWN,MEMBNAME       MEMBER NAME TO MESSAGE
+         LA    R1,BADSTOW              POINT TO MESSAGE
+         SVC   35                      ISSUE WTO
+         ABEND 222,DUMP                TERMINATE IN ERROR
+***********************************************************************
+*             END OF JOB                                              *
+***********************************************************************
+EOJ      CLOSE (PDSOUT,,SYSPRINT,,SYSIN,,PDSIN) CLOSE FILES
+         L     R13,4(R13)              POINT TO CALLER'S SAVE AREA
+         L     R14,12(R13)             RESTORE RETURN REG: R14
+         L     R15,RETCODE             SET RETURN CODE
+         LM    R0,R12,20(R13)          RESTORE CALLER'S REGS 0-12
+         BR    R14                     RETURN
+***********************************************************************
+*        STORAGE AND FILE AREAS                                       *
+***********************************************************************
+*
+DBLWD    DS    D                       DOUBLEWORD WORK AREA
+*
+DATETIME DS    0D                      CONVERTED DATE/TIME
+TIMEHH   DS    XL1                       HOUR (HH)
+TIMEMM   DS    XL1                       MINUTE (MM)
+TIMESEC  DS    XL1                       SECONDS (SS)
+TIMEFRAC DS    XL3                       DECIMAL FRACTION (6 PLACES)
+         DS    XL2                       ZEROS
+DATEPART DS    PL4                       DATE (YYYYDDD)
+         DS    XL4                       RESERVED
+*
+ST9      DS    A                       RETURN ADDRESS FOR STOWIT
+SAVECURR DS    A                       SAVE AREA FOR CURRIN
+CMONREXA DC    A(CMONREXX)             ADRESS OF CMONREXX
+CMONCLSA DC    A(CMONCLST)             ADRESS OF CMONCLST
+INBLKA   DS    A                       PDSIN BLOCK ADDRESS
+CURRIN   DS    A                       CURRENT PDSIN RECORD ADDRESS
+INENDA   DS    A                       CURRENT PDSIN BLOCK END ADDRESS
+OUTBLKA  DS    A                       PDSOUT BLOCK ADDRESS
+CURROUT  DS    A                       CURRENT PDSOUT RECORD AREA
+SAVE3R   DS    3A                      REG SAVE
+GL9      DS    A                       RETURN ADDRESS FOR GETLINE
+PL9      DS    A                       RETURN ADDRESS FOR GETLINE
+CP9      DS    A                       RETURN ADDRESS FOR COPYPROC
+CR9      DS    A                       RETURN ADDRESS FOR COPYREST
+PC9      DS    A                       RETURN ADDRESS FOR PUTCALL
+RX9      DS    A                       RETURN ADDRESS FOR REXXPROC
+NR9      DS    A                       RETURN ADDRESS FOR NONREXX
+IN9      DS    A                       RETURN ADDRESS FOR INITNEW
+CI9      DS    A                       RETURN ADDRESS FOR COPYISRT
+INTTRC   DC    F'0'                    CURRENT PDSIN TTRC
+F4       DC    F'4'                    CONSTANT 4
+F8       DC    F'8'                    CONSTANT 8
+RETCODE  DS    F                       RETURN CODE
+H0       DC    H'0'                    CONSTANT 0
+H2       DC    H'2'                    CONSTANT 2
+H4       DC    H'4'                    CONSTANT 4
+H5       DC    H'5'                    CONSTANT 5
+H255     DC    H'255'                  CONSTANT 255
+EOF      DS    XL1                     1=EOF PDSIN MEMBER
+ERROR    DS    XL1                     1=ERROR
+COMMENT  DS    XL1                     1=COMMENT
+REXX     DS    XL1                     1=REXX
+PROC     DS    XL1                     1=PROC STATEMENT
+PRTLINE  DC    CL133' '                PRINT LINE
+BLANKS   DC    CL133' '                BLANKS
+EXIST    DC    X'00'                   01=MEMBER EXISTS IN PDS
+BLDLU1   DS    CL30                    USER DATA FROM PDSIN BLDL
+BLDLC1   DS    XL1                     LENGTH FROM PDSIN BLDL
+*
+BLDLIST  DS    0H                      BLDL LIST
+         DC    H'1',H'76'               ONE MEMBER, 76 BYTES MAX
+BLDLNAME DS    CL8                      MEMBER NAME
+BLDLTTR  DS    XL3                      MEMBER TTR
+BLDLKZ   DS    XL2                      FLAGS
+BLDLC    DS    XL1                      ALIAS, NBR NOTES, USERLENG
+BLDLUDTA DS    0CL62                    USER DATA
+BLDLVER  DC    XL1'01'                   VERSION
+BLDLMLVL DC    XL1'00'                   MODIFICATION LEVEL
+         DC    XL2'0000'                 ?????
+BLDLCRDT DC    PL4'0'                    CREATION DATE
+BLDLCHDT DC    PL4'0'                    LAST CHANGED DATE
+BLDLTIME DC    XL2'0000'                 LAST CHANGED TIME (HHMM)
+BLDLSIZE DC    AL2(17)                   NUMBER RECORDS IN MEMBER
+BLDLINIT DC    AL2(17)                   INITIAL NBR RECORDS
+BLDLMODS DC    XL2'0000'                 NUMBER MODIFICATIONS
+BLDLID   DC    CL8'BC0THOR'              LAST USERID
+         DC    CL2'  '                   ????
+         DC    CL32' '                   ????
+*
+STOWLIST DS    0H                      DIRECTORY ENTRY FOR NEW MEMBER
+STOWNAME DC    CL8' '                   MEMBER NAME
+         DC    XL3'00'                  MEMBER TTR (SET BY BPAM)
+STOWC    DC    XL1'0F'                  ALIAS, NBR NOTES, USERLENG
+STOWUDTA DS    0CL30                    USER DATA
+STOWVER  DC    XL1'01'                   VERSION
+STOWMLVL DC    XL1'00'                   MODIFICATION LEVEL
+         DC    XL2'0000'                 ?????
+STOWCRDT DC    PL4'0'                    CREATION DATE
+STOWCHDT DC    PL4'0'                    LAST CHANGED DATE
+STOWTIME DC    XL2'0000'                 LAST CHANGED TIME (HHMM)
+STOWSIZE DC    AL2(0)                    NUMBER RECORDS IN MEMBER
+STOWINIT DC    AL2(0)                    INITIAL NBR RECORDS
+STOWMODS DC    XL2'0000'                 NUMBER MODIFICATIONS
+STOWID   DC    CL8'BC0THOR'              LAST USERID
+         DC    CL2'  '                   ????
+STOWEND  EQU   *
+*
+SAVESTLS DS    CL(STOWEND-STOWLIST)      SAVE DEFAULT STOW LIST
+*
+CTLREC   DS    0CL80                   CONTROL RECORD
+MEMBNAME DS    CL8                       MEMBER NAME
+         DS    CL72
+*
+TOOLONG  DS    0CL133                  RECORD TOO LONG MESSAGE
+         DC    CL1' '                    CARR. CTL
+TOOLONGN DC    CL8' '                    MEMBER NAME
+         DC    CL43' CONTAINS RECORD(S) LONGER THAN THE PDSOUT '
+         DC    CL41'BLKSIZE WHICH HAVE BEEN TRUNCATED TO FIT.'
+         DC    CL40' '
+*
+BADBKSZ  DS    0F                      WTO LENGTH ERROR MESSAGE
+         DC    AL2(BBKEND-BADBKSZ)     AREA LENGTH
+         DC    X'8000'                 MCS FLAGS
+         DC    C'PDSOUT BLKSIZE MUST BE AT LEAST'
+BBKSIZE  DC    X'402020202020'         EDIT WORD FOR BLOCK SIZE
+BBKEND   EQU   * END OF TEXT
+         DC    X'0200'                 DESC=7
+         DC    X'0020'                 ROUTCDE=11
+*
+BADSTOW  DS    0F                      WTO STOW ERROR MESSAGE
+         DC    AL2(BSTEND-BADSTOW)     AREA LENGTH
+         DC    X'8000'                 MCS FLAGS
+         DC    C'STOW FAILED FOR MEMBER '
+BADSTOWN DC    CL8' '                  MEMBER NAME
+         DC    C' ON PDSOUT'
+BSTEND   EQU   * END OF TEXT
+         DC    X'0200'                 DESC=7
+         DC    X'0020'                 ROUTCDE=11
+*
+STOWED   DS    0CL133                  NORMAL MESAGE
+         DC    CL1' '                    CARRIAGE CONROL BYTE
+STOWEDN  DS    CL8                       MEMBER NAME
+         DC    CL124' WAS UPDATED SUCCESSFULLY'
+*
+BADFIND  DS    0F                      WTO STOW ERROR MESSAGE
+         DC    AL2(BFIEND-BADFIND)     AREA LENGTH
+         DC    X'8000'                 MCS FLAGS
+         DC    C'FIND FAILED FOR MEMBER '
+BADFINDN DC    CL8' '                  MEMBER NAME
+         DC    C' ON PDSIN.'
+BFIEND   EQU   * END OF TEXT
+         DC    X'0200'                 DESC=7
+         DC    X'0020'                 ROUTCDE=11
+*
+FINDSTRT DC    256X'FF'                SCAN FOR FIRST NON-NUMERIC/BLANK
+         ORG   FINDSTRT+C' '
+         DC    X'00'
+         ORG   FINDSTRT+C'0'
+         DC    10X'00'
+         ORG
+*
+FINDR    DC    256X'00'                FIND "R" IN RECORD
+         ORG   FINDR+C'R'
+         DC    C'R'
+         ORG   FINDR+X'99'
+         DC    C'R'
+         ORG
+*
+CMONREXX DC    AL2(CMREND-CMONREXX),AL2(0)
+         DC    CL8' '
+         DC    CL1'"'                  " FOR REXX
+         DC    C'CALL ''TEST.LOAD(CLISTMON)'' '''
+CMONRNAM DC    CL8' '
+         DC    C''''
+         DC    CL1'"'                  " FOR REXX
+CMREND   EQU   *
+*
+CMONCLST DC    AL2(CMCEND-CMONCLST),AL2(0)
+         DC    CL8' '
+         DC    C'CALL ''TEST.LOAD(CLISTMON)'' '''
+CMONCNAM DC    CL8' '
+         DC    C''''
+CMCEND   EQU   *
+***********************************************************************
+*             DCB'S                                                   *
+***********************************************************************
+PDSIN    DCB   DSORG=PO,MACRF=R,DDNAME=PDSIN,EODAD=EOFPDSIN
+PDSOUT   DCB   DSORG=PO,MACRF=W,DDNAME=PDSOUT
+SYSPRINT DCB   DSORG=PS,MACRF=PM,DDNAME=SYSPRINT,                      X
+               RECFM=FBA,LRECL=133
+SYSIN    DCB   DSORG=PS,MACRF=GM,DDNAME=SYSIN,EODAD=EOJ,               X
+               RECFM=FBA,LRECL=80
+         LTORG
+PDSVUPDT CSECT
+***********************************************************************
+*             REGISTER EQUATES                                        *
+***********************************************************************
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END

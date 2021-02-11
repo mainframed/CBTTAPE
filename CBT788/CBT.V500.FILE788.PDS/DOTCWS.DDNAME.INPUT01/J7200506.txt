@@ -1,0 +1,1530 @@
+       Identification Division.
+       Program-ID.    J7200506.
+       Author.        Craig Schneiderwent.
+      *
+      * The purpose of this application is to encapsulate triggered
+      * message processing for MQSeries applications triggered in CICS.
+      *
+      * Applications that are triggered can call this subroutine and
+      * receive their triggering message.  If the triggering message's
+      * MQMD-BACKOUTCOUNT >= the queue's MQIA-BACKOUT-THRESHOLD the
+      * "poison" message will be moved to the queue's
+      * MQCA-BACKOUT-REQ-Q-NAME.  If the queue has no
+      * MQCA-BACKOUT-REQ-Q-NAME the poison message will be discarded.
+      *
+      * In any case, a message will be written to the system log
+      * indicating what action was taken.
+      *
+      * Note that in the case where a message has been backed out and
+      * is too large to be retrieved into the caller's buffer (reason
+      * code MQRC-TRUNCATED-MSG-FAILED) the message is retrieved a
+      * second time.  If this second retrieval fails, the message is
+      * DELIBERATELY lost.  The reasoning behind this behavior is that
+      * the message cannot be processed and will cause repeated abends
+      * resulting ultimately in a potential outage.
+      *
+      * Another approach might be to turn off triggering, but that
+      * begets interesting security issues.  And what if the MQSET
+      * fails?  That's why I picked the "lose the unretrievable
+      * message" option.  It is, after all, poison and unretrievable.
+      *
+      * The MQOPEN of the triggered queue is performed with
+      * MQOO-SAVE-ALL-CONTEXT.  This allows the MQOPEN and the MQPUT
+      * for the poison queue to be done with MQOO-PASS-ALL-CONTEXT
+      * and MQPMO-PASS-ALL-CONTEXT, respectively, passing the HOBJ of
+      * the triggered queue on the MQPUT to preserve the original
+      * message context.
+      *
+      * If LS-RSN-CD = MQRC-TRUNCATED-MSG-FAILED and the caller is
+      * not prepared to adjust its buffer size, it would be prudent
+      * for the caller to roll back the current unit of work and allow
+      * poison message processing to remove the message from the queue.
+      *
+      * In the above case, an EXEC CICS GETMAIN for an area of the
+      * appropriate size is performed and the MQGET is re-executed
+      * to retrieve the entire message which is then requeued.
+      *
+      * If the GETMAIN fails, the MQGET is re-executed with
+      * MQGMO-ACCEPT-TRUNCATED-MSG and the truncated message is
+      * then requeued.
+      *
+      * If the sending application requested a Negative Action
+      * Notification (NAN) via MQMD-REPORT, a copy of the WTO will
+      * be sent to the MQMD-REPLYTOQ with a MQMD-MSGTYPE of
+      * MQMT-REPORT and a MQMD-FEEDBACK of MQFB-NAN.
+      *
+      * If your transaction updates recoverable resources (say, DB2)
+      * you probably want to BIND the DB2 package with RELEASE(COMMIT)
+      * instead of RELEASE(DEALLOCATE).  That will prevent deadlocks
+      * on pages already COMMITted by your application.
+      *
+      * If the passed queue name is blank, low values or high values,
+      * an EXEC CICS RETRIEVE is done to obtain the MQTM and the
+      * queue name is obtained from that structure.  The queue name is
+      * also passed back to the caller in the queue name parameter.
+      *
+      *
+      * Sample Use:
+      *
+      * Working-Storage Section.
+      * 01  J7200506-PGM PIC X(008) VALUE 'J7200506'.
+      * 01  DFHCOMMAREA PIC X(001).
+      * 01  MY-QUE-NM   PIC X(048).
+      * 01  MY-MQMD.
+      *     COPY CMQMDV.
+      * 01  MY-BUFR-LN  PIC S9(008) COMP-5.
+      * 01  MY-DATA-LN  PIC S9(008) COMP-5.
+      * 01  MY-MSG      PIC X(...).
+      * 01  MY-CMPN-CD  PIC S9(008) COMP-5.
+      * 01  MY-RSN-CD   PIC S9(008) COMP-5.
+      * 01  MY-WAIT-TM  PIC S9(008) COMP-5.
+      *
+      * 01  Switches
+      *     05  J7200506-RC             PIC S9(008) COMP-5 VALUE +0.
+      *     COPY J7200506 REPLACING ==:PRFX:== BY ==UTL-==.
+      *
+      * ....
+      *
+      * Procedure Division.
+      * MOVE LENGTH OF MY-MSG TO MY-BUFR-LN
+      * MOVE +2000            TO MY-WAIT-TM  *> Two Seconds
+      * PERFORM WITH TEST AFTER
+      * UNTIL J7200506-RC NOT = MSG-RETRIEVED-OK
+      *     CALL J7200506-PGM USING
+      *         DFHEIBLK             *>CICS EIB
+      *         DFHCOMMAREA          *>Dummy commarea - not used
+      *         MY-QUE-NM            *>MQ queue name
+      *         MY-MQMD              *>MQMD structure returned
+      *         MY-BUFR-LN           *>length of MY-MSG
+      *         MY-DATA-LN           *>length of message returned
+      *         MY-MSG               *>message from MQ
+      *         MY-CMPN-CD           *>MQ completion code
+      *         MY-RSN-CD            *>MQ reason code
+      *         MY-WAIT-TM           *>MQGET timeout
+      *     END-CALL
+      *     MOVE RETURN-CODE TO J7200506-RC
+      *     IF UTL-MSG-RETRIEVED-OK
+      *         ...business process for retrieved message...
+      *         EXEC CICS SYNCPOINT END-EXEC
+      *     END-IF
+      * END-PERFORM
+      * EVALUATE TRUE
+      *     WHEN UTL-NO-MSG-QUE-CLOSED
+      *          CONTINUE
+      *     WHEN UTL-MQ-ERROR
+      *          ...application-specific error handling...
+      *          (what is provided by this program may be sufficient)
+      *     WHEN UTL-POISON-MESSAGE
+      *          ...application-specific error handling...
+      *          (what is provided by this program may be sufficient)
+      * END-EVALUATE
+      * EXEC CICS RETURN END-EXEC
+      *
+      * Return Codes:
+      * MSG-RETRIEVED-OK             +0
+      * NO-MSG-QUE-CLOSED            +1
+      * MQ-ERROR                     +10 THRU +19
+      * OPEN-FAILED                  +11
+      * INQUIRE-FAILED               +12
+      * CLOSE-FAILED                 +13
+      * GET-FAILED                   +14
+      * PUT-FAILED                   +15
+      * PUT1-FAILED                  +16
+      * UNKNOWN-ERROR                +19
+      * POISON-MSG                   +20 THRU +29
+      * POISON-MSG-REQUEUED          +21
+      * POISON-MSG-REQUEUE-FAILED    +22
+      * POISON-MSG-DISCARDED         +23
+      *
+      *
+       Environment Division.
+       Data Division.
+       Working-Storage Section.
+       01  CONSTANTS.
+           05  MYNAME                  PIC X(008) VALUE 'J7200506'.
+           05  CICS-ERR-PGM            PIC X(008) VALUE 'J7200501'.
+           05  MQ-RSN-CD-PGM           PIC X(008) VALUE 'J7200502'.
+           05  MQ-QMGR-PGM             PIC X(008) VALUE 'J7200503'.
+           05  MQ-INQ-PGM              PIC X(008) VALUE 'J7200507'.
+           05  HEX-CONV-PGM            PIC X(008) VALUE 'J7200508'.
+           05  MQ-API-PGMS.
+               COPY CMQAPIDC.
+           05  WS-MQRO-NAN-BIT-NB      PIC S9(008) COMP-5 VALUE +1.
+           05  WS-MQRO-PASS-CORREL-ID-BIT-NB
+                                       PIC S9(008) COMP-5 VALUE +6.
+           05  WS-MQRO-PASS-MSG-ID-BIT-NB
+                                       PIC S9(008) COMP-5 VALUE +7.
+           05  WS-CMQV.
+               COPY CMQV.
+           05  ERR-MSG-CONSTANTS.
+               10  ERR-MSG-ID-01       PIC X(009) VALUE 'UDOT0002I'.
+               10  ERR-MSG-ID-02       PIC X(009) VALUE 'UDOT0002E'.
+               10  ERR-MSG-ID-03       PIC X(009) VALUE 'UDOT0002W'.
+               10  ERR-MSG-ID-04       PIC X(009) VALUE 'UDOT0003W'.
+               10  ERR-MSG-ID-05       PIC X(009) VALUE 'UDOT0003E'.
+               10  ERR-MSG-ID-06       PIC X(009) VALUE 'UDOT0004E'.
+               10  ERR-MSG-TXT01       PIC X(023)
+                   VALUE 'Poison message in queue'.
+               10  ERR-MSG-TXT02       PIC X(004)
+                   VALUE 'from'.
+               10  ERR-MSG-TXT03       PIC X(003)
+                   VALUE 'via'.
+               10  ERR-MSG-TXT04       PIC X(011)
+                   VALUE 'requeued to'.
+               10  ERR-MSG-TXT05       PIC X(012)
+                   VALUE 'not requeued'.
+               10  ERR-MSG-TXT06       PIC X(015)
+                   VALUE 'with truncation'.
+               10  ERR-MSG-TXT07       PIC X(007)
+                   VALUE 'MsgID=x'.
+               10  ERR-MSG-TXT08       PIC X(010)
+                   VALUE 'CorrelID=x'.
+               10  ERR-MSG-TXT09       PIC X(020)
+                   VALUE 'Attempted to acquire'.
+               10  ERR-MSG-TXT10       PIC X(005)
+                   VALUE 'bytes'.
+
+       01  WORK-AREAS.
+           05  HCONN                   PIC S9(008) COMP-5.
+           05  OPEN-OPTIONS            PIC S9(008) COMP-5 VALUE +0.
+           05  CLOSE-OPTIONS           PIC S9(008) COMP-5 VALUE +0.
+           05  HOBJ                    PIC S9(008) COMP-5.
+           05  HOBJ-INQ                PIC S9(008) COMP-5.
+           05  HOBJ-GET                PIC S9(008) COMP-5.
+           05  HOBJ-PUT                PIC S9(008) COMP-5.
+           05  WS-BUFR-LN              PIC S9(008) COMP-5.
+           05  CICS-RESP               PIC S9(008) COMP-5.
+           05  CICS-RESP2              PIC S9(008) COMP-5.
+           05  BACK-OUT-THLD           PIC S9(008) COMP-5.
+           05  HEX-FLD-LN              PIC S9(008) COMP-5.
+           05  ERR-MSG-LN              PIC 9(008)  COMP-5 VALUE 1.
+           05  ERR-MSG-SUFX-LN         PIC 9(008)  COMP-5 VALUE 1.
+           05  CEESITST-TEST-FLD       PIC S9(008) COMP-5.
+           05  CEESITST-BIT-NB         PIC S9(008) COMP-5.
+           05  CEESITST-RSLT           PIC S9(008) COMP-5.
+           05  WS-MQTM-LN              PIC S9(004) COMP-5.
+           05  CEESITST-FC             PIC X(012).
+           05  CICS-APPL-ID            PIC X(008) VALUE SPACES.
+           05  THIS-USERID             PIC X(008) VALUE SPACES.
+           05  BACK-OUT-QUE-NM         PIC X(048) VALUE SPACES.
+           05  QMGR-NM                 PIC X(048) VALUE SPACES.
+           05  WS-MQMD-MSGID-EXPD      PIC X(048).
+           05  WS-MQMD-CORRELID-EXPD   PIC X(048).
+           05  ERR-MSG-WTO             PIC X(690) VALUE SPACES.
+           05  ERR-MSG-WTO-SUFX        PIC X(100) VALUE SPACES.
+           05  CICS-API-FAILED         PIC X(030) VALUE SPACES.
+           05  CICS-API-FAILED-LOC     PIC X(004) VALUE SPACES.
+           05  CICS-RESP-TXT           PIC X(025) VALUE SPACES.
+           05  CICS-RESP-DSPL          PIC 9(010) VALUE ZEROES.
+           05  CICS-RESP-DSPL-X
+               REDEFINES
+               CICS-RESP-DSPL          PIC X(010).
+           05  CICS-RESP2-DSPL         PIC 9(010) VALUE ZEROES.
+           05  CICS-RESP2-DSPL-X
+               REDEFINES
+               CICS-RESP2-DSPL         PIC X(010).
+           05  WS-BUFR-LN-DSPL         PIC 9(010) VALUE ZEROES.
+           05  WS-BUFR-LN-DSPL-X
+               REDEFINES
+               WS-BUFR-LN-DSPL         PIC X(010).
+Debug *    05  CD-DSPL                 PIC 9(010) VALUE ZEROES.
+Debug *    05  CD-DSPL-X
+Debug *        REDEFINES
+Debug *        CD-DSPL                 PIC X(010).
+
+       COPY J7200507 REPLACING ==:PRFX:== BY ==J7200507-==.
+
+       01  WS-MQMD.
+           COPY CMQMDV.
+
+       01  WS-CMQODV-INQ.
+           COPY CMQODV.
+
+       01  WS-CMQODV-PUT.
+           COPY CMQODV.
+
+       01  WS-CMQODV-GET.
+           COPY CMQODV.
+
+       01  WS-CMQODV.
+           COPY CMQODV.
+
+       01  WS-CMQGMOV.
+           COPY CMQGMOV.
+
+       01  WS-CMQPMOV.
+           COPY CMQPMOV.
+
+       01  WS-MQTM.
+           COPY CMQTMV.
+
+       01  SWITCHES.
+           05  QMGR-KNOWN-SW           PIC X(001) VALUE SPACE.
+               88  QMGR-KNOWN                  VALUE 'Y'.
+           05  QUE-OPEN-SW             PIC X(001) VALUE SPACE.
+               88  QUE-OPEN                    VALUE 'Y'.
+           05  INQ-CMPL-SW             PIC X(001) VALUE SPACE.
+               88  INQ-CMPL                    VALUE 'Y'.
+           05  MSG-TRUNCATED-SW        PIC X(001) VALUE SPACE.
+               88  MSG-TRUNCATED               VALUE 'Y'.
+           05  MQ-QMGR-PGM-RC          PIC S9(008) COMP-5.
+               88  MQ-QMGR-PGM-OK              VALUE +0.
+               88  MQ-QMGR-PGM-OPEN-FAILED     VALUE +1.
+               88  MQ-QMGR-PGM-INQ-FAILED      VALUE +2.
+               88  MQ-QMGR-PGM-CLOSE-FAILED    VALUE +3.
+           05  BIT-TEST-SW             PIC S9(008) COMP-5.
+               88  BIT-IS-OFF                  VALUE +0.
+               88  BIT-IS-ON                   VALUE +1.
+
+       Local-Storage Section.
+       01  PER-INVOCATION-WORK-AREAS.
+           05  RSN-CD-DSPL             PIC 9(010)        VALUE ZEROES.
+           05  RSN-CD-DSPL-X
+               REDEFINES
+               RSN-CD-DSPL             PIC X(010).
+           05  RSN-CD-TXT              PIC X(030)         VALUE SPACES.
+           05  ERR-MSG-MQ-FUNC         PIC X(008)         VALUE SPACES.
+           05  ERR-MSG-MQ-QUE-NM       PIC X(048)         VALUE SPACES.
+           05  WS-MSG-PTR              POINTER            VALUE NULL.
+           05  BIT-TEST-FW             PIC S9(008) COMP-5 VALUE +0.
+           05  BIT-TEST-X
+               REDEFINES
+               BIT-TEST-FW.
+               10                      PIC X(003).
+               10  BIT-TEST-LOW-BYTE   PIC X(001).
+           05  WS-MQMD-RPT-FW          PIC S9(008) COMP-5 VALUE +0.
+           05  WS-MQMD-RPT-X
+               REDEFINES
+               WS-MQMD-RPT-FW.
+               10  WS-MQMD-BYTES
+                   OCCURS 4 TIMES      PIC X(001).
+           05  SAVE-RC                 PIC S9(008) COMP-5 VALUE +0.
+           COPY J7200506 REPLACING ==:PRFX:== BY == ==.
+           05  HAVE-ERR-MSG-SUFX-SW    PIC X(001)         VALUE SPACE.
+               88  HAVE-ERR-MSG-SUFX           VALUE 'Y'.
+           05  GETMAIN-DONE-SW         PIC X(001)         VALUE SPACE.
+               88  GETMAIN-DONE                VALUE 'Y'.
+           05  SEND-NAN-SW             PIC X(001) VALUE SPACE.
+               88  SEND-NAN                    VALUE 'Y'.
+           05  PASS-CORREL-ID-SW       PIC X(001) VALUE SPACE.
+               88  PASS-CORREL-ID              VALUE 'Y'.
+           05  PASS-MSG-ID-SW          PIC X(001) VALUE SPACE.
+               88  PASS-MSG-ID                 VALUE 'Y'.
+
+       Linkage Section.
+       01  DFHCOMMAREA PIC X(001).
+       01  LS-QUE-NM   PIC X(048).
+       01  LS-MQMD.
+           COPY CMQMDL.
+       01  LS-BUFR-LN  PIC S9(008) COMP-5.
+       01  LS-DATA-LN  PIC S9(008) COMP-5.
+       01  LS-MSG      PIC X.
+       01  LS-CMPN-CD  PIC S9(008) COMP-5.
+       01  LS-RSN-CD   PIC S9(008) COMP-5.
+       01  LS-GET-WAIT PIC S9(008) COMP-5.
+       01  LS-MSG-COPY PIC X.
+      *
+      * Note that LS-MSG-COPY is not a passed parameter from the
+      * caller.  It is used when calling the MQ API so that we can
+      * point the API at either LS-MSG or a GETMAINed area.  This
+      * is done by setting the address of LS-MSG-COPY appropriately.
+      *
+
+       Procedure Division Using
+           DFHCOMMAREA
+           LS-QUE-NM
+           LS-MQMD
+           LS-BUFR-LN
+           LS-DATA-LN
+           LS-MSG
+           LS-CMPN-CD
+           LS-RSN-CD
+           LS-GET-WAIT
+           LS-MSG-COPY
+           .
+
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' Begin'
+
+           SET MSG-RETRIEVED-OK TO TRUE
+           MOVE SPACE TO MSG-TRUNCATED-SW
+           MOVE LS-BUFR-LN TO WS-BUFR-LN
+      *
+      *    These addresses are here because we _may_ need to
+      *    getmain some storage in the event the caller did not
+      *    provide enough room for the message.
+      *
+           SET WS-MSG-PTR TO ADDRESS OF LS-MSG
+           SET ADDRESS OF LS-MSG-COPY TO WS-MSG-PTR
+      *
+      *    No match criteria
+      *    It turns out that, when specifying MQMO-NONE, one
+      *    must also do one of the following
+      *    1. set _both_ MQMD-MSGID and MQMD-CORRELID to
+      *       their respective "null" values
+      *    2. set MQGMO-VERSION to MQGMO-VERSION-2
+      *
+      *    This behavior is documented in the MQ programming reference
+      *    as a note after the MQMO-NONE documentation in the
+      *    matchoptions section of the MQGMO structure.
+      *
+           MOVE MQMO-NONE TO MQGMO-MATCHOPTIONS OF WS-CMQGMOV
+           MOVE MQMI-NONE TO MQMD-MSGID OF LS-MQMD
+           MOVE MQCI-NONE TO MQMD-CORRELID OF LS-MQMD
+
+           IF CICS-APPL-ID = SPACES
+               EXEC CICS ASSIGN
+                   APPLID(CICS-APPL-ID)
+                   USERID(THIS-USERID)
+               END-EXEC
+           END-IF
+
+           IF LS-QUE-NM = SPACES OR
+              LS-QUE-NM = LOW-VALUES OR
+              LS-QUE-NM = HIGH-VALUES
+               IF MQTM-QNAME = SPACES
+                   MOVE LENGTH OF WS-MQTM TO WS-MQTM-LN
+                   EXEC CICS RETRIEVE
+                       INTO(WS-MQTM)
+                       LENGTH(WS-MQTM-LN)
+                   END-EXEC
+               END-IF
+               MOVE MQTM-QNAME TO LS-QUE-NM
+           END-IF
+
+           PERFORM 0120-GET-QMGR-NM
+           IF MQ-ERROR
+               MOVE SAVE-RC TO RETURN-CODE
+               GOBACK
+           END-IF
+
+           IF INQ-CMPL
+               CONTINUE
+           ELSE
+               PERFORM 0110-GET-BACK-OUT-INFO
+               IF LS-CMPN-CD = MQCC-OK
+                   SET INQ-CMPL TO TRUE
+               ELSE
+                   GOBACK
+               END-IF
+           END-IF
+
+           PERFORM 1000-PRCS
+
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' End'
+
+           MOVE SAVE-RC TO RETURN-CODE
+           GOBACK
+           .
+
+       0110-GET-BACK-OUT-INFO.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 0110-GET-BACK-OUT-INFO'
+
+      *
+      * Retrieve backout information from the queue definition.  This
+      * information is used when retrieving a message to see if we
+      * have reached the backout threshold due to prior units of work
+      * being backed out (probable abends), and determine what to do
+      * in the case of a backout - if a backout queue name is present
+      * an attempt will be make to requeue "poison" messages there.
+      *
+
+           MOVE +2             TO J7200507-SELECTORCOUNT
+           MOVE +1             TO J7200507-INTATTRCOUNT
+           MOVE +48            TO J7200507-CHARATTRLENGTH
+           MOVE MQHC-DEF-HCONN TO HCONN
+           MOVE MQOT-Q         TO MQOD-OBJECTTYPE
+                               OF WS-CMQODV-INQ
+           MOVE LS-QUE-NM      TO MQOD-OBJECTNAME
+                               OF WS-CMQODV-INQ
+           MOVE MQCA-BACKOUT-REQ-Q-NAME
+             TO J7200507-SELECTORS( 1 )
+           MOVE MQIA-BACKOUT-THRESHOLD
+             TO J7200507-SELECTORS( 2 )
+
+           CALL MQ-INQ-PGM USING
+               HCONN
+               J7200507-SELECTORCOUNT
+               J7200507-SELECTORS-TABLE
+               J7200507-INTATTRCOUNT
+               J7200507-INTATTRS-TABLE
+               J7200507-CHARATTRLENGTH
+               J7200507-CHARATTRS-TABLE
+               WS-CMQODV-INQ
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+
+           IF LS-CMPN-CD = MQCC-OK
+               MOVE J7200507-CHARATTRS-TABLE TO BACK-OUT-QUE-NM
+               MOVE J7200507-INTATTRS( 1 )   TO BACK-OUT-THLD
+           ELSE
+               MOVE RETURN-CODE TO SAVE-RC
+               EVALUATE TRUE
+                   WHEN OPEN-FAILED
+                        MOVE MQOPEN     TO ERR-MSG-MQ-FUNC
+                   WHEN INQUIRE-FAILED
+                        MOVE MQINQ      TO ERR-MSG-MQ-FUNC
+                   WHEN CLOSE-FAILED
+                        MOVE MQCLOSE    TO ERR-MSG-MQ-FUNC
+               END-EVALUATE
+               IF INFO-RETURNED-OK
+                   CONTINUE
+               ELSE
+                   PERFORM 9040-FMT-MSG-04-05
+                   PERFORM 9100-WTO
+               END-IF
+           END-IF
+           .
+
+       0120-GET-QMGR-NM.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 0120-GET-QMGR-NM'
+
+      *
+      * Retrieve the name of the queue manager currently connected
+      * to this CICS region.
+      *
+
+           IF QMGR-KNOWN
+               CONTINUE
+           ELSE
+               CALL MQ-QMGR-PGM USING
+                   QMGR-NM
+                   LS-CMPN-CD
+                   LS-RSN-CD
+               END-CALL
+               MOVE RETURN-CODE TO MQ-QMGR-PGM-RC
+               EVALUATE TRUE
+                   WHEN MQ-QMGR-PGM-OK
+                        SET QMGR-KNOWN TO TRUE
+                   WHEN MQ-QMGR-PGM-OPEN-FAILED
+                        SET OPEN-FAILED TO TRUE
+                   WHEN MQ-QMGR-PGM-INQ-FAILED
+                        SET INQUIRE-FAILED TO TRUE
+                   WHEN MQ-QMGR-PGM-CLOSE-FAILED
+                        SET CLOSE-FAILED TO TRUE
+                   WHEN OTHER
+                        SET UNKNOWN-ERROR TO TRUE
+               END-EVALUATE
+           END-IF
+           .
+
+       1000-PRCS.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 1000-PRCS'
+
+      *
+      * Open the queue, get the message, check to see if it is
+      * "poison" (cannot be processed due to prior difficulties),
+      * close the queue.
+      *
+
+           MOVE LS-GET-WAIT TO MQGMO-WAITINTERVAL
+           IF LS-GET-WAIT > 0
+               MOVE MQGMO-WAIT TO MQGMO-OPTIONS OF WS-CMQGMOV
+           ELSE
+               MOVE MQGMO-NO-WAIT TO MQGMO-OPTIONS OF WS-CMQGMOV
+           END-IF
+
+           ADD MQGMO-FAIL-IF-QUIESCING TO
+               MQGMO-OPTIONS OF WS-CMQGMOV
+
+           ADD MQGMO-CONVERT TO
+               MQGMO-OPTIONS OF WS-CMQGMOV
+
+           IF QUE-OPEN
+               MOVE HOBJ-GET TO HOBJ
+           ELSE
+               COMPUTE OPEN-OPTIONS =
+                   MQOO-INPUT-AS-Q-DEF +
+                   MQOO-SAVE-ALL-CONTEXT +
+                   MQOO-FAIL-IF-QUIESCING
+               MOVE LS-QUE-NM      TO MQOD-OBJECTNAME
+                                   OF WS-CMQODV-GET
+               MOVE MQHC-DEF-HCONN TO HCONN
+               MOVE WS-CMQODV-GET  TO WS-CMQODV
+               PERFORM 8010-OPEN
+               MOVE HOBJ TO HOBJ-GET
+               SET QUE-OPEN TO TRUE
+           END-IF
+
+           IF LS-CMPN-CD = MQCC-OK
+               PERFORM 8040-GET
+               EVALUATE TRUE
+                 WHEN LS-RSN-CD = MQRC-NO-MSG-AVAILABLE
+                      MOVE MQCO-NONE TO CLOSE-OPTIONS
+                      PERFORM 8030-CLOSE
+                      IF LS-CMPN-CD = MQCC-OK
+                          SET NO-MSG-QUE-CLOSED TO TRUE
+                      ELSE
+                          SET CLOSE-FAILED      TO TRUE
+                          MOVE MQCLOSE          TO ERR-MSG-MQ-FUNC
+                          PERFORM 9040-FMT-MSG-04-05
+                          PERFORM 9100-WTO
+                      END-IF
+                 WHEN MQMD-BACKOUTCOUNT OF LS-MQMD >= BACK-OUT-THLD
+      *               Poison message, previously backed out
+                      PERFORM 1100-DEJA-VU
+                 WHEN OTHER
+      *               No special processing necessary
+                      CONTINUE
+               END-EVALUATE
+           END-IF
+           .
+
+       1100-DEJA-VU.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 1100-DEJA-VU'
+
+      *
+      * We have retrieved this message previously and the unit of
+      * work was backed out.  This has occurred enough times that
+      * the backout threshold has been reached and this message is
+      * now considered to be "poison" (we cannot process it).  The
+      * message will be moved to a poison queue if one exists.
+      *
+           PERFORM 1130-CK-RPT-OPT
+           IF LS-RSN-CD = MQRC-TRUNCATED-MSG-FAILED
+               ADD MQGMO-MARK-SKIP-BACKOUT TO
+                   MQGMO-OPTIONS OF WS-CMQGMOV
+               ADD MQGMO-SYNCPOINT TO
+                   MQGMO-OPTIONS OF WS-CMQGMOV
+      *
+      * This message is too large to be processed by the caller.  We
+      * will requeue it after acquiring enough storage to retrieve it.
+      *
+               MOVE LS-DATA-LN TO WS-BUFR-LN
+               PERFORM 9110-GETMAIN
+               IF CICS-RESP = DFHRESP( NORMAL )
+                   SET ADDRESS OF LS-MSG-COPY TO WS-MSG-PTR
+                   SET GETMAIN-DONE TO TRUE
+               ELSE
+                   SET HAVE-ERR-MSG-SUFX TO TRUE
+                   PERFORM 1150-GETMAIN-ERR-MSG-SUFX
+                   PERFORM 9050-FMT-MSG-06
+                   PERFORM 9100-WTO
+                   MOVE SPACE TO HAVE-ERR-MSG-SUFX-SW
+      *
+      * Unable to acquire storage - truncate the message.
+      *
+                   ADD MQGMO-ACCEPT-TRUNCATED-MSG TO
+                       MQGMO-OPTIONS OF WS-CMQGMOV
+                   SET MSG-TRUNCATED TO TRUE
+                   SET WS-MSG-PTR TO NULL
+               END-IF
+               PERFORM 8040-GET
+               IF LS-CMPN-CD = MQCC-OK
+                   CONTINUE
+               ELSE
+                   PERFORM 9020-FMT-MSG-02
+                   SET POISON-MSG-REQUEUE-FAILED TO TRUE
+                   PERFORM 9100-WTO
+      * Note that the message is _deliberately_ lost - unprocessable.
+               END-IF
+           END-IF
+
+           IF POISON-MSG-REQUEUE-FAILED
+      *
+      * Unable to MQGET message - failure has been WTO'd.
+      *
+               CONTINUE
+           ELSE
+               IF BACK-OUT-QUE-NM = SPACES
+                   PERFORM 9030-FMT-MSG-03
+                   SET POISON-MSG-DISCARDED TO TRUE
+                   PERFORM 9100-WTO
+               ELSE
+                   PERFORM 1110-OPEN-BACKOUT-QUE
+                   IF LS-CMPN-CD = MQCC-OK
+                       PERFORM 1120-PUT-MSG-IN-BACKOUT-QUE
+                       IF LS-CMPN-CD = MQCC-OK
+                           PERFORM 9010-FMT-MSG-01
+                           SET POISON-MSG-REQUEUED TO TRUE
+                       ELSE
+                           PERFORM 9020-FMT-MSG-02
+                           SET POISON-MSG-REQUEUE-FAILED TO TRUE
+                       END-IF
+                       PERFORM 9100-WTO
+                       MOVE HOBJ-PUT TO HOBJ
+                       PERFORM 8030-CLOSE
+                   END-IF
+               END-IF
+           END-IF
+
+           IF SEND-NAN
+               IF MQMD-REPLYTOQ OF LS-MQMD = SPACES
+                 OR MQMD-REPLYTOQ OF LS-MQMD = LOW-VALUES
+                 OR MQMD-REPLYTOQ OF LS-MQMD = HIGH-VALUES
+                   CONTINUE
+               ELSE
+                   PERFORM 1140-SEND-NAN
+               END-IF
+           END-IF
+
+           EXEC CICS SYNCPOINT END-EXEC
+           IF GETMAIN-DONE
+               PERFORM 9120-FREEMAIN
+               IF CICS-RESP = DFHRESP( NORMAL )
+                   CONTINUE
+               ELSE
+                   PERFORM 9050-FMT-MSG-06
+                   PERFORM 9100-WTO
+               END-IF
+           END-IF
+           .
+
+       1110-OPEN-BACKOUT-QUE.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 1110-OPEN-BACKOUT-QUE'
+
+      *
+      * Note that the context of the original message is preserved
+      * when moving a poison message to the backout queue.
+      * Here, MQOO-PASS-ALL-CONTEXT is used on the MQOPEN.
+      *
+           MOVE MQOT-Q          TO MQOD-OBJECTTYPE
+                                OF WS-CMQODV-PUT
+           MOVE BACK-OUT-QUE-NM TO MQOD-OBJECTNAME
+                                OF WS-CMQODV-PUT
+           MOVE WS-CMQODV-PUT   TO WS-CMQODV
+           COMPUTE OPEN-OPTIONS =
+               MQOO-OUTPUT +
+               MQOO-PASS-ALL-CONTEXT +
+               MQOO-FAIL-IF-QUIESCING
+           PERFORM 8010-OPEN
+           MOVE HOBJ            TO HOBJ-PUT
+           .
+
+       1120-PUT-MSG-IN-BACKOUT-QUE.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 1120-PUT-MSG-IN-BACKOUT-QUE'
+
+      *
+      * Note that the context of the original message is preserved
+      * when moving a poison message to the backout queue.
+      * Here, MQPMO-PASS-ALL-CONTEXT is used on the MQPUT and the
+      * HOBJ from the original MQGET is passed in MQPMO-CONTEXT.
+      *
+           MOVE HOBJ-GET        TO MQPMO-CONTEXT
+                                OF WS-CMQPMOV
+           MOVE LS-MQMD         TO WS-MQMD
+           MOVE MQEI-UNLIMITED  TO MQMD-EXPIRY
+                                OF WS-MQMD
+           COMPUTE MQPMO-OPTIONS OF WS-CMQPMOV =
+               MQPMO-PASS-ALL-CONTEXT +
+               MQPMO-FAIL-IF-QUIESCING
+           MOVE HOBJ-PUT        TO HOBJ
+           PERFORM 8050-PUT
+           .
+
+       1130-CK-RPT-OPT.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 1130-CK-RPT-OPT'
+
+      *
+      * Check to see if the message sender requested a Negative
+      * Action Notification (NAN) report.  If so, set a switch
+      * to indicate so.
+      *
+
+           MOVE MQMD-REPORT OF LS-MQMD TO CEESITST-TEST-FLD
+           MOVE WS-MQRO-NAN-BIT-NB TO CEESITST-BIT-NB
+           PERFORM 8060-BIT-TEST
+           MOVE CEESITST-RSLT      TO BIT-TEST-SW
+           IF BIT-IS-ON
+               SET SEND-NAN TO TRUE
+           END-IF
+
+           MOVE WS-MQRO-PASS-CORREL-ID-BIT-NB TO CEESITST-BIT-NB
+           PERFORM 8060-BIT-TEST
+           MOVE CEESITST-RSLT      TO BIT-TEST-SW
+           IF BIT-IS-ON
+               SET PASS-CORREL-ID TO TRUE
+           END-IF
+
+           MOVE WS-MQRO-PASS-MSG-ID-BIT-NB TO CEESITST-BIT-NB
+           PERFORM 8060-BIT-TEST
+           MOVE CEESITST-RSLT      TO BIT-TEST-SW
+           IF BIT-IS-ON
+               SET PASS-MSG-ID TO TRUE
+           END-IF
+           .
+
+       1140-SEND-NAN.
+      *
+      * The sending application requested a Negative Action
+      * Notification (NAN) report.  This is sent to indicate the
+      * message was not processed by the receiving application.
+      *
+           MOVE MQPMO-FAIL-IF-QUIESCING TO MQPMO-OPTIONS OF WS-CMQPMOV
+           MOVE MQFB-NAN    TO MQMD-FEEDBACK OF WS-MQMD
+           MOVE MQRO-NONE   TO MQMD-REPORT   OF WS-MQMD
+           MOVE MQMT-REPORT TO MQMD-MSGTYPE  OF WS-MQMD
+
+           IF PASS-CORREL-ID
+               CONTINUE
+           ELSE
+               MOVE MQMD-MSGID OF LS-MQMD TO MQMD-CORRELID OF WS-MQMD
+           END-IF
+
+           IF PASS-MSG-ID
+               CONTINUE
+           ELSE
+               MOVE MQMI-NONE TO MQMD-MSGID OF WS-MQMD
+           END-IF
+
+           MOVE MQOT-Q          TO MQOD-OBJECTTYPE
+                                OF WS-CMQODV-PUT
+           MOVE MQMD-REPLYTOQ   OF LS-MQMD
+                                TO MQOD-OBJECTNAME
+                                OF WS-CMQODV-PUT
+           MOVE SPACES          TO MQMD-REPLYTOQ
+                                OF WS-MQMD
+           MOVE SPACES          TO MQMD-REPLYTOQMGR
+                                OF WS-MQMD
+           MOVE WS-CMQODV-PUT   TO WS-CMQODV
+           CALL MQPUT1 USING
+               HCONN
+               WS-CMQODV
+               WS-MQMD
+               WS-CMQPMOV
+               ERR-MSG-LN
+               ERR-MSG-WTO
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+
+           IF LS-CMPN-CD = MQCC-OK
+               CONTINUE
+           ELSE
+               SET PUT1-FAILED TO TRUE
+               MOVE MQPUT1     TO ERR-MSG-MQ-FUNC
+               MOVE SPACE      TO MSG-TRUNCATED-SW
+               PERFORM 9040-FMT-MSG-04-05
+               PERFORM 9100-WTO
+           END-IF
+           .
+
+       1150-GETMAIN-ERR-MSG-SUFX.
+           MOVE WS-BUFR-LN TO WS-BUFR-LN-DSPL
+           STRING
+               ERR-MSG-TXT09
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               WS-BUFR-LN-DSPL-X
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT10
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO-SUFX
+             WITH POINTER
+               ERR-MSG-SUFX-LN
+           END-STRING
+
+           .
+
+       8010-OPEN.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 8010-OPEN'
+
+           CALL MQOPEN USING
+               HCONN
+               WS-CMQODV
+               OPEN-OPTIONS
+               HOBJ
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+
+Debug *    PERFORM 9910-DSPL-CMP-RSN-CD
+           IF LS-CMPN-CD = MQCC-OK
+               CONTINUE
+           ELSE
+               SET OPEN-FAILED TO TRUE
+               MOVE MQOPEN     TO ERR-MSG-MQ-FUNC
+               PERFORM 9040-FMT-MSG-04-05
+               PERFORM 9100-WTO
+           END-IF
+           .
+
+       8030-CLOSE.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 8030-CLOSE'
+
+           CALL MQCLOSE USING
+               HCONN
+               HOBJ
+               CLOSE-OPTIONS
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+Debug *    PERFORM 9910-DSPL-CMP-RSN-CD
+           .
+
+       8040-GET.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 8040-GET'
+
+           CALL MQGET USING
+               HCONN
+               HOBJ
+               LS-MQMD
+               WS-CMQGMOV
+               WS-BUFR-LN
+               LS-MSG-COPY
+               LS-DATA-LN
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+
+Debug *    PERFORM 9910-DSPL-CMP-RSN-CD
+           EVALUATE LS-CMPN-CD ALSO LS-RSN-CD
+              WHEN MQCC-OK ALSO ANY
+              WHEN ANY     ALSO MQRC-NO-MSG-AVAILABLE
+                   CONTINUE
+              WHEN OTHER
+                   SET GET-FAILED TO TRUE
+                   MOVE MQGET     TO ERR-MSG-MQ-FUNC
+                   PERFORM 9040-FMT-MSG-04-05
+                   PERFORM 9100-WTO
+           END-EVALUATE
+           .
+
+       8050-PUT.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 8050-PUT'
+
+           CALL MQPUT USING
+               HCONN
+               HOBJ
+               WS-MQMD
+               WS-CMQPMOV
+               LS-BUFR-LN
+               LS-MSG
+               LS-CMPN-CD
+               LS-RSN-CD
+           END-CALL
+
+Debug *    PERFORM 9910-DSPL-CMP-RSN-CD
+           IF LS-CMPN-CD = MQCC-OK
+               CONTINUE
+           ELSE
+               SET PUT-FAILED TO TRUE
+               MOVE MQPUT     TO ERR-MSG-MQ-FUNC
+               PERFORM 9040-FMT-MSG-04-05
+               PERFORM 9100-WTO
+           END-IF
+           .
+
+       8060-BIT-TEST.
+      *
+      * Oddly enough, there are no documented LE feedback codes
+      * for this callable service.  So I'm not checking.
+      *
+
+           CALL 'CEESITST' USING
+               CEESITST-TEST-FLD
+               CEESITST-BIT-NB
+               CEESITST-FC
+               CEESITST-RSLT
+           END-CALL
+           .
+
+       9010-FMT-MSG-01.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9010-FMT-MSG-01'
+
+      *
+      * Message has been requeued to the backout queue.
+      *
+
+           MOVE LENGTH OF MQMD-MSGID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-MSGID OF LS-MQMD
+               WS-MQMD-MSGID-EXPD
+           END-CALL
+
+           MOVE LENGTH OF MQMD-CORRELID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-CORRELID OF LS-MQMD
+               WS-MQMD-CORRELID-EXPD
+           END-CALL
+
+           MOVE SPACES TO ERR-MSG-WTO
+           MOVE +1     TO ERR-MSG-LN
+           STRING
+               ERR-MSG-ID-01
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-APPL-ID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               EIBTRNID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MYNAME
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               THIS-USERID
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT01
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               QMGR-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               LS-QUE-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT02
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-USERIDENTIFIER OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT03
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-PUTAPPLNAME    OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT04
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               BACK-OUT-QUE-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT07
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-MSGID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT08
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-CORRELID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+
+           IF MSG-TRUNCATED
+               PERFORM 9090-ADD-TRUNC-MSG
+           END-IF
+           .
+
+       9020-FMT-MSG-02.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9020-FMT-MSG-02'
+
+      *
+      * Message was not requeued due to MQ error.  Completion and
+      * Reason codes are displayed.
+      *
+
+           MOVE LENGTH OF MQMD-MSGID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-MSGID OF LS-MQMD
+               WS-MQMD-MSGID-EXPD
+           END-CALL
+
+           MOVE LENGTH OF MQMD-CORRELID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-CORRELID OF LS-MQMD
+               WS-MQMD-CORRELID-EXPD
+           END-CALL
+
+           MOVE SPACES TO ERR-MSG-WTO
+           MOVE +1     TO ERR-MSG-LN
+           CALL MQ-RSN-CD-PGM USING
+               LS-RSN-CD
+               RSN-CD-TXT
+           END-CALL
+           MOVE LS-RSN-CD TO RSN-CD-DSPL
+           STRING
+               ERR-MSG-ID-02
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-APPL-ID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               EIBTRNID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MYNAME
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               THIS-USERID
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT01
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               QMGR-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               LS-QUE-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT02
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-USERIDENTIFIER OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT03
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-PUTAPPLNAME    OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT05
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               RSN-CD-DSPL-X
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               RSN-CD-TXT
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT07
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-MSGID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT08
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-CORRELID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+
+           IF MSG-TRUNCATED
+               PERFORM 9090-ADD-TRUNC-MSG
+           END-IF
+           .
+
+       9030-FMT-MSG-03.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9030-FMT-MSG-03'
+
+      *
+      * Message has not been requeued, there is no backout queue
+      * specified.
+      *
+
+           MOVE LENGTH OF MQMD-MSGID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-MSGID OF LS-MQMD
+               WS-MQMD-MSGID-EXPD
+           END-CALL
+
+           MOVE LENGTH OF MQMD-CORRELID OF LS-MQMD TO HEX-FLD-LN
+           CALL HEX-CONV-PGM USING
+               HEX-FLD-LN
+               MQMD-CORRELID OF LS-MQMD
+               WS-MQMD-CORRELID-EXPD
+           END-CALL
+
+           MOVE SPACES TO ERR-MSG-WTO
+           MOVE +1     TO ERR-MSG-LN
+           STRING
+               ERR-MSG-ID-03
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-APPL-ID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               EIBTRNID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MYNAME
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               THIS-USERID
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT01
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               QMGR-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               LS-QUE-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT02
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-USERIDENTIFIER OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT03
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MQMD-PUTAPPLNAME    OF LS-MQMD
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT05
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT07
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-MSGID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT08
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+               WS-MQMD-CORRELID-EXPD
+                 DELIMITED BY SIZE
+               QUOTE
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+
+           IF MSG-TRUNCATED
+               PERFORM 9090-ADD-TRUNC-MSG
+           END-IF
+           .
+
+       9040-FMT-MSG-04-05.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9040-FMT-MSG-04-05'
+
+      * An MQSeries warning or error has occurred.
+
+           MOVE SPACES TO ERR-MSG-WTO
+           MOVE +1     TO ERR-MSG-LN
+           MOVE MQOD-OBJECTNAME OF WS-CMQODV TO ERR-MSG-MQ-QUE-NM
+           CALL MQ-RSN-CD-PGM USING
+               LS-RSN-CD
+               RSN-CD-TXT
+           END-CALL
+           MOVE LS-RSN-CD TO RSN-CD-DSPL
+           IF LS-CMPN-CD = MQCC-WARNING
+               STRING
+                   ERR-MSG-ID-04
+                     DELIMITED BY SIZE
+                   SPACE
+                     DELIMITED BY SIZE
+                 INTO
+                   ERR-MSG-WTO
+                 WITH POINTER
+                   ERR-MSG-LN
+               END-STRING
+           ELSE
+               STRING
+                   ERR-MSG-ID-05
+                     DELIMITED BY SIZE
+                   SPACE
+                     DELIMITED BY SIZE
+                 INTO
+                   ERR-MSG-WTO
+                 WITH POINTER
+                   ERR-MSG-LN
+               END-STRING
+           END-IF
+
+           STRING
+               CICS-APPL-ID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               EIBTRNID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MYNAME
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               THIS-USERID
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               QMGR-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-MQ-QUE-NM
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-MQ-FUNC
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               RSN-CD-DSPL-X
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               RSN-CD-TXT
+                 DELIMITED BY SPACE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+
+           IF MSG-TRUNCATED
+               PERFORM 9090-ADD-TRUNC-MSG
+           END-IF
+           .
+
+       9050-FMT-MSG-06.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9050-FMT-MSG-06'
+
+      * A CICS error has occurred.
+
+           MOVE SPACES TO ERR-MSG-WTO
+           MOVE +1     TO ERR-MSG-LN
+           CALL CICS-ERR-PGM USING
+               CICS-RESP
+               CICS-RESP-TXT
+           END-CALL
+           MOVE CICS-RESP  TO CICS-RESP-DSPL
+           MOVE CICS-RESP2 TO CICS-RESP2-DSPL
+           STRING
+               ERR-MSG-ID-06
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-APPL-ID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               EIBTRNID
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               MYNAME
+                 DELIMITED BY SIZE
+               SPACE
+                 DELIMITED BY SIZE
+               THIS-USERID
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-API-FAILED
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-RESP-DSPL-X
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-RESP-TXT
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-RESP2-DSPL-X
+                 DELIMITED BY SPACE
+               SPACE
+                 DELIMITED BY SIZE
+               CICS-API-FAILED-LOC
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+
+           IF HAVE-ERR-MSG-SUFX
+               STRING
+                   SPACE
+                     DELIMITED BY SIZE
+                   ERR-MSG-WTO-SUFX(1:ERR-MSG-SUFX-LN)
+                     DELIMITED BY SIZE
+                 INTO
+                   ERR-MSG-WTO
+                 WITH POINTER
+                   ERR-MSG-LN
+               END-STRING
+           END-IF
+           .
+
+       9090-ADD-TRUNC-MSG.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9090-ADD-TRUNC-MSG'
+
+           STRING
+               SPACE
+                 DELIMITED BY SIZE
+               ERR-MSG-TXT06
+                 DELIMITED BY SIZE
+             INTO
+               ERR-MSG-WTO
+             WITH POINTER
+               ERR-MSG-LN
+           END-STRING
+           .
+
+       9100-WTO.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9100-WTO'
+
+      *
+      *    The NOHANDLE is here because if an error occurs during
+      *    error processing, an abend is too likely to create an
+      *    abend loop.
+      *
+           EXEC CICS
+                WRITE OPERATOR
+                TEXT(ERR-MSG-WTO)
+                TEXTLENGTH(ERR-MSG-LN)
+                NOHANDLE
+           END-EXEC
+           .
+
+       9110-GETMAIN.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9110-GETMAIN'
+
+           MOVE 'GETMAIN' TO CICS-API-FAILED
+           MOVE '9110'    TO CICS-API-FAILED-LOC
+
+
+           EXEC CICS GETMAIN
+                SET(WS-MSG-PTR)
+                FLENGTH(WS-BUFR-LN)
+                RESP(CICS-RESP)
+                RESP2(CICS-RESP2)
+           END-EXEC
+           .
+
+       9120-FREEMAIN.
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        ' 9120-FREEMAIN'
+
+           MOVE 'FREEMAIN' TO CICS-API-FAILED
+           MOVE '9120'     TO CICS-API-FAILED-LOC
+
+           EXEC CICS FREEMAIN
+                DATAPOINTER(WS-MSG-PTR)
+                RESP(CICS-RESP)
+                RESP2(CICS-RESP2)
+           END-EXEC
+           .
+
+Debug *9910-DSPL-CMP-RSN-CD.
+Debug *    MOVE LS-CMPN-CD TO CD-DSPL
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        'MQCC = '
+Debug *        CD-DSPL-X
+Debug *    MOVE LS-RSN-CD TO CD-DSPL
+Debug *    DISPLAY
+Debug *        MYNAME
+Debug *        'MQRC = '
+Debug *        CD-DSPL-X
+Debug *    .
+Debug *

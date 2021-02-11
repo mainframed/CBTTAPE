@@ -1,0 +1,1884 @@
+/* REXX */
+/*-------------------------------------------------------------------*/
+/* DRCLEAR  > REXX used to create JCL that clears DASD at POST-DR.   */
+/*            OBJECTIVE - write lo-vals on all D/R DASD vols         */
+/*          > REXX creates 2 jobs for each 3390 type - ALLOC & SCRAT */
+/*          > CALLS PROGRAM DRSPACE to obtain DASD information.      */
+/*                                                                   */
+/*  V3      : Base calcs on #OPS instead of #devices        05/13/05 */
+/*  V2      : Automatically calcs the #JOBS per INITIATOR   08/23/04 */
+/*  V1      : INITIAL REXX                                  07/27/04 */
+/*-------------------------------------------------------------------*/
+/*         |********* K E Y  V A L U E S - START *********|          */
+#A3INITS = 10                        /* ALLOC MOD-3 JES2 inits avail */
+#A9INITS = 10    /* A L L O C */     /* ALLOC MOD-9 JES2 inits avail */
+#ALINITS = 10                        /* ALLOC MOD-L JES2 inits avail */
+/*-------------------------------------------------------------------*/
+#S3INITS = ??                        /* SCRAT MOD-3 JES2 inits avail */
+#S9INITS = ??   /* S C R A T C H */  /* SCRAT MOD-9 JES2 inits avail */
+#SLINITS = ??                        /* SCRAT MOD-L JES2 inits avail */
+/*         |********* K E Y  V A L U E S - END   *********|          */
+/*-------------------------------------------------------------------*/
+/*  Both files are written to the DR INSTLIB as members named :      */
+/*     ALLOCX & SCRATX where "X" = mod type (3,9,L).                 */
+/*  1. ALLOCX : JCL to allocate scratch datasets on all D/R volumes. */
+/*     > Allocate a ds (max 50085 tracks or 3339 cyls) in this way:  */
+/*      > if vol space <= 3339 cyls, alloc 1 50085 trk (or less) DS. */
+/*      > if vol space > 3339, create as many 50085 trk DSs as needed*/
+/*        with the last alloc being < 50085.                         */
+/*      > Multi-file defines kept together in same job for same vol. */
+/*  2. SCRATX : JCL to IEHPROGM scratch the above datasets.          */
+/*      > Multi-file scratches kept together in same job for same vol*/
+/*  3. There is code to throw out any DASD that does not have at     */
+/*     least a MINIMUM amount of free space available. Field MINPCT  */
+/*     can be set (0-100). This is a precaution used to flag any     */
+/*     DASD that was not initialized properly. A zero value means    */
+/*     that ALL DASD will be processed, regardless. Zero=default.    */
+/*-------------------------------------------------------------------*/
+/*  N O T E ::: This REXX performs the JOBS per INIT calcs for you   */
+/*  -------     The number of OPS per step is fixed (see "R" ratio). */
+/*  The number of steps/JOB and the number of JOBS is dependent on   */
+/*  the number of each device type and the no. initiators assigned.  */
+/*-------------------------------------------------------------------*/
+/* NOTES on ALL calculations :                                       */
+/*     ALL calcs are based upon all volumes being EMPTY              */
+/*     GOAL IS --> to spread the work as evenly as possible. EX. an  */
+/*     initiator executing 1 MOD-L scratch JOB may have 10 operations*/
+/*     in 1 step whereas a MOD-3 scratch JOB will have 1 operation   */
+/*     per step in a 10 step JOB. Both should run roughly the same.  */
+/*  >  KEY #1 is the fact : NO alloc can exceed 65535 trk (4369 cyls)*/
+/*  >  KEY #2 is the value of 50085 tracks per 1 mod-3 (3339 cyls).  */
+/*       This value has been ARBITRARILY assigned a factor value of 1*/
+/*       ALL MOD-3's are done w/ 1 alloc   -> 1 MOD-3 = 3339   CYLS  */
+/*       ALL MOD-9's are done w/ 3 allocs  -> 1 MOD-9 = 10,016 CYLS  */
+/*       ALL MOD-L's are done w/ 10 allocs -> 1 MOD-L = 32,759 CYLS  */
+/*  >  KEY #3 is using the above 1:3:10 ratio as THE factor for      */
+/*       calculating the number of 'OPERATIONS' per step. See fields */
+/*       (R3, R9, RL).                                               */
+/*  >  KEY #4 is to assign an equivalent no. operations per JOB.     */
+/*      This REXX does that - #steps/JOB are normalized by devtype   */
+/*    > CALCS used to assign # JOBS (and INITS) per DEVTYPE follow:  */
+/*        1. an "OP" is a single DASD extent to be cleared           */
+/*        2. #OPS per STEP  = R factor (ratio value of 1:3:10)       */
+/*        3. Calc total #OPS per DEVTYPE: (# typ-UCBs * R factor)    */
+/*        4. Total UP #OPS for ALL DASD.                             */
+/*        5. Find "IFACTOR" by dividing #INITIATORS BY TOTAL #OPS    */
+/*        6. Multiply "IFACTOR" against each set of #OPS/DEVTYPE     */
+/*        7. Assign the No. inits accordingly (to #SxINITS fields).  */
+/*  > KEY #5 : None of this works unless you have "ERASE-ON-SCRATCH" */
+/*             turned on in RACF SETROPTS                            */
+/*-------------------------------------------------------------------*/
+/* NOTES  ("ERASE-ON-SCRATCH") :                                     */
+/*  For this process to work, SETROPTS ERASE(NOSECLEVEL) must be set.*/
+/*  In addition, the rule IBMUSER.DR*.*  (see DSNAME in the MODELS)  */
+/*  must be created for the above setting with the "ERASE ON DELETE" */
+/*  option turned on - where dsname HLQ is IBMUSER. SUNGARD already  */
+/*  is set up for this.                                              */
+/*-------------------------------------------------------------------*/
+CALL msg('OFF')
+CVTSYSAD    = D2x(C2d(Storage(10,4)) + 48)      /* Point to CVTSYSAD */
+CVTECVT     = D2X(C2d(Storage(10,4)) + 140)     /* Point to CVTECVT  */
+CVTSNAME    = D2X(C2d(Storage(10,4)) + 340)     /* Point to CVTSNAME */
+Sysid       = strip(Storage(CVTSNAME,8))        /* sysid             */
+uid         = sysvar(sysuid)                    /* user id           */
+mydate      = date('U')                         /* DATE MM/DD/YY     */
+mytime      = time()                            /* TOD HH:MM:SS      */
+#MOD3DEV    = 0                                 /* total MOD3 devs   */
+#MOD9DEV    = 0                                 /* total MOD9 devs   */
+#MODLDEV    = 0                                 /* total MODL devs   */
+/* ================== W O R K I N G   S T O R A G E ================ */
+/* MOD-3 : 1  50085 TRK files/vol -  or 1  ALLOC  per UCB            */
+/* MOD-9 : 3  50085 TRK files/vol -  or 3  ALLOCS per UCB            */
+/* MOD-L : 10 50085 TRK files/vol -  or 10 ALLOCS per UCB            */
+/*                           (1:3:10 ratio)                          */
+/*-------------------------------------------------------------------*/
+R3=1                                 /* --------->  MOD-3 RATIO VALUE*/
+R9=3                                 /* --------->  MOD-9 RATIO VALUE*/
+RL=10                                /*---------->  MOD-L RATIO VALUE*/
+/*-------------------------------------------------------------------*/
+MINPCT      = 0                                 /* 0 recommended     */
+UCBPOOL3    = POOL3                             /* 3390-3  UCB POOL  */
+UCBPOOL9    = POOL9                             /* 3390-9  UCB POOL  */
+UCBPOOLL    = POOLL                             /* 3390-L  UCB POOL  */
+ALLOC3      = ALLOC3                            /* DEF SCR / MOD-3   */
+SCRAT3      = SCRAT3                            /* DEL SCR / MOD-3   */
+ALLOC9      = ALLOC9                            /* DEF SCR / MOD-9   */
+SCRAT9      = SCRAT9                            /* DEL SCR / MOD-9   */
+ALLOCL      = ALLOCL                            /* DEF SCR / MOD-L   */
+SCRATL      = SCRATL                            /* DEL SCR / MOD-L   */
+MODLALLC    = MODLALLC                          /* ALLOCATE MODEL    */
+MODLSCRT    = MODLSCRT                          /* SCRATCH MODEL     */
+#sg3        = 0                                 /* #SUNGARD MOD3's   */
+#sg9        = 0                                 /* #SUNGARD MOD9's   */
+#sgL        = 0                                 /* #SUNGARD MODL's   */
+#pmax       = 6                                 /* Max entries/pt lin*/
+bump1       = x2d(1)                            /* ucb bumper        */
+z3          = 1                                 /* slot subscr MOD-3 */
+z9          = 1                                 /* slot subscr MOD-9 */
+zL          = 1                                 /* slot subscr MOD-L */
+HOTUCB      = '????'                            /* UCB IN PROCESS    */
+HOTVOL      = '??????'                          /* UCB VOLSER        */
+HOTTRKS     = '????????'                        /* UCB AVAIL TRKS    */
+MAXTRKS     = '????????'                        /* UCB MAX CYCLS     */
+HOTRC       = '??'                              /* DRSPACE RC        */
+HOTMSG      = '                                                  '
+HOTMSG      = HOTMSG||'                              ' /* DRSPACE MSG*/
+KTRACKS     = 50085                             /* 3339 cylinders    */
+dashes      = '--------------------------------------------------'
+dashes      = dashes||'-----------------------------'
+dash7       = substr(dashes,1,7)
+blanks      = '                                                  '
+blanks      = blanks||'                             '
+say ' '
+say ' '
+say ' '
+say ' '
+vers        = V3                                /* VERSION #         */
+say 'DRCLEAR (Version='vers') Revision Date: 05/16/2005 - RGG'
+/* ===================== M A I N L I N E =========================== */
+CALL GETSYS              /* Get sysid for dsname build               */
+CALL UPDYN               /* Production or test ?                     */
+CALL CLEANUP             /* Free up any lingering ds holds           */
+CALL ALLOCATE            /* Allocate datasets                        */
+CALL OKVALUES            /* IF USER OK's - display what data is used */
+CALL VERIFY3             /* READ/VERIFY MOD-3 UCB POOL               */
+CALL VERIFY9             /* READ/VERIFY MOD-9 UCB POOL               */
+CALL VERIFYL             /* READ/VERIFY MOD-L UCB POOL               */
+CALL BLDSLOT3            /* BUILD MOD-3 UCB IN-CORE POOL             */
+CALL BLDSLOT9            /* BUILD MOD-9 UCB IN-CORE POOL             */
+CALL BLDSLOTL            /* BUILD MOD-L UCB IN-CORE POOL             */
+CALL ASKINITS            /* Prompt for # avail initiators            */
+CALL CALCJOBS            /* ASSIGN JOBS to INITIATORS                */
+CALL READMODL            /* READ both INPUT MODELS                   */
+CALL CALCVALS            /* Calculate critical JOB values            */
+CALL HSKP3               /* Setup MOD-3 headers                      */
+CALL PROCESS3            /* PROCESS MOD-3 DASD                       */
+CALL HSKP9               /* Setup MOD-9 headers                      */
+CALL PROCESS9            /* PROCESS MOD-9 DASD                       */
+CALL HSKPL               /* Setup MOD-L headers                      */
+CALL PROCESSL            /* PROCESS MOD-L DASD                       */
+CALL SHOWRPT             /* Display process report                   */
+CALL SHOWERR             /* Display ERRORS  report                   */
+exit                     /* we are done                              */
+/* ===================== S U B - R T N S =========================== */
+/*---*/
+GETSYS:
+  say ' '
+  say ' '
+  say ' '
+  do forever
+    say 'Please enter your target SYSTEM name (ie; SYSA, SYSJ, etc.)'
+    parse upper pull Sysname
+    if datatype(Sysname,A) /= 1 then
+      do
+        say '-- RESPONSE invalid --'
+        say '-- REENTER --'
+        say ' '
+        iterate
+      end         */
+    CDRSDS ='DISASTER.MVS.'Sysname'.INSTLIB'    /* DISASTER  DATASET */
+return
+/*---*/
+UPDYN:
+  say 'This can be a TEST or a PROD execution...'
+  say ' "TEST" will alter (NO) files ...'
+  do forever
+    say 'Do you request TEST or PROD ?'
+    parse upper pull update
+    if update /= 'TEST' then
+    if update /= 'PROD' then
+      do
+        say '-- RESPONSE invalid --'
+        say '-- REENTER --'
+        say ' '
+        iterate
+      end
+  return
+/*---*/
+CLEANUP:
+  ADDRESS TSO
+  "DELETE ('"uid"."Sysid".SCREPORT')"
+  "DELETE ('"uid"."Sysid".SCERRORS')"
+  "FREE DA("CDRSDS"("UCBPOOL3"))"
+  "FREE DA("CDRSDS"("UCBPOOL9"))"
+  "FREE DA("CDRSDS"("UCBPOOLL"))"
+  "FREE DA("CDRSDS"("ALLOC3"))"
+  "FREE DA("CDRSDS"("SCRAT3"))"
+  "FREE DA("CDRSDS"("ALLOC9"))"
+  "FREE DA("CDRSDS"("SCRAT9"))"
+  "FREE DA("CDRSDS"("ALLOCL"))"
+  "FREE DA("CDRSDS"("SCRATL"))"
+  "FREE DA("CDRSDS"("MODLALLC"))"
+  "FREE DA("CDRSDS"("MODLSCRT"))"
+  "FREE FI(REPORT,ERRORS,CDRSDS,MODLALLC,MODLSCRT)"
+  "FREE FI(UCBPOOL3,UCBPOOL9,UCBPOOLL)"
+  "FREE FI(ALLOC3,ALLOC9,ALLOCL)"
+  "FREE FI(SCRAT3,SCRAT9,SCRATL)"
+return
+/*---*/
+ALLOCATE:
+  ADDRESS TSO
+  "ALLOC FI(REPORT) DA('"UID"."SYSID".SCREPORT') NEW CATALOG
+       SPACE(1,1) CYLINDERS RECFM(F B) LRECL(80) BLKSIZE(27920)"
+  if rc ¬= 0 then
+    do
+      say '('UID'.'SYSID'.SCREPORT) NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(ERRORS) DA('"UID"."SYSID".SCERRORS') NEW CATALOG
+       SPACE(1,1) CYLINDERS RECFM(F B) LRECL(80) BLKSIZE(27920)"
+  if rc ¬= 0 then
+    do
+      say '('UID'.'SYSID'.SCERRORS) NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(UCBPOOL3) DA("CDRSDS"("UCBPOOL3")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('UCBPOOL3') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(UCBPOOL9) DA("CDRSDS"("UCBPOOL9")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('UCBPOOL9') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(UCBPOOLL) DA("CDRSDS"("UCBPOOLL")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('UCBPOOLL') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(MODLALLC) DA("CDRSDS"("MODLALLC")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('MODLALLC') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(MODLSCRT) DA("CDRSDS"("MODLSCRT")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('MODLSCRT') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(ALLOC3) DA("CDRSDS"("ALLOC3")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('ALLOC3') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(SCRAT3) DA("CDRSDS"("SCRAT3")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('SCRAT3') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(ALLOC9) DA("CDRSDS"("ALLOC9")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('ALLOC9') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(SCRAT9) DA("CDRSDS"("SCRAT9")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('SCRAT9') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(ALLOCL) DA("CDRSDS"("ALLOCL")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('ALLOCL') NOT ALLOCATED .... Check error'
+      exit
+    end
+  "ALLOC FI(SCRATL) DA("CDRSDS"("SCRATL")) SHR"
+  if rc ¬= 0 then
+    do
+      say CDRSDS'('SCRATL') NOT ALLOCATED .... Check error'
+      exit
+    end
+return
+/*---*/
+OKVALUES:
+  say 'Dataset to be used in this REXX is :'
+  say CDRSDS
+  say ' '
+  say 'SUNGARD 3390 MOD-3 UCB used are :'
+  call read3
+  say 'SUNGARD 3390 MOD-9 UCB used are :'
+  call read9
+  say 'SUNGARD 3390 MOD-L UCB used are :'
+  call readL
+  say ' '
+  say 'Are these values correct ? (Y/N)'
+  do forever
+    parse upper pull YN
+    if YN /= 'Y' then
+    if YN /= 'N' then
+      do
+        say '-- RESPONSE invalid --'
+        say '-- REENTER --'
+        say ' '
+        iterate
+      end
+   if yn = 'N' then
+     do
+       say 'DRCLEAR cancelled - fix and rerun'
+       call cleanup
+       exit
+     end
+   else
+     do
+       say 'Values accepted'
+       say ' '
+       return
+     end
+  end
+return
+/*---*/
+READ3:
+  "EXECIO * DISKR UCBPOOL3 (STEM read3. FINIS)"
+  do x=1 to read3.0
+    if substr(read3.x,1,1) ='*' then
+      iterate
+    tmpx=pos(' ',read3.x)
+    tmpread=substr(read3.x,1,tmpx)
+    say tmpread
+  end
+  say ' '
+  drop read3.
+return
+/*---*/
+READ9:
+  "EXECIO * DISKR UCBPOOL9 (STEM read9. FINIS)"
+  do x=1 to read9.0
+    if substr(read9.x,1,1) ='*' then
+      iterate
+    tmpx=pos(' ',read9.x)
+    tmpread=substr(read9.x,1,tmpx)
+    say tmpread
+  end
+  say ' '
+  drop read9.
+return
+/*---*/
+READL:
+  "EXECIO * DISKR UCBPOOLL (STEM readl. FINIS)"
+  do x=1 to readl.0
+    if substr(readl.x,1,1) ='*' then
+      iterate
+    tmpx=pos(' ',readl.x)
+    tmpread=substr(readl.x,1,tmpx)
+    say tmpread
+  end
+  say ' '
+  drop readl.
+return
+/*---*/
+VERIFY3:
+  "EXECIO * DISKR UCBPOOL3 (STEM CDRS3. FINIS)"
+  "FREE DA("CDRSDS"("UCBPOOL3"))"
+  hotdsn=CDRSDS'('UCBPOOL3')'
+  do x=1 to CDRS3.0
+    if substr(cdrs3.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrs3.x,1,4)
+    hirange=substr(cdrs3.x,6,4)
+    if datatype(lorange,'x') /= 1 then
+      do
+        call rangerr3
+        exit
+      end
+    if datatype(hirange,'x') /= 1 then
+      do
+        call rangerr3
+        exit
+      end
+    hiranged=x2d(hirange)
+    loranged=x2d(lorange)
+    #MOD3DEV=#MOD3DEV + ((hiranged-loranged) + 1)
+  end
+return
+/*---*/
+VERIFY9:
+  "EXECIO * DISKR UCBPOOL9 (STEM CDRS9. FINIS)"
+  "FREE DA("CDRSDS"("UCBPOOL9"))"
+  hotdsn=CDRSDS'('UCBPOOL9')'
+  do x=1 to CDRS9.0
+    if substr(cdrs9.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrs9.x,1,4)
+    hirange=substr(cdrs9.x,6,4)
+    if datatype(lorange,'x') /= 1 then
+      do
+        call rangerr9
+        exit
+      end
+    if datatype(hirange,'x') /= 1 then
+      do
+        call rangerr9
+        exit
+      end
+    hiranged=x2d(hirange)
+    loranged=x2d(lorange)
+    #MOD9DEV=#MOD9DEV + ((hiranged-loranged) + 1)
+  end
+return
+/*---*/
+VERIFYL:
+  "EXECIO * DISKR UCBPOOLL (STEM CDRSL. FINIS)"
+  "FREE DA("CDRSDS"("UCBPOOLL"))"
+  hotdsn=CDRSDS'('UCBPOOLL')'
+  do x=1 to CDRSL.0
+    if substr(cdrsL.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrsL.x,1,4)
+    hirange=substr(cdrsL.x,6,4)
+    if datatype(lorange,'x') /= 1 then
+      do
+        call rangerrL
+        exit
+      end
+    if datatype(hirange,'x') /= 1 then
+      do
+        call rangerrL
+        exit
+      end
+    hiranged=x2d(hirange)
+    loranged=x2d(lorange)
+    #MODLDEV=#MODLDEV + ((hiranged-loranged) + 1)
+  end
+return
+/*---*/
+BLDSLOT3:
+  do x=1 to CDRS3.0
+    if substr(cdrs3.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrs3.x,1,4)
+    hirange=substr(cdrs3.x,6,4)
+    lorangex=x2d(lorange)
+    hirangex=x2d(hirange)
+    slotrang=(hirangex-lorangex) + 1
+    #sg3=#sg3+slotrang
+    currucb=x2d(lorange)
+    do y=1 to slotrang
+      currucbd=d2x(currucb)
+      currucbd=right(currucbd,4,0)
+      slot3.z3=currucbd
+      z3=z3+1
+      currucb=currucb + bump1
+    end
+  end
+  slot3.0=z3-1
+return
+/*---*/
+BLDSLOT9:
+  do x=1 to CDRS9.0
+    if substr(cdrs9.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrs9.x,1,4)
+    hirange=substr(cdrs9.x,6,4)
+    lorangex=x2d(lorange)
+    hirangex=x2d(hirange)
+    slotrang=(hirangex-lorangex) + 1
+    #sg9=#sg9+slotrang
+    currucb=x2d(lorange)
+    do y=1 to slotrang
+      currucbd=d2x(currucb)
+      currucbd=right(currucbd,4,0)
+      slot9.z9=currucbd
+      z9=z9+1
+      currucb=currucb + bump1
+    end
+  end
+  slot9.0=z9-1
+return
+/*---*/
+BLDSLOTL:
+  do x=1 to CDRSL.0
+    if substr(cdrsL.x,1,1) ='*' then
+      iterate
+    lorange=substr(cdrsL.x,1,4)
+    hirange=substr(cdrsL.x,6,4)
+    lorangex=x2d(lorange)
+    hirangex=x2d(hirange)
+    slotrang=(hirangex-lorangex) + 1
+    #sgL=#sgL+slotrang
+    currucb=x2d(lorange)
+    do y=1 to slotrang
+      currucbd=d2x(currucb)
+      currucbd=right(currucbd,4,0)
+      slotL.zL=currucbd
+      zL=zL+1
+      currucb=currucb + bump1
+    end
+  end
+  slotL.0=zL-1
+return
+/*---*/
+ASKINITS:
+  do forever
+    say 'Please enter the total number of JES2 INITIATORS you will use'
+    parse upper pull #INITS
+    if datatype(#INITS,W) = 0 then
+      do
+        say '-- RESPONSE invalid, please enter a NUMERIC value --'
+        say '-- REENTER --'
+        say ' '
+        iterate
+      end
+    say 'No. JES2 inits being used is '#INITS
+    say ' '
+    leave
+  end
+return
+/*---*/
+CALCJOBS:
+  #MOD3OPS=#MOD3DEV * R3
+  #MOD9OPS=#MOD9DEV * R9
+  #MODLOPS=#MODLDEV * RL
+  #MODOPTOT=#MOD3OPS+#MOD9OPS+#MODLOPS
+  ifactor=#INITS/#MODOPTOT
+  #S3INITS=trunc((#MOD3OPS * ifactor) + 0.5)
+  #S9INITS=trunc((#MOD9OPS * ifactor) + 0.5)
+  #SLINITS=trunc((#MODLOPS * ifactor) + 0.5)
+  if #S3INITS < 1 then #S3INITS=1
+  if #S9INITS < 1 then #S9INITS=1
+  if #SLINITS < 1 then #SLINITS=1
+  say #S3INITS' initiators needed to clear '#MOD3DEV' MOD-3 devices'
+  say '   with '#MOD3OPS' projected operations'
+  say #S9INITS' initiators needed to clear '#MOD9DEV' MOD-9 devices'
+  say '   with '#MOD9OPS' projected operations'
+  say #SLINITS' initiators needed to clear '#MODLDEV' MOD-L devices'
+  say '   with '#MODLOPS' projected operations'
+return
+/*---*/
+READMODL:
+  "EXECIO * DISKR MODLALLC (stem allcin. FINIS)"
+  "FREE DA("CDRSDS"("MODLALLC"))"
+  "EXECIO * DISKR MODLSCRT (stem scrtin. FINIS)"
+  "FREE DA("CDRSDS"("MODLSCRT"))"
+  JOBA.1="//TSAX0001 JOB (0000,0000),'06DRCLEAR',CLASS=A,MSGCLASS=R  "
+  JOBA.1=JOBA.1||'                     '
+  JOBA.2='//*'
+  JOBA.3='//* ALLOCATE ENTIRE VOLS W/ SCRATCH DATASET(S)'
+  JOBS.1="//TSSX0001 JOB (0000,0000),'06DRCLEAR',CLASS=A,MSGCLASS=R  "
+  JOBS.1=JOBS.1||'                     '
+  JOBS.2='//*'
+  JOBS.3='//* SCRATCH DUMMY DATASETS HOLDING DASD TRACKS'
+return
+/*---*/
+RANGERR3:
+  say cdrs3.x
+  say 'CDRS UCB range line has incorrect format'
+  say 'Dsname = 'hotdsn
+  call cleanup
+return
+/*---*/
+RANGERR9:
+  say cdrs9.x
+  say 'CDRS UCB range line has incorrect format'
+  say 'Dsname = 'hotdsn
+  call cleanup
+return
+/*---*/
+RANGERRL:
+  say cdrsL.x
+  say 'CDRS UCB range line has incorrect format'
+  say 'Dsname = 'hotdsn
+  call cleanup
+return
+/*---*/
+CALCVALS:
+  #maxallc3=trunc(((slot3.0) / #A3INITS) + 0.5)
+  #maxscrt3=trunc(((slot3.0) / #S3INITS) + 0.5)
+  #maxallc9=trunc(((slot9.0) / #A9INITS) + 0.5)
+  #maxscrt9=trunc(((slot9.0) / #S9INITS) + 0.5)
+  #maxallcL=trunc(((slotL.0) / #ALINITS) + 0.5)
+  #maxscrtL=trunc(((slotL.0) / #SLINITS) + 0.5)
+  if #maxscrt3 < 1 then
+    #maxscrt3=1
+  if #maxscrt9 < 1 then
+    #maxscrt9=1
+  if #maxscrtl < 1 then
+    #maxscrtl=1
+  if #maxscrt3 > 255 then
+    do
+      say 'Max steps/JOB exceeded for MOD-3'
+      say 'Value set to 255'
+      say 'REXX continues'
+      #maxscrt3=255
+    end
+  if #maxscrt9 > 255 then
+    do
+      say 'Max steps/JOB exceeded for MOD-9'
+      say 'Value set to 255'
+      say 'REXX continues'
+      #maxscrt9=255
+    end
+  if #maxscrtl > 255 then
+    do
+      say 'Max steps/JOB exceeded for MOD-L'
+      say 'Value set to 255'
+      say 'REXX continues'
+      #maxscrtl=255
+    end
+  #A3OPS=(slot3.0 * R3)
+  #S3OPS=(slot3.0 * R3)
+  #A9OPS=(slot9.0 * R9)
+  #S9OPS=(slot9.0 * R9)
+  #ALOPS=(slotL.0 * RL)
+  #SLOPS=(slotL.0 * RL)
+/*----------------------------*/
+  slota3=format(slot3.0,6,0)
+  inita3=format(#A3INITS,3,0)
+  maxa3=format(#maxallc3,3,0)
+  opsa3=format(#A3OPS,7,0)
+/*----------------------------*/
+  slots3=format(slot3.0,6,0)
+  inits3=format(#S3INITS,3,0)
+  maxs3=format(#maxscrt3,3,0)
+  opss3=format(#A3OPS,7,0)
+/*----------------------------*/
+  slota9=format(slot9.0,6,0)
+  inita9=format(#A9INITS,3,0)
+  maxa9=format(#maxallc9,3,0)
+  opsa9=format(#A9OPS,7,0)
+/*----------------------------*/
+  slots9=format(slot9.0,6,0)
+  inits9=format(#S9INITS,3,0)
+  maxs9=format(#maxscrt9,3,0)
+  opss9=format(#A9OPS,7,0)
+/*----------------------------*/
+  slotal=format(slotl.0,6,0)
+  inital=format(#ALINITS,3,0)
+  maxal=format(#maxallcL,3,0)
+  opsal=format(#ALOPS,7,0)
+/*----------------------------*/
+  slotsl=format(slotL.0,6,0)
+  initsl=format(#SLINITS,3,0)
+  maxsl=format(#maxscrtl,3,0)
+  opssl=format(#ALOPS,7,0)
+/*----------------------------*/
+return
+/*-------------------------------------------------------------------*/
+/*---------------------- MAIN PROCESS (MOD-3) -----------------------*/
+/*-------------------------------------------------------------------*/
+/*---*/
+HSKP3:
+  pe=1
+  px=1
+  pt.px=dashes
+  px=px+1
+  pt.px='                                     D R C L E A R            '
+  px=px+1
+  pt.px='                         *-- J O B   P R O J E C T I O N S --*'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px='*****************'
+  px=px+1
+  pt.px='#JES2 INITS: '#INITS' *'
+  px=px+1
+  pt.px='*****************'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=' ALLOC MOD-3 UCBs 'slota3', #Ops ('opsa3'), '
+  pt.px=pt.px||'JES INITS : 'inita3', Steps/JOB : 'maxa3
+  px=px+1
+  pt.px=' SCRAT MOD-3 UCBs 'slots3', #Ops ('opss3'), '
+  pt.px=pt.px||'JES INITS : 'inits3', Steps/JOB : 'maxs3
+  px=px+1
+  pt.px=' ALLOC MOD-9 UCBs 'slota9', #Ops ('opsa9'), '
+  pt.px=pt.px||'JES INITS : 'inita9', Steps/JOB : 'maxa9
+  px=px+1
+  pt.px=' SCRAT MOD-9 UCBs 'slots9', #Ops ('opss9'), '
+  pt.px=pt.px||'JES INITS : 'inits9', Steps/JOB : 'maxs9
+  px=px+1
+  pt.px=' ALLOC MOD-L UCBs 'slotaL', #Ops ('opsaL'), '
+  pt.px=pt.px||'JES INITS : 'initaL', Steps/JOB : 'maxaL
+  px=px+1
+  pt.px=' SCRAT MOD-L UCBs 'slotsL', #Ops ('opssL'), '
+  pt.px=pt.px||'JES INITS : 'initsL', Steps/JOB : 'maxsL
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='                      D/R DASD CLEARING JCL CREATE REPORT'
+  pt.px=pt.px||'     'mydate' 'mytime'     '
+  px=px+1
+  pt.px='                              No. 3390 MOD-3 ('slot3.0')  '
+  pt.px=pt.px||'                          '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px=' UCB  VOLSER  UCB  VOLSER  UCB  VOLSER  '
+  pt.px=pt.px||'UCB  VOLSER  UCB  VOLSER  UCB  VOLSER    '
+  px=px+1
+  pt.px=' ---- ------  ---- ------  ---- ------  ---- ------  '
+  pt.px=pt.px||'---- ------  ---- ------ '
+  px=px+1
+  pt.px=' '
+  pr.pe=dashes
+  pe=pe+1
+  pr.pe='                        D/R DASD CLEARING ERRORS REPORT  '
+  pr.pe=pr.pe||'     'mydate' 'mytime'     '
+  pe=pe+1
+  pr.pe=dashes
+  pe=pe+1
+  pr.pe=' '
+return
+/*---*/
+PROCESS3:
+  tmpaj=joba.1
+  m=6
+  l=overlay('3',tmpaj,m,1)
+  tmpaj=l
+  tmpsj=jobs.1
+  m=6
+  l=overlay('3',tmpsj,m,1)
+  tmpsj=l
+  alloc3.1=tmpaj
+  alloc3.2=joba.2
+  alloc3.3=joba.3
+  scrat3.1=tmpsj
+  scrat3.2=jobs.2
+  scrat3.3=jobs.3
+  a3=4
+  s3=4
+  p#=0
+  #errs3 = 0
+  dsctra = 1
+  dsctrs = 1
+  ds3atot= 0
+  ds3stot= 0
+  genjoba='N'
+  genjobs='N'
+  #mod3aops=0
+  #mod3sops=0
+  #mod3asteps=0
+  #mod3ssteps=0
+  #tot3aops=0
+  #tot3sops=0
+  #tot3asteps=0
+  #tot3ssteps=0
+  #allc3jobs = 1
+  #scrt3jobs = 1
+  say 'Create jobs for clearing all DASD with lo-vals'
+  say ' '
+  /*------------------- U C B  L O O P - M O D 3 --------------------*/
+  do x=1 to slot3.0
+    hotucb=substr(slot3.x,1,4)
+    dsctra=1
+    dsctrs=1
+    hotvol='VOL=??'
+    hottrks='AVAIL=??'
+    maxtrks='MAXNO=??'
+    hotrc='RC'
+    hotmsg=blanks
+    address linkpgm "DRSPACE hotucb hotvol hottrks maxtrks hotrc hotmsg"
+    if rc /= 0 | hottrks='00000000' then
+      do
+        #errs3=#errs3+1
+        pe=pe+1
+        pr.pe=' '
+        pe=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe='UCB='HOTUCB' Space search error. RC='HOTRC
+        pe=pe+1
+        pr.pe='Volid='HOTVOL
+        pe=pe+1
+        pr.pe='MAX Trks in UCB='maxtrks
+        pe=pe+1
+        pr.pe='Avail Trks='HOTTRKS
+        pe=pe+1
+        pr.pe='Ermsg='HOTMSG
+        if pos('0C010009',HOTMSG) /= 0 then
+          do
+            pe=pe+1
+            pr.pe='-> UCB IS NOT ONLINE ! <-'
+          end
+        pe=pe+1
+        pr.pe='Volume WILL NOT be cleared...Process continues'
+        pe=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe=' '
+        iterate
+      end
+    actual=(hottrks/maxtrks)
+    numeric digits 3
+    actual=trunc(actual * 100)
+    numeric digits
+    if actual < minpct then
+      do
+        #errs3=#errs3+1
+        /****************************************************/
+        /* ERROR CONDITION 02 - UCB has < minpct free space */
+        /****************************************************/
+        call ERRORPCT
+        iterate             /* drop vol from any processing */
+      end
+    WORKTRKS=HOTTRKS
+    pt.px=pt.px||HOTUCB||' '||HOTVOL||'  '
+    p#=p#+1
+    if p#=#pmax then
+      do
+        p#=0
+        px=px+1
+        pt.px=' '
+      end
+ /* Calculate No. Extents to alloc FOR THIS UCB .......  */
+ /*  MAX xtent size allowed is 3339 cyls or 50085 tracks */
+ /*  MAX xtent size allowed by MVS is 65535 tracks       */
+    #xtents=worktrks/ktracks
+    #xtentsr=worktrks//ktracks
+    if #xtentsr > 0 then
+      #xtents=#xtents + 1.0
+    #xtents=trunc(#xtents)
+  /* --- ALLOCATE MOD-3 code --- */
+    if genjoba='Y' then
+      do
+        genjoba='N'
+        #allc3jobs=#allc3jobs+1
+        #a3jobctr=right(#allc3jobs,4,'0')
+        #mod3aops=0
+        #mod3asteps=0
+        j=7
+        l=overlay(#a3jobctr,tmpaj,j,4)
+        tmpaj=l
+        alloc3.a3=tmpaj
+        a3=a3+1
+        alloc3.a3=joba.2
+        a3=a3+1
+        alloc3.a3=joba.3
+        a3=a3+1
+      end
+    drop3='NO'
+    do #XTENTS
+      do y=1 to allcin.0
+        alctmp=allcin.y
+        if pos('PGM=IEF',alctmp) /= 0 then
+          do
+            if drop3='YES' then
+              iterate
+            else
+              drop3='YES'
+          end
+        if pos('.DS',alctmp) /= 0 then
+          do
+            u=pos('.DS',alctmp)
+            dscnt=right(dsctra,6,'0')
+            k=overlay(dscnt,alctmp,U+3,6)
+            dsctra=dsctra+1
+            alloc3.a3=k
+            alctmp=alloc3.a3
+            ds3atot=ds3atot+1
+          end
+        if pos('DRUUUU',alctmp) /= 0 then
+          do
+            u=pos('DRUUUU',ALctmp)
+            k=overlay(HOTUCB,alctmp,u+2,4)
+            alloc3.a3=k
+            a3=a3+1
+            iterate
+          end
+        if pos('UUUUU',alctmp) /= 0 then
+          do
+            u=pos('UUUUU',alctmp)
+            k=overlay(HOTUCB,alctmp,u+1,4)
+            alloc3.a3=k
+            a3=a3+1
+            iterate
+          end
+        if pos('SER=VVVVVV',alctmp) /= 0 then
+          do
+            u=pos('VVVVVV',alctmp)
+            k=overlay(HOTVOL,alctmp,u,6)
+            alloc3.a3=k
+            a3=a3+1
+            iterate
+          end
+        if pos('TTTTTTTT',alctmp) /= 0 then
+          do
+            u=pos('TTTTTTTT',alctmp)
+            if worktrks > KTRACKS then
+              do
+                worktrks=worktrks-ktracks
+                ktracks=right(ktracks,8,'0')
+                k=overlay(Ktracks,alctmp,u,8)
+              end
+            else
+              do
+                worktrks=right(worktrks,8,'0')
+                k=overlay(worktrks,alctmp,u,8)
+              end
+            alloc3.a3=k
+            a3=a3+1
+            iterate
+          end
+        alloc3.a3=alctmp
+        a3=a3+1
+      end
+      #mod3aops=#mod3aops+1
+      #tot3aops=#tot3aops+1
+    end
+    #tot3asteps=#tot3asteps+1
+    #mod3asteps=#mod3asteps+1
+    if #mod3asteps >= #maxallc3 then
+      genjoba='Y'
+  /* --- SCRATCH MOD-3 code --- */
+  /*===============================================================*/
+    if genjobS='Y' then
+      do
+        genjobs='N'
+        #scrt3jobs=#scrt3jobs+1
+        #s3jobctr=right(#scrt3jobs,4,'0')
+        #mod3sops=0
+        #mod3ssteps=0
+        j=7
+        l=overlay(#s3jobctr,tmpsj,j,4)
+        tmpsj=l
+        scrat3.s3=tmpsj
+        s3=s3+1
+        scrat3.s3=jobs.2
+        s3=s3+1
+        scrat3.s3=jobs.3
+        s3=s3+1
+      end
+    do y=1 to scrtin.0
+      if pos('UUUUU',scrtin.y) /= 0 then
+        do
+          u=pos('UUUUU',scrtin.y)
+          k=overlay(HOTUCB,scrtin.y,u+1,4)
+          scrat3.s3=k
+          s3=s3+1
+          iterate
+        end
+      if pos('SER=VVVVVV',scrtin.y) /= 0 then
+        do
+          u=pos('VVVVVV',scrtin.y)
+          k=overlay(HOTVOL,scrtin.y,u,6)
+          scrat3.s3=k
+          s3=s3+1
+          iterate
+        end
+      /* S P E C I A L */
+      if pos('SCRATCH',scrtin.y) /= 0 then
+        do #XTENTS
+          scrtmp=scrtin.y
+          if pos('VVVVVV',scrtmp) /= 0 then
+            do
+              u=pos('VVVVVV',scrtmp)
+              k=overlay(HOTVOL,scrtmp,u,6)
+              scrat3.s3=k
+              scrtmp=scrat3.s3
+            end
+          if pos('DRUUUU',scrtmp) /= 0 then
+            do
+              u=pos('DRUUUU',scrtmp)
+              k=overlay(HOTUCB,scrtmp,u+2,4)
+              scrat3.s3=k
+              scrtmp=scrat3.s3
+            end
+          if pos('.DS',scrtmp) /= 0 then
+            do
+              u=pos('.DS',scrtmp)
+              dscnt=right(dsctrs,6,'0')
+              k=overlay(dscnt,scrtmp,U+3,6)
+              scrat3.s3=k
+              s3=s3+1
+              dsctrs=dsctrs+1
+              ds3stot=ds3stot+1
+            end
+          #mod3sops=#mod3sops+1
+          #tot3sops=#tot3sops+1
+        end
+      else
+        do
+          scrat3.s3=scrtin.y
+          s3=s3+1
+        end
+    end
+    #tot3ssteps=#tot3ssteps+1
+    #mod3ssteps=#mod3ssteps+1
+    if #mod3ssteps >= #maxscrt3 then
+      genjobs='Y'
+  end
+  if update='PROD' then
+    do
+      "EXECIO * DISKW ALLOC3 (STEM ALLOC3. FINIS)"
+      "EXECIO * DISKW SCRAT3 (STEM SCRAT3. FINIS)"
+    end
+  say ' '
+  say dashes
+  mymsg='('#allc3jobs') MOD-3 JOBS with ('#tot3asteps') STEPS '
+  mymsg=mymsg||'with ('#tot3aops') OPS created for ALLOC'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('ALLOC3')'
+  say dashes
+  mymsg='('#scrt3jobs') MOD-3 JOBS with ('#tot3ssteps') STEPS '
+  mymsg=mymsg||'with ('#tot3sops') OPS created for SCRAT'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('SCRAT3')'
+  say dashes
+  say '('slot3.0') MOD-3 UCBs input to be scratched'
+  say '('#errs3') MOD-3 UCBs skipped due to errors'
+  total3=slot3.0-#errs3
+  say dash7
+  say '('total3') MOD-3 UCBs scheduled to be scratched'
+  say dashes
+  say '('ds3atot') MOD-3 scratch datasets to be allocated'
+  say '('ds3stot') MOD-3 scratch datasets to be scratched'
+  say ' '
+  say '/////////////////////////////////////////////////////////////'
+  say '///////////////////// E N D  M O D - 3 //////////////////////'
+  say '/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#allc3jobs') MOD-3 JOBS with ('#tot3asteps') '
+  pt.px=pt.px||'STEPS with ('#tot3aops') OPS created for ALLOCATING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('ALLOC3')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#scrt3jobs') MOD-3 JOBS with ('#tot3ssteps') '
+  pt.px=pt.px||'STEPS with ('#tot3sops') OPS created for SCRATCHING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('SCRAT3')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('slot3.0') MOD-3 UCBs input to be scratched'
+  px=px+1
+  pt.px='('#errs3') MOD-3 UCBs skipped due to errors'
+  px=px+1
+  pt.px=dash7
+  px=px+1
+  pt.px='('total3') MOD-3 UCBs scheduled to be scratched'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('ds3atot') MOD-3 scratch datasets to be allocated'
+  px=px+1
+  pt.px='('ds3stot') MOD-3 scratch datasets to be scratched'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px='///////////////////// E N D  M O D - 3 //////////////////////'
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+return
+/*-------------------------------------------------------------------*/
+/*---------------------- MAIN PROCESS (MOD-9) -----------------------*/
+/*-------------------------------------------------------------------*/
+/*---*/
+HSKP9:
+  pt.px=dashes
+  px=px+1
+  pt.px='                      D/R DASD CLEARING JCL CREATE REPORT'
+  pt.px=pt.px||'     'mydate' 'mytime'     '
+  px=px+1
+  pt.px='                              No. 3390 MOD-9 ('slot9.0')  '
+  pt.px=pt.px||'                          '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px=' UCB  VOLSER  UCB  VOLSER  UCB  VOLSER  '
+  pt.px=pt.px||'UCB  VOLSER  UCB  VOLSER  UCB  VOLSER    '
+  px=px+1
+  pt.px=' ---- ------  ---- ------  ---- ------  ---- ------  '
+  pt.px=pt.px||'---- ------  ---- ------ '
+  px=px+1
+  pt.px=' '
+return
+/*---*/
+PROCESS9:
+  tmpaj=joba.1
+  m=6
+  l=overlay('9',tmpaj,m,1)
+  tmpaj=l
+  tmpsj=jobs.1
+  m=6
+  l=overlay('9',tmpsj,m,1)
+  tmpsj=l
+  alloc9.1=tmpaj
+  alloc9.2=joba.2
+  alloc9.3=joba.3
+  scrat9.1=tmpsj
+  scrat9.2=jobs.2
+  scrat9.3=jobs.3
+  a9=4
+  s9=4
+  p#=0
+  #errs9 = 0
+  dsctra = 1
+  dsctrs = 1
+  ds9atot= 0
+  ds9stot= 0
+  genjoba='N'
+  genjobs='N'
+  #mod9aops=0
+  #mod9sops=0
+  #mod9asteps=0
+  #mod9ssteps=0
+  #tot9aops=0
+  #tot9sops=0
+  #tot9asteps=0
+  #tot9ssteps=0
+  #allc9jobs = 1
+  #scrt9jobs = 1
+  say ' '
+  /*------------------- U C B  L O O P - M O D 9 --------------------*/
+  do x=1 to slot9.0
+    hotucb=substr(slot9.x,1,4)
+    dsctra=1
+    dsctrs=1
+    hotvol='VOL=??'
+    hottrks='AVAIL=??'
+    maxtrks='MAXNO=??'
+    hotrc='RC'
+    hotmsg=blanks
+    address linkpgm "DRSPACE hotucb hotvol hottrks maxtrks hotrc hotmsg"
+    if rc /= 0 | hottrks='00000000' then
+      do
+        #errs9=#errs9+1
+        pe=pe+1
+        pr.pe=' '
+        pe=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe='UCB='HOTUCB' Space search error. RC='HOTRC
+        pe=pe+1
+        pr.pe='Volid='HOTVOL
+        pe=pe+1
+        pr.pe='MAX Trks in UCB='maxtrks
+        pe=pe+1
+        pr.pe='Avail Trks='HOTTRKS
+        pe=pe+1
+        pr.pe='Ermsg='HOTMSG
+        if pos('0C010009',HOTMSG) /= 0 then
+          do
+            pe=pe+1
+            pr.pe='-> UCB IS NOT ONLINE ! <-'
+          end
+        pe=pe+1
+        pr.pe='Volume WILL NOT be cleared...Process continues'
+        pe=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe=' '
+        iterate
+      end
+    numeric digits 3
+    actual=trunc(actual * 100)
+    numeric digits
+    if actual < minpct then
+      do
+        #errs9=#errs9+1
+        /****************************************************/
+        /* ERROR CONDITION 02 - UCB has < minpct free space */
+        /****************************************************/
+        call ERRORPCT
+        iterate             /* drop vol from any processing */
+      end
+    WORKTRKS=HOTTRKS
+    pt.px=pt.px||HOTUCB||' '||HOTVOL||'  '
+    p#=p#+1
+    if p#=#pmax then
+      do
+        p#=0
+        px=px+1
+        pt.px=' '
+      end
+ /* Calculate No. Extents to alloc FOR THIS UCB .......  */
+ /*  MAX xtent size allowed is 3339 cyls or 50085 tracks */
+ /*  MAX xtent size allowed by MVS is 65535 tracks       */
+    #xtents=worktrks/ktracks
+    #xtentsr=worktrks//ktracks
+    if #xtentsr > 0 then
+      #xtents=#xtents + 1.0
+    #xtents=trunc(#xtents)
+  /* --- ALLOCATE MOD-9 code --- */
+    if genjoba='Y' then
+      do
+        genjoba='N'
+        #allc9jobs=#allc9jobs+1
+        #a9jobctr=right(#allc9jobs,4,'0')
+        #mod9asteps=0
+        #mod9aops=0
+        j=7
+        l=overlay(#a9jobctr,tmpaj,j,4)
+        tmpaj=l
+        alloc9.a9=tmpaj
+        a9=a9+1
+        alloc9.a9=joba.2
+        a9=a9+1
+        alloc9.a9=joba.3
+        a9=a9+1
+      end
+    drop9='NO'
+    do #XTENTS
+      do y=1 to allcin.0
+        alctmp=allcin.y
+        if pos('PGM=IEF',alctmp) /= 0 then
+          do
+            if drop9='YES' then
+              iterate
+            else
+              drop9='YES'
+          end
+        if pos('.DS',alctmp) /= 0 then
+          do
+            u=pos('.DS',alctmp)
+            dscnt=right(dsctra,6,'0')
+            k=overlay(dscnt,alctmp,U+3,6)
+            dsctra=dsctra+1
+            alloc9.a9=k
+            alctmp=alloc9.a9
+            ds9atot=ds9atot+1
+          end
+        if pos('DRUUUU',alctmp) /= 0 then
+          do
+            u=pos('DRUUUU',ALctmp)
+            k=overlay(HOTUCB,alctmp,u+2,4)
+            alloc9.a9=k
+            a9=a9+1
+            iterate
+          end
+        if pos('SER=VVVVVV',alctmp) /= 0 then
+          do
+            u=pos('VVVVVV',alctmp)
+            k=overlay(HOTVOL,alctmp,u,6)
+            alloc9.a9=k
+            a9=a9+1
+            iterate
+          end
+        if pos('UUUUU',alctmp) /= 0 then
+          do
+            u=pos('UUUUU',alctmp)
+            k=overlay(HOTUCB,alctmp,u+1,4)
+            alloc9.a9=k
+            a9=a9+1
+            iterate
+          end
+        if pos('TTTTTTTT',alctmp) /= 0 then
+          do
+            u=pos('TTTTTTTT',alctmp)
+            if worktrks > KTRACKS then
+              do
+                worktrks=worktrks-ktracks
+                ktracks=right(ktracks,8,'0')
+                k=overlay(Ktracks,alctmp,u,8)
+              end
+            else
+              do
+                worktrks=right(worktrks,8,'0')
+                k=overlay(worktrks,alctmp,u,8)
+              end
+            alloc9.a9=k
+            a9=a9+1
+            iterate
+          end
+        alloc9.a9=alctmp
+        a9=a9+1
+      end
+      #mod9aops=#mod9aops+1
+      #tot9aops=#tot9aops+1
+    end
+    #tot9asteps=#tot9asteps+1
+    #mod9asteps=#mod9asteps+1
+    if #mod9asteps >= #maxallc9 then
+      genjoba='Y'
+  /* --- SCRATCH MOD-9 code --- */
+  /*===============================================================*/
+    if genjobs='Y' then
+      do
+        genjobs='N'
+        #scrt9jobs=#scrt9jobs+1
+        #s9jobctr=right(#scrt9jobs,4,'0')
+        #mod9sops=0
+        #mod9ssteps=0
+        j=7
+        l=overlay(#s9jobctr,tmpsj,j,4)
+        tmpsj=l
+        scrat9.s9=tmpsj
+        s9=s9+1
+        scrat9.s9=jobs.2
+        s9=s9+1
+        scrat9.s9=jobs.3
+        s9=s9+1
+      end
+    do y=1 to scrtin.0
+      if pos('UUUUU',scrtin.y) /= 0 then
+        do
+          u=pos('UUUUU',scrtin.y)
+          k=overlay(HOTUCB,scrtin.y,u+1,4)
+          scrat9.s9=k
+          s9=s9+1
+          iterate
+        end
+      if pos('SER=VVVVVV',scrtin.y) /= 0 then
+        do
+          u=pos('VVVVVV',scrtin.y)
+          k=overlay(HOTVOL,scrtin.y,u,6)
+          scrat9.s9=k
+          s9=s9+1
+          iterate
+        end
+      /* S P E C I A L */
+      if pos('SCRATCH',scrtin.y) /= 0 then
+        do #XTENTS
+          scrtmp=scrtin.y
+          if pos('VVVVVV',scrtmp) /= 0 then
+            do
+              u=pos('VVVVVV',scrtmp)
+              k=overlay(HOTVOL,scrtmp,u,6)
+              scrat9.s9=k
+              scrtmp=scrat9.s9
+            end
+          if pos('DRUUUU',scrtmp) /= 0 then
+            do
+              u=pos('DRUUUU',scrtmp)
+              k=overlay(HOTUCB,scrtmp,u+2,4)
+              scrat9.s9=k
+              scrtmp=scrat9.s9
+            end
+          if pos('.DS',scrtmp) /= 0 then
+            do
+              u=pos('.DS',scrtmp)
+              dscnt=right(dsctrs,6,'0')
+              k=overlay(dscnt,scrtmp,U+3,6)
+              scrat9.s9=k
+              s9=s9+1
+              dsctrs=dsctrs+1
+              ds9stot=ds9stot+1
+            end
+          #mod9sops=#mod9sops+1
+          #tot9sops=#tot9sops+1
+        end
+      else
+        do
+          scrat9.s9=scrtin.y
+          s9=s9+1
+        end
+    end
+    #tot9ssteps=#tot9ssteps+1
+    #mod9ssteps=#mod9ssteps+1
+    if #mod9ssteps >= #maxscrt9 then
+      genjobs='Y'
+  end
+  if update ='PROD' then
+    do
+      "EXECIO * DISKW ALLOC9 (STEM ALLOC9. FINIS)"
+      "EXECIO * DISKW SCRAT9 (STEM SCRAT9. FINIS)"
+    end
+  say ' '
+  say dashes
+  mymsg='('#allc9jobs') MOD-9 JOBS with ('#tot9asteps') STEPS '
+  mymsg=mymsg||'with ('#tot9aops') OPS created for ALLOC'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('ALLOC9')'
+  say dashes
+  mymsg='('#scrt9jobs') MOD-9 JOBS with ('#tot9ssteps') STEPS '
+  mymsg=mymsg||'with ('#tot9sops') OPS created for SCRAT'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('SCRAT9')'
+  say dashes
+  say '('slot9.0') MOD-9 UCBs input to be scratched'
+  say '('#errs9') MOD-9 UCBs skipped due to errors'
+  total9=slot9.0-#errs9
+  say dash7
+  say '('total9') MOD-9 UCBs scheduled to be scratched'
+  say dashes
+  say '('ds9atot') MOD-9 scratch datasets to be allocated'
+  say '('ds9stot') MOD-9 scratch datasets to be scratched'
+  say ' '
+  say '/////////////////////////////////////////////////////////////'
+  say '///////////////////// E N D  M O D - 9 //////////////////////'
+  say '/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#allc9jobs') MOD-9 JOBS with ('#tot9asteps') '
+  pt.px=pt.px||'STEPS with ('#tot9aops') OPS created for ALLOCATING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('ALLOC9')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#scrt9jobs') MOD-9 JOBS with ('#tot9ssteps') '
+  pt.px=pt.px||'STEPS with ('#tot9sops') OPS created for SCRATCHING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('SCRAT9')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('slot9.0') MOD-9 UCBs input to be scratched'
+  px=px+1
+  pt.px='('#errs9') MOD-9 UCBs skipped due to errors'
+  px=px+1
+  pt.px=dash7
+  px=px+1
+  pt.px='('total9') MOD-9 UCBs scheduled to be scratched'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px='('ds9atot') MOD-9 scratch datasets to be allocated'
+  px=px+1
+  pt.px='('ds9stot') MOD-9 scratch datasets to be scratched'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px='///////////////////// E N D  M O D - 9 //////////////////////'
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+return
+/*-------------------------------------------------------------------*/
+/*---------------------- MAIN PROCESS (MOD-L) -----------------------*/
+/*-------------------------------------------------------------------*/
+/*---*/
+HSKPL:
+  pt.px=dashes
+  px=px+1
+  pt.px='                      D/R DASD CLEARING JCL CREATE REPORT'
+  pt.px=pt.px||'     'mydate' 'mytime'     '
+  px=px+1
+  pt.px='                              No. 3390 MOD-L ('slotL.0')  '
+  pt.px=pt.px||'                          '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px=' UCB  VOLSER  UCB  VOLSER  UCB  VOLSER  '
+  pt.px=pt.px||'UCB  VOLSER  UCB  VOLSER  UCB  VOLSER    '
+  px=px+1
+  pt.px=' ---- ------  ---- ------  ---- ------  ---- ------  '
+  pt.px=pt.px||'---- ------  ---- ------ '
+  px=px+1
+  pt.px=' '
+return
+/*---*/
+PROCESSL:
+  tmpaj=joba.1
+  m=6
+  l=overlay('L',tmpaj,m,1)
+  tmpaj=l
+  tmpsj=jobs.1
+  m=6
+  l=overlay('L',tmpsj,m,1)
+  tmpsj=l
+  allocl.1=tmpaj
+  allocl.2=joba.2
+  allocl.3=joba.3
+  scratl.1=tmpsj
+  scratl.2=jobs.2
+  scratl.3=jobs.3
+  al=4
+  sl=4
+  p#=0
+  #errsl = 0
+  dsctra = 1
+  dsctrs = 1
+  dslatot= 0
+  dslstot= 0
+  genjoba='N'
+  genjobs='N'
+  #modlaops=0
+  #modlsops=0
+  #modlasteps=0
+  #modlssteps=0
+  #totlasteps=0
+  #totlaops=0
+  #totlsops=0
+  #totlssteps=0
+  #allcljobs=1
+  #scrtljobs=1
+  say ' '
+  /*------------------- U C B  L O O P - M O D L --------------------*/
+  do x=1 to slotl.0
+    hotucb=substr(slotl.x,1,4)
+    dsctra=1
+    dsctrs=1
+    hotvol='VOL=??'
+    hottrks='AVAIL=??'
+    maxtrks='MAXNO=??'
+    hotrc='RC'
+    hotmsg=blanks
+    address linkpgm "DRSPACE hotucb hotvol hottrks maxtrks hotrc hotmsg"
+    if rc /= 0 | hottrks='00000000' then
+      do
+        #errsl=#errsl+1
+        pe=pe+1
+        pr.pe=' '
+        pr=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe='UCB='HOTUCB' Space search error. RC='HOTRC
+        pe=pe+1
+        pr.pe='Volid='HOTVOL
+        pe=pe+1
+        pr.pe='MAX Trks in UCB='maxtrks
+        pe=pe+1
+        pr.pe='Avail Trks='HOTTRKS
+        pe=pe+1
+        pr.pe='Ermsg='HOTMSG
+        if pos('0C010009',HOTMSG) /= 0 then
+          do
+            pe=pe+1
+            pr.pe='-> UCB IS NOT ONLINE ! <-'
+          end
+        pe=pe+1
+        pr.pe='Volume WILL NOT be cleared...Process continues'
+        pe=pe+1
+        pr.pe='*************************************************'
+        pe=pe+1
+        pr.pe=' '
+        iterate
+      end
+    actual=(hottrks/maxtrks)
+    numeric digits 3
+    actual=trunc(actual * 100)
+    numeric digits
+    if actual < minpct then
+      do
+        #errsl=#errsl+1
+        /****************************************************/
+        /* ERROR CONDITION 02 - UCB has < minpct free space */
+        /****************************************************/
+        call ERRORPCT
+        iterate             /* drop vol from any processing */
+      end
+    WORKTRKS=HOTTRKS
+    pt.px=pt.px||HOTUCB||' '||HOTVOL||'  '
+    p#=p#+1
+    if p#=#pmax then
+      do
+        p#=0
+        px=px+1
+        pt.px=' '
+      end
+ /* Calculate No. Extents to alloc FOR THIS UCB .......  */
+ /*  MAX xtent size allowed is 3339 cyls or 50085 tracks */
+ /*  MAX xtent size allowed by MVS is 65535 tracks       */
+    #xtents=worktrks/ktracks
+    #xtentsr=worktrks//ktracks
+    if #xtentsr > 0 then
+      #xtents=#xtents + 1.0
+    #xtents=trunc(#xtents)
+  /* --- ALLOCATE MOD-L code --- */
+    if genjoba='Y' then
+      do
+        genjoba='N'
+        #allcljobs=#allcljobs+1
+        #aljobctr=right(#allcljobs,4,'0')
+        #modlaops=0
+        #modlasteps=0
+        j=7
+        l=overlay(#aljobctr,tmpaj,j,4)
+        tmpaj=l
+        allocl.al=tmpaj
+        al=al+1
+        allocl.al=joba.2
+        al=al+1
+        allocl.al=joba.3
+        al=al+1
+      end
+    dropl='NO'
+    do #XTENTS
+      do y=1 to allcin.0
+        alctmp=allcin.y
+        if pos('PGM=IEF',alctmp) /= 0 then
+          do
+            if dropl='YES' then
+              iterate
+            else
+              dropl='YES'
+          end
+        if pos('.DS',alctmp) /= 0 then
+          do
+            u=pos('.DS',alctmp)
+            dscnt=right(dsctra,6,'0')
+            k=overlay(dscnt,alctmp,U+3,6)
+            dsctra=dsctra+1
+            allocl.al=k
+            alctmp=allocl.al
+            dslatot=dslatot+1
+          end
+        if pos('DRUUUU',alctmp) /= 0 then
+          do
+            u=pos('DRUUUU',ALctmp)
+            k=overlay(HOTUCB,alctmp,u+2,4)
+            allocl.al=k
+            al=al+1
+            iterate
+          end
+        if pos('SER=VVVVVV',alctmp) /= 0 then
+          do
+            u=pos('VVVVVV',alctmp)
+            k=overlay(HOTVOL,alctmp,u,6)
+            allocl.al=k
+            al=al+1
+            iterate
+          end
+        if pos('UUUUU',alctmp) /= 0 then
+          do
+            u=pos('UUUUU',alctmp)
+            k=overlay(HOTUCB,alctmp,u+1,4)
+            allocl.al=k
+            al=al+1
+            iterate
+          end
+        if pos('TTTTTTTT',alctmp) /= 0 then
+          do
+            u=pos('TTTTTTTT',alctmp)
+            if worktrks > KTRACKS then
+              do
+                worktrks=worktrks-ktracks
+                ktracks=right(ktracks,8,'0')
+                k=overlay(Ktracks,alctmp,u,8)
+              end
+            else
+              do
+                worktrks=right(worktrks,8,'0')
+                k=overlay(worktrks,alctmp,u,8)
+              end
+            allocl.al=k
+            al=al+1
+            iterate
+          end
+        allocl.al=alctmp
+        al=al+1
+      end
+      #modlaops=#modlaops+1
+      #totlaops=#totlaops+1
+    end
+    #totlasteps=#totlasteps+1
+    #modlasteps=#modlasteps+1
+    if #modlasteps >= #maxallcL then
+      genjoba='Y'
+  /* --- SCRATCH MOD-L code --- */
+  /*===============================================================*/
+    if genjobS='Y' then
+      do
+        genjobs='N'
+        #scrtljobs=#scrtljobs+1
+        #sljobctr=right(#scrtljobs,4,'0')
+        #modlsops=0
+        #modlssteps=0
+        j=7
+        l=overlay(#sljobctr,tmpsj,j,4)
+        tmpsj=l
+        scratl.sl=tmpsj
+        sl=sl+1
+        scratl.sl=jobs.2
+        sl=sl+1
+        scratl.sl=jobs.3
+        sl=sl+1
+      end
+    do y=1 to scrtin.0
+      if pos('UUUUU',scrtin.y) /= 0 then
+        do
+          u=pos('UUUUU',scrtin.y)
+          k=overlay(HOTUCB,scrtin.y,u+1,4)
+          scratl.sl=k
+          sl=sl+1
+          iterate
+        end
+      if pos('SER=VVVVVV',scrtin.y) /= 0 then
+        do
+          u=pos('VVVVVV',scrtin.y)
+          k=overlay(HOTVOL,scrtin.y,u,6)
+          scratl.sl=k
+          sl=sl+1
+          iterate
+        end
+      /* S P E C I A L */
+      if pos('SCRATCH',scrtin.y) /= 0 then
+        do #XTENTS
+          scrtmp=scrtin.y
+          if pos('VVVVVV',scrtmp) /= 0 then
+            do
+              u=pos('VVVVVV',scrtmp)
+              k=overlay(HOTVOL,scrtmp,u,6)
+              scratl.sl=k
+              scrtmp=scratl.sl
+            end
+          if pos('DRUUUU',scrtmp) /= 0 then
+            do
+              u=pos('DRUUUU',scrtmp)
+              k=overlay(HOTUCB,scrtmp,u+2,4)
+              scratl.sl=k
+              scrtmp=scratl.sl
+            end
+          if pos('.DS',scrtmp) /= 0 then
+            do
+              u=pos('.DS',scrtmp)
+              dscnt=right(dsctrs,6,'0')
+              k=overlay(dscnt,scrtmp,U+3,6)
+              scratl.sl=k
+              sl=sl+1
+              dsctrs=dsctrs+1
+              dslstot=dslstot+1
+            end
+          #modlsops=#modlsops+1
+          #totlsops=#totlsops+1
+        end
+      else
+        do
+          scratl.sl=scrtin.y
+          sl=sl+1
+        end
+    end
+    #totlssteps=#totlssteps+1
+    #modlssteps=#modlssteps+1
+    if #modlssteps >= #maxscrtl then
+      genjobs='Y'
+  end
+  if update='PROD' then
+    do
+      "EXECIO * DISKW ALLOCL (STEM ALLOCL. FINIS)"
+      "EXECIO * DISKW SCRATL (STEM SCRATL. FINIS)"
+    end
+  say ' '
+  say dashes
+  mymsg='('#allcljobs') MOD-L JOBS with ('#totlasteps') STEPS '
+  mymsg=mymsg||'with ('#totlaops') OPS created for ALLOC'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('ALLOCL')'
+  say dashes
+  mymsg='('#scrtljobs') MOD-L JOBS with ('#totlssteps') STEPS '
+  mymsg=mymsg||'with ('#totlsops') OPS created for SCRAT'
+  say mymsg
+  say dashes
+  say '    See member 'CDRSDS'('SCRATL')'
+  say dashes
+  say '('slotl.0') MOD-L UCBs input to be scratched'
+  say '('#errsl') MOD-L UCBs skipped due to errors'
+  totall=slotl.0-#errsl
+  say dash7
+  say '('totall') MOD-L UCBs scheduled to be scratched'
+  say dashes
+  say '('dslatot') MOD-L scratch datasets to be allocated'
+  say '('dslstot') MOD-L scratch datasets to be scratched'
+  say ' '
+  say '/////////////////////////////////////////////////////////////'
+  say '///////////////////// E N D  M O D - L //////////////////////'
+  say '/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#allcljobs') MOD-L JOBS with ('#totlasteps') '
+  pt.px=pt.px||'STEPS with ('#totlaops') OPS created for ALLOCATING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('ALLOCL')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('#scrtljobs') MOD-L JOBS with ('#totlssteps') '
+  pt.px=pt.px||'STEPS with ('#totlsops') OPS created for SCRATCHING'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='    See member 'CDRSDS'('SCRATL')'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('slotl.0') MOD-L UCBs input to be scratched'
+  px=px+1
+  pt.px='('#errsl') MOD-L UCBs skipped due to errors'
+  px=px+1
+  pt.px=dash7
+  px=px+1
+  pt.px='('totall') MOD-L UCBs scheduled to be scratched'
+  px=px+1
+  pt.px=dashes
+  px=px+1
+  pt.px='('dslatot') MOD-L scratch datasets to be allocated'
+  px=px+1
+  pt.px='('dslstot') MOD-L scratch datasets to be scratched'
+  px=px+1
+  pt.px=' '
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px='/////////////////////// E N D  M O D - L ////////////////////'
+  px=px+1
+  pt.px='/////////////////////////////////////////////////////////////'
+  px=px+1
+  pt.px=' '
+return
+/*---*/
+ERRORPCT:
+  pr=pe+1
+  pr.pe='*************************************************'
+  pe=pe+1
+  pr.pe='UCB='HOTUCB'  VOL='HOTVOL' Space FREE% ('actual')  '
+  pe=pe+1
+  pr.pe='UCB must have MIN. ('minpct')% space FREE B4 clearing  '
+  pe=pe+1
+  pr.pe='Volume will NOT be cleared .. Process Continues  '
+  pe=pe+1
+  pr.pe='*************************************************'
+  pe=pe+1
+  pr.pe=' '
+return
+/*---*/
+SHOWRPT:
+  "EXECIO * DISKW REPORT (STEM pt. FINIS)"
+  "ISPEXEC BROWSE DATASET('"uid"."Sysid".SCREPORT')"
+return
+/*---*/
+SHOWERR:
+  if #errs3+#errs9+#errsl=0 then
+    do
+      pe=pe+1
+      pr.pe=' *** NO ERRORS FOUND ***'
+    end
+  "EXECIO * DISKW ERRORS (STEM pr. FINIS)"
+  "ISPEXEC BROWSE DATASET('"uid"."Sysid".SCERRORS')"
+return

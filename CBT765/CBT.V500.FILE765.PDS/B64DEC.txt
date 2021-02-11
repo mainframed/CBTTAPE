@@ -1,0 +1,289 @@
+*Process Margins(2,72,1),Nonumber,Optimize(TIME),A,X,Ag,System(MVS);
+ /********************************************************************/
+ /*                                                                  */
+ /*   B64dec                                                         */
+ /*   ------------------------------------------------------------   */
+ /*   Decode a Base64-encoded string.                                */
+ /*                                                                  */
+ /*   ------------------------------------------------------------   */
+ /*   Usage:                                                         */
+ /*     outString = B64dec(inString)                                 */
+ /*                                                                  */
+ /*   Where:                                                         */
+ /*     inString is a Base64-encoded string up to 32756 bytes in     */
+ /*     length.  outString will be the Base64-decoded inString.      */
+ /*                                                                  */
+ /*   ------------------------------------------------------------   */
+ /*                                                                  */
+ /*   Modification History:                                          */
+ /*     20Aug2007 SYO   Initial version                              */
+ /*                                                                  */
+ /********************************************************************/
+
+1B64dec: Procedure
+         (Rsvd1, Rsvd2, Rsvd3, Rsvd4, Args, EvalBlk@@)
+         Options(Main,Reentrant,NoExecOps) Reorder;
+   Declare
+     Rsvd1                   Pointer,
+     Rsvd2                   Pointer,
+     Rsvd3                   Pointer,
+     Rsvd4                   Pointer,
+     Args                    Fixed Binary(31,0),
+     EvalBlk@@               Pointer,
+
+     ArgIn                   Character(32756) Varying Aligned Init(''),
+
+     Bits24                  Bit(24) Based(Bytes3@),
+     Bytes3                  Character(3) Aligned Initial(' '),
+     Bytes3@                 Pointer Aligned Initial(SysNull),
+     Debug                   Bit(1) Aligned Initial(False),
+     HiVal                   Pointer Aligned Initial(SysNull),
+     I                       Fixed Binary(31,0) Initial(0),
+     J                       Fixed Binary(31,0) Initial(0),
+     ParmOffset              Fixed Binary(31,0) Initial(0),
+     ParmString              Character(1024) Aligned Initial(' '),
+     Pau                     Bit(1) Aligned Initial(False),
+     RC                      Fixed Binary(31,0) Initial(0),
+     RClen                   Fixed Binary(31,0) Initial(0),
+     RCodeData               Character(32756) Varying Aligned Init(''),
+     RCodeLen                Fixed Binary(31,0) Initial(0),
+     VarName                 Character(255) Aligned Initial(' '),
+     VarValue                Character(255) Aligned Initial(' '),
+     WorkArea                Character(4096) Aligned Initial(' '),
+     WorkString              Character(255) Varying Aligned Initial(''),
+
+     InitFunc                Character(8) Aligned Initial(' '),
+     InitParmModName         Character(8) Aligned Initial(' '),
+     InitParmListAddr        Pointer Aligned Initial(SysNull),
+     InitUserFldAddr         Pointer Aligned Initial(SysNull),
+     InitRsvdPtr             Pointer Aligned Initial(SysNull),
+     InitEnvBlkAddr          Pointer Aligned Initial(SysNull),
+     InitRsn                 Fixed Binary(31,0) Initial(0),
+     InitStrgWkAddr          Pointer Aligned Initial(SysNull),
+     InitRC                  Fixed Binary(31,0) Initial(0),
+     InitECTaddr             Pointer Aligned Initial(SysNull),
+
+     RltFunc                 Character(8) Aligned Initial(' '),
+     RltEvalBlk@             Pointer Aligned Initial(SysNull),
+     RltRClen                Fixed Binary(31,0) Initial(0),
+     RltEnvBlk@              Pointer Aligned Initial(SysNull),
+     RltRC                   Fixed Binary(31,0) Initial(0),
+
+     EvalBlk@                Pointer Aligned Initial(SysNull),
+     01 EvalBlk              Based(EvalBlk@),
+       02 EvPad1             Fixed Binary(31,0) Unaligned,
+       02 EvSize             Fixed Binary(31,0) Unaligned,
+       02 EvLen              Fixed Binary(31,0) Unaligned,
+       02 EvPad2             Fixed Binary(31,0) Unaligned,
+       02 EvData             Character(32756),
+
+     01 ShVBlock             Unaligned,
+       02 ShVNext            Fixed Binary(31,0) Initial(0),
+       02 ShVUser            Fixed Binary(31,0) Initial(0),
+       02 ShVCode            Character(1),
+       02 ShVRet             Character(1),
+       02 Filler             Character(2),
+       02 ShVBufL            Fixed Binary(31,0),
+       02 ShVNamA            Pointer,
+       02 ShVNamL            Fixed Binary(31,0),
+       02 ShVValA            Pointer,
+       02 ShVValL            Fixed Binary(31,0),
+
+     Addr                    Builtin,
+     Length                  Builtin,
+     Null                    Builtin,
+     PLIRetC                 Builtin,
+     PLIRetV                 Builtin,
+     Repeat                  Builtin,
+     Substr                  Builtin,
+     SysNull                 Builtin,
+     Translate               Builtin,
+     Trim                    Builtin,
+     Unspec                  Builtin,
+     UpperCase               Builtin,
+     Verify                  Builtin,
+
+     IRXEXC                  Entry
+                             External Options(Assembler,Inter,Retcode),
+     IRXINIT                 Entry
+                             External Options(Assembler,Inter,Retcode),
+     IRXRLT                  Entry
+                             External Options(Assembler,Inter,Retcode)
+   ;
+
+   Declare
+     Sysprint                File Stream Print Output
+   ;
+
+   Declare
+     B64alphabet             Character(65) Static Aligned Initial
+                             (('ABCDEFGHIJKLMNOPQRSTUVWXYZ' ||
+                               'abcdefghijklmnopqrstuvwxyz' ||
+                               '0123456789' ||
+                               '+/=')),
+     False                   Bit(1) Static Aligned Initial('0'B),
+     True                    Bit(1) Static Aligned Initial('1'B)
+   ;
+
+ /*===================================================================*/
+ /*   Initialization.                                                 */
+ /*===================================================================*/
+ EvalBlk@ = EvalBlk@@;
+ Bytes3@ = Addr(Bytes3);
+ Unspec(HiVal) = 'FFFFFFFF'BX;
+
+ RC = 0;
+ RClen = (EvalBlk.EvSize * 8) - 16;
+ RCodeData = 'FAIL 9999';
+ RCodeLen = Length(RCodeData);
+
+ /* Process the arguments --------------------------------------------*/
+ RC = ProcessArgs(Args);
+ If (RC ¬= 0) Then Go To Quit;
+ If (Length(ArgIn) > 32756) Then Do;
+     RcodeData = 'FAIL Input length exceeds maximum 32,756 bytes';
+     RCodeLen = Length(RCodeData);
+     Go To Quit;
+   End;
+
+ /* Load address of IRXxxxxx entry points ----------------------------*/
+ If (RC = 0) Then
+   Do;
+     Fetch IRXINIT;
+     Fetch IRXEXC;
+     Fetch IRXRLT;
+
+     InitFunc = 'FINDENVB';
+     InitParmModName = '        ';
+     InitParmListAddr = SysNull;
+     InitUserFldAddr = SysNull;
+     InitRsvdPtr = SysNull;
+     InitEnvBlkAddr = SysNull;
+     InitRsn = 0;
+     InitStrgWkAddr = SysNull;
+     InitRC = 0;
+     InitECTaddr = SysNull;
+     Call IRXINIT(InitFunc, InitParmModName, InitParmListAddr,
+          InitUserFldAddr, InitRsvdPtr, InitEnvBlkAddr, InitRsn,
+          InitStrgWkAddr, InitRC, InitECTaddr);
+
+     If (InitRsn ¬= 0) Then Do;
+         Put String(RCodeData) Edit
+           ('FAIL IRXINIT RC=',InitRC,' RSN=',InitRsn)
+           (A,P'99999',A,P'99999');
+         RCodeLen = Length(RCodeData);
+         GoTo Quit;
+       End;
+   End  /*  of "If(RC=0)Then Do"  */;
+
+ /*===================================================================*/
+ /*   Decode the input string.                                        */
+ /*===================================================================*/
+ RCodeData = '';
+ Do While(ArgIn ¬= '');
+    Bits24 = '000000'BX;
+    Do I = 1 To 4;
+      J = Index(B64alphabet, Substr(ArgIn,I,1)) - 1;
+      If (J ¬= 64) Then
+        Substr(Bits24,((I-1)*6)+1,6) = Substr(Unspec(J), 27, 6);
+    End  /*  of "Do I=1 To 4"  */;
+    If (Substr(ArgIn, 3, 2) = '==') Then Do;
+        RCodeData = RCodeData || Substr(Bytes3, 1, 1);
+      End  /*  of "If(XX==)Then Do"  */;
+    Else If (Substr(ArgIn, 4, 1) = '=') Then Do;
+        RCodeData = RCodeData || Substr(Bytes3, 1, 2);
+      End  /*  of "If(XXX=)Then Do"  */;
+    Else Do;
+        RCodeData = RCodeData || Bytes3;
+      End  /*  of "If(XXXX)Then Do"  */;
+    If (Length(ArgIn) > 4) Then
+      ArgIn = Substr(ArgIn, 5);
+    Else
+      ArgIn = '';
+ End  /*  of "Do While(ArgIn¬='')"  */;
+ RCodeLen = Length(RCodeData);
+
+ /*===================================================================*/
+ /*   Clean up and quit.                                              */
+ /*===================================================================*/
+ /* Set return data in Evaluation Block ------------------------------*/
+ Quit:
+   If (RClen < RCodeLen) Then Do;
+       RltFunc = 'GETBLOCK';
+       RltEvalBlk@ = SysNull;
+       RltRClen = ((Trunc(RCodeLen / 8) + 1) * 8) + 16;
+       RltEnvBlk@ = SysNull;
+       RltRC = 0;
+       Call IRXRLT(RltFunc, RltEvalBlk@, RltRClen, RltEnvBlk@, RltRC);
+       EvalBlk@ = RltEvalBlk@;
+     End;
+   Substr(EvalBlk.EvData, 1, RCodeLen) = RCodeData;
+   EvalBlk.EvLen = RCodeLen;
+
+   /* Set R15 --------------------------------------------------------*/
+   Call PliRetC(0);
+
+   /* Quit -----------------------------------------------------------*/
+   Return;
+
+1/*********************************************************************/
+ /*                                                                   */
+ /*   ProcessArgs                                                     */
+ /*   -------------------------------------------------------------   */
+ /*   Process the input arguments.                                    */
+ /*                                                                   */
+ /*********************************************************************/
+
+   ProcessArgs:  Procedure(Args) Options(Reentrant) Reorder
+                 Returns(Fixed Binary(31,0));
+     Declare
+       Args                  Fixed Binary(31,0),
+
+       Arg#                  Fixed Binary(31,0) Initial(0),
+       I                     Fixed Binary(31,0) Initial(0),
+       Pau                   Bit(1) Aligned Initial(False),
+       WorkStr               Character(32756) Varying Aligned Init(''),
+
+       ArgStrPtr             Pointer Aligned Initial(Null),
+       01 ArgStr(255)        Based(ArgStrPtr),
+         02 Ptr              Pointer Unaligned,
+         02 Len              Fixed Binary(31,0) Unaligned,
+       ArgData               Character(255) Based,
+
+       RC                    Fixed Binary(31,0) Initial(0)
+     ;
+
+     ArgStrPtr = Addr(Args);
+
+     Pau = False;
+     Arg# = 0;
+     I = 0;
+     Do While(¬ Pau);
+       I = I + 1;
+
+       If (ArgStr(I).Ptr = HiVal) Then
+         Pau = True;
+       Else Do;
+           WorkStr = Substr(ArgStr(I).Ptr->ArgData,1,ArgStr(I).Len);
+
+           Arg# = Arg# + 1;
+           Select (Arg#);
+             When (1)  Do;
+                 ArgIn = WorkStr;
+               End  /*  of "When(1) Do"  */;
+             Otherwise Do;
+                 /*---------- 1   5   10   15   20   25 --------------*/
+                 RCodeData = 'FAIL too many arguments';
+                 RCodeLen = Length(RCodeData);
+                 RC = 16;
+                 Pau = True;
+               End  /*  of "Otherwise Do"  */;
+           End  /*  of "Select(Arg#)"  */;
+         End  /*  of "If(not-end-of-args)Then...Else Do"  */;
+     End  /*  of "Do While(¬Pau)"  */;
+
+     Return(RC);
+   End  /*  of procedure "ProcessArgs"  */;
+
+
+ End  /*  of Procedure "B64dec" */;

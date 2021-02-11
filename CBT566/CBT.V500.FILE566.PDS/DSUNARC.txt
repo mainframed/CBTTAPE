@@ -1,0 +1,736 @@
+         PUNCH ' ORDER DSUNARC(P)'
+DSUNARC  TITLE 'ISSUE HSM RECALL FOR ARCHIVED DATASETS IN JOB'
+&GEN     SETC  'GEN'
+*--------------------------------------------------------------------*
+*        FUNCTION:                                                   *
+*              TO SCAN SIOT, RETREIVE ALL DATASET NAMES AND          *
+*              ISSUE RECALL TO HSM IF DSN IS ARCHIVED                *
+*                                                                    *
+*        USAGE:                                                      *
+*              PUT THIS AS THE FIRST STEP IN THE JOB WITH NO         *
+*              DDNAMES.                                              *
+*              //DSUNARC   EXEC PGM=DSUNARC                          *
+*                                                                    *
+*        ATTRIBUTE: RENT                                             *
+*                   AMODE=31 RMODE=24                                *
+*              ARCH MACROS MUST HAVE DATA BELOW 16M LINE             *
+*                                                                    *
+*        REGS ON INPUT:                                              *
+*                                                                    *
+*              R1  ='WAIT' OR 'ABEND'                                *
+*                                                                    *
+*        REGS ON OUTPUT:                                             *
+*                                                                    *
+*              R15 = 0 ALL RECALLED                                  *
+*                  = ABEND 901, 902                                  *
+*                                                                    *
+*        REGS USAGE:                                                 *
+*                                                                    *
+*              R5  = OS SIOT                                         *
+*              R6  = OS SCT                                          *
+*              R7  = OS JCT                                          *
+*              R8  = TBLDSECT                                        *
+*              R9  = BAL REG                                         *
+*              R10 = JFCB IN DSN00000-DSN00090                       *
+*              R11 = LOCAL WORK AREA                                 *
+*              R12 = BASE1                                           *
+*              R13 = SAVE AREA                                       *
+*                                                                    *
+*--------------------------------------------------------------------*
+* 08/22/97 KBASS ADDED RELATIVE GDG (-1) AND WHOLE GDG BASE SUPPORT  *
+*                ALSO NOW BUILD TBL ENTRIES FROM A 32K BUFFER SO I   *
+*                DO NOT HAVE TO SCAN JFCB/CATALOG TWICE              *
+* 09/09/98 KMB1  HDELETE MUST BE DISP=(MOD,DELETE)                   *
+* 11/16/00 KMB2  LOOP BACK THRU DATASETS TO SEE IF STILL ARCHIVED    *
+*                AND ONLY RECALL/WAIT ON THE FIRST ONE ON RETRY      *
+*--------------------------------------------------------------------*
+DSUNARC  CSECT
+DSUNARC  AMODE 31
+DSUNARC  RMODE 24
+         SAVE (14,12),T,DSUNARC_&SYSDATC._&SYSTIME
+         LR    R12,R15
+         USING DSUNARC,R12
+         USING TBLDSECT,R8
+         LR    R10,R1              COPY PARM
+*
+*--------------------------------------------------------------------*
+*              GETMAIN AN ZERO LOCAL AREA                            *
+*--------------------------------------------------------------------*
+         L     R0,=A(LWASIZE)
+         STORAGE OBTAIN,LENGTH=(0),SP=LWASP,BNDRY=PAGE,LOC=BELOW
+         USING LWAMAP,R11
+         LR    R11,R1
+         LR    R1,R0
+         LR    R0,R11
+         SLR   R14,R14
+         SLR   R15,R15
+         MVCL  R0,R14              ZERO MEMORY
+*--------------------------------------------------------------------*
+*              CHAIN SAVE AREAS                                      *
+*--------------------------------------------------------------------*
+         LR    R1,R11
+         LA    R0,LWASAVE#-1
+SAVELP   DS    0H
+         ST    R13,4(,R1)
+         LR    R13,R1
+         LA    R1,72(,R1)
+         ST    R1,8(,R13)
+         BCT   R0,SAVELP
+         LR    R13,R11
+         MVC   0(4,R13),=C'QZQZ'
+*--------------------------------------------------------------------*
+*              ANALYZE PARM FIELD                                    *
+*--------------------------------------------------------------------*
+         L     R1,4(,R13)
+         L     R1,X'18'(,R1)       RESTORE R1
+         ICM   R2,15,0(R1)         @ OF PARM
+         BZ    NOPARM
+         LH    R14,0(,R2)          LENGTH OF PARM
+         C     R14,=F'5'           ROOM FOR 'ABEND'
+         BL    NOPARM
+         CLC   =C'ABEND',2(R2)     IS IT ABEND
+         BNE   NOPARM
+         OI    LWAFLAG,$ABEND
+NOPARM   DS    0H
+         MVC   LWALOOPS,=F'10'     MAX # OF LOOPS THRU CODE     KMB2
+*--------------------------------------------------------------------*
+*              RETRY LOOP                                            *
+*--------------------------------------------------------------------*
+RETRY    DS    0H                                               KMB2
+         NI    LWAFLAG,$ABEND+$RETRY TURN OFF ALL BUT THESE     KMB2
+         XC    LWACLEAR(LWACLRLN),LWACLEAR CLEAR WORK AREA      KMB2
+         SPACE 1                                                KMB2
+COUNT    DS    0H
+*--------------------------------------------------------------------*
+*              FIND JCT                                              *
+*--------------------------------------------------------------------*
+         L     R2,PSATOLD-PSA(0)   ACTIVE TCB
+         L     R2,TCBJSCB-TCB(,R2) GET JSCB
+         L     R2,JSCBACT-JSCB(,R2) GET ACTIVE JSCB
+         L     R1,JSCBJCT-JSCB(,R2) GET OS/JCT
+*                                  *--------------------------- *
+         BAL   R9,SWAREQ           * R1 = SVA   ..FFFFFF FMT    *
+         LTR   R15,R15             * CALL SWAREQ TO CONVERT SVA *
+         BNZ   ALLDONE             * R1 = CONVERTED SVA, NOPREF *
+*                                  *--------------------------- *
+         LR    R7,R1
+*--------------------------------------------------------------------*
+*              LOOK AT JCT                                           *
+*--------------------------------------------------------------------*
+         USING JCTDSECT,R7         ADDR OF JCT IN R7 VIA INPUT
+         SR    R1,R1               ZERO FOR ICM
+         ICM   R1,7,JCTSSTR        GET SCT SVA
+         BZ    ALLDONE
+NEWSCT   DS    0H
+*                                  *--------------------------- *
+         BAL   R9,SWAREQ           * R1 = SVA   ..FFFFFF FMT    *
+         LTR   R15,R15             * CALL SWAREQ TO CONVERT SVA *
+         BNZ   DONESTEP            * R1 = CONVERTED SVA, NOPREF * KMB2
+*                                  *--------------------------- *
+         LR    R6,R1               SCT, NO PREFIX RETURNED
+*--------------------------------------------------------------------*
+*              LOOK AT SCT                                           *
+*--------------------------------------------------------------------*
+         USING SCTDSECT,R6         MAKE ADDRESSABLE
+         ICM   R1,7,SCTFSIOT       ADDR OF FIRST SIOT
+         BZ    NEXTSTEP            NO DDNAMES THIS STEP, CHECK NEXT
+NEWSIOT  DS    0H
+         XC    LWAVOL,LWAVOL
+         NI    LWAFLAG,255-$GDG
+         ZAP   LWAGDG,=P'+0'
+*                                  *--------------------------- *
+         BAL   R9,SWAREQ           * R1 = SVA   ..FFFFFF FMT    *
+         LTR   R15,R15             * CALL SWAREQ TO CONVERT SVA *
+         BNZ   NEXTSTEP            * R1 = CONVERTED SVA, NOPREF *
+*                                  *--------------------------- *
+         LR    R5,R1
+*--------------------------------------------------------------------*
+*              SCAN SIOT FOR DATASET                                 *
+*--------------------------------------------------------------------*
+         USING SIOTDSCT,R5         MAKE SIOT ADDRESSABLE
+NEWSIOTA DS    0H
+         SR    R1,R1               CLEAR FOR ICM
+         ICM   R1,B'0111',SCTPJFCB GET JFCB ADDR
+*                                  *--------------------------- *
+         BAL   R9,SWAREQ           * R1 = SVA   ..FFFFFF FMT    *
+         LTR   R15,R15             * CALL SWAREQ TO CONVERT SVA *
+         BNZ   NEXTSIOT            * R1 = CONVERTED SVA, NOPREF *
+*                                  *--------------------------- *
+         LR    R10,R1
+         USING JFCB,R10
+         TM    JFCBTSDM,JFCSDS     SYSIN/SYSOUT OR SUBSUS=
+         BO    NEXTSIOT             YES
+*                                                               *
+         MVC   LWADSN,JFCB         COPY DATASET NAME
+         MVI   LWADSN+L'LWADSN,C' ' 45TH CHAR BLANK FOR CAMLST
+         MVC   LWADSN2,LWADSN      SAVE ORIGINAL DSN FROM JCL
+*--------------------------------------------------------------------*
+*              CHECK IF GDG(***) SPECIFIED                           *
+*--------------------------------------------------------------------*
+         TM    JFCBIND1,JFCGDG     IS THIS A GDG(***) DSN
+         BZ    DSN00090              NO
+DSN00020 DS    0H
+*--------------------------------------------------------------------*
+*              RELATIVE GDG FOUND ADD (-000) TO DSN                  *
+*--------------------------------------------------------------------*
+         LA    R1,LWADSN
+         LA    R2,44-9
+         LA    R3,JFCBELNM         RELATIVE GDG NUMBER
+DSN00025 DS    0H                  FIND END OF DATASET
+         CLI   0(R1),C'('          STRANGE, THIS SHOULD NOT OCCUR
+         BE    DSN00090             YES, NEXT DSN FROM JCL
+         CLI   0(R1),C' '          FIND FIRST BLANK
+         BE    DSN00030             YES
+         LA    R1,1(,R1)           NEXT CHAR
+         BCT   R2,DSN00025         AND LOOP
+         B     NEXTSIOT            DID NOT FIND IT
+DSN00030 DS    0H                  ADD (NNN)
+         MVI   0(R1),C'('
+         LA    R1,1(,R1)
+         LA    R2,7
+DSN00035 DS    0H
+         CLI   0(R3),C' '          END OF RELATIVE GDG NUMBER
+         BE    DSN00040             YES
+         MVC   0(1,R1),0(R3)       MOVE IN GDG NUMBER
+         LA    R1,1(,R1)           NEXT DSN CHAR
+         LA    R3,1(,R3)           NEXT GDG NUMBER
+         BCT   R2,DSN00035
+DSN00040 DS    0H
+         MVI   0(R1),C')'          CLOSE OUT GDG NAME
+DSN00090 DS    0H
+         B     DSN00100            DONT CHECK TEMP DSN STUFF
+         DROP  R10
+*--------------------------------------------------------------------*
+*              CHECK FOR TEMPORARY DSN                               *
+*--------------------------------------------------------------------*
+         CLC   =C'SYS',LWADSN      POSSIBLE
+         BNE   DSN00100
+         CLI   LWADSN+3,C'0'       >= SYS0
+         BL    DSN00100             NO
+         CLI   LWADSN+3,C'9'       <= SYS9
+         BH    DSN00100             NO
+         CLC   =C'.T',LWADSN+8      TEMPORARY
+         BNE   DSN00100
+         CLC   =C'.RA',LWADSN+16     DATASET
+         BNE   DSN00100
+         B     NEXTSIOT            YES
+DSN00100 DS    0H
+         SPACE 1
+         CLC   =C'NULLFILE',LWADSN IS IT NULLFILE
+         BE    NEXTSIOT             YES, SKIP IT
+*
+DSNGDG00 DS    0H
+         SPACE 1
+         CLC   =C'KBASS.TEST.X',LWADSN
+         BNE   KB001
+         MVC   LWAWTO(WTO100L),WTO100
+         MVC   LWAWTO+4(44),LWADSN
+         WTO   ,MF=(E,LWAWTO)
+KB001    DS    0H
+         LA    R0,LWAWORK
+         LA    R1,LWAWORKL
+         SLR   R15,R15
+         MVCL  R0,R14              ZERO LWAWORK
+*
+         LA    R1,LWALOC1
+         MVC   0(LOCATEL,R1),LOCATE
+*
+         LA    R0,LWADSN           DSNAME FOR LOCATE
+         ST    R0,4(,R1)
+         LA    R0,LWAWORK          ANSWER AREA FOR LOCATE
+         ST    R0,12(,R1)
+*--------------------------------------------------------------------*
+*              LOCATE DATASET VIA CATALOG                            *
+*--------------------------------------------------------------------*
+         CATALOG (1)
+*
+         ST    R15,LWACATRC
+*
+         L     R15,LWACATRC
+         LTR   R15,R15             FOUND IT
+         BZ    DSN00180             YES
+         CL    R15,=F'8'           RC=8, POSSIBLE GDG
+         BNE   NEXTSIOT             NO
+*--------------------------------------------------------------------*
+*              IF RC=8 AND WAS A GDG THEN GET NEXT JCL DSN           *
+*--------------------------------------------------------------------*
+         TM    LWAFLAG,$GDG        PROCESSING
+         BO    NEXTSIOT             IF WAS A GDG, NEXT SIOT
+*--------------------------------------------------------------------*
+*              LETS SEE IF JCL DSN IS A GDG BASE                     *
+*              BUILD (-000) ONTO DATASET                             *
+*--------------------------------------------------------------------*
+         OI    LWAFLAG,$GDG
+DSNGDG10 DS    0H
+         CP    LWAGDG,=P'+255'     ARE WE PASSED MAX GDG LIMIT
+         BH    NEXTSIOT             YES
+         MVC   LWADSN,LWADSN2      RESTORE ORIGINAL DSN FROM JCL
+         LA    R1,LWADSN
+         LA    R2,44-9
+DSNGDG15 DS    0H
+         CLI   0(R1),C'('          GDG OR PDS
+         BE    NEXTSIOT             YES, NEXT DSN FROM JCL
+         CLI   0(R1),C' '
+         BE    DSNGDG20
+         LA    R1,1(,R1)
+         BCT   R2,DSNGDG15
+         B     NEXTSIOT
+DSNGDG20 DS    0H
+         MVC   0(2,R1),=C'(-'
+         UNPK  2(3,R1),LWAGDG
+         OC    2(3,R1),=C'000'     MAKE SURE ALL NUMERIC
+         MVI   2+3(R1),C')'
+         AP    LWAGDG,=P'+1'
+         B     DSNGDG00
+*--------------------------------------------------------------------*
+*              CHECK VOLSER='MIGRAT'                                 *
+*--------------------------------------------------------------------*
+DSN00180 DS    0H
+         MVC   LWAVOL,LWAWORK+6
+         SPACE 1
+         CLC   XARCHIVE,LWAVOL     IS IT ARCHIVED
+         BNE   DSN00200             NO
+         SPACE 2
+         BAL   R9,DSNADD
+         C     R15,=F'4'           DATASET ALREADY THERE
+         BE    DSN00200             YES
+         SPACE 3
+DSN00200 DS    0H
+         TM    LWAFLAG,$GDG        ARE WE DOING SPECIAL GDG NAMES
+         BZ    NEXTSIOT             NO
+         B     DSNGDG10
+*--------------------------------------------------------------------*
+*              DATASET IS ARCHIVED                                   *
+*--------------------------------------------------------------------*
+         SPACE 2
+NEXTSIOT DS    0H
+         ICM   R1,B'0111',SCTPSIOT GET NEXT SIOT
+         BNZ   NEWSIOT
+NEXTSTEP DS    0H                  NEXT STEP ROUTINE
+         ICM   R1,7,SCTANSCT       GET ADDR OF NEXT STEP (SCT)
+         BZ    DONESTEP            THATS ALL OF THE STEPS IF 0
+         B     NEWSCT              GO PROCESS NEXT STEP (SCT)
+         EJECT
+*--------------------------------------------------------------------*
+*              ALL DONE SCANNING,  NOW UNARC                         *
+*--------------------------------------------------------------------*
+DONESTEP DS    0H
+TABL0000 DS    0H
+*--------------------------------------------------------------------*
+*              TABLE OF DSN NOW BUILT                                *
+*              EITHER 1) DELETE FROM ARCHIVE IF DISP=(MOD,DELETE) KMB1
+*              OR     2) RECALL IT                                   *
+*--------------------------------------------------------------------*
+         L     R8,LWATTOP          TOP TABLE ADDRESS
+TABL0100 DS    0H
+         LTR   R8,R8               TEST TABLE ENTRY ADDRESS
+         BZ    FINISH               ZERO, THEN CALL W/WAIT
+         CLI   TBLDSN,0            IS THEN ENTRY ZERO
+         BE    FINISH               YES, CALL W/WAIT
+         TM    LWAFLAG,$RETRY      IS THIS A RETRY              KMB2
+         BO    CALLWAIT             YES, ONLY RECALL ONE & WAIT KMB2
+*
+         SPACE 1
+         CLI   TBLFLAG,C'D'        IS IT DELETE
+         BNE   TABL0200             NO, UNARC
+*--------------------------------------------------------------------*
+*              DISP=(...,DELETE),  THEREFORE JUST DELETE IT          *
+*--------------------------------------------------------------------*
+         MVC   LWAWTO(WTO101L),WTO101
+         MVC   LWAWTO+WTO1011(44),TBLDSN
+         WTO   ,MF=(E,LWAWTO)      ISSUE MESSAGE
+         SPACE 2
+         MVC   LWADSN,TBLDSN
+         ARCHDEL DSN=LWADSN,WKAREA=LWAWORK,WAIT=YES,PURGE=YES
+         LTR   R15,R15
+         BZ    TABL0800
+         SPACE 2
+         BAL   R9,HSMRETCD         DISPLAY RETURN CODE
+         B     TABL0800
+*--------------------------------------------------------------------*
+*              RECALL IT                                             *
+*--------------------------------------------------------------------*
+TABL0200 DS    0H
+         MVC   LWADSN,TBLDSN
+         MVC   LWAWTO(WTO100L),WTO100
+         MVC   LWAWTO+WTO1001(44),LWADSN
+         WTO   ,MF=(E,LWAWTO)      ISSUE MESSAGE
+         SPACE 1
+         CL    R8,LWATBLST         THE LAST NON-DELETED ENTRY
+         BE    CALLWAIT             YES, DO WAIT
+         SLR   R15,R15
+         MVC   LWADSN,TBLDSN
+         ARCHRCAL DSN=LWADSN,WKAREA=LWAWORK,WAIT=NO
+         B     RECALLRC
+*
+CALLWAIT DS    0H                  WAIT IF THIS IS LAST ENTRY
+         WTO   'UNARC102 WAITING FOR LAST HRECALL',ROUTCDE=11
+         SLR   R15,R15
+         L     R0,LWATBUF1
+         L     R1,LWATBUFC
+         MVC   LWADSN,TBLDSN
+         ARCHRCAL DSN=LWADSN,WKAREA=LWAWORK,WAIT=YES
+RECALLRC DS    0H
+         LTR   R15,R15             ALL OK
+         BZ    TABL0800             YES
+         BAL   R9,HSMRETCD         DISPLAY RETURN CODE
+         B     FINISH
+TABL0800 DS    0H
+         L     R8,TBLNEXT          NEXT ENTRY
+         B     TABL0100
+         SPACE 3
+*--------------------------------------------------------------------*
+*                                                                    *
+*              SUBROUTINES                                           *
+*                                                                    *
+*--------------------------------------------------------------------*
+*--------------------------------------------------------------------*
+*              ADD DSN TO TABLE                                      *
+*--------------------------------------------------------------------*
+DSNADD   DS    0H
+         SPACE 3
+         ICM   R1,15,LWATBUF1      1ST BUFFER GOTTEN YET
+         BNZ   DSNA0020             YES
+         L     R0,=A(TBLBUFSZ)
+         STORAGE OBTAIN,LENGTH=(0),SP=LWASP,BNDRY=PAGE,LOC=ANY
+         ST    R1,LWATBUF1         1ST BUFFER
+         ST    R1,LWATBUFC         SAVE CURRENT BUFFER
+*
+         LR    R0,R1               ZERO
+         L     R1,=A(TBLBUFSZ)      TABLE
+         SLR   R15,R15               BUFFER
+         MVCL  R0,R14                 AREA
+*
+         L     R1,LWATBUF1         1ST BUFFER
+         USING BUFFER,R1
+         L     R0,=A(TBLBUFSZ)
+         ALR   R0,R1
+         ST    R0,BUFFEND          SAVE END OF TABLE
+         XC    BUFFNEXT,BUFFNEXT   ZERO NEXT BLOCK CHAIN
+         LA    R0,BUFFENT          @ FOR 1ST TBL ENTRY
+         ST    R0,LWATBLA          SET CURRENT TBL ENTRY
+         ST    R0,LWATTOP          SET TOP TBL ENTRY
+         DROP  R1
+DSNA0020 DS    0H
+*--------------------------------------------------------------------*
+*              REAL DSN ADD PART                                     *
+*--------------------------------------------------------------------*
+DSNA0100 DS    0H
+*
+         L     R1,LWATTOP          @ OF CURRENT ENTRY
+         MVI   LWADEL,0            PRESET DELETE FLAG=NO
+         TM    SCTSDISP,SIOTDLET   IS IT DELETE
+         BZ    DSNA0110             NO
+         TM    SCTSBYT3,SCTSMOD    IS IT MOD                    KMB1
+         BZ    DSNA0110             NO                          KMB1
+         MVI   LWADEL,C'D'         IS IT DELETE
+DSNA0110 DS    0H
+         LR    R8,R1
+         SPACE 1
+DSNA0200 DS    0H
+         CLI   TBLDSN,0            1ST FREE ENTRY
+         BE    DSNA0300             YES, ADD DATASET
+         CLC   TBLDSN,LWADSN       IS NEW DATASET ALREADY THERE
+         BNE   DSNA0220             NO, CHECK NEXT ENTRY
+         B     DSNARC00             YES, DUPLICATE DATASET
+         SPACE 1
+DSNA0220 DS    0H
+         ICM   R1,15,TBLNEXT       ALREADY CHAINED
+         BNZ   DSNA0110             YES
+*
+         LA    R2,TBLLEN(,R8)      R8 POINTS TO PREV ENTRY
+         L     R1,LWATBUFC         CURRENT BUFFER
+         USING BUFFER,R1
+         CL    R2,BUFFEND          ROOM FOR THIS ON
+         BNL   DSNA0230             NO
+*
+         ST    R2,TBLNEXT          CHAIN IN NEW ENTRY
+         LR    R8,R2               POINT AT NEW ENTRY
+         B     DSNA0300            GO ADD ENTRY
+*
+         DROP  R1
+*
+DSNA0230 DS    0H
+*--------------------------------------------------------------------*
+*              ADD NEW BUFFER      R8 STILL POINTS AT LAST ENTRY     *
+*--------------------------------------------------------------------*
+         L     R0,=A(TBLBUFSZ)
+         STORAGE OBTAIN,LENGTH=(0),SP=LWASP,BNDRY=PAGE,LOC=ANY
+         L     R2,LWATBUFC         OLD CURRENT BUFFER
+         ST    R1,BUFFNEXT-BUFFER(,R2) CHAIN NEW BUFF TO OLD
+         ST    R1,LWATBUFC         NEW CURRENT BUFFER
+*
+         LR    R0,R1               ZERO
+         L     R1,=A(TBLBUFSZ)      TABLE
+         SLR   R15,R15               BUFFER
+         MVCL  R0,R14                 AREA
+*
+         L     R1,LWATBUFC         CURRENT BUFFER
+         USING BUFFER,R1
+         L     R0,=A(TBLBUFSZ)
+         ALR   R0,R1
+         ST    R0,BUFFEND          SAVE END OF TABLE
+         XC    BUFFNEXT,BUFFNEXT   ZERO NEXT BLOCK CHAIN
+         LA    R0,BUFFENT          @ FOR 1ST TBL ENTRY
+         ST    R0,LWATBLA
+         ST    R0,TBLNEXT          R8 STILL POINTS AT LAST ENTRY
+         DROP  R1                   CHAINS OLD TO NEW TBL ENTRY
+         L     R8,LWATBLA          POINT AT NEW ENTRY
+         B     DSNA0300            GO ADD ENTRY
+*--------------------------------------------------------------------*
+*              END OF TABLE SEARCH , JUST ADD IT                     *
+*--------------------------------------------------------------------*
+DSNA0300 DS    0H
+         MVC   TBLDSN,LWADSN       COPY DSNAME
+         MVC   TBLFLAG,LWADEL      MOVE IN DELETE FLAG
+         CLI   TBLFLAG,C'D'        IS DSN TO BE DELETED
+         BE    DSNA0380             YES
+         ST    R8,LWATBLST         LAST RECALL ENTRY
+DSNA0380 DS    0H
+DSNARC00 DS    0H
+         SLR   R15,R15
+         BR    R9
+*--------------------------------------------------------------------*
+*              HSM RETURN CODE CHECKER                               *
+*--------------------------------------------------------------------*
+HSMRETCD DS    0H
+         LA    R1,HSMTBL#
+         LA    R2,HSMTBL
+HSMR0100 DS    0H
+         CL    R15,0(,R2)          IS THIS OUT RETURN CODE
+         BE    HSMR0500             YES
+         LA    R2,HSMTBLEN(,R2)     NO, NEXT ENTRY
+         BCT   R1,HSMR0100         LOOP
+         SPACE 1
+         MVC   LWAWTO(HSM999LN),HSMRC999
+         CVD   R15,LWADEC
+         MVC   LWAWTO+HSM99901(8),=X'4020202020202120'
+         ED    LWAWTO+HSM99901(8),LWADEC+4
+         WTO   ,MF=(E,LWAWTO)      I JUST DONT KNOW
+         BR    R9
+HSMR0500 DS    0H
+         L     R2,4(,R2)           @ OF WTO
+         WTO   ,MF=(E,(R2))
+         BR    R9
+         SPACE 2
+HSMTBL   DC    A(100),A(HSMRC100)  HSM NOT UP
+HSMTBLEN EQU   *-HSMTBL            ARC11NNN* MESSAGES
+         DC    A(002),A(HSMRC002)  NOT MIGRATED
+         DC    A(069),A(HSMRC069)  ADRDSSU FAILED
+         DC    A(074),A(HSMRC074)  RECALL HELD
+         DC    A(095),A(HSMRC095)  OPERATOR REPLIED NO
+         DC    A(400),A(HSMRC400)  INVALID REQUEST
+         DC    A(402),A(HSMRC402)  DATASET NOT FOUND
+         DC    A(403),A(HSMRC403)  DATASET WAS * OR BLANK
+         DC    A(806),A(HSMRC806)  LINK ERROR
+         PRINT NOGEN
+HSMTBL#  EQU   (*-HSMTBL)/HSMTBLEN END OF TABLE
+         SPACE 2
+HSMRC002 WTO   'UNARC9002 DATASET NOT MIGRATED',                       X
+               ROUTCDE=11,MF=L
+HSMRC069 WTO   'UNARC9069 DFHSM ADRDSSU FAILURE, PROBABLY TOO LARGE',  X
+               ROUTCDE=11,MF=L
+HSMRC074 WTO   'UNARC9074 DFHSM RECALL PROBABLY HELD',                 X
+               ROUTCDE=11,MF=L
+HSMRC095 WTO   'UNARC9095 DFHSM OPERATOR REPLIED NO TO MOUNT',         X
+               ROUTCDE=11,MF=L
+HSMRC100 WTO   'UNARC9100 DFHSM IS NOT RUNNING',                       X
+               ROUTCDE=11,MF=L
+HSMRC400 WTO   'UNARC9400 DFHSM INVALID REQUEST',                      X
+               ROUTCDE=11,MF=L
+HSMRC402 WTO   'UNARC9402 DFHSM DATASET LOCATE FAILED',                X
+               ROUTCDE=11,MF=L
+HSMRC403 WTO   'UNARC9403 DFHSM DATASET WAS "*" OR BLANK',             X
+               ROUTCDE=11,MF=L
+HSMRC806 WTO   'UNARC9806 DFHSM LINK ERROR',                           X
+               ROUTCDE=11,MF=L
+HSMRC999 WTO   'UNARC9999 DFHSM UNKNOWN RETURN CODE = XXXXXXXX   ',    X
+               ROUTCDE=11,MF=L
+HSM999LN EQU   *-HSMRC999
+HSM99901 EQU   4+38,8              OFFSET TO RETURN CODE
+         SPACE 3
+*--------------------------------------------------------------------*
+*              SWAREQ CONVERT      BAL   R9,SWAREQ                   *
+*              INPUT               R1=SVA ADDR  ..FFFFFF FORMAT      *
+*              OUTPUT              R1=REAL ADDR ..FFFFFF FORMAT      *
+*                                  DOES NOT POINT TO PREFIX          *
+*              MODIFIES REGS       R15,R0,R1                         *
+*--------------------------------------------------------------------*
+SWAREQ   DS    0H
+         XC    WEPA,WEPA
+         LA    R15,WEPA
+         ST    R15,WEPAP
+         STCM  R1,7,SWVA-ZB505(R15) PUT SVA ..FFFFFF INTO FFFFFF00
+         SWAREQ FCODE=RL,EPA=WEPAP,UNAUTH=YES,MF=(E,WSWA)
+         LTR   R15,R15
+         BNZR  R9
+         SPACE 3
+         LA    R15,WEPA
+         L     R1,SWBLKPTR-ZB505(,R15) GET HIGH SVA
+         LA    R15,0
+         BR    R9
+         PRINT &GEN
+         SPACE 3
+*--------------------------------------------------------------------*
+*              ERROR EXITS                                           *
+*--------------------------------------------------------------------*
+*--------------------------------------------------------------------*
+*              ALL DONE                                              *
+*--------------------------------------------------------------------*
+ALLDONE  DS    0H
+*--------------------------------------------------------------------*
+*              CLEAN HOUSE                                           *
+*--------------------------------------------------------------------*
+FINISH   DS    0H
+         ICM   R1,15,LWATBUF1      GET FIRST TBL BUFFER ADDR
+FINISH2  DS    0H
+         LTR   R1,R1
+         BZ    FINISH10            IF ZERO BYPASS
+         L     R2,0(,R1)           NEXT BUFFER
+         L     R0,=A(TBLBUFSZ)
+         STORAGE RELEASE,ADDR=(1),LENGTH=(0),SP=LWASP
+         LR    R1,R2
+         B     FINISH2             FREE ALL THE TABLE BUFFERS
+FINISH10 DS    0H
+*--------------------------------------------------------------------*
+*              LOOP BACK THRU TO SEE IF SOME ARE STILL ARCHIVED      *
+*--------------------------------------------------------------------*
+         L     R8,LWATTOP          TOP TABLE ADDRESS            KMB2
+         LTR   R8,R8               ANY ENTRIES?                 KMB2
+         BZ    EXIT                 NO, THEN WE ARE DONE        KMB2
+*                                                               KMB2
+         L     R1,LWALOOPS         GET RETRY COUNTER            KMB2
+         S     R1,=F'1'            -1                           KMB2
+         BM    EXIT                IF <= 0 THEN EXIT            KMB2
+         ST    R1,LWALOOPS         SAVE NEW VALUE               KMB2
+         OI    LWAFLAG,$RETRY      INDICATE THIS IS A RETRY     KMB2
+         B     RETRY                                            KMB2
+*--------------------------------------------------------------------*
+*              EXIT ALL DONE                                         *
+*--------------------------------------------------------------------*
+*
+EXIT     DS    0H
+         L     R13,4(,R13)
+         L     R0,=A(LWASIZE)
+         LR    R1,R11
+         STORAGE RELEASE,ADDR=(1),LENGTH=(0),SP=LWASP
+         RETURN (14,12),RC=0
+         SPACE 3
+         EJECT
+*--------------------------------------------------------------------*
+*              CONSTANTS                                             *
+*--------------------------------------------------------------------*
+         LTORG ,
+XARCHIVE DC    CL6'MIGRAT'
+         SPACE 3
+LOCATE   CAMLST NAME,2,,4
+LOCATEL  EQU   *-LOCATE
+         SPACE 1
+WTO100   WTO   'UNARC100 SCHEDULING HRECALL FOR    ..                  X
+                                                             ',        X
+               MF=L,ROUTCDE=(11)
+WTO1001  EQU   4+35,44
+WTO100L  EQU   *-WTO100
+         SPACE 1
+WTO101   WTO   'UNARC101 DISP=(,DELETE) HDELETE OF ..                  X
+                                                             ',        X
+               MF=L,ROUTCDE=(11)
+WTO1011  EQU   4+35,44
+WTO101L  EQU   *-WTO101
+         PRINT NOGEN
+         SPACE 3
+         PRINT &GEN
+BLANKS   DC    CL256' '
+*
+         EJECT ,
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*        LOCAL WORK AREA MAPPING                                  *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+LWAMAP   DSECT
+LWASAVE# EQU   20
+LWASAVE  DS    (9*LWASAVE#)D
+LWADEC   DS    2D
+LWAWTO   DS    CL(WTO100L),0F
+LWALOC1  DS    XL(LOCATEL),0F
+LWAREC   DS    CL80
+*                                  AREA TO CLEAR BETWEEN LOOPS  KMB2
+LWACLEAR EQU   *                                                KMB2
+LWATBUF1 DS    A                   1ST TABLE BUFFER
+LWATBUFC DS    A                   CURRENT TABLE BUFFER
+LWATTOP  DS    F                   1ST TABLE ENTRY
+LWATBLA  DS    A                   CURRENT TABLE ENTRY
+LWATBLST DS    A                   LAST 'D' ENTRY
+LWACATRC DS    F
+LWACLRLN EQU   *-LWACLEAR                                       KMB2
+*                           END OF AREA TO CLEAR BETWEEN LOOPS  KMB2
+LWALOOPS DS    F                   MAX # OF LOOPS               KMB2
+LWADSN   DS    CL44,C
+LWAVOL   DS    CL6
+LWADSN2  DS    CL44
+LWATBLQ  DS    CL46
+LWAGDG   DS    PL2
+LWAFLAG  DS    X
+$ABEND   EQU   X'80'
+$RETRY   EQU   X'40'
+$COUNTED EQU   X'20'
+$FINISH  EQU   X'10'
+$GDG     EQU   X'08'
+LWADEL   DS    X                   TEMPORARY DELETE FLAG
+WEPAP    DS    A
+WEPA     DS    CL(ZB505LEN),0F'0'
+WSWA     SWAREQ MF=L
+         DS    D
+LWAWORK  DS    XL264               LOCATE/ARCH WORK AREA
+LWAWORKL EQU   *-LWAWORK           LENGTH OF LOCATE WORK AREA
+LWASIZE  EQU   *-LWAMAP
+LWASP    EQU   1
+         EJECT
+*--------------------------------------------------------------------*
+*              DSECTS - LOCAL                                        *
+*--------------------------------------------------------------------*
+BUFFER   DSECT
+BUFFNEXT DS    A
+BUFFEND  DS    A
+BUFFPRFL EQU   *-BUFFER
+BUFFENT  EQU   *
+*
+TBLDSECT DSECT
+TBLNEXT  DS    A
+TBLDSN   DS    CL44
+TBLFLAG  DS    C
+         DS    0F                  ALIGN TO FULL WORD
+TBLLEN   EQU   *-TBLDSECT
+TBLNUM   EQU   ((32768-BUFFPRFL)/TBLLEN)       # ENTRIES IN 32768
+TBLBUFSZ EQU   BUFFPRFL+(TBLLEN*TBLNUM) GETMAIN SIZE
+         EJECT
+*--------------------------------------------------------------------*
+*              DSECTS - SYSTEM                                       *
+*--------------------------------------------------------------------*
+         PRINT NOGEN
+         SPACE 5
+         IKJTCB                    TCB
+         SPACE 5
+         IHAPSA                    PSA
+         SPACE 5
+JFCB     DSECT
+         IEFJFCBN LIST=YES         JFCB
+         SPACE 5
+JSCB     EQU   IEZJSCB
+         IEZJSCB                   JSCB
+JCTDSECT DSECT
+         IEFAJCTB                  OS JCT DSECT
+         SPACE 5
+SCTDSECT DSECT
+         IEFASCTB                  OS SCT DSECT
+         SPACE 5
+SIOTDSCT DSECT
+         IEFASIOT                  SIOT DSECT
+         SPACE 5
+         IEFZB505 LOCEPAX=YES
+ZB505LEN EQU   *-ZB505
+         PRINT NOGEN
+         CVT   DSECT=YES           NEEDED BY SWAREQ MACRO
+         IEFJESCT TYPE=DSECT       NEEDED BY SWAREQ MACRO
+         PRINT GEN
+         YREGS  ,
+         END

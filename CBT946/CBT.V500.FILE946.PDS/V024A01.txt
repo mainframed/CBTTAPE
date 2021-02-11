@@ -1,0 +1,198 @@
+ Balancing CPU use
+This tuning EXEC offers a method of dynamically changing the priority of a CMS
+user based on CPU use.  It can be frequently executed (every 5 minutes,
+triggered by the WAKEUP command, for example) to balance CPU use among users.
+We execute the tuning routine on our VM/SP (non-HPO) installation to ease
+pressure caused by a CPU-intensive database query system.  Typically, we will
+have a dozen database users, each attempting to claim 20% of the available CPU,
+and thereby unfairly impacting other less-intensive users.  The following EXEC
+has been used successfully to penalise the individuals instead of penalising the
+entire system.
+VM priority describes the relative order in a queue of users waiting to be
+serviced.  A low priority has a high numeric value, while an important user has
+a low numeric value for priority.  Therefore, service machines, such as VTAM or
+guests, should be priority 1, and batch machines should have a priority of about
+80.  Default is 64.
+The way the tuning EXEC works is as follows.  To allow the percentage of CPU use
+to be queried, logon-ids are passed to a subroutine that turns FAVORed status
+on.  The INDICATE command will now show FAVORed users' respective CPU use.
+Logon-ids are passed to another subroutine that, first, turns off the FAVORed
+status and, second, manipulates the user's priority based on percentage of CPU
+use.  In each of the subroutines, special users (service machines, guests, etc)
+are accounted for and excluded from the procedure.
+If a machine is deemed to be using too much CPU for the system's good, its
+priority is reduced to 70.  If a machine is not adversely affecting the CPU, its
+priority is set to 64.  The resetting of priority to 64 every time through the
+loop is redundant, but it guards against a formerly CPU-intensive user remaining
+indefinitely at priority 70.
+TUNEVM EXEC
+/* This EXEC will perform VM tuning by selecting user virtual
+   machines (not explicity excluded) and resetting their priority to
+   70 if they are using too much CPU.  Otherwise, user priority is
+   set to the system default, 64.
+*/
+_MAIN_LINE_:
+THEIRS = QUEUED()
+'MAKEBUF'                       /* Stack output in our own buffer. */
+   'EXECIO * CP (STRING QUERY NAMES'
+                                    /* Get list of logged-on users.*/
+   DO  WHILE QUEUED() > THEIRS        /* Output is queued to stack.*/
+       PULL USERID.1 '-' TERMINAL.1 ',' , /* Get output from CP    */
+                                              /*command from stack.*/
+            USERID.2 '-' TERMINAL.2 ',' , /* Place userIDs and     */
+                                          /*terminal address into  */
+            USERID.3 '-' TERMINAL.3 ',' ,             /* an array. */
+            USERID.4 '-' TERMINAL.4 .
+       CALL _TEST_USERS_ SPACE(USERID.1,0) /* Use userids found in */
+       CALL _TEST_USERS_ SPACE(USERID.2,0) /* query command as     */
+       CALL _TEST_USERS_ SPACE(USERID.3,0) /*argument to subroutine*/
+       CALL _TEST_USERS_ SPACE(USERID.4,0) /*Pass userid only after*/
+   END                                      /* removing all blanks */
+   'DROPBUF'                    /* Destroy previously used buffer. */
+   THEIRS = QUEUED()
+   'MAKEBUF'                    /* Stack output in our own buffer. */
+   'EXECIO * CP (STRING INDICATE FAVOR'         /* Show percent CPU*/
+                                                     /*utilization.*/
+   DO  WHILE QUEUED() > THEIRS       /* Output is queued to stack. */
+       PULL  1 USERID.1 +8 17 PERCENT.1 +3 , /* Get output from CP */
+                                              /*command from stack:*/
+            21 USERID.2 +8 37 PERCENT.2 +3 , /*virtual machine and */
+            41 USERID.3 +8 57 PERCENT.3 +3      /* percent CPU use */
+       CALL _PRIORITIZE_USERS_ SPACE(USERID.1,0) PERCENT.1
+                      /* Remove blanks from userid and pass userid */
+       CALL _PRIORITIZE_USERS_ SPACE(USERID.2,0) PERCENT.2
+                      /* and percent CPU utilization as arguments. */
+       CALL _PRIORITIZE_USERS_ SPACE(USERID.3,0) PERCENT.3
+   END
+    'DROPBUF'                    /* Destroy previously used buffer. */
+   EXIT 0                           /* Get outa here when all done */
+_TEST_USERS_:                                                                /*
+This subroutine turns on FAVORED so the percent CPU use will be
+   displayed in an INDICATE FAVOR command.  Service machines (VTAM,
+   batch processors, guest machines) are excluded from the SET
+   FAVORED command.
+*/
+   ARG MACHINE
+   SELECT
+       WHEN MACHINE = "" THEN NOP
+                      /* Ignore null output from CP QUERY command. */
+       WHEN MACHINE = "VSM" THEN NOP
+                                  /* Ignore VSCS heading in stack. */
+       WHEN MACHINE = "VTAM" THEN NOP
+                           /* Don't mess with VTAM service machine.*/
+       WHEN MACHINE = "GCSRECOV" THEN NOP
+                          /* Don't mess with Group Control System. */
+       WHEN MACHINE = "RSCS" THEN NOP
+                          /* Don't mess with RSCS service machine. */
+       WHEN SUBSTR(MACHINE,1,6) = "CMSBAT" THEN NOP
+                        /* Don't mess with BATCH service machines. */
+       OTHERWISE 'CP SET FAVORED '||MACHINE||' 1'
+                        /* Turn on FAVORED (but only temporarily). */
+   END
+RETURN
+_PRIORITIZE_USERS_:
+/* This subroutine turns the FAVORED status back off and if a virtual
+   machine is using too much CPU, it's PRIORITY
+   will be reduced to 70.  All other virtual machines' PRIORITY are
+   reset to default 64 so as to not penalize previously
+   set users who are no longer hogging CPU resources.
+*/
+   ARG MACHINE PERCENT
+   SELECT
+       WHEN MACHINE = "" THEN NOP
+                      /* Ignore null output from CP QUERY command. */
+       WHEN MACHINE = "VSM" THEN NOP
+                                  /* Ignore VSCS heading in stack. */
+       WHEN MACHINE = "VTAM" THEN NOP
+                          /* Don't mess with VTAM service machine. */
+       WHEN MACHINE = "GCSRECOV" THEN NOP
+                          /* Don't mess with Group Control System. */
+       WHEN MACHINE = "RSCS" THEN NOP
+                          /* Don't mess with RSCS service machine. */
+       WHEN SUBSTR(MACHINE,1,6) = "CMSBAT' THEN NOP
+                        /* Don't mess with BATCH service machines. */
+       OTHERWISE DO
+                 'CP SET FAVORED '||MACHINE||' OFF'
+                                         /* Turn FAVORED back OFF. */
+                 IF PERCENT < 10       /* Using more than 10% CPU? */
+                    THEN DO
+                        'CP SET PRIORITY '||MACHINE||' 64
+                            /* Not using 10% or more, so set to VM */
+                        END            /* VM default priority 64. */
+                    ELSE DO
+                        OTHERS = QUEUED()
+                        'MAKEBUF'
+                        /*  First, stack output in our own buffer. */
+                       'EXECIO * CP (STRING QUERY PRIORITY '||MACHINE
+                        DO  WHILE QUEUED() > OTHERS
+                                     /* Output is queued to stack. */
+                             PULL . . . PRTY .
+                             /* Get current priority of this user. */
+                         END
+                         'DROPBUF'
+                              /* Don't need that buffer any longer. */
+                         'CP SET PRIORITY '||MACHINE||' 70'
+                            /* Set to lowest priority above batch. */
+                         SAY TIME() DATE() MACHINE||' was using '|| ,
+                             PERCENT||'% CPU at priority '||PRTY|| ,
+                                     /* Say what is going on here. */
+                             '.  Reset to 70. '
+                         END
+                 END                /* End of OTHERWISE statement. */
+   END                                 /* End of SELECT statement. */
+RETURN
+George Perkins
+Senior Technical Services Specialist
+Oscar Mayer Foods Corporation (USA)     ) Xephon 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

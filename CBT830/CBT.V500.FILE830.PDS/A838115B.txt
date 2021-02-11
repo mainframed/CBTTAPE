@@ -1,0 +1,554 @@
+Development of an MVS subsystem (continued)
+
+This month we conclude our look at developing MVS
+subsystems by examining some of the other important issues
+which need to be considered.
+
+
+SERIALIZATION
+
+Consider whether access to storage should be serialized.  Some
+examples where serialization would be appropriate are:
+
+o      To be certain that the subsystem will not be activated at the
+      same time by another job, the address of SSVT should be
+      put into SSCVT using the compare and swap machine
+      instruction.
+
+o      When adding subsystem requests to queues, removing
+      them, or moving to a different queue, queues must be
+      locked to prevent simultaneous access from other tasks
+      (one queue in the CSA serves all address spaces).  You
+      should consider that function routines are executing
+      virtually simultaneously (one central processor) and even
+      truly simultaneously (multi-processor system).  Changing
+      pointers by means of the compare and swap instruction
+      while manipulating queues is not sufficient.
+
+Here is a simple way of locking.  It assumes that the address
+space  only locks the queue for a short time and always unlocks
+the queue (even in the case of an abend).
+
+L_LOCK   .....
+         MVC   W_NTRY,SSCB_MTRY   maximum number of lock retries
+         USING PSA,0
+         L     R7,PSAAOLD         address of ASCB
+         DROP  0
+         LA    R9,SSCB_QLCK       address of lock word
+         SLR   R8,R8              0 = queue not locked
+         DO WHILE=(CS,R8,R7,NE,0(R9))  if 0 then lock word = A(ASCB)
+*          while queue locked
+           LH    R14,W_NTRY
+           BCTR  R14,0            decrement lock retry count
+           STH   R14,W_NTRY
+           IF    (LTR,R14,R14,NP)  no more retries
+*            let's guess the address space that has locked the queue,
+*            will not unlock it; program error
+             .....
+           ENDIF
+           STIMERM SET,ID=W_TID,BINTVL=K_TWERT,WAIT=YES,MF=(E,W_STIML)
+*            set timer: wait a little bit until retry
+           SLR   R8,R8            0 = queue not locked
+         ENDDO
+         .....
+K_TWERT  DC    F'1'               STIMERM value = 1/100 sec.
+         .....
+W_TID    DS    F                  STIMERM ID
+W_STIML  STIMERM SET,MF=L         STIMERM macro list
+W_NTRY   DS    H                  remaining number of lock retries
+         .....
+L_UNLOCK .....
+         USING PSA,0
+         L     R7,PSAAOLD         address of ASCB
+         DROP  0
+         LA    R9,SSCB_QLCK       address of lock word
+         SLR   R8,R8              0 = queue not locked
+         IF    (CS,R7,R8,NE,0(R9))  unlock queue
+*          lock has been changed; program error
+           .....
+         ENDIF
+         .....
+
+Of course, you may use ENQ/DEQ as well.
+
+
+CROSS MEMORY POST
+
+Unless it's a very simple subsystem, posting the WAIT of a
+different address space will occur at several locations.  This is
+because function routines always execute in the address space
+of the subsystem caller.  Some examples are:
+
+o      The function routine for 'request termination of subsystem'
+      posts the subsystem address space.
+
+o      The subsystem address space posts the server address space
+      at a regular time interval to avoid termination because of
+      exceeding the wait time limit.
+
+o      After linking an element to the request queue, the
+      processing address space will be posted in the case of
+      waiting for a new request to process.
+
+o      The processing address space posts the address space of a
+      subsystem caller when it is waiting for the end of the
+      processing of its request.
+
+Unfortunately, cross memory POST is poorly documented.
+Some items need to be observed:
+
+o      The POST code in the ECB is limited to 30 bits.
+      Therefore, it's not possible to put a 31-bit address into an
+      ECB.  A POST code that has been passed has to be
+      checked eventually.
+
+o      An invalid address of an ECB may lead to severe errors.
+      Therefore it makes sense to check the address of an ECB
+      that has been passed to make certain that it is one of the
+      possible ECBs.  Doing so is only possible if the ECB is not
+      residing in the address space to be posted but in the CSA.
+
+o      If the waiting and the posting address space could be the
+      same, it should be verified by comparing the addresses of
+      their ASCBs and a normal POST should be done.
+
+o      The error routine, which has to be coded in the case of
+      cross memory POST, will only be called if the ECB
+      address or its contents are invalid.  A wrong ASCB address
+      results in an S075 or S0C4 abend.  Therefore, it may be
+      helpful to check whether the address space still exists
+      before executing POST, for example, like this:
+
+        .....
+        L     R1,CVTPTR(,0)      address of CVT
+        USING CVTMAP,R1
+        L     R1,CVTASVT         address of ASVT
+        USING ASVT,R1
+        L     R4,ASVTMAXU        number of address spaces
+        DO    WHILE=(LTR,R4,R4,P)
+*         while entry for address space in ASVT
+          IF    (TM,ASVTENTY,ASVTAVAL,Z)  address space used
+            IF    (CL,R2,EQ,ASVTENTY)  address space found
+              SLR   R4,R4        quit loop
+            ENDIF
+          ENDIF
+          BCTR  R4,0
+          LA    R1,L'ASVTENTY(,R1)  next entry
+        ENDDO
+        DROP  R1
+        IF    (LTR,R4,R4,Z)      address space does not exist
+          .....
+        ENDIF
+        .....
+        CVT   DSECT=YES,LIST=NO    CVT: communication vector table
+        IHAASVT DSECT=YES,LIST=NO  ASVT: address space vector table
+        .....
+
+o      The way in which the cross memory POST error routine
+      works is often misunderstood.  It is not a label in the
+      program where a branch is taken at the end of POST if an
+      error has occurred: it has already been executed when
+      control is returned to the calling program (it is executing in
+      SRB mode in the posting address space).  The POST SVC
+      does not indicate that an error has occurred.  The error
+      routine, for example, has to switch on a flag, which can be
+      tested after return from POST. Because the error routine
+      has no access to the register contents of the caller, there's a
+      problem in doing so if the code is re-entrant (eg function
+      routines).  A solution is:
+
+         .....
+         MVI   W_XMERR,0          reset error indicator byte
+         MVC   W_POSTL,K_POST     move to GETMAINed storage
+         MVC   W_ERRTN,K_ERRTN    move to GETMAINed storage
+         L     R3,SSCB_AECB       address of ECB in CSA
+         L     R0,SSCB_POCD       POST code
+         POST  (R3),(0),ASCB=(R2),ERRET=W_ERRTN,MF=(E,W_POSTL)  XMPOST
+         IF    (TM,W_XMERR,1,0)   XMPOST error routine indicated error
+           .....
+         ENDIF
+         .....
+K_ERRTNP DS    0H
+*          XMPOST error routine, will be moved to GETMAINed storage,
+*          called by operating system in case of XMPOST error;
+*          executing in SRB mode in posting address space
+         BCTR  R15,0              skip to one byte in front of routine
+         OI    0(R15),1           indicate error
+         BR    R14                return to operating system
+K_ERRTN  EQU   K_ERRTNP,*-K_ERRTNP
+         .....
+K_POSTP  POST  ,,,ASCB=,ERRET=,MF=L
+K_POST   EQU   K_POSTP,*-K_POSTP
+         .....
+         DS    0A
+W_POSTL  DS    XL(L'K_POST)
+         DS    0H
+         DS    B
+W_XMERR  DS    B                  to indicate XMPOST error
+W_ERRTN  DS    XL(L'K_ERRTN)      storage for XMPOST error routine
+         .....
+
+
+SERVER ADDRESS SPACE
+
+If the processing of subsystem requests is performed in a
+separate address space (other than the subsystem address space)
+this server address space should be controlled by the subsystem
+address space.  That means:
+
+o      After subsystem initialization, the subsystem address space
+      starts the server address space:
+      -      using the START command (server address space
+            executes as a started task).
+      -      using the START command to start a reader procedure
+            which writes the job to the internal reader.
+      -      writing the job to the internal reader directly.
+
+      After normal or abnormal end, restart of the server address
+      space may be initiated.
+
+o      The server address space may terminate after receiving a ]
+      subsystem request provided for that.
+
+o      The subsystem address space recognizes whether the server
+      address space has become active within an adequate time.
+      To achieve this, for instance, the server address space may
+      notify the subsystem address space by means of cross
+      memory POST.
+
+o      The subsystem address space recognizes when the server
+      address space has been terminated.  Cross memory POST
+      can be used too, in the case of an abend called in the
+      ESTAE exit.  It's also possible to use standard subsystem
+      function 4 (notification of end of task).  Function 8
+      (notification of end of memory) works only if it is a started
+      task.  End of memory of a batch address space isn't at the
+      end of job but when the initiator has been stopped!
+      Because this function routine will be called very frequently
+      (at the end of every task executing in the system), it should
+      be coded in such a way that, if it is not the proper address
+      space, only a small number of machine instructions are
+      executing, eg only abended tasks are to be processed:
+
+         .....
+         USING *,R15
+         ST    R1,24(,R13)        save address of SSOB
+         USING SSOB,R1
+         L     R1,SSOBINDV        address of SSOB extension
+         USING SSOBEXT,R1
+         IF    (TM,SSETFLAG,SSETYPE,Z)  no ABEND, no work to do
+           DROP  R1
+           SLR   R15,R15
+           L     R1,24(,R13)      restore address of SSOB
+           BR    R14
+         ENDIF
+         .....
+         IEFJSSOB ET,CONTIG=NO    SSOB of function 4 : end-of-task
+         .....
+
+      Note that the SSOB extension is not adjacent to SSOB!
+
+
+IDENTIFYING AN ADDRESS SPACE
+
+Using standard subsystem function 4 (notification of end of
+task), it's often necessary for the function routine to be able to
+recognize whether it is an address space of a subsystem caller.
+An address space can be identified by the address of its ASCB
+as long as it exists (the address of the ASCB of a new address
+space may be the same again).  In the case of a batch job, the
+address space exists as long as the initiator is active.  For these
+reasons, the address of the ASCB on its own isn't sufficient.
+One way to get a clear distinction is to use the job name and
+the JES job number in addition.  Obtain these three values in
+the function routine as described below, eg to store them into a
+subsystem-specific control block:
+
+         .....
+         USING PSA,0
+         L     R1,PSAAOLD         address of ASCB
+         USING ASCB,R1
+         ST    R1,W_AASCB
+         IF    (ICM,R15,B'1111',ASCBJBNI,Z)
+*          address of job name (initiated job)
+           L     R15,ASCBJBNS
+*            address of job name (started task or TSO user)
+         ENDIF
+         MVC   W_JNAM,0(R15)      job name
+         L     R1,PSATOLD         address of TCB
+         DROP  0
+         USING TCB,R1
+         L     R1,TCBJSCB         address of JSCB
+         USING IEZJSCB,R1
+         L     R1,JSCBACT         address of active JSCB
+         L     R1,JSCBSSIB        address of life-of-job SSIB
+         USING SSIB,R1
+         MVC   W_JNUM,SSIBJBID    JES job number
+         DROP  R1
+         .....
+W_AASCB  DS    A
+W_JNAM   DS    CL8
+W_JNUM   DS    CL8
+         .....
+         IHAPSA DSECT=YES,LIST=NO   PSA: Prefixed Save Area (= page 0)
+         IHAASCB DSECT=YES,LIST=NO  ASCB: Address Space Control Block
+         IKJTCB DSECT=YES,LIST=NO   TCB: Task Control Block
+         IEZJSCB ,                  JSCB: Job Step Control Block
+         IEFJSSIB ,                 SSIB: Subsystem Information Block
+         .....
+
+The function routine for the end of task obtains these fields in
+the same way to compare them with the values stored in the
+subsystem-specific control block.  In this function routine you
+can also get the addresses of ASCB and TCB this way:
+
+         .....
+         L     R1,SSETASCB        address of ASCB
+         .....
+         L     R1,SSETCBA         address of TCB
+         .....
+         IEFJSSOB ET,CONTIG=NO    SSOB of function 4 : end-of-task
+         .....
+
+
+SUBSYSTEM PARAMETERS
+
+It's often preferable not to hard code certain values but to read
+them at the start of the subsystem address space and to store
+them in a subsystem-specific control block, for example:
+
+o      Subsystem name.
+
+o      Name of load module containing the function routines.
+
+o      Number of user SVC.
+
+o      Name of start procedure of server address space.
+
+o      Trace switches.
+
+o      Maximum wait time of subsystem caller until request is
+      processed (in the case of synchronous processing in a
+      separate address space) and other similar types of wait time limits.
+
+o      Maximum number of retries of subsystem call if a function
+      has not yet been activated and other similar types of retry counts.
+
+Also, there should be a parameter which causes an
+unconditional start, ie if the subsystem has to be initialized (all
+control blocks newly created) even though it is already active.
+This is helpful, for example, in the case of an abend, if
+deactivation of the subsystem has not been completed.  If the
+subsystem has been designed so that functions will only be
+deactivated at termination and activated again at the next start-
+up, then (without this facility) an IPL would be required when
+changing the layout of the SSVT or a control block linked to
+SSVT or SSCVT.
+
+
+HANDLING ABNORMAL ENDS
+
+Intercept an abend of the subsystem address space by means of
+an ESTAE exit in order to terminate the subsystem properly.
+Handling the abend of a function routine isn't generally
+necessary, it depends on the function.  Coding ESTAE macro
+calls inside function routines is not mandatory.  A general
+ESTAE call before executing IEFSSREQ in the common
+interface module (if such a module is used) does the job too.
+Specify TERM=YES to intercept X22-type system abends as
+well.
+
+
+PREVENTING SYSTEM ABEND 522
+
+After initializing the subsystem, there's often no more work for
+the subsystem address space to do for quite a long time.  It is
+waiting until termination of the subsystem is requested (by
+means of cross memory POST).  An address space receives an
+S522 abend if the wait time limit specified in the PARMLIB is
+exceeded.  The following solution is independent of definitions
+outside the subsystem:
+
+o      Set time and define a timer exit routine.
+
+o      Double WAIT instead of a single WAIT.
+
+o      When timer interrupt has occurred, the time exit routine
+      posts the second ECB.
+
+o      Check whether only the second ECB has been posted.  If
+      this is true, then repeat the whole thing.
+
+         .....
+         LA    R1,W_ECBT          address of timer ECB
+         ST    R1,W_AECBT         is argument to time exit
+         DO    UNTIL=(TM,SSCB_ECBS,X'40',O) until subsystem ECB posted
+           SLR   R0,R0
+           ST    R0,W_ECBT        clear timer ECB
+           STIMERM SET,ID=W_TID,BINTVL=W_TIME,                        X
+                 EXIT=L_TEXIT,PARM=W_AECBT,MF=(E,W_STIML)  set timer
+           LA    R0,SSCB_ECBS     address of subsystem ECB
+           LA    R1,W_ECBT        address of timer ECB
+           STM   R0,R1,W_ECBAL    to ECB address list
+           OI    W_ECBAL+4,X'80'  indicate end of list
+           WAIT  1,ECBLIST=W_ECBAL  multiple WAIT
+         ENDDO
+         STIMERM CANCEL,ID=W_TID,MF=(E,W_STIML)  cancel timer
+         .....
+L_TEXIT  .....                   timer exit routine
+         L     R1,4(,R1)         address of timer ECB
+         POST  (1),0             post it
+         .....
+W_ECBAL  DS    0A                ECB address list for WAIT
+         DS    A                   address of subsystem ECB
+         DS    A                   address of timer ECB
+W_ECBT   DS    F                 timer ECB
+W_AECBT  DS    A                 address of timer ECB for timer exit
+W_TID    DS    F                 timer ID
+W_TIME   DS    F                 wait time for timer
+W_STIML  STIMERM SET,MF=L
+         .....
+
+
+A RESTART DATASET
+
+Subsystem requests that the subsystem cannot process (or
+cannot process any further) may be saved to a restart dataset.
+Upon restarting the subsystem, these requests will be read
+again and then processed.  Normally these requests are for
+asynchronous functions, where user data will be added to a
+queue residing in CSA, to be processed later by the subsystem
+address space or a server address space.  There are two cases:
+
+o      The subsystem is terminating because of operator
+      intervention or an abend and requests are still queued for
+      processing.
+
+o      The subsystem is inactive.  Therefore, the interface module
+      is writing the request to the restart dataset to be processed
+      later.  To achieve this, dynamic allocation and de-
+      allocation of the restart dataset takes place.  If it is
+      currently allocated because of writing another request, it's
+      necessary to wait.
+
+I experienced this in the case of cancellations (eg abends S222,
+S322, S522, etc).  The last buffer will not be written at the
+close.  To circumvent this problem, write a dummy record as
+the last record in this situation.  However, if it has been written
+for any other reason, ignore it when reading it.  In the ESTAE
+exit it's possible to determine whether the type of abend is
+'cancel' in field SDWAERRA of SDWA, bit SDWAABTM is
+set.
+
+ENQ/DEQ may be used to wait for receiving exclusive access
+to the restart dataset.  Another solution is:
+
+o      Try to allocate.
+
+o      If error code X'020C' or X'0210' occurs, then a different
+      user currently has access to the dataset.
+
+o      Wait a little, using the STIMERM macro.
+
+o      Retry allocation (if the retry count limit has not been
+      exceeded).
+
+When doing an allocation with DISP=MOD, you should note
+that a new dataset will be created if the DSNAME cannot be
+located in the catalog (specifying UNIT and SPACE is not
+necessary as DYNALLOC uses the default values).  Therefore,
+this method works only with DISP=OLD.  If allocation has
+been completed successfully, another allocation with
+DISP=MOD can take place.  Don't specify the same
+DDNAME, otherwise DYNALLOC will try to use the existing
+allocation.  An error will occur because DYNALLOC isn't able
+to change OLD to MOD.
+
+
+PROPAGATING A SUBSYSTEM REQUEST
+
+A subsystem unable to process a request may propagate this
+request to another subsystem.  Examples are:
+
+o      All requests are directed to a certain subsystem.  This
+      subsystem is propagating every request to the proper
+      subsystem.
+
+o      The request is directed to the first subsystem of a set of
+      subsystems.  If this one doesn't process this type of
+      request, it passes the request to the next one, and so forth.
+
+If all subsystems are executing under the same operating
+system, the following may happen:
+
+o      The function routine called by the requesting program adds
+      the caller's data as an element to the request queue of the
+      first subsystem.
+
+o      The function routine called by the processing address space
+      transfers the element from the request queue to the
+      processing queue and passes the caller's data to the
+      processing address space.
+
+o      If the processing address space recognizes that it isn't
+      competent to process this request, it will call a function
+      linking the element to the request queue of the next
+      subsystem, and so forth.
+
+o      If it is a synchronous request, then, after processing, the
+      element will be linked to the response queue of the original
+      subsystem.
+
+
+A UNIFORM INTERFACE
+
+If it is a complex subsystem, it makes sense to implement
+functions as follows:
+
+o      Notify the subsystem address space about the start/end of
+      the server address space.
+
+o      Pass a request to the server address space.
+
+o      Respond from the server address space back to the requestor.
+
+o      Propagate a request to the next subsystem.
+
+These may be called subsystem internal functions or subsystem
+calls (ie in function routines).  The main advantage is that
+authorized code is executing entirely behind the subsystem
+interface.
+
+It's better not to call the functions immediately by IEFSSREQ
+at several places but, rather, to code IEFSSREQ once in an
+interface module.  Doing so makes it possible to get a uniform
+interface which can be called by as many programming
+languages as possible.  The interface module may do work (in
+addition to preparing the arguments for IEFSSREQ) which is
+not authorized and common to all functions, for example:
+
+      Check arguments
+      Switch AMODE
+      Log the request
+      Execute 'dummy functions'
+      Call ESTAE
+      Save request to restart the dataset if the subsystem is inactive.
+
+
+RMODE/AMODE
+
+It's advantageous to program principally in such a way that
+modules may reside below or above the 16-megabyte line and
+are not restricted to 24 or 31-bit mode.  To do this, assemble
+all code that has to be executed in 24-bit mode (eg GET and
+PUT macros) to a separate load module to be loaded
+dynamically, ie all CSECTs, except that of this load module,
+are given RMODE ANY and AMODE ANY.  Modules
+representing external interfaces (in the case of a subsystem, the
+subsystem interface module) should be independent of the
+caller's AMODE.  To achieve this, switch to AMODE 31 and
+switch back to the caller's AMODE before returning control.
+
+Walter Wiedemann
+Consultant (Germany)                               c Walter Wiedemann 1991
+

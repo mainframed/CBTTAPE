@@ -1,0 +1,337 @@
+Switching between transactions
+
+While in the middle of one transaction, a user often needs to
+look up information using another transaction.  Normally, they
+must exit from the first one, start the second, exit from that,
+and return to the first transaction.  Additionally, they must
+typically re-key several fields to get back to the point they were
+at before leaving in the first place.
+
+While reading Chapter 5 of the CICS 1.7 Customization Guide,
+I learned of a global user exit named XZCATT, which is
+invoked by the control program DFHZCP just prior to attaching
+a task.  It permits you to modify the transaction-id of the task if
+you choose.
+
+The user exit is enabled by a short program, which is added to
+the start-up PLT list.  It simply issues the EXEC CICS
+ENABLE command as described in the latter part of Chapter 5.
+
+While using a pseudo-conversational transaction, if the user
+hits PF15, the following occurs:
+
+1      The user exit checks to see if PF15 (could be any PF key)
+      was hit and whether the incoming transaction-id meets
+      certain user-defined criteria (if any).  If not, nothing is
+      altered.
+
+2      The original transaction-id is stashed in the TCTTE user
+      area (which must be a least 7 bytes in length), and the
+      transaction-id to attach is changed to 'SAVE'.
+
+3      Transaction SAVE uses program SAVE00.  This program
+      stores the original transaction-id (from the TCTTE user
+      area), the cursor position, and the current screen buffer in
+      one temporary storage record.  The incoming
+      COMMAREA, if any, is stored in another temporary
+      storage record.  SAVE00 alternates between two queue
+      names in order to permit saving one transaction when
+      another is already saved but not yet restored.  This enables
+      us to toggle between two transactions.  If a user hits PF15
+      and no other transaction is currently saved, the screen is
+      cleared and a message is sent to prompt them to enter
+      another transaction-id.  However, if there is a previously-
+      saved transaction, then after saving the new transaction,
+      control is passed (via XCTL) to another program,
+      BACK00, which contains the logic for restoring the older
+      saved transaction.
+
+4      Program BACK00 reads the temporary storage queue and
+      sends the screen buffer, followed by a SEND CONTROL
+      command to reposition the cursor.  It then does a
+      RETURN specifying the original transaction-id and
+      COMMAREA.  It will appear to the user as if they had
+      never left the transaction.  The transaction BACK can also
+      be invoked directly from a cleared screen to restore a saved
+      transaction, if one exists.
+
+Note that no macro-level code is needed.  Obtaining the
+address of the TCTTE user area in SAVE00 and BACK00 is
+achieved through the EXEC CICS INQUIRE TERMINAL
+command, which is described in the Customization Guide (not
+the Programmer's Guide).
+
+Secondly, I chose a PF key instead of a PA key because, to get
+the current cursor position, I needed to perform some kind of
+terminal input (such as the EXEC CICS RECEIVE  in
+SAVE00), and a PA key, in common with the CLEAR key,
+does not return terminal data.  If there is a way around this, I'd
+like to know (I would have used PA3 instead).
+
+Thirdly, be sure nothing else is using the first 7 bytes of the the
+TCTTE user area.  If there is a conflict, you can lengthen the
+user area and modify the offsets used by this set of programs.
+
+The following source code is for the four programs that
+comprise the save/restore function, namely:
+
+o      UTMZCPX - The global user exit.  It should be defined as resident.
+
+o      UTMEXENA - The start-up PLT program to enable the exit.
+
+o      SAVE00 (transaction-id SAVE) - This program saves the
+      current transaction.
+
+o      BACK00 (transaction-id BACK) - This program restores a
+      saved transaction.
+
+
+UTMZCPX
+
+* PROGRAM: UTMZCPX - GLOBAL USER EXIT CALLED BY DFHZCP
+* NOTES:   LINK-EDITED (NO CICS TRANSLATION REQUIRED)
+TCTTEAR  EQU   10                   TCTTE.
+         COPY  DFHTCTTE
+UTMZCPX  CSECT
+         STM   R14,R12,12(R13)      SAVE CALLER'S REGISTERS.
+         LR    R12,R15              ESTABLISH BASE.
+         USING UTMZCPX,R12
+         B     STRT                 ==> BYPASS LITERALS
+         DC    CL8'UTMZCPX'
+         DC    CL8'mm/dd/yy'
+STRT     DS    0H
+         CLI   TCTTEAID,C'C'        PRESSED PF15 ?
+         BNE   EXIT                 ==> NO, LEAVE ALONE.
+CHECK    DS    0H
+         CLI   5+2(R2),C'0'         IF 3RD CHARACTER OF TRANID
+         BL    EXIT                 NOT NUMERIC, THEN LEAVE ALONE.
+         CLI   5+2(R2),C'9'         (Or any other trans-id check
+         BH    EXIT                 applicable to your shop...)
+SAVE     DS    0H
+         L     R1,TCTTECIA          R1 -> TCTTE USER AREA.
+         MVC   0(4,R1),5(R2)        PUT ORIGINAL TRANS-ID IN IT.
+         MVC   5(4,R2),=C'SAVE'     NEW TRANS-ID TO ATTACH WITH.
+EXIT     DS    0H
+         LM    R14,R12,12(R13)      RESTORE CALLER'S REGISTERS.
+         SR    R15,R15              SET RETURN CODE TO ZERO.
+         BR    R14                  RETURN TO CALLER.
+         LTORG
+         END   UTMZCPX
+
+
+UTMEXENA
+
+*ASM     XOPTS(NOEPILOG)
+* PROGRAM: UTMEXENA - ENABLE GLOBAL USER EXIT.
+* NOTES:   COMMAND LEVEL; NO TRANSID; ADD TO START-UP PLT.
+DATAREG  EQU   7
+CODEREG  EQU   8
+EIBREG   EQU   9
+         DFHEISTG
+UTMEXENA DFHEIENT CODEREG=CODEREG,DATAREG=DATAREG,EIBREG=EIBREG
+         EXEC  CICS ENABLE PROGRAM('UTMZCPX')                          +
+               EXIT(XZCATT)                                            +
+               START.
+         EXEC  CICS RETURN.
+         LTORG
+         END   UTMEXENA
+
+
+SAVE00
+
+*ASM     XOPTS(NOEPILOG)
+* PROGRAM: SAVE00 - SAVE CURRENT PSEUDO-CONVERSATION
+* NOTES:   TRANS-ID = SAVE.  COMMAND-LEVEL.
+DATAREG  EQU   7
+CODEREG  EQU   8
+EIBREG   EQU   9
+         DFHEISTG
+DFHEISTG DSECT ,                 CONTINUE DYNAMIC STORAGE.
+LEN      DS    H                 LENGTH WORK.
+QINO     DS    H                 QUEUE ITEM NUMBER.
+QID      DS    OCL8              QUEUE NAME.
+QTRAN    DS    CL4               - TRANS-ID.
+QTERM    DS    CL4               - TERMID.
+TCTUA    DSECT ,                 TCTTE USER AREA.
+UATRAN   DS    CL4               TRANS-ID PUT HERE BY EXIT.
+CNTQUE   DS    H                 NUMBER OF QUEUES SAVED.
+CURQUE   DS    C                 LAST QUEUE SAVED INTO (1 OR 2).
+GMSTRG   DSECT ,                 FOR QUEUE ITEM 1.
+GMTRAN   DS    CL4               - TRANS-ID.
+GMCURS   DS    H                 - CURSOR POSITION.
+GMSCRN   DS    CL4090            - SCREEN BUFFER.
+GMLEN    EQU   *-GMSTRG          MAX GETMAIN NEEDED.
+COMMSTRG DSECT ,                 INCOMING COMMAREA.
+         DS    C
+SAVE00   DFHEIENT CODEREG=CODEREG,DATAREG=DATAREG,EIBREG=EIBREG
+         EXEC  CICS INQUIRE TERMINAL(EIBTRMID) USERAREA(R2).
+         USING  TCTUA,R2
+         CLI   UATRAN,X'00'      DID WE GET HERE VIA EXIT ?
+         BH    OKSTRT            ==> YES..
+         MVC   LEN,=Y(EMSG1LEN)  NO...SEND ERROR MESSAGE...
+         EXEC  CICS SEND FROM(EMSG1) LENGTH(LEN) ERASE.
+         B     RETURN
+OKSTRT   DS    0H
+         CLI   CURQUE,X'00'      CURR QUEUE ID EVER SET ?
+         BH    *+8               ==> YES..
+         MVI   CURQUE,C'2'       INITIALIZE IT TO '2'.
+         LH    R1,CNTQUE         ADD 1 TO QUEUE COUNT...
+         LA    R1,1(,R1)
+         STH   R1,CNTQUE
+         CLI   CURQUE,C'1'       SWITCH CURRENT QUEUE ID...
+         BE    *+12
+         MVI   CURQUE,C'1'
+         BE    *+8
+         MVI   CURQUE,C'2'
+         MVC   QTRAN(3),=C'SAV'  BUILD QUEUE NAME THEN DELETE...
+         MVC   QTRAN+3(1),CURQUE
+         MVC   QTERM,EIBTRMID
+         EXEC  CICS IGNORE CONDITION QIDERR.
+         EXEC  CICS DELETEQ TS QUEUE(QID).
+         EXEC  CICS RECEIVE.     TO OBTAIN CURSOR POSITION.
+         MVC   LEN,=Y(GMLEN)
+         EXEC  CICS GETMAIN SET(R10) LENGTH(LEN) INITIMG(HEX00).
+         USING GMSTRG,R10
+         MVC   GMTRAN,UATRAN     MOVE ORIGINAL TRANS-ID.
+         MVC   CMCURS,EIBCPOSN   MOVE CURSOR POSITION.
+         MVC   LEN,=Y(GMLEN-6)
+         EXEC  CICS RECEIVE INTO(GMSCRN) LENGTH(LEN) ASIS BUFFER.
+         LH    R1,LEN            LENGTH OF SCREEN BUFFER
+         LA    R1,6(,R1)           PLUS TRANS-ID AND CURSOR
+         STH   R1,LEN                GIVES TOTAL LENGTH.
+         MVC   QINO,=H'1'        SPECIFY QUEUE ITEM = 1.
+         EXEC  CICS WRITEQ TS QUEUE(QID) FROM(GMSTRG)                  +
+               LENGTH(LEN) ITEM(QINO) AUXILIARY.
+         CLC   EIBCALEN,=H'0'    ANY COMMAREA ?
+         BNH   DONE              ==> NO...
+         L     R3,DFHEICAP       LOAD COMMAREA ADDRESS.
+         USING COMMSTRG,R3
+         MVC   QINO,=H'2'        SPECIFY QUEUE ITEM = 2.
+         EXEC  CICS WRITEQ TS QUEUE(QID) FROM(COMMSTRG)                +
+               LENGTH(EIBCALEN) ITEM(QINO) AUXILIARY.
+DONE     DS    0H
+         CLC   CNTQUE,=H'2'     ANOTHER TRANS TO SWITCH TO ?
+         BNE   SENDMSG          ==> NO...
+         XC    UATRAN,UATRAN    CLEAR TRANS-ID TEMP HOLD.
+         EXEC  CICS XCTL PROGRAM('BACK00').
+SENDMSG  DS    0H
+         MVC   GMSTRG(MSGLEN),DONEMSG    BUILD MESSAGE...
+         MVC   GMSTRG+5(4),UATRAN
+         MVC   LEN,=Y(MSGLEN)
+         XC    UATRAN,UATRAN     CLEAR TRANS-ID TEMP HOLD.
+         EXEC  CICS SEND FROM(GMSTRG) LENGTH(LEN) ERASE.
+RETURN   DS    0H
+         EXEC  CICS RETURN.
+EMSG1    DC    C'CANNOT INVOKE ''SAVE'' DIRECTLY'
+EMSG1LEN EQU   *-EMSG1
+DONEMSG  DS    0C
+         DC    X'1140401DF0'     SBA (1,1) + SF + ASKIP.
+         DC    C'**** SAVED...ENTER ANOTHER TRANS-ID ==>'
+         DC    X'1DC913'         SF + (UNPROT,FSET,IC).
+         DC    C'____'           FOUR UNDERLINES.
+         DC    X'1DF040'         SF + ASKIP + BLANK.
+MSGLEN   EQU   *-DONEMSG
+HEX00    DC    X'00'
+         LTORG
+         END   SAVE00
+
+
+BACK00
+
+*ASM     XOPTS(NOEPILOG)
+* PROGRAM: BACK00 - RESTORE A SAVED PSEUDO-CONVERSATION
+* NOTES:   TRANS-ID = BACK.  COMMAND-LEVEL.
+DATAREG  EQU   7
+CODEREG  EQU   8
+EIBREG   EQU   9
+         DFHEISTG
+DFHEISTG DSECT ,                 CONTINUE DYNAMIC STORAGE.
+LEN      DS    H                 LENGTH WORK.
+LEN1     DS    H                 LENGTH OF ITEM 1.
+LEN2     DS    H                 LENGTH OF ITEM 2.
+QCNT     DS    H                 NUMBER OF ITEMS IN QUEUE.
+QINO     DS    H                 QUEUE ITEM NUMBER.
+QID      DS    0CL8              QUEUE NAME.
+QTRAN    DS    CL4               - TRANS-ID.
+QTERM    DS    CL4               - TERMID.
+TCTUA    DSECT ,                 TCTTE USER AREA.
+UATRAN   DS    CL4               (NOT USED HERE).
+CNTQUE   DS    H                 NUMBER OF QUEUES SAVED.
+CURQUE   DS    C                 LAST QUEUE SAVED INTO (1 OR 2).
+TSREC1   DSECT ,                 QUEUE ITEM 1.
+TSTRAN   DS    CL4               - TRANS-ID.
+TSCURS   DS    H                 - CURSOR POSITION.
+TSSCRN   DS    CL4090            - SCREEN BUFFER.
+TSREC2   DSECT ,                 QUEUE ITEM 2.
+TSCOMM   DS    C                 - COMMAREA.
+BACK00   DFHEIENT CODEREG=CODEREG,DATAREG=DATEREG,EIBREG=EIBREG
+         EXEC  CICS INQUIRE TERMINAL(EIBTRMID) USERAREA(R6).
+         USING  TCTUA,R6
+         CLC   CNTQUE,=H'0'      IS THERE ANYTHING SAVED ?
+         BNH   NOTHING           ==> NO...ERROR MSG.
+         MVC   QTRAN(3),=C'SAV'  BUILD (PARTIAL) QUEUE NAME...
+         MVC   QTERM,EIBTRMID
+         CLC   CNTQUE,=H'2'      MORE THAN ONE QUEUE RIGHT NOW ?
+         BE    TWOQUES           ==> YES..SKIP AHEAD.
+         MVC   QTRAN+3(1),CURQUE   FINISH QUEUE NAME.
+         B     RESTORE             ==> RESTORE FROM LAST SAVED.
+TWOQUES  DS    0H
+         CLI   CURQUE,C'1'       IF 2 QUEUES, WE WANT TO RESTORE
+         BE    *+12                FROM THE ONE THAT WAS "NOT"
+         MVI   QTRAN+3,C'1'          SAVED INTO LAST.
+         BE    *+8
+         MVI   QTRAN+3,C'2'
+RESTORE  DS    0H
+         MVC   QINO,=H'1'        SPECIFY QUEUE ITEM 1.
+         EXEC  CICS READQ TS QUEUE(QID) SET(R2) ITEM(QINO)             +
+               LENGTH(LEN1) NUMITEMS(QCNT).
+         MVC   LEN,LEN1          AMT OF STRG NEEDED FOR ITEM 1.
+         EXEC  CICS GETMAIN SET(R10) LENGTH (LEN).
+         LH    R3,LEN1           SOURCE LENGTH FOR MVCL.
+         LR    R4,R10            TARGET ADDRESS FOR MVCL.
+         LR    R5,R3             TARGET LENGTH FOR MVCL.
+         MVCL  R4,R2             MOVE TS REC 1 TO GETMAIN'D AREA.
+         CLC   QCNT,=H'2'        IS THERE A COMMAREA TOO ?
+         BNL   GETCOMM           ==> YES..GO GET IT.
+         XC    LEN2,LEN2         SET COMM AREA LENGTH TO ZERO.
+         B     DELQ              ==> DONE WITH QUEUE.
+GETCOMM  DS    0H
+         MVC   QINO,=H'2'        SPECIFY QUEUE ITEM = 2.
+         EXEC  CICS READQ TS QUEUE(QID) SET(R2) ITEM(QINO)             +
+               LENGTH(LEN2).
+         MVC   LEN,LEN2          AMT OF STRG NEEDED FOR ITEM 2.
+         EXEC  CICS GETMAIN SET(R11) LENGTH(LEN).
+         LH    R3,LEN2           SOURCE LENGTH FOR MVCL.
+         LR    R4,R11            TARGET ADDRESS FOR MVCL.
+         LR    R5,R3             TARGET LENGTH FOR MVCL.
+         MVCL  R4,R2             MOVE TS REC 2 TO GETMAIN'D AREA.
+         USING TSREC1,R10
+         USING TSREC2,R11
+DELQ     DS    0H
+         EXEC  CICS DELETEQ TS QUEUE(QID).
+         LH    R1,CNTQUE         SUBTRACT 1 FROM QUEUE COUNT...
+         BCTR  R1,0
+         STH   R1,CNTQUE
+         LH    R1,LEN1           SUBTRACT 6 FROM FIRST LENGTH
+         SH    R1,=H'6'            GIVING SCREEN BUFFER LENGTH...
+         STH   R1,LEN1
+         EXEC  CICS SEND FROM(TSSCRN) LENGTH(LEN1)                     +
+               CTLCHAR(HEX42) ERASE.
+         EXEC  CICS SEND CONTROL CURSOR(TSCURS).
+         EXEC  CICS RETURN TRANSID(TSTRAN)                             +
+               COMMAREA(TSCOMM) LENGTH(LEN2).
+NOTHING  DS    0H
+         MVC   LEN,=Y(EMSG1LEN)
+         EXEC  CICS SEND FROM(EMSG1) LENGTH(LEN) ERASE.
+         EXEC  CICS RETURN.
+EMSG1    DC    C'NO TRANSACTION CURRENTLY SAVED'
+EMSG1LEN EQU   *-EMSG1
+HEX42    DC    X'42'             CTLCHAR = RESET AND FREEKB.
+         LTORG
+         END   BACK00
+
+
+Lawrence Holder
+Senior Programmer/Analyst
+University of Tennessee at Martin (USA)             c UTM 1991
+

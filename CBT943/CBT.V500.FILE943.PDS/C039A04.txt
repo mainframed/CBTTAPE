@@ -1,0 +1,198 @@
+ Performance problems and the CICS dispatcher
+THE PROBLEM
+The CICS dispatcher works on the basis of a First In First Out (FIFO) priority.
+This means that TheavyU tasks that enter the active dispatcher chain will stay
+on the top of the chain against all new tasks with the same priority, and the
+new tasks will get control only when the tasks on the top of the chain are
+waiting for an uncompleted event.
+The problem shows itself mainly if there are several heavy tasks running
+simultaneously with equal priority.  This stops all new tasks with the same
+priority from processing, and the heavy tasks will stay at the top of the active
+chain, while the chain is increasing with new tasks until the MAXTASK threshold
+is reached.
+The obvious solution to this problem is either to ensure that no task that is
+known to be heavy on system resources is allowed to run on the live CICS system,
+or to reduce the priority of all heavy tasks.
+When trying to apply the above solutions one encounters several difficulties,
+some of the reasons for which are:
+1    Tasks are user/data driven.  The same transaction running from two separate
+terminals can use different amounts of resources.
+2    Most new transactions are tested on a test CICS system with small test
+databases or files, so programs that show good performance on a test CICS system
+might not perform well in a live environment.
+3    A program with a bug could loop, and if the loop contains requests for CICS
+services, CICS will not purge it - unlike  the situation with runaway tasks.
+A NEW SOLUTION
+In CICS Update an interesting solution was published some time ago ÝStabilising
+CICS response times by Michel Vanwesemael, issue 12, November 1986¨.  The author
+suggested a TrotatingU technique.
+HereUs another working solution which I will call the TbouncingU technique.  In
+it, all application tasks enter the dispatcher with the same priority.  The more
+processing they do the lower they go down the active chain.  Once they reach the
+bottom they bounce up and start all over again.
+The method is used as follows.  A count is kept in the TCA of the times that a
+task requests CICS services.  Once the count reaches the threshold, the taskUs
+dynamic priority is reduced by 1 and the task is deleted and re-inserted in its
+new place on the active chain.  This process carries on until the dynamic
+priority reaches 1, in which case the original priority of that task is restored
+and the cycle is repeated until the task completes.
+The threshold is set to 100.  This number was chosen after tracing several small
+transactions and counting the number of times they requested the services of
+CICS.  The threshold can be changed to suit the environment in which CICS is
+running.
+The benefits of this method are:
+1    Short tasks are filtered out quickly.
+2    Heavy tasks will get a fair chance but are not allowed to monopolise the
+CICS region.
+3    No time is wasted in trying to measure the overhead of a new transaction in
+order to set its priority.
+This method has been running for the last six months at our installation and the
+effect has been better response time for everybody.
+To try this method you must do the following:
+1    Allocate the same priority to all application transactions.  This number is
+set depending on how far down you want the heavy tasks to slide.  I use a
+priority value of 50.
+2    Include the following KCP exit to your CICS system.  This requires an entry
+in the PLTPI for the first program which starts the exit, and two entries in the
+PPT.  Remember to check the SIT to make sure that EXITS=YES has been specified.
+Notes
+%    This exit works on CICS 1.7 running under MVS/XA.  Using it under any other
+environment without modifications will cause CICS to go down.
+%    It is assumed that most transactions on the system are psuedo-
+conversational.
+%    The exit uses 3 bytes in the taskUs system TCA at offset XT189U.
+PROGRAM 1 KCPPLT
+DFHEISTG DSECT
+XDFHSTRT CSECT
+          EXEC CICS ENABLE PROGRAM('KCPEXT') EXIT('XKCDISP') START
+         EXEC CICS RETURN
+         END
+PROGRAM 2 KCPEXT
+DFHEIBR  EQU   9
+SYSTCA   EQU   7
+DCACBAR  EQU   3
+         COPY  DFHDCADS
+         DFHTCA CICSYST=YES
+         COPY DFHCSADS
+         DFHEIS EIB=YES
+EISCBAR  EQU   2
+KCPEXT   CSECT ,
+         USING *,15
+         STM   R14,R12,12(R13)
+         LR    R8,R13
+         USING DFHUEPAR,R1
+         L     R12,UEPTCA
+         L     R13,UEPCSA
+         L     SYSTCA,TCASYAA          ADDRESS THE SYSTEM TCA
+         USING DFHSYTCA,SYSTCA
+         USING DFHDCADS,R3
+         TM    DCAFLG1,DCASTASK        IS IT A SYSTEM TASK
+         BO    RETURN                  YES - GET OUT
+         TM    TCAKCTTA+2,X'0C'        IS IT A USER TASK?
+         BNO   RETURN                  NO - GET OUT
+         CLI   TCATCDP,X'FF'           IS PRIORITY 255?
+         BE    RETURN                  YES - GET OUT
+         CLI   TCATCDP,X'01'           IS PRIORITY MINIMUM
+         BE    RETURN                  YES - GET OUT
+         ICM   R4,B'0111',TCAEISA+1    IS TASK USING EIB
+         BZ    BEGN                    NO  JUMP EDF CHECK
+         L     EISCBAR,TCAEISA         ADDRESS THE EIB BLOCK
+         ICM   R4,B'0111',EISEDFDL+1   IS TASK UNDER EDF
+         BNZ   RETURN                  YES GET OUT
+BEGN     CLI   393(R7),X'00'           IS THIS
+         BNE   PRCD                    THE FIRST
+CHCK     CLI   395(R7),X'00'           TIME?
+         BNE   PRCD
+         MVI   393(R7),X'01'           YES INITIALISE PRI SAVE AREA.
+PRCD     XR    R4,R4
+         XR    R5,R5
+         XR    R6,R6
+         IC    R6,395(R7)              LOAD COUNTER IN R6 OFFSET X'18B'
+         LA    R6,1(R6)                ADD 1 TO COUNTER
+         STC   R6,395(R7)              STORE NEW VALUE BACK
+         LA    R5,100                  LOAD THRESHOLD IN R5
+         CR    R6,R5                   HAS TASK REACHED THRESHOLD?
+         BL    RETURN                  NO - GET OUT. NO PRIORITY CHANGE
+         IC    R4,TCATCDP              LOAD THE PRIORITY IN R4
+         LA    R5,1
+         SR    R4,R5                   REDUCE PRIORITY BY 1
+         STC   R4,TCATCDP              REPLACE PRIORITY IN TCA
+         STC   R4,DCATCDP              REPLACE PRIORITY IN DCA
+         MVI   395(R7),X'00'           INITIALISE THE COUNT AREA.
+         IC    R6,393(R7)              KEEP TRACK OF THE
+         LA    R6,1(R6)                PRIORITY DEDUCTIONS
+         STC   R6,393(R7)              AND SAVE THEM
+         CLI   TCATCDP,X'01'           IS PRIORITY MINIMUM
+         BNE   TDEL                    NO - GO ORGANISE DCA QUEUE
+         MVC   TCATCDP,393(R7)         GIVE THIS GUY A
+         MVC   DCATCDP,393(R7)         SECOND CHANCE
+         MVI   393(R7),X'01'           INITIALISE THE ORIGINAL PRI AREA
+         MVI   395(R7),X'00'           INITIALISE THE COUNT AREA.
+         IC    R6,394(R7)              SAVE
+         LA    R6,1(R6)                AMOUNT OF CHANCES
+          STC   R6,394(R7)              GIVEN
+*                       TASK    DELETE
+TDEL     LM    R10,R11,DCAKCFA
+         ST    R10,DCAKCFA-DFHDCADS(R11)
+         ST    R11,DCAKCBA-DFHDCADS(R10)
+*                       TASK    INSERT
+TINS     LA    R10,CSAACTOF
+         IC    R9,DCATCDP
+*                       SCAN DCA
+SDCA     L     R10,DCAKCFA-DFHDCADS(R10)
+         CLM   R9,1,DCATCDP-DFHDCADS(R10)
+         BH    SDCA
+*                       INSERT NEW DCA
+INDCA    L     R11,DCAKCBA-DFHDCADS(R10)
+         STM   R10,R11,DCAKCFA
+         ST    R3,DCAKCFA-DFHDCADS(R11)
+         ST    R3,DCAKCBA-DFHDCADS(R10)
+RETURN   LR    R13,R8
+         LM    R14,R12,12(R13)
+         BR    14                         GET OUT
+         LTORG
+         DFHUEXIT TYPE=EP
+         END   KCPEXT
+
+
+Jamil El-Imad
+Software Engineer
+E A Juffali and Bros (Saudi Arabia)     ) Jamil El-Imad 1989
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,394 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+;***********************************************************************
+;*                                                                     *
+;* This member must be compiled as a MODULE.                           *
+;*                                                                     *
+;***********************************************************************
+;
+;=======================================================================
+;
+; The infamous array-fake-out package.
+;
+; An array is a structure of type ZIL-ARRAY
+; whose elements are the type, dimensions, data, etc., and,
+; most important, a function used to access array information.
+;
+; A symbol with an ARRAY property is also given an SUBR property
+; which is a lexical closure binding the array to ZARRAY, and
+; which simply executes the functional portion of the array.
+; In this way the interpreter need not be modified to recognize arrays.
+;
+;=======================================================================
+
+;
+;***********************************************************************
+;*                                                                     *
+;* 01/23/87 - Now supports arrays with any positive # of dimensions.   *
+;*            1- and 2-dimensional arrays are more efficient, though.  *
+;*                                                                     *
+;***********************************************************************
+;
+
+; Herald.
+
+(when (< (msglevel) 2)
+ (cterpri)
+ (princ "Loading \"ZLARRAY\", ZIL's Maclisp-compatible array module.")
+ (terpri)
+)
+
+; Definition of an array object.
+
+(defstruct zil-array
+           name
+           data
+           type
+           dimensions
+           function
+)
+
+(defmacro zil-array-dimension-1 (array)
+ `(zcar (zil-array-dimensions ,array)))
+
+(defmacro zil-array-dimension-2 (array)
+ `(zcadr (zil-array-dimensions ,array)))
+
+(putprop 'zil-array
+         #'(lambda (array &rest args)
+                   (zilapply (zil-array-function array) args))
+         'defstruct-funcall-method)
+
+(defun zil-array (array)
+ (let ((real-array (if (symbolp array) (get array 'array) array)))
+      (if (not (zil-array-p real-array))
+          (zerror "Not an array" array)
+          real-array)))
+
+(defun zil-1d-array-handler (array dim1 val val?)
+ (cond
+  ((null dim1)
+   (zil-array-data array))
+  ((not (integerp dim1))
+   (zerror "Invalid index-1 specified for array"
+           (zil-array-name array) dim1))
+  ((or (minusp dim1) (>= dim1 (zil-array-dimension-1 array)))
+   (zerror "Out-of-range index-1 specified for array"
+           (zil-array-name array) dim1))
+  (val?
+   (vset (zil-array-data array) dim1 val))
+  (t
+   (vref (zil-array-data array) dim1))))
+
+(defun zil-2d-array-handler (array dim1 dim2 val val?)
+ (cond
+  ((and (null dim1) (null dim2))
+   (zil-array-data array))
+  ((not (integerp dim1))
+   (zerror "Invalid index-1 specified for array"
+           (zil-array-name array) dim1))
+  ((not (integerp dim2))
+   (zerror "Invalid index-2 specified for array"
+           (zil-array-name array) dim2))
+  ((or (minusp dim1) (>= dim1 (zil-array-dimension-1 array)))
+   (zerror "Out-of-range index-1 specified for array"
+           (zil-array-name array) dim1))
+  ((or (minusp dim2) (>= dim2 (zil-array-dimension-2 array)))
+   (zerror "Out-of-range index-2 specified for array"
+           (zil-array-name array) dim2))
+  (t
+   (let ((index (+ (* dim1 (zil-array-dimension-2 array)) dim2)))
+        (if val?
+            (vset (zil-array-data array) index val)
+            (vref (zil-array-data array) index))))))
+
+(defun zil-nd-array-handler (array dims)
+ (let (
+       (rank (length (zil-array-dimensions array)))
+       (rlen (length dims))
+       (val)
+       (val?)
+      )
+  (cond
+   ((eql rlen rank)
+    (setq val? nil))
+   ((eql rlen (1+ rank))
+    (setq val (zcar (last dims))
+          val? t))
+   ((< rlen rank)
+    (zerror "Too few arguments to array" (zil-array-name array)))
+   (t
+    (zerror "Too many arguments to array" (zil-array-name array))))
+  (cond
+   ((mapand #'null dims)
+    (zil-array-data array))
+   (t (do (
+           (dims dims (cdr dims))
+           (dimx (zil-array-dimensions array)
+                 (cdr dimx))
+           (index 0)
+          )
+          ((null dimx)
+           (if val?
+               (vset (zil-array-data array) index val)
+               (vref (zil-array-data array) index)))
+          (let ((dim (zcar dims)))
+               (cond
+                ((not (integerp dim))
+                 (zerror "Invalid index specified for array"
+                         (zil-array-name array) dim))
+                ((or (minusp dim)
+                     (>= dim (zcar dimx)))
+                 (zerror "Out-of-range index specified for array"
+                         (zil-array-name array) dim))
+                (t
+                 (incf index
+                       (* dim (do ((d (cdr dimx) (cdr d))
+                                   (prod 1 (* (zcar d) prod)))
+                                  ((null d) prod))))))))))))
+
+(defun arrayp (a)
+ (zil-array-p (if (symbolp a) (get a 'array) a)))
+
+;
+; *ARRAYCALL must be defined before *ARRAY, since *ARRAY uses the SUBR
+; property of *ARRAYCALL.
+;
+
+(xdefmacro arraycall (type array &rest dims)
+ `(*arraycall ',type ,array . ,dims))
+
+(defun *arraycall (type array &rest dims)
+ (let ((real-array (zil-array array)))
+      (zilapply (zil-array-function real-array) dims)))
+
+(defun (*arraycall setfmethod) (a b)
+ `(,@a ,b)
+)
+
+(eval-when ()
+ #.(defvar funprop ' #+ZILCO subr #-ZILCO expr)
+)
+
+(defun *array (name type &rest dims
+                         &aux (ndims (length dims))
+                              newarray oldarray oldsubr arfun)
+
+ (when name
+       (when (setq oldarray (get name 'array))
+             (push oldarray (get name 'array-save-array))
+             (remprop name 'array)))
+
+ (setq newarray
+  (let ((size (case ndims
+                    (0 (zerror "No array dimensions given" name))
+                    (1 (adv (zcar dims)))
+                    (2 (* (adv (zcar dims)) (adv (zcadr dims))))
+                    (t (do ((dims dims (cdr dims))
+                            (prod 1 (* (adv (zcar dims)) prod)))
+                           ((null dims) prod)))))
+        (initial-value (case type
+                             (fixnum 0)
+                             (flonum 0.0)
+                             (t nil)))
+       )
+        (make-zil-array
+            :name       name
+            :data       (make-vector size initial-value)
+            :type       type
+            :dimensions dims
+        )))
+
+ (setf (zil-array-function newarray)
+       (let ((zarray newarray)) ; This variable is closed over.
+        (case ndims
+         (1 #'(lambda (&optional (arg1 nil arg1?)
+                                 (arg2 nil arg2?)
+                       &rest     argr)
+               (unless arg1?
+                (zerror "Too few arguments to array"
+                        (zil-array-name zarray)))
+               (when argr
+                (zerror "Too many arguments to array"
+                        (zil-array-name zarray)))
+               (zil-1d-array-handler zarray arg1 arg2 arg2?)))
+         (2 #'(lambda (&optional (arg1 nil arg1?)
+                                 (arg2 nil arg2?)
+                                 (arg3 nil arg3?)
+                       &rest     argr)
+               (unless (and arg1? arg2?)
+                (zerror "Too few arguments to array"
+                        (zil-array-name zarray)))
+               (when argr
+                (zerror "Too many arguments to array"
+                        (zil-array-name zarray)))
+               (zil-2d-array-handler zarray arg1 arg2 arg3 arg3?)))
+         (t #'(lambda (&rest argr)
+               (zil-nd-array-handler zarray argr))))))
+
+ (cond
+  (name
+   (putprop name newarray 'array)
+   (when (setq oldsubr (get name '#.funprop))
+         (push oldsubr (get name 'array-save-subr))
+         (remprop name '#.funprop))
+
+   (setf (plist name); Put new functional prop on end so gets found last
+         (nconc (plist name)
+                (list '#.funprop (zil-array-function newarray))))
+
+   (putprop name #'(lambda (a b) `(store ,a ,b)) 'setfmethod)
+
+   name)       ; Return the name of the array.
+  (t
+   newarray)   ; Unnamed array - return the array object itself.
+ )
+)
+
+(defmacro adv (x)
+ (let ((g (gensym)))
+      `(let ((,g ,x))
+            (if (integerp ,g)
+                ,g
+                (zerror "Invalid array dimension specified" name ,g)))))
+
+
+(xdefmacro array (name type &rest dims)
+ (prog
+  `(*array ',name ',type . ,dims)
+  (putprop name #'(lambda (a b) `(store ,a ,b)) 'setfmethod)
+ )
+)
+
+(xdefmacro store (form value) (mxstore form value))
+
+(defun mxstore (form value)
+ (prog (newform)
+  xloop
+       (and (consp form)
+            (eq (zcar form) 'apply)
+            (return `(apply . ,(store-munge (cdr form) value))))
+       (setq newform (macroexpand-1 form))
+       (unless (eq newform form)
+               (setq form newform)
+               (go xloop))
+       (return `(,@newform ,value))
+ )
+)
+
+(defmacro store-munge (args value)
+ `(loop for sub-args on ,args
+        when (null (cdr sub-args))
+        collect `(append ,(zcar sub-args) (list ,,value))
+        else
+        collect (zcar sub-args)
+  ))
+
+(defun arraydims (array)
+ (setq array (zil-array array))
+ (cons (zil-array-type array)
+       (zil-array-dimensions array))
+)
+
+(defun array-type (array)
+ (zil-array-type (zil-array array))
+)
+
+(defun array-\#-dims (array)
+ (length (zil-array-dimensions (zil-array array)))
+)
+
+(defun array-dimension-n (dim array)
+ (let ((array (zil-array array)))
+  (cond
+   ((not (integerp dim))
+    (zerror "Arg 1 to ARRAY-DIMENSION-N not an integer" dim))
+   ((not (plusp dim))
+    nil)
+   (t
+    (nth (1- dim) (zil-array-dimensions array))))))
+
+(defun listarray (array)
+ (vlist (zil-array-data (zil-array array))))
+
+(defun fillarray (array value &aux real-array)
+ (setq real-array (zil-array array))
+ (cond
+  ((arrayp value)
+   (do* ((i 0 (add1 i))
+         (d (zil-array-data real-array))
+         (l (vlength d))
+         (filler (zil-array-data (zil-array value)))
+         (fi 0 (add1 fi))
+         (fl (vlength filler))
+        )
+        ((or (>= fi fl) (>= i l)) array)
+        (vset d i (vref filler fi))))
+  ((vectorp value)
+   (do* ((i 0 (add1 i))
+         (d (zil-array-data real-array))
+         (l (vlength d))
+         (fi 0 (add1 fi))
+         (fl (vlength value))
+        )
+        ((or (>= fi fl) (>= i l)) array)
+        (vset d i (vref value fi))))
+  ((consp value)
+   (do* ((i 0 (add1 i))
+         (d (zil-array-data real-array))
+         (l (vlength d))
+         (value value (cdr value))
+         (lastval (car (last value)))         ; Note - no ZCAR here.
+        )
+        ((>= i l) array)
+        (vset d i (if value (zcar value) lastval))))
+  (t
+   (zerror "Arg 2 to FILLARRAY not an array, vector or list" value))))
+
+(defun *rearray (array &optional type &rest dims &aux real-array a)
+ (setq real-array (zil-array array))
+ (cond
+  ((not (symbolp array))
+   (warn "Can't do *REARRAY on this array" array)
+   nil)
+  ((null type)                           ; No type or dimensions.
+   (if (setq a (pop (get array 'array-save-subr)))
+       (putprop array a '#.funprop)
+       (remprop array '#.funprop))
+   (if (setq a (pop (get array 'array-save-array)))
+       (putprop array a 'array)
+       (remprop array 'array))
+  )
+  ((null dims)                           ; Type but no dimensions.
+   (setf (zil-array-type real-array) type)
+  )
+  (t
+   (prog (a b c d e f i)
+         (setq a (zil-array-data real-array))     ; Old array data.
+         (setq b (zilapply #'*array (list* array type dims)))
+         (setq c (zil-array-data (zil-array b)))  ; New array data.
+         (setq d (vlength c))
+         (setq e (vlength a))
+         (setq i 0)
+    loop (and (eql i d)
+              (return array))
+         (and (eql i e) (go loop2))
+         (vset c i (setq f (vref a i)))
+         (setq i (add1 i))
+         (go loop)
+   loop2 (and (eql i d)
+              (return array))
+         (vset c i f)
+         (setq i (add1 i))
+         (go loop2)
+         )))
+ array
+)
+

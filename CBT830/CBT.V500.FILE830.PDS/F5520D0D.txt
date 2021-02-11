@@ -1,0 +1,371 @@
+Restoring records based on keys
+
+The following program, KEYRANGE, could be of use to any
+MVS Update readers who use Goal Systems' FAVER.
+KEYRANGE allows users to restore a range of records based
+on the keys. The user supplies the cluster's key length and
+offset, the 'from' key, and the 'to' key. Only records that fall
+into the specified range are restored to the cluster. Having this
+feature implemented as an exit is nice because it is independent
+of the release of FAVER - there is no need to upgrade or wait
+for the feature as a future enhancement.
+
+         TITLE 'KEYRANGE '
+*+--------------------------------------------------------------------+
+*|  Keyrange is a sample user exit for the GVRESTOR program used      |
+*|  to restore records in the range (inclusive) FROMKEY to TOKEY.     |
+*|   Entry:  Gvrestor passes the following parms:                     |
+*|             r1 ->  A( flag )                                       |
+*|                    A( record length )                              |
+*|                    A( record )                                     |
+*|           Upon entry, the ddname $UXPARMS is opened and the control|
+*|           statements for KEYRANGE are read and examined.  The      |
+*|           first parm must be KEYS(len offset), followed by the     |
+*|           FROMKEY() and finally the TOKEY() parm.  Only one parm   |
+*|           per line is allowed;  the parms may begin in any         |
+*|           column.  Below is an example:                            |
+*|                //$UXPARMS  DD  *                                   |
+*|                     KEYS(90 0)                                     |
+*|                     FROMKEY(RECORD30)                              |
+*|                     TOKEY  (RECORD50)                              |
+*|           The KEYS(len off) parm must specify the key length and   |
+*|           offset from the DEFINE of the cluster (in other words,   |
+*|           the record's key length and offset).  The FROMKEY() and  |
+*|           TOKEY() may be generic.  They may range from 1           |
+*|           byte in length up to the length of the key.              |
+*|           Below is another example:                                |
+*|                //$UXPARMS  DD  *                                   |
+*|                     KEYS(8  5)                                     |
+*|                     FROMKEY(X'C1')                                 |
+*|                       TOKEY(X'C2')                                 |
+*|                //SYSIN     DD  *                                   |
+*|                   RESTORE                                          |
+*|                   CLUSTER                                          |
+*|                   CL=MASTER.CLUSTER  UEXIT=KEYRANGE                |
+*|           The above example specifies FROMKEY and TOKEY in a hex   |
+*|           format.  The example restores records in the range from  |
+*|           A (X'C1') to B (X'C2').                                  |
+*|           If there is any type of error, the exit is turned off at |
+*|           the point of error.  All records are restored from that  |
+*|           point.                                                   |
+*|   Return: If in range, a RESTORE code is returned, otherwise a     |
+*|           DELETE code is returned.                                 |
+*+--------------------------------------------------------------------+
+KEYRANGE    CSECT
+         B     AROUND(R15)         Go around--->
+         DC    CL8'KEYRANGE'
+         DS    0H
+AROUND   EQU   *-KEYRANGE
+         STM   R14,R12,12(R13)     Save callers regs
+         LR    R12,R15             Copy BALR reg for base
+         USING KEYRANGE,R12
+         LA    R14,SAVEAREA        Address save area
+         ST    R13,4(R14)          Chain callers save to own
+         ST    R14,8(R13)          Chain own save to callers
+         LR    R13,R14             Address own save area
+*|  save parameters passed from gvrestor.  check for eof.             |
+         LM    R3,R5,0(R1)         load parm addresses in R3 - R5
+         ST    R3,FLAG@            save address of flag field
+         L     R4,0(R4)            get the passed record's length
+         ST    R4,RECLEN           save the record length
+         ST    R5,RECORD@          save the address to the passed rec
+         CLC   0(4,R3),=F'-1'      end of file?
+         BE    CLEOF               yes, wrap if up ->
+*|  if $uxparms is opened ok, BRANCH2 will be set so that on each     |
+*|     subsequent call the record is immediately processed.           |
+*|     otherwise if a problem is encountered BRANCH1 will be set      |
+*|     to bypass this exit.                                           |
+*|  the first time in however, attempt to OPEN and process $UXPARMS.  |
+BRANCH1  BC    0,BYPASSUX          problem(s) encountered, do not use
+BRANCH2  BC    0,CHECKRNG          check to see if key is in range
+         LA    R8,UXSYSIN          address dcb
+         USING IHADCB,R8
+         OPEN  ((R8),(INPUT))      open $UXPARMS data set
+         TM    DCBOFLGS,DCBOFOPN   open ok?
+         BZ    ERROR               no ->
+         MVI   BRANCH2+1,X'F0'     open successfully, set branch
+         DROP  R8
+*|  read a control card.  to keep it simple, require 1 control        |
+*|  statement per line.                                               |
+GETUXPRM DS    0H
+         GET   UXSYSIN,CARD        read a control parm?
+         OI    UXFLAG,CARDREAD     yes
+         LA    R3,CARD             point to input buffer
+         BAL   R7,NONBLANK         find a parm ->>
+         CLC   FROMKEY,0(R3)       fromkey control parm?
+         BE    FROMKEYH            yes, handle parm
+         CLC   TOKEY,0(R3)         tokey control parm?
+         BE    TOKEYH              yes, handle parm
+         CLC   KEYS,0(R3)          keys parm?
+         BE    KEYSH               yes, handle parm
+         B     ERROR               else unknown parm
+*|  fromkey handler - the key can be specified in character or hex.   |
+*|  to specify a hex key, the key must be enclosed in single quotes   |
+*|  and preceded by an X.  For example, FROMKEY(X'40404040').         |
+*|  Generic keys are allowed by specifying only a partial key.  A     |
+*|  FROMKEY cannot be longer than the cluster's key length.           |
+FROMKEYH DS    0H
+         LA    R3,L'FROMKEY(R3)    point beyond parm
+         BAL   R7,NONBLANK         get next nonblank
+         CLI   0(R3),C'('          open paren?
+         BNE   ERROR               no, error ->
+         LA    R3,1(R3)            bypass
+         BAL   R7,NONBLANK         get next nonblank
+         ICM   R4,15,KEYLEN        get the key length
+         BZ    ERROR               zero length not allowed
+         GETMAIN R,LV=(R4)
+         LTR   R15,R15             storage acquired ok?
+         BNZ   ERROR               no ->
+         ST    R1,FROMKEY@         save address of fromkey
+         BAL   R7,SAVEKEY          move fromkey to acquired area
+         L     R1,FROMKEY@         address fromkey
+         BAL   R7,FTKEYLEN         get the length of the fromkey
+         ST    R6,FROMKLEN         save length of fromkey
+         B     GETUXPRM            get next parm ----------->
+*|  tokey handler - the key can be specified in character or hex.     |
+*|  to specify a hex key, the key must be enclosed in single quotes   |
+*|  and preceded by an X.  For example, TOKEY(X'40404040').           |
+*|  Generic keys are allowed by specifying only a partial key.  A     |
+*|  TOKEY cannot be longer than the cluster's key length.             |
+TOKEYH   DS    0H
+         LA    R3,L'TOKEY(R3)      point beyond parm
+         BAL   R7,NONBLANK         get next nonblank
+         CLI   0(R3),C'('          open paren?
+         BNE   ERROR               no, error ->
+         LA    R3,1(R3)            bypass
+         BAL   R7,NONBLANK         get next nonblank
+         ICM   R4,15,KEYLEN        get the key length
+         BZ    ERROR               zero length not allowed
+         GETMAIN R,LV=(R4)
+         LTR   R15,R15             storage acquired ok?
+         BNZ   ERROR               no ->
+         ST    R1,TOKEY@           save address of tokey
+         BAL   R7,SAVEKEY          save tokey into acquired area
+         L     R1,TOKEY@           address tokey
+         BAL   R7,FTKEYLEN         get the tokey length
+         ST    R6,TOKEYLEN         save length of tokey
+         B     GETUXPRM            next parm -->>
+*|   keys handler - user must specify the key length and offset       |
+*|   in the form of "KEYS(length offset)".                            |
+KEYSH    DS    0H
+         LA    R3,L'KEYS(R3)       get past the parm
+         BAL   R7,NONBLANK         get next nonblank
+         CLI   0(R3),C'('          must be next character
+         BNE   ERROR               no, error
+         LA    R3,1(R3)            bypass
+         BAL   R7,NONBLANK         point to length
+         BAL   R7,CONVERT          convert character to packed
+         ST    R6,KEYLEN           save key length
+         BAL   R7,NONBLANK         point to offset
+         BAL   R7,CONVERT          convert character rep to packed
+         ST    R6,KEYOFF           save converted key offset
+         B     GETUXPRM            continue --->
+*|   savekey  - copy/translate fromkey or tokey from $uxparms to      |
+*|   area pointed to by r1.   r3 must point to first byte beyond the  |
+*|   open paren "(".                                                  |
+SAVEKEY  DS    0H
+         STM   R0,R15,SUBSAVE      save regs
+         L     R6,KEYLEN           get length of key
+         BCTR  R6,0                -1 for mvc
+         BCTR  R6,0                -1 for the first +
+         MVI   0(R1),C'+'          init key area
+         MVC   1(0,R1),0(R1)       complete initialization
+         EX    R6,*-6              execute the move
+         CLC   =X'E77D',0(R3)      is this a hex fromkey?
+         BE    HEXKEY              process the hex fromkey ->
+         L     R6,KEYLEN           get counter
+CHARKEY  CLI   0(R3),C')'          close paren found?
+         BE    FKCLOSED            yes ->
+         MVC   0(1,R1),0(R3)       move 1 byte to key area
+         LA    R1,1(R1)            increment target
+         LA    R3,1(R3)            increment source
+         BCT   R6,CHARKEY          still within key length?
+         B     ERROR               no, error
+*|   handle hex fromkey                                               |
+HEXKEY   DS    0H
+         LA    R3,2(R3)            point beyond X'
+         L     R6,KEYLEN           get the key length
+         SLL   R6,1                * 2 = max hex length
+HEXKEYLP CLC   =X'7D5D',0(R3)      at end?  ')
+         BE    FKCLOSED            yes ->
+         MVC   CVHX(3),0(R3)       convert character...
+         TR    CVHX,HXTHX          representation of hex to hex
+         PACK  CVPK,CVHX           1 byte converted
+         MVC   0(1,R1),CVPK        move a byte
+         LA    R3,2(R3)            bump source
+         LA    R1,1(R1)            bump target
+         BCT   R6,HEXKEYLP         in range of key length?
+         B     ERROR               no error
+FKCLOSED DS    0H
+         LM    R0,R2,SUBSAVE       restore regs
+         LM    R4,R15,SUBSAVE+16   restore regs
+         BR    R7                  return --->
+*|   Check key range - if the incoming record's key is less than or   |
+*|   greater than fromkey or tokey respectively, pass a 'delete' code |
+*|   back to gvrestor  else, if the key is within the fromkey/tokey   |
+*|   range, then pass a 'restore' code to gvrestor.                   |
+CHECKRNG DS    0H
+         L     R6,RECORD@          address passed record
+         A     R6,KEYOFF           point to key in record
+         L     R4,FROMKEY@         address fromkey
+         L     R8,FROMKLEN         use length of fromkey as counter
+FRMKYCHK CLC   0(1,R6),0(R4)       compare rec key to fromkey
+         BL    DELETE              if low, delete record
+         LA    R4,1(R4)            next byte of fromkey
+         LA    R6,1(R6)            next byte of record key
+         BCT   R8,FRMKYCHK         keep checking fromkey
+*|   check record key against tokey                                   |
+         L     R6,RECORD@          address passed record
+         A     R6,KEYOFF           point to key in record
+         L     R4,TOKEY@           address tokey
+         L     R8,TOKEYLEN         use length of tokey as counter
+TOKYCHK  CLC   0(1,R6),0(R4)       compare rec key to fromkey
+         BH    DELETE              if high, delete record
+         LA    R4,1(R4)            next byte of fromkey
+         LA    R6,1(R6)            next byte of record key
+         BCT   R8,TOKYCHK          keep checking fromkey
+*|   record key has passed fromkey/tokey tests, keep the record       |
+         B     RESTORE
+*|   Convert takes character representation of a number and converts  |
+*|   it to the packed decimal version.  r3 points to character rep    |
+*|   and r6 returns the packed version.                               |
+CONVERT  DS    0H
+         STM   R0,R15,SUBSAVE      save incoming
+         LR    R5,R3               copy pointer to char
+         SLR   R7,R7               zero length accumulator
+         ST    R7,KEYOWORD         zero work area
+GETLEN   CLI   0(R5),C' '          delimiter?
+         BE    CHKLEN              yes, check length
+         CLI   0(R5),C')'          delimiter?
+         BE    CHKLEN              yes, check length
+         LA    R7,1(R7)            accumulate length
+         LA    R5,1(R5)            next byte
+         B     GETLEN              next....
+CHKLEN   DS    0H
+         LTR   R7,R7               test length
+         BZ    ERROR               zero is not allowed, error
+DCKLOP   LA    R8,TEMPWORD+3       target address for unpack
+         MVC   CVHX(3),0(R3)       move 3 bytes to get 1
+         TR    CVHX,HXTHX          translate
+         PACK  CVPK,CVHX           convert
+         MVC   0(1,R8),CVPK        save converted byte
+         L     R9,TEMPWORD         get byte just converted
+         SRL   R9,4                shift out garbage
+         ST    R9,TEMPWORD         save
+         L     R9,KEYOWORD         gotta shift it
+         SLL   R9,4                left 1 position
+         ST    R9,KEYOWORD         save
+         OC    KEYOWORD,TEMPWORD   combine
+         LA    R3,1(R3)            next digit
+         SLR   R9,R9               clear
+         ST    R9,TEMPWORD         zero out
+         BCT   R7,DCKOLP           continue ->>
+         LM    R0,R2,SUBSAVE       restore regs except for r3
+         LM    R4,R15,SUBSAVE+16   restore regs
+         L     R6,KEYOWORD         return to caller
+         SLL   R6,4                convert pack decimal
+         O     R6,=X'0000000F'     to hex representation
+         ST    R6,DWORD+4          save to work area
+         CVB   R6,DWORD            ...
+         BR    R7                  goback
+*|   nonblank - find the next nonblank character (r3)                 |
+NONBLANK DS    0H
+         LA    R5,CARD+80          address end of card
+NEXTBYTE CLI   0(R3),C' '          blank?
+         BNE   NBRET               no, return
+         LA    R3,1(R3)            next character
+         CR    R3,R5               end of card?
+         BH    ERROR               beyond, error
+         B     NEXTBYTE            continue
+NBRET    BR    R7                  goback
+*|   From/to key length finder                                        |
+*|         in:  r1 -> fromkey or tokey                                |
+*|        out:  r6 -  length of key passed                            |
+FTKEYLEN DS    0H
+         LR    R6,R1               copy address
+         L     R9,KEYLEN           max length of a from/to key
+STOPCHAR CLI   0(R6),C'+'          stop character?
+         BE    ENDFOUND            yes
+         LA    R6,1(R6)            no, increment to next byte of key
+         BCT   R9,STOPCHAR         keep looking for stop char
+ENDFOUND SR    R6,R1               return length in R6
+         BR    R7                  return ->
+*|   delete a record - pass delete code to gvrestore                  |
+DELETE   DS    0H
+         L     R1,FLAG@            address restore flag
+         LA    R2,DELETECD         get the delete code
+         ST    R2,0(R1)            set code
+         B     DONE                return to gvrestore
+*|   restore a record - pass restore code to gvrestore                |
+RESTORE  DS    0H
+         L     R1,FLAG@            address restore flag
+         LA    R2,RESTORCD         get the restore code
+         ST    R2,0(R1)            set code
+         B     DONE                return to restore
+*|   return to caller                                                 |
+DONE     EQU   *
+CLEOF    EQU   *
+         L     R13,4(,R13)         get callers save area pointer
+         L     R14,12(,R13)        get return address
+         LM    R0,R12,20(R13)      restore R0 through R12
+         BR    R14                 return to caller --->
+*|   error handler - for any error, turn off this exit.               |
+ERROR    DS    0H
+         MVI   BRANCH1+1,X'F0'     disable the exit
+         B     RESTORE             restore all recs
+*|  bypass user exit - by default, restore all records once bypass    |
+*|  is enacted.                                                       |
+BYPASSUX DS    0H
+         B     RESTORE
+*|   user exit eodad exit                                             |
+UXEOF    DS    0H
+         CLOSE UXSYSIN
+         TM    UXFLAG,CARDREAD     any control statements read?
+         BZ    ERROR               no, error
+         B     CHECKRNG            now check first record ->>>
+         TITLE 'KEYRANGE - Data Areas'
+SAVEAREA DS    18F                 save area
+SUBSAVE  DS    16F                 subroutine save area
+FROMKLEN DS    F                   length of fromkey
+TOKEYLEN DS    F                   length of tokey
+KEYLEN   DS    F                   length of key (from KEYS(len off)
+KEYOFF   DS    F                   offset of key (from KEYS(len off)
+FROMKEY@ DS    F                   address of fromkey area
+TOKEY@   DS    F                   address of tokey area
+TEMPWORD DS    F                   work area
+KEYOWORD DS    F                   convert work area
+RECLEN   DS    F                   record length (from gvrestor)
+RECORD@  DS    F                   address of passed record
+FLAG@    DS    F                   address of passed flag
+DWORD    DS    D                   doubleword work area
+FROMKEY  DC    C'FROMKEY'          ...constants...
+TOKEY    DC    C'TOKEY'
+KEYS     DC    C'KEYS'
+UXFLAG   DS    XL1                 various indicators follow:
+CARDREAD EQU   X'80'               control statement read flag
+DELETECD EQU   8                   delete code
+RESTORCD EQU   4                   restore code
+CARD     DS    CL80                input area
+CVPK     DS    CL2
+CVHX     DS    CL3
+HXTHX    EQU   *-193
+         DC    X'FAFBFCFDFEFF'
+         DC    41X'00'
+         DC    C'0123456789'
+UXSYSIN  DCB   DDNAME=$UXPARMS,                                        C
+               DSORG=PS                                                C
+               MACRF=GM                                                C
+               EODAD=UXEOF,                                            C
+               RECFM=FB,                                               C
+               LRECL=80,                                               C
+               BLKSIZE=4000
+         LTORG
+PATCH    DC    64S(*)
+         DCBD  DSORG=PS,DEVD=(DA)
+         END
+
+
+J Patrick Sweeney
+Associate Developer
+Goal Systems International Inc (USA)                  c Xephon 1992
+

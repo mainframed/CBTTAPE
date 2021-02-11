@@ -1,0 +1,148 @@
+
+## $DOC.txt
+```
+TRYIT is an ISPF Edit macro that will invoke current edit data. See the
+tutorial for more information.
+
+   Members:
+
+      $DOC     - this member
+      $RECV    - Exec to Receive the ISPF EXEC, PANELS, and SAMPLES
+      PANELS   - TSO Transmit of the ISPF Panels
+      REXX     - RUNC REXX Library in TSO Transmit
+
+Installation:
+
+Execute the $RECV exec to create EXEC, and PANELS libraries.
+
+Installation:
+   1. Copy the restored EXEC members into your SYSEXEC (or SYSPROC) library
+   2. Copy the restored PANELS members into your ISPPLIB library
+```
+
+## $USERDOC.txt
+```
+Users Guide for TRYIT
+by Lionel B. Dyck
+
+Revised Feb 28, 2019
+
+===== Table of Contents
+
+      Source and License
+      Introduction
+      Usage
+
+===== Source and License
+
+The full source for TRYIT is distributed with the package, which may
+be found at http://www.lbdsoftware.com
+
+License: This code is distributed under the GPL License which may
+be found at http://www.gnu.org/copyleft/gpl.html
+
+===== Introduction
+
+TRYIT is an ISPF Edit command that is designed to be used to test an
+Assembler program, CLIST, REXX Exec, JCL, ISPF Panel or ISPF Skeleton
+while it is being edited. The way this works is such that the JCL,
+CLIST, REXX Exec, ISPF Panel, or ISPF Skeleton does *not* have to be in
+a library in the existing SYSPROC, SYSEXEC, ISPPLIB, or ISPSLIB
+allocations thus allowing the development and testing in other, less
+critical, data sets.
+
+If a JCL Syntax checking product is available then TRYIT can be used
+to invoke it - this is assuming the product can be invoked as an ISPF
+Edit Macro (e.g. CA-JCLCheck and JCLPrep).
+
+For Assembler programs the active member will be assembled and optionally
+linkedited into a specified target library. After entering TRYIT the user
+will be prompted to enter the assembly and linkedit information if the
+member is determined to be an assembler program.
+
+For CLIST and REXX Exec members the active data set in which the member
+resides will be allocated using the TSO ALTLIB facility and then the
+member executed, along with any passed optional parameters.
+
+For ISPF Panels and ISPF Skeletons the active data set in which the
+member resides will be allocated using the ISPF LIBDEF facility then
+then the panel Displayed or Selected based upon the parameters provided
+to TRYIT. If there are any errors in the panel or skeleton an ISPF
+message will be displayed and the error may then be corrected using ISPF
+Edit and TRYIT used once again to verify the panel or skeleton - all
+without the need to split the screen and invoke ISPF Test.
+
+Note there are limitations to the Skeleton testing as variables and
+imbed tables may not be available.
+
+Because of the use of ALTLIB or LIBDEF the member being tested will be
+able to find subroutines or other ISPF Panels providing they reside
+within the data set being edited thus allowing an entire package to be
+developed, updated, and/or tested, in less critical libraries.
+
+The type of member being edited is dynamically determined with a default
+of REXX Exec assumed if all the tests fail. The tests include:
+
+        1) The data set suffix
+           - Assembler: ASM ASSEM
+           - CLIST: CLIST, SYSPROC, CMDPROC
+           - REXX:  EXEC, REXX, SYSEXEC
+           - Panel: PANEL, PANELS, ISPPLIB
+           - Skels: SKEL, SKELS, ISPSLIB
+        2) CLIST: Look for PROC followed by a number on record 1
+        3) REXX: Look for the word REXX in record 1
+        4) Panel: Look for any of these in record 1
+           )ATTR )PANEL )CCSID )PROC )BODY )INIT )REINIT ..PREP:
+        5) JCL: First record starts with //
+
+This provides a very easy method for iterative testing and updating of
+the member until the member works as desired.
+
+===== Usage
+
+Use TRYIT from any ISPF Edit command line while editing a CLIST, REXX Exec, or
+ISPF Panel. The syntax is:
+
+    TRYIT optional-parms
+
+The optional-parms are:
+
+     ? to display the ISPF Tutorial
+
+     For CLISTs and REXX Execs any parameters that the member being edited
+     would need to have passed to it.
+
+     For Assembler there are not supported options at this time.
+
+     For ISPF Panels one, or more, of the following:
+
+         APPL followed by a 1 to 4 character application id to be
+             used when SEL is specified to select the panel
+         POP will cause the panel to be displayed as a popup
+             - optionally POP may be followed by a row and column
+               to be used for the popup
+         SEL will Select the panel instead of just Displaying it
+         TUT will display the panel as an ISPF Tutorial
+             (default is to just display the panel)
+
+     For example:
+
+          EDIT       hlq.test.exec(sample)
+          Command ===> tryit opt1 opt2
+
+Upon completion of the processing of the member a message is displayed
+in the upper right with a return code or short message with a long
+message, available by pressing PF1 (Help), with more information.  For
+CLISTs and REXX Execs the return code is whatever the CLIST or REXX Exec
+return while for ISPF Panels the message is either a zero return code if
+there are no problems or the short and long error messages generated by
+the ISPF Display, Selection, or Tutorial services.
+
+For Assembler programs upon completion of the assembly the assembly
+listing will be displayed using ISPF browse. If a load library is
+specified under the link edit options then after the linkedit the
+linkedit listing will also be displayed using ISPF Browse.  The
+linkedit will only occur if the assembly completes with a return code
+less than 8.
+```
+

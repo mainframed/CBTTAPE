@@ -1,0 +1,473 @@
+/***************************************************************/
+/*                     scr.c                                   */
+/* A set of video management functions from the book           */
+/* Systems Programming in C by Michael J. Young                */
+/***************************************************************/
+#include <dos.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <mem.h>
+#include <ctype.h>
+#include <sys/stat.h> */
+#include <scr.h>
+
+/***************************************************************/
+/* gets the current video mode, number of display columns, and */
+/* video page.                                                 */
+/***************************************************************/
+void get_mode(struct mode *mode_ptr) {
+ unsigned char ah_hold;
+
+ _AH = 15;                   /* BIOS get video mode service */
+ geninterrupt(0x10);         /* BIOS video services */
+ ah_hold = _AH;               /* AH returns columns */
+ mode_ptr->video_mode = _AL; /* AL returns mode */
+ mode_ptr->columns = ah_hold;
+ mode_ptr->video_page = _BH; /* BH returns active page */
+}
+
+/***************************************************************/
+/* sets the video mode and display page. note that the columns */
+/* field is not used and will not be set, since this value is  */
+/* implicit in the mode.                                       */
+/***************************************************************/
+void set_mode(struct mode *mode_ptr) {
+ _AH = 0;     /* BIOS set mode service */
+ _AL = mode_ptr->video_mode;
+ geninterrupt(0x10);       /* BIOS video services */
+ _AH = 5;     /* BIOS set active page service */
+ _AL = mode_ptr->video_page;
+ geninterrupt(0x10);   /* BIOS video services */
+}
+
+/***************************************************************/
+/* assigns the current cursor position to the variables pointed*/
+/* to by row and col for video page page.                      */
+/***************************************************************/
+void get_cur(int *row, int *col, int page) {
+ _BH = (unsigned char)page;
+ _AH = 3;
+ geninterrupt(0x10);
+ *row = _DH;
+ *col = _DL;
+ }
+
+/***************************************************************/
+/* positions the cursor as specified by row and col for the    */
+/* video page page.                                            */
+/***************************************************************/
+void set_cur(int row, int col, int page) {
+ _BH = (unsigned char)page;
+ _DH = row;
+ _DL = col;
+ _AH = 2;     /* BIOS set cursor position service */
+ geninterrupt(0x10);         /* BIOS video service */
+}
+
+/***************************************************************/
+/* assigns the current cursor atarting and stopping lines to   */
+/* the variables pointed to by start_line and stop_line. These */
+/* parameters determine the shape of the cursor.               */
+/***************************************************************/
+void get_style(int *start_line, int *stop_line) {
+ _BH = 0;                    /* get it for page 0, as all are same */
+ _AH = 3;     /* BIOS read cursor position service */
+ geninterrupt(0x10);         /* BIOS video service */
+ *start_line = _CH;
+ *stop_line = _CL;
+}
+
+/***************************************************************/
+/* sets the cursor shape according to the values passed in     */
+/* start_line and stop_line.                                   */
+/***************************************************************/
+void set_style(int start_line, int stop_line) {
+ _CH = start_line;
+ _CL = stop_line;
+ _AH = 1;     /* BIOS set cursor type service */
+ geninterrupt(0x10);         /* BIOS video service */
+}
+
+/***************************************************************/
+/*                  data for the push and pop functions        */
+/***************************************************************/
+#define MAXSCREENS 10
+
+static char *bufptar[MAXSCREENS]; /* Elements of this array point to */
+         /* the screen storage buffers on   */
+         /* the screen stack. */
+static int bufidx = -1;    /* Index to bufptar  */
+
+/***************************************************************/
+/* save content of current screen on the screen stack          */
+/***************************************************************/
+int scr_push(void) {
+ int video_seg;
+
+ if(++bufidx >= MAXSCREENS)  /* test if max exceeded */
+  return(MAXTOOSMALL);
+ if((bufptar[bufidx] = malloc(4000)) == NULL) {
+  --bufidx;
+  return(NOHEAP);
+ }
+ if(*(char far *)0x00400049 == 7) /* test video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ movedata(video_seg, 0, FP_SEG((char far *)bufptar[bufidx]),
+    FP_OFF((char far *)bufptar[bufidx]),4000);
+ return(NOERROR);
+}
+
+/***************************************************************/
+/* restores the most recently saved screen on the screen stack */
+/* and removes it from the stack if remove is non-zero;        */
+/***************************************************************/
+int scr_pop(int remove) {
+ int video_seg;
+
+ if(bufidx < 0)            /* no screens to restore */
+  return(STACKEMPTY);
+ if(*(char far *)0x00400049 == 7) /* test video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ movedata(FP_SEG((char far *)bufptar[bufidx]),
+    FP_OFF((char far *)bufptar[bufidx]),video_seg,0,4000);
+ if(remove)
+  free(bufptar[bufidx--]);
+ return(NOERROR);
+}
+
+/******************************************************************/
+/* reads the 4000-byte screen image file specified by filename    */
+/* (may contain a full path) into the buffer pointed to by buffer */
+/******************************************************************/
+#include <fcntl.h>
+#include <io.h>
+
+int read_window(char *buffer, char *filename) {
+ int file_handle;
+
+ if((file_handle = open(filename,O_RDONLY | O_BINARY)) == -1)
+  return(OPENERR);
+ if(read(file_handle, buffer, 4000) != 4000)
+  return(READERR);
+ if(close(file_handle) == -1)
+  return(CLOSERR);
+ return(NOERROR);
+}
+
+/********************************************************************/
+/* displays the rectangular area of the screen data buffer buffer   */
+/* specified by source_start_row, source_start_col, source_end_row, */
+/* and source_end_col at the beginning position on the screen given */
+/* by target_row and target_col.                                    */
+/********************************************************************/
+void put_window(char *buffer, int source_start_row, int source_start_col,
+    int source_end_row, int source_end_col, int target_row,
+    int target_col) {
+ register int row, source_off, video_off;
+ int bytes_per_row, video_seg;
+
+ /* calculate offset of 1st character in buffer */
+ source_off = FP_OFF((char far *)buffer) + source_start_row * 160
+     + source_start_col * 2;
+ if(*(char far *)0x00400049 == 7)  /* test video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ /* calculate offset of 1st character in video memory */
+ video_off = target_row * 160 + target_col * 2;
+ /* calculate number of bytes per row */
+ bytes_per_row = (source_end_col - source_start_col + 1) * 2;
+ /* move data to video memory row by row. */
+ for(row=1; row <= source_end_row - source_start_row + 1; ++row) {
+  movedata(FP_SEG((char far *)buffer),source_off, video_seg,
+     video_off, bytes_per_row);
+  source_off += 160;    /* increment offset in buffer */
+  video_off += 160;    /* increment offset in video memory */
+ }
+}
+
+/***************************************************************/
+/* displays null-terminated string with video attribute attr   */
+/* beginning at the position specified by row and col          */
+/***************************************************************/
+void scr_puts(char *string, int attr, int row, int col) {
+ register int a;      /* fast register storage for attr */
+ char far *video;     /* far pointer to video memory */
+ int video_seg, video_off;   /* Store video memory address */
+
+ a = attr;
+ if(*(char far *)0x00400049 == 7) /* Test video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ video_off = row * 160 + col * 2; /* Beginning video memory offset */
+ video = MK_FP(video_seg, video_off); /* Initialize video memory pointer */
+ while(*string) {            /* write characters from string until null */
+  *video++ = *string++;
+  *video++ = a;
+ }
+}
+
+/***************************************************************/
+/* displays a box on the screen starting at row and column ULR */
+/* and ULC and ending at row and column LRR and LRC. Style     */
+/* selects the line style, and may be between 0 and 3.         */
+/***************************************************************/
+void put_box(int ULR, int ULC, int LRR, int LRC, int style) {
+ register int i;
+ int delta1, delta2;
+ /* Store the box characters for each style */
+ static char ulc[] = {218,201,213,214};
+ static char urc[] = {191,187,184,183};
+ static char llc[] = {192,200,212,211};
+ static char lrc[] = {217,188,190,189};
+ static char hl[] = {196,205,205,196};
+ static char vl[] = {179,186,179,186};
+ int video_seg;     /* Segment address of video memory */
+ char far *video;    /* far pointer to video memory */
+
+ delta1 = (LRC - ULC) * 2;  /* bytes between 2 vertical lines */
+ delta2 = 160 - delta1;    /* bytes between right vertical   */
+         /* line and left vertical line of */
+         /* next row. */
+ if(*(char far *)0x00400049 == 7)  /* test video mode */
+  video_seg = 0xB000;             /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ video = MK_FP(video_seg, ULR * 160 + ULC * 2); /* Initialize far pointer*/
+               /* to upper left corner  */
+               /* of box. */
+ *video = ulc[style]; /* Upper left corner of box */
+ video += 2;     /* Draw upper left corner */
+ for(i=1; i <= LRC - ULC - 1; ++i) { /* Draw top horizontal line */
+  *video = hl[style];
+  video += 2;
+ }
+ *video = urc[style]; /* Draw upper right corner */
+ video += delta2;
+ for(i=1; i <= LRR - ULR - 1; ++i) {  /* Draw both vertical lines */
+  *video = vl[style]; /* left vertical line */
+  video += delta1;
+  *video = vl[style]; /* Right vertical line */
+  video += delta2;
+ }
+ *video = llc[style];        /* Draw lower left corner */
+ video += 2;
+ for(i=1; i <= LRC - ULC - 1; ++i) {  /* Draw bottom horizontal line */
+  *video = hl[style];
+  video += 2;
+ }
+ *video = lrc[style]; /* Draw lower right corner */
+}
+
+/***************************************************************/
+/* clears the rectangular section of the screen specified by   */
+/* the four parameters.                                        */
+/***************************************************************/
+void scr_clear(int start_row, int start_col, int stop_row, int stop_col) {
+ _BH = 0x07;     /* Use normal, white on black video attrib */
+ _CH = start_row;
+ _CL = start_col;
+ _DH = stop_row;
+ _DL = stop_col;
+ _AX = 0x600;    /* BIOS scroll page up function */
+ geninterrupt(0x10);   /* BIOS video services */
+}
+
+/****************************************************************/
+/* Reads characters into buffer, echoing the input starting     */
+/* at row and column using video attribute attr. characters are */
+/* read until an exit key (CR, Esc, or arrow) is encountered, or*/
+/* until the number read is one less than the specified buffer  */
+/* size, length. If the first key pressed is an exit key, the   */
+/* buffer is unaltered. Otherwise, the buffer is initially      */
+/* filled with blanks and terminated with a null; therefore, the*/
+/* resulting string will be blank-padded on the right. The      */
+/* terminating exit key is not placed into the buffer. The      */
+/* length parameter should equal the sizeof the receiving buffer*/
+/* The mode parameter can specify one or more of the following  */
+/* features (constants defined in scr.h):                       */
+/*      NOFEAT:   No mode features specified                    */
+/*      AUTOEXIT: Exit field automatically when buffer is full  */
+/*      UPPER:    Convert all letters to upper case             */
+/* The function returns one of the following codes indicating   */
+/* the field exit key pressed by the user:                      */
+/*     -1     <Esc>                                             */
+/*      0     <CR>                                              */
+/*      1     <Left arrow>                                      */
+/*      2     <Right arrow>                                     */
+/*      3     <Up arrow>                                        */
+/*      4     <Down arrow>                                      */
+/*      5     Automatic exit (last character entered and        */
+/*            AUTOEXIT was selected).                           */
+/****************************************************************/
+int scr_gets(char *buffer, int attr, int row, int col, int length, int mode) {
+ register int cur_col, i;  /* current column / loop index */
+ int video_seg;     /* Segment of video memory */
+ int far *video;     /* far pointer to video memory */
+ int key;      /* Stores input key value */
+ int first_char = 1;    /* Flag to indicate the 1st character */
+ char *chpt;      /* For filling buffer with blanks */
+ int far *intfp;     /* For filling buffer with blanks */
+
+ cur_col = col;     /* Initialize current column */
+ if(*(char far *)0x00400049 == 7) /* Test Video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ /* Initialize far pointer to video memory */
+ video = MK_FP(video_seg, row * 160 + col * 2);
+ /* Place cursor at first position */
+ set_cur(row, cur_col, 0);
+ for(;;)                      /* Keyboard read loop */
+  switch (key = kbd_getc()) {
+   case 0x011B:   /* Esc */
+    return(-1);
+   case 0x4B00:   /* Left arrow */
+    return(1);
+   case 0x4D00:   /* Right arrow */
+    return(2);
+   case 0x4800:   /* Up arrow */
+    return(3);
+   case 0x5000:   /* Down arrow */
+    return(4);
+   case 0x1C0D:   /* Return */
+    return(0);
+   case 0x0E08:   /* Backspace */
+    if(cur_col > col) {
+     set_cur(row, --cur_col, 0);
+     *--video = (attr << 8) | ' ';
+     *--buffer = ' ';
+    }
+    break;
+   default:
+    if(cur_col >= col + length - 1)    /* Test end of buffer */
+     break;
+    if(key & 0x00FF == 0)   /* Test for non-ASCII character */
+     break;
+    if(mode & UPPER)        /* Uppercase conversion */
+     key = toupper(key & 0x00FF);
+    else
+     key &= 0x00FF;      /* Remove extended code */
+    /* Place key in video memory and buffer */
+    *video++ = (attr << 8) | key;
+    *buffer++ = key;
+    set_cur(row, ++cur_col, 0);   /* Update cursor position */
+    if(first_char) {       /* Blank fill buffer on first char */
+     first_char = 0;
+     chpt = buffer;
+     intfp = video;
+     for(i = 1; i <= length-2; ++i) {
+      *chpt++ = ' ';
+      *intfp++ = (attr << 8) | ' ';
+     }
+     *chpt = '\0';
+    }
+    /* Test for AUTOEXIT */
+    if((cur_col >= col + length - 1) && (mode & AUTOEXIT))
+     return(5);            /* Code for AUTOEXIT */
+     break;
+   }
+}
+
+
+
+
+/****************************************************************/
+/* Displays the video attribute attr on the rectangular area    */
+/* of the screen specified by the last four parameters, without */
+/* altering existing screen data.                               */
+/****************************************************************/
+void put_attr(int attr, int start_row, int start_col,
+     int stop_row, int stop_col) {
+ register int row, col;
+ int video_seg, char_per_row, delta;
+ char far *video;    /* Far pointer to video memory */
+ if(*(char far *)0x00400049 == 7) /* test video mode */
+  video_seg = 0xB000;             /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ /* Initialize pointer to first attribute in video memory. */
+ video = MK_FP(video_seg, (start_row * 160 + start_col * 2) +1);
+ /* Calculate characters per row */
+ char_per_row = stop_col - start_col + 1;
+ /* Calculate increment value between rows */
+ delta = 160 - (stop_col - start_col +1) * 2;
+ for(row = 1; row <= stop_row - start_row +1; ++row) {
+  for(col = 1; col <= char_per_row; ++col) {        /* Display a row */
+   *video = attr;    /* write the attribute */
+   video += 2;     /* Increment to next attribute */
+  }
+  video += delta;      /* Increment to next row */
+ }
+}
+
+/****************************************************************/
+/* Reads a key using the BIOS. the return value contains:    */
+/*    High-order byte: extended code                            */
+/*    Low-order byte:  ASCII value                              */
+/****************************************************************/
+int kbd_getc() {
+ _AH = 0;     /* BIOS service 0: read keyboard */
+ geninterrupt(0x16);         /* BIOS keyboard services */
+ return(_AX);                /* Extended code/ASCII value returned in AH/AL */
+}
+
+/*****************************************************************/
+/* Writes the currently displayed screen image into the file     */
+/* specified by filename.                                        */
+/*****************************************************************/
+int write_window(char *filename) {
+ int filehandle, code = 0;
+
+ scr_push();                 /* save the screen on the stack */
+ if((filehandle = open(filename,O_RDWR|O_BINARY)) != -1) {
+  put_box(2,0,4,79,1);
+  scr_clear(3,1,3,78);
+  scr_puts("File already exists; overwrite? (y/n): ",0x8F,3,17);
+  set_cur(3,57,0);
+  switch(kbd_getc()&0x00FF) {
+   case 'y':
+   case 'Y':
+    code = 0;
+    break;
+   default:
+    close(filehandle);
+    code = 1;
+    break;
+  }
+ }
+ else if((filehandle = open(filename,O_RDWR|O_BINARY|O_CREAT,
+    S_IREAD|S_IWRITE)) == -1) {
+    scr_puts("Error creating file",0x8F,3,28);
+    code = 1;
+   }
+ if(!code) {
+  write(filehandle, (char *)bufptar[bufidx], 4000);
+  close(filehandle);
+ return(code);
+ }
+ scr_pop(-1);                        /* pop current screen off stack */
+}
+
+/***************************************************************/
+/* Writes a character the screen at the specified location and */
+/* with the attribute given. Cursor location is unchanged;     */
+/***************************************************************/
+void scr_putc(char key, int row, int col, int attr) {
+ char far *video;     /* far pointer to video memory */
+ int video_seg, video_off;   /* Store video memory address */
+
+ if(*(char far *)0x00400049 == 7) /* Test video mode */
+  video_seg = 0xB000;    /* monochrome */
+ else
+  video_seg = 0xB800;    /* color */
+ video_off = row * 160 + col * 2; /* Beginning video memory offset */
+ video = MK_FP(video_seg, video_off); /* Initialize video memory pointer */
+ *video++ = key;
+ *video = attr;
+}

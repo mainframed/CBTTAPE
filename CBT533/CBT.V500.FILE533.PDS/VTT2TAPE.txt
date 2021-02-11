@@ -1,0 +1,2540 @@
+   TITLE 'VTT2TAPE -- COPY AWS FORMAT FILE TO A REAL TAPE'
+**************************************************************
+**************************************************************
+**                                                          **
+**                                                          **
+**  MODULE: VTT2TAPE.   Written by Sam Golob                **
+**                                                          **
+**       Copyright (c) 2001-2005 by Sam Golob               **
+**                                                          **
+**       A component of the:                                **
+**       Virtual Tape Transportation System (VTTS)          **
+**                                                          **
+**  PURPOSE:  Program to process P390 and FLEX-ES MVS       **
+**            Virtual Tape data in AWS format.  This data   **
+**            is uploaded to an MVS system as an FB-80      **
+**     card-image file.  The receiving MVS system does      **
+**     not have to be able to handle AWS-format virtual     **
+**     tapes, but it can use this program to read the tape  **
+**     data from this folded AWS-format file, and create    **
+**     a real tape from it.                                 **
+**                                                          **
+**     The OS2 or PC AWS-format tape file that was created  **
+**     by the P390 or FLEX-ES system as a virtual tape, is  **
+**     uploaded to the MVS system as an FB-80 card-image    **
+**     file, with its (continuous stream of) data folded    **
+**     over into 80-byte records, that can be blocked on    **
+**     MVS.  This VTT2TAPE program reads the resulting      **
+**     file, and creates a real output tape using EXCP, on  **
+**     a real tape drive, by filling a buffer and writing   **
+**     out its contents to the real tape.                   **
+**                                                          **
+**     This program is designed to also take input from     **
+**     the FB-80 AWS-format output file, which is produced  **
+**     by the VTT2DISK program.  These two programs,        **
+**     VTT2TAPE and VTT2DISK, are designed to work          **
+**     together, as paired and opposite programs.           **
+**                                                          **
+**  METHOD:                                                 **
+**                                                          **
+**     1.  Since all the tape data is folded into 80-byte   **
+**         record segments, these have to be logically      **
+**         strung together, to be able to correctly write   **
+**         the tape data to tape blocks.                    **
+**                                                          **
+**     2.  First, the program has to correctly jump from    **
+**         one AWS header record to the next, and so        **
+**         proceed through all the headers in the entire    **
+**         tape file, not missing any.  Diagnostic output   **
+**         from this process, is written to the optional    **
+**         SYSTRACE ddname, if it is present in the         **
+**         execution JCL (see below).                       **
+**                                                          **
+**         The first header of an AWS-format tape is the    **
+**         first six bytes of the file.  Once you have      **
+**         the first header, you have the number of bytes   **
+**         of data until the next header, and so forth.     **
+**                                                          **
+**         The UNFOLDEM called program unfolds the data     **
+**         from a chunk of data after an AWS header, and    **
+**         strings it out into an output buffer, after      **
+**         which an EXCP operation writes the entire        **
+**         buffer to tape.  If a block of data is from      **
+**         several chunks, the data pieces are all strung   **
+**         out into the output buffer, and then at the      **
+**         end of the block (flag X'20' in the header),     **
+**         all of the buffer data is written out to tape.   **
+**                                                          **
+**     3.  In the process of jumping from one header to     **
+**         another, the program then moves the correct      **
+**         number of data bytes that are in between the     **
+**         headers, into the output buffer, 80-bytes or     **
+**         less, at a time.  This action depends on the     **
+**         type of header that we have.                     **
+**                                                          **
+**           HEADER TYPE       ACTION                       **
+**           ------ ----       ------                       **
+**           X'80'             Initialize buffer address.   **
+**                             Write chunk of data to       **
+**                              the buffer.                 **
+**                                                          **
+**           X'00'             Write another chunk of data  **
+**                              to the end of the previous  **
+**                              chunk in the buffer.        **
+**                                                          **
+**           X'20'             Add the chunk of data to     **
+**                              the buffer.                 **
+**                             Write out the entire buffer. **
+**                             Initialize the start of      **
+**                              buffer address.             **
+**                                                          **
+**           X'A0'             X'80' and X'20' combined.    **
+**                                                          **
+**           X'40'             Write a tape mark.           **
+**                             Finalize the tape file.      **
+**                             Initialize the output buffer **
+**                              location.                   **
+**                                                          **
+**  Note:  If the output tape is too short, VTT2TAPE        **
+**         attempts to recover by issuing an EOV macro,     **
+**         which calls for a mount of a second tape,        **
+**         as a PRIVATE SCRATCH tape.  More data from the   **
+**         AWS file is written out to the second tape.      **
+**                                                          **
+**         However, there is a catch here.  The second      **
+**         tape does not contain additional labels, as      **
+**         DFP would have written.  The second tape         **
+**         continues with the next block of data, after     **
+**         the last block which was successfully written    **
+**         to the first tape.                               **
+**                                                          **
+**         Therefore, in order to subsequently read the     **
+**         second tape, you have to treat both tapes as     **
+**         two-volume BLP, using JCL similar to this,       **
+**         even if the first tape is SL...                  **
+**                                                          **
+**       //TAPOUT    DD  DISP=OLD,UNIT=TAPE,                **
+**       //          VOL=(,RETAIN,SER=(VOL001,VOL002,etc)), **
+**       //          LABEL=(n,BLP,EXPDT=98000)              **
+**                                                          **
+**         where n (for BLP) would be 3m-1 (where m is      **
+**         the SL file number).                             **
+**                                                          **
+**         Sorry for that.  The reason is because this      **
+**         program writes tape blocks using EXCP, and       **
+**         for the second volume, I'd have to manufacture   **
+**         my own tape labels, and I haven't added such     **
+**         an enhancement at this time.  If BSAM or QSAM    **
+**         created a second SL tape, then the extra EOV     **
+**         and VOL and HDR labels are created by DFP.       **
+**         EXCP contains no such provisions, leaving any    **
+**         extra label creation entirely up to the          **
+**         programmer.                                      **
+**                                                          **
+**                                                          **
+**  OPTIONAL DDNAMES:                                       **
+**                                                          **
+**         In order to make sure that the VTT2TAPE program  **
+**         is doing its job properly, it produces a lot of  **
+**         trace data and status data, as it is reading     **
+**         through the folded FB-80 AWS format tape.  In    **
+**         order not to clutter the summary report, most    **
+**         of this data is written to "Optional DDNAMEs".   **
+**                                                          **
+**         Optional DDNAMEs don't have to be coded in the   **
+**         JCL.  But if they are coded, they will contain   **
+**         the extra trace data which VTT2TAPE produces.    **
+**                                                          **
+**         The optional DDNAMEs are SYSFILES, SYSTRACE,     **
+**         SYSMOVED, and SYSIN.                             **
+**                                                          **
+**         Full JCL to run the VTT2TAPE program is as       **
+**         follows:                                         **
+**                                                          **
+**         (But you can code PARM=READ, or                  **
+**            PARM='TVOL(volser)'       or                  **
+**            PARM='TVOL=volser'              )             **
+**                                                          **
+**         If you code, PARM='TVOL.....' to override the    **
+**         volser of the new tape, this may be further      **
+**         overridden by the SYSIN card:  NEWVOL=volser.    **
+**                                                          **
+**       //   jobcard                                       **
+**       //AWSREAD  EXEC PGM=VTT2TAPE                       **
+**       //STEPLIB   DD  DISP=SHR,DSN=your.load.library     **
+**       //AWSIN     DD  DISP=SHR,DSN=folded.aws.file,      **
+**                   DCB=(RECFM=FB,LRECL=80,BLKSIZE=nnnnn)  **
+**       //TAPOUT    DD  DISP=OLD,UNIT=582,VOL=SER=TEST01,  **
+**       //          LABEL=(1,BLP,EXPDT=98000)              **
+**       //SYSPRINT  DD  SYSOUT=*                           **
+**       //SYSFILES  DD  SYSOUT=*                           **
+**       //SYSTRACE  DD  SYSOUT=*                           **
+**       //SYSMOVED  DD  SYSOUT=*                           **
+**       //SYSUDUMP  DD  SYSOUT=*                           **
+**       //SYSIN     DD  *                                  **
+**       NEWVOL=PROD01                                      **
+**       /*                                                 **
+**       //                                                 **
+**                                                          **
+**         where you can leave out SYSTRACE, SYSMOVED,      **
+**         and SYSUDUMP, if you want to.  I'd strongly      **
+**         suggest including (at least) SYSFILES, though.   **
+**                                                          **
+**         If you code NEWVOL=volser in a //SYSIN card,     **
+**         starting in column 1, VTT2TAPE will change       **
+**         the VOLSER in every VOL1 label (should only be   **
+**         one of them) on the tape, to the value you       **
+**         specify.                                         **
+**                                                          **
+**         SYSFILES gives you block counts and byte counts  **
+**         for all files read and written.  SYSFILES also   **
+**         differentiates between label files and data      **
+**         files.                                           **
+**                                                          **
+**         SYSTRACE tells you if you are running through    **
+**         all the AWS headers properly.  SYSMOVED tells    **
+**         you how many bytes were moved from each chunk    **
+**         of data between AWS headers.  SYSUDUMP is        **
+**         there to contain the MVS-produced dump, upon     **
+**         any abnormal termination of the program.         **
+**                                                          **
+**                                                          **
+**  CHANGE LOG:                                             **
+**                                                          **
+**    Version 1.1 - Correct Operation of data moves from    **
+**       the AWS file to the output buffer, and produce     **
+**       traces to debug this.  SYSMOVED ddname.            **
+**                                                          **
+**    Version 1.2 - Add byte counts and SYSFILES ddname.    **
+**       Fix AWSTAPE emulator problem when writing a        **
+**       tape mark.  OS/2 AWSTAPE emulator cares what       **
+**       the byte count is in CCW+6, even if the opcode     **
+**       is X'1F'.  Made sure the byte count is always 0    **
+**       when doing EXCP with a "write tape mark" opcode.   **
+**                                                          **
+**    Version 1.3 - Check for error conditions on output.   **
+**       Put version number and assembly date into headers. **
+**       Put cumulative byte totals in SYSFILES report.     **
+**                                                          **
+**    Version 1.4 - Differentiate between label files and   **
+**       data files.  Different cumulative byte counts for  **
+**       each.                                              **
+**                                                          **
+**    Version 1.5 - Better SYSFILES report upon volume      **
+**       switch, if the first output tape is too short.     **
+**       Pass null SL files.  Don't stop in the middle of   **
+**       them, because of the two tape marks after the      **
+**       HDR2.                                              **
+**                                                          **
+**    Version 1.6 - Block counts for each file and for the  **
+**       entire tape.                                       **
+**                                                          **
+**    Version 1.7 - Allow PARM=READ, just to get stats.     **
+**                                                          **
+**    Version 1.8 - Make file-level stats reporting into    **
+**       a subroutine.                                      **
+**                                                          **
+**    Version 1.9 - Header validation.  If a header is      **
+**       corrupted, the chain of headers will be broken,    **
+**       and we try to detect this and abort the program,   **
+**       before any significant damage is done to the       **
+**       output file.  We try and keep as much valid data   **
+**       as possible in the output tape.  Add return code   **
+**       indication of different error conditions.          **
+**                                                          **
+**    Version 1.9A - Better messages if this header's       **
+**       previous byte value doesn't match the last         **
+**       header's current byte value.  Pinpoint file and    **
+**       block number in error.  Allow 4-byte version       **
+**       number literal, in preparation for 1.10, etc.      **
+**                                                          **
+**    Version 1.10 -   Optional SYSIN dd name which can     **
+**       contain a card:  NEWVOL=volser   starting in       **
+**       column 1, which overrides the output tape's        **
+**       volume serial.                                     **
+**                                                          **
+**    Version 1.11 -   INAREA now addressed indirectly.     **
+**                                                          **
+**    Version 1.12 -   Logic changed to accommodate chunks  **
+**       of data between headers that are shorter than the  **
+**       tape blocks.  Much of the program has been         **
+**       completely rewritten.  Moves of data between AWS   **
+**       headers to the output buffer, are now done only    **
+**       by the UNFOLDEM called program.  The SYSFILES      **
+**       report has been improved.  The SYSMOVED and        **
+**       SYSTRACE reports now reflect the data associated   **
+**       with each header encountered.                      **
+**                                                          **
+**    Version 1.13 -   Put in ASG enhancement to allow a    **
+**       volser change through a PARM='TVOL=nwvser', or     **
+**       PARM='TVOL(nwvser)'.  Put in a check for short     **
+**       volsers (less than 6 characters) and ran the parm  **
+**       for the volser through a translate table first,    **
+**       to uppercase it and clean it up somewhat.  The     **
+**       volser that is coded in the SYSIN DD card can      **
+**       completely override this, so you still have the    **
+**       freedom to create bizarre volsers if you really    **
+**       want to.  BTW, you do not need to code the new     **
+**       volser in the JCL.  This program does not do a     **
+**       RDJFCB to find out what is in the JCL.             **
+**                                                          **
+**                                                          **
+**  RETURN CODES:                                           **
+**                                                          **
+**    RC =  0 :    Normal Operation                         **
+**                                                          **
+**    RC =  4 :    A Private Scratch tape was asked for,    **
+**                 because the end of the first output      **
+**                 tape was reached.                        **
+**                                                          **
+**    RC =  8 :                                             **
+**                                                          **
+**    RC = 12 :    Program operation had to be aborted      **
+**                 because the chain of AWS headers was     **
+**                 broken in the middle, and an invalid     **
+**                 "AWS header" was encountered.  The       **
+**                 program writes out all valid tape        **
+**                 blocks, and then stops action, with a    **
+**                 message that indicates the problem,      **
+**                 and the header found to be in error.     **
+**                 The last tape block written, is the      **
+**                 block before the last correct AWS        **
+**                 header.  This condition probably         **
+**                 occurred because an invalid AWS header   **
+**                 "current length" made it impossible      **
+**                 to find the next valid AWS header.       **
+**                                                          **
+**                                                          **
+**    Please note that a higher return code will            **
+**    supersede a lower return code, and that multiple      **
+**    error conditions might exist, if there is a nonzero   **
+**    return code higher than 4.  Look at the SYSFILES      **
+**    report, and the other reports, to determine the       **
+**    exact error(s) present.                               **
+**                                                          **
+**                                                          **
+**************************************************************
+         EJECT
+**************************************************************
+         MACRO
+*  ---------------------------------------------------------------  *
+*    This macro is used to display hex values in a printed report.
+*  ---------------------------------------------------------------  *
+&NAME    HEX   &TO,&LEN,&FROM
+&NAME    DS    0H
+         ST    R4,SAVER4B
+         STM   15,1,HEXSAVE
+         LA    1,&FROM
+         LA    0,&LEN
+         LA    15,&TO
+         BAL   4,HEX
+         L     R4,SAVER4B
+         LM    15,1,HEXSAVE
+         MEND
+         SPACE
+**************************************************************
+         GBLC  &LLEV
+&LLEV    SETC  '1.13'
+         YREGS
+         EJECT
+VTT2TAPE CSECT
+*                           It is probably not necessary to run
+*                           this program in 24-bit mode.  But
+*                           it works when it is run that way.
+VTT2TAPE AMODE 24
+VTT2TAPE RMODE 24
+         USING *,R15
+         B     EYECATCH
+         DC    C'--- '            MAKE EYECATCHER VISIBLE
+         DC    C'VTT2TAPE - AWS FB-80 DISK FILE INPUT TO REAL TAPE - '
+         DC    C'LEVEL '
+SYSLEV   DC    C'&LLEV'
+         DC    C' - '
+SYSDAT   DC    C'&SYSDATE'
+         DC    C'  ',C'&SYSTIME ',C'--- '
+         DC    C'Copyright (c) 2001 by Sam Golob '
+SAVEAREA DC    18F'0'
+EYECATCH DS    0D                    ENSURE ALIGNMENT
+         SAVE  (14,12)
+         LR    R5,R1                 SAVE PARM POINTER
+         LA    R1,SAVEAREA           NEW SAVE-AREA ADDR
+         ST    R1,8(,R13)            FORWARD SAVE-AREA CHAIN PTR
+         ST    R13,4(,R1)            BACKWARD SAVE-AREA CHAIN PTR
+         LR    R13,R1                NEW SAVE AREA ADDRESS
+         DROP  R15
+* -----                              SET UP BASE REGISTERS
+         USING VTT2TAPE,R12,R11,R10,R8
+         LR    R12,R15
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+         LA    R10,4095(,R11)
+         LA    R10,1(,R10)
+         LA    R8,4095(,R10)
+         LA    R8,1(,R8)
+         LR    R1,R5                 RESTORE PARM POINTER
+*
+         MVC   SVNEWVOL(6),=C'      '    MAKE SVNEWVOL BLANK
+         L     R1,0(,R1)             Get PARM field
+         CLC   =C'TVOL',2(R1)        Is it a Tape volume override?
+         BNE   CHKREAD               No. Then check if "read only".
+         MVC   CHKNWVOL(6),7(R1)     Yes. Move chars from PARM=TVOL.
+         TR    CHKNWVOL(6),TRTBLPRT  Translate to clean this up some.
+*
+*  Code to guard against a short volser or leading blanks in the PARM.
+* >> below
+*
+         STM   R2,R5,SAVR2T5         Save 4 registers
+         LA    R3,CHKNWVOL           Load address of source field
+         LA    R4,6                  Load limit of characters moved
+         LA    R5,SVNEWVOL           Load address of target field
+         LR    R2,R5                 Start address of target field
+MVELOOP  DS    0H                    Guard against a short volser.
+         CLI   0(R3),X'00'           Delimiter of hexzeros?
+         BE    MVELEND               Yes, end the move.
+         CLI   0(R3),C' '            Delimiter of blank?
+         BE    MVELEND               Yes, end the move.
+         CLI   0(R3),C')'            Delimiter of close paren?
+         BE    MVELEND               Yes, end the move.
+         MVC   0(1,R5),0(R3)         Move one character over.
+         OI    FLAGNEWV,X'01'        Flag that volser needs change.
+         LA    R3,1(,R3)             Bump source character.
+         LA    R5,1(,R5)             Bump target character.
+         BCT   R4,MVELOOP            Try again if before end.
+MVELEND  DS    0H
+         LM    R2,R5,SAVR2T5         Restore 4 registers
+MOVEEND  DS    0H
+*
+* >> above
+*  Code to guard against a short volser or leading blanks in the PARM.
+*
+* ----- >                            Parm = READ    <--- below
+*    See code for PARM='TVOL=nwvser' which is above, in several places.
+* ----- >
+CHKREAD  CLC   =C'READ',2(R1)        Is it "READ" only?
+         BNE   COPYTAPE              No. Default is to copy the tape.
+         OI    READFLAG,X'01'        Yes. Turn on flag indicating so.
+COPYTAPE DS    0H
+* ----- >                            Parm = READ    <--- above
+*
+         L     R15,=V(UNFOLDEM)      UNFOLDEM subprogram
+         ST    R15,SVUNFOLD          Save its entry point
+         L     R0,=A(INAREA)         Address of tape buffer
+         ST    R0,SVINAREA           Store it away for later use.
+***********************************************************************
+* GET SYSTEM DATE AND TIME - A standard way to get date and time      *
+***********************************************************************
+         STM   R14,R2,SAVE1402
+         TIME  DEC,DATETIME,LINKAGE=SYSTEM,DATETYPE=MMDDYYYY
+         OI    DATE+4,X'0F'
+         UNPK  DATED,DATE
+         OI    TIME+3,X'0F'
+         UNPK  TIMED,TIME
+*                          FILL HEADDATE AREA WITH INFO TO REUSE
+         MVC   HEADDATE(2),DATED
+         MVI   HEADDATE+2,C'/'
+         MVC   HEADDATE+3(2),DATED+2
+         MVI   HEADDATE+5,C'/'
+         MVC   HEADDATE+6(4),DATED+4
+         MVC   HEADDATE+12(2),TIMED
+         MVI   HEADDATE+14,C':'
+         MVC   HEADDATE+15(2),TIMED+2
+         MVI   HEADDATE+17,C':'
+         MVC   HEADDATE+18(2),TIMED+4
+         MVC   MESSAGE1+88(31),HEADDLIT    Today's date and time
+         MVC   MESSAGE4+88(31),HEADDLIT      in the reports.
+         MVC   MESSAGE5+88(31),HEADDLIT
+         MVC   MESSAGE6+88(31),HEADDLIT
+         LM    R14,R2,SAVE1402
+***********************************************************************
+         MVC   LEVDATE(8),SYSDAT
+***********************************************************************
+         MVC   MESSAGE1+61(21),LEVELLIT    Program level and
+         MVC   MESSAGE4+61(21),LEVELLIT      assembly date
+         MVC   MESSAGE5+61(21),LEVELLIT
+         MVC   MESSAGE6+61(21),LEVELLIT
+* ----------------------------------------------------------------- *
+INITEM   DS    0H                    Initialize some constants and
+         MVI   FLAGSYST,X'00'        No optional ddnames initially.
+         ZAP   INHDRS,=P'0'          Count number of AWS headers
+         ZAP   INTYPE1,=P'0'         Counts of Header Types
+         ZAP   INTYPE2,=P'0'
+         ZAP   INTYPE3,=P'0'
+         ZAP   INTYPE4,=P'0'
+         ZAP   INTYPE5,=P'0'
+         ZAP   FILCOUNT,=P'0'        Initialize file counter
+         MVC   DBIN(8),=D'0'         Initialize byte counters
+         MVC   LBIN(8),=D'0'
+         MVC   DAIN(8),=D'0'
+         MVC   DAINF(8),=D'0'
+         MVC   LBINF(8),=D'0'
+         MVC   DBINF(8),=D'0'
+         MVC   OURRC,=F'0'
+         MVC   MAXRC,=F'0'
+* ----------------------------------------------------------------- *
+TIOTSCAN DS    0H             Determine the presence of Optional
+*                             DDNAMEs:  SYSTRACE, SYSMOVED, SYSFILES
+* ----->                      and open them if there is JCL for them.
+* ----------------------------------------------------------------- *
+         L     R5,16          R5=CVT
+         L     R5,0(,R5)      R5=TCB WORDS
+         L     R5,4(,R5)      R5=MY TCB
+         L     R5,12(,R5)     R5=TIOT
+         LA    R5,24(,R5)     R5=FIRST DD ENTRY
+TIOTLOOP CLC   0(4,R5),=XL4'00' END OF TIOT?
+         BE    TIOTSEND       YES, CHECK FOR OUTPUT VOL OVERRIDES
+         CLC   4(8,R5),SYSTRACE+40  SYSTRACE DDNAME THERE?
+         BNE   TIOTMOVD       NO
+         OI    FLAGSYST,X'01'       SHOW PRESENCE OF SYSTRACE DD
+         B     TIOTNEXT       CONTINUE
+TIOTMOVD CLC   4(8,R5),SYSMOVED+40
+         BNE   TIOTFILE
+         OI    FLAGSYST,X'02'       SHOW PRESENCE OF SYSMOVED DD
+         B     TIOTNEXT
+TIOTFILE CLC   4(8,R5),SYSFILES+40
+         BNE   TIOTSYSN
+         OI    FLAGSYST,X'04'       SHOW PRESENCE OF SYSFILES DD
+         B     TIOTNEXT
+TIOTSYSN CLC   4(8,R5),SYSIN+40
+         BNE   TIOTNEXT
+         OI    FLAGSYST,X'08'       SHOW PRESENCE OF SYSIN DD
+         B     TIOTNEXT
+TIOTNEXT SR    R3,R3
+         IC    R3,0(,R5)      R3=LENGTH OF DD ENTRY
+         AR    R5,R3          R5=NEXT DD ENTRY
+         B     TIOTLOOP       GO CHECK IT
+TIOTSEND DS    0H
+***********************************************************************
+*    Now OPEN the files and start the processing.
+***********************************************************************
+*---------------------------------------------------------------------*
+* -------------- >>>>>>   Look for new output volume name - BELOW
+         TM    FLAGSYST,X'08'       Is SYSIN there?
+         BZ    NONSYSIN             No. Then can't open it.
+         OPEN  (SYSIN,(INPUT))
+SYSINLUP DS    0H
+         GET   SYSIN,GETSYSIN
+         CLC   =C'NEWVOL=',GETSYSIN  Is the literal NEWVOL= in col 1?
+         BNE   SYSINLUP              No. Don't use this card.
+         CLI   GETSYSIN+7,C' '       Is the next letter a blank?
+         BE    SYSINLUP              Yes. Ignore this card.
+         MVC   SVNEWVOL(6),GETSYSIN+7     Save the next 6 chars.
+         OI    FLAGNEWV,X'01'             And show a new volser here.
+         B     NONSYSIN
+SYSINEND DS    0H
+         CLOSE SYSIN
+NONSYSIN DS    0H
+* -------------- >>>>>>   Look for new output volume name - ABOVE
+*---------------------------------------------------------------------*
+         OPEN  (AWSIN,(INPUT))
+         OPEN  (SYSPRINT,(OUTPUT))
+         TM    READFLAG,X'01'        Is this run READ ONLY?
+         BO    NOTAPOPN              Yes. Don't OPEN output tape.
+         OPEN  (TAPOUT,(OUTPUT))
+NOTAPOPN DS    0H
+         TM    FLAGSYST,X'01'        DO WE WANT THE TRACE REPORT?
+         BNO   NOSYSTRC              NO. THEN DON'T OPEN THE DCB.
+         OPEN  (SYSTRACE,(OUTPUT))
+         PUT   SYSTRACE,MESSAGE4
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSTRACE,PRTLINE
+*--->>
+         TM    READFLAG,X'01'        If READ ONLY, print extra line.
+         BZ    NOEXTRA4
+         MVC   PRTLINE,PRTLINE-1
+         MVC   PRTLINE+4(21),=C'This Run is READ ONLY'
+         PUT   SYSTRACE,PRTLINE
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSTRACE,PRTLINE
+NOEXTRA4 DS    0H
+         PUT   SYSTRACE,MESSAGE9
+         PUT   SYSTRACE,MESSAG10
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSTRACE,PRTLINE
+         PUT   SYSTRACE,MESSAGE8
+*--->>
+NOSYSTRC DS    0H
+         TM    FLAGSYST,X'02'        DO WE WANT THE MOVED REPORT?
+         BNO   NOSYSFIL              NO. THEN DON'T OPEN THE DCB.
+         OPEN  (SYSMOVED,(OUTPUT))
+         PUT   SYSMOVED,MESSAGE5
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSMOVED,PRTLINE
+*--->>
+         TM    READFLAG,X'01'        If READ ONLY, print extra line.
+         BZ    NOEXTRA5
+         MVC   PRTLINE,PRTLINE-1
+         MVC   PRTLINE+4(21),=C'This Run is READ ONLY'
+         PUT   SYSMOVED,PRTLINE
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSMOVED,PRTLINE
+NOEXTRA5 DS    0H
+*--->>
+NOSYSFIL DS    0H
+         TM    FLAGSYST,X'04'        DO WE WANT THE FILES REPORT?
+         BNO   NOSYSMVD              NO. THEN DON'T OPEN THE DCB.
+         OPEN  (SYSFILES,(OUTPUT))
+         PUT   SYSFILES,MESSAGE6
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSFILES,PRTLINE
+*--->>
+         TM    READFLAG,X'01'        If READ ONLY, print extra line.
+         BZ    NOEXTRA6
+         MVC   PRTLINE,PRTLINE-1
+         MVC   PRTLINE+4(21),=C'This Run is READ ONLY'
+         PUT   SYSFILES,PRTLINE
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSFILES,PRTLINE
+NOEXTRA6 DS    0H
+*--->>
+NOSYSMVD DS    0H
+* ----------------------------------------------------------------- *
+*     Write the top Header Line, with the date and time in it.
+* ----------------------------------------------------------------- *
+         PUT   SYSPRINT,MESSAGE1
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+*--->>
+         TM    READFLAG,X'01'        If READ ONLY, print extra line.
+         BZ    NOEXTRA1
+         MVC   PRTLINE,PRTLINE-1
+         MVC   PRTLINE+4(21),=C'This Run is READ ONLY'
+         PUT   SYSPRINT,PRTLINE
+         MVC   PRTLINE,PRTLINE-1
+         PUT   SYSPRINT,PRTLINE
+NOEXTRA1 DS    0H
+*--->>
+* ----------------------------------------------------------------- *
+*     Start trying to bop through the AWS headers.  The first 6
+*     bytes of the file, is the first header, so we start there.
+* ----------------------------------------------------------------- *
+LOOPSTRT DS    0H                    START OF PROCESSING
+         LA    R7,INCARD             INITIALIZE BEG OF RECORD
+         ST    R7,SAVEBEGC           AND SAVE THIS SETTING.
+* ---------------------------------------------------------------- *
+         LA    R6,INCAEND            INITIALIZE END OF RECORD
+         ST    R6,SAVEENDC           AND SAVE THIS SETTING.
+         LA    R1,80(,R6)            BOP BY ANOTHER RECORD LENGTH
+         ST    R1,SAVEEN80           AND SAVE WHERE THIS IS.
+* ---------------------------------------------------------------- *
+         GET   AWSIN,INCARD           Do the very first GET to find
+*                                     the first header in the file.
+*                                     The first header lets you find
+*                                     all the other headers.
+         AP    UNFINRCD,=P'1'         Update the control block too
+         MVC   INHEADER(6),0(R7)      Got the first header
+* ---------------------------------------------------------------- *
+*     We come here when we know we're at the beginning of an
+*     AWS header record.
+* ---------------------------------------------------------------- *
+GOTHEADR DS    0H                     Got a header record
+* ---------------------------------------------------------------- *
+         MVC   HDRPREVS(2),HDRPREV    SAVE PREVIOUS BLOCK SIZE
+         MVC   HDRLENGS(2),HDRLENG    SAVE SIZE OF NEXT BLOCK
+* ---------------------------------------------------------------- *
+         AP    INHDRS,=P'1'           Count the number of headers.
+         MVC   HEADER(6),INHEADER     Move header to formatting area.
+*--->
+         ST    R9,SAVER9HV            Save link register
+         BAL   R9,VALIDHDR            Make sure header flags are valid
+         L     R9,SAVER9HV            Restore link register
+         TM    HDRVFLAG,X'01'         Is the header in error?
+         BO    HEADRERR               Yes-report condition and end pgm.
+*--->
+*--->       Format the header by interpreting the length fields,
+*--->       and then print the values for diagnosis if necessary.
+*--->
+*--->       HDRLENG contains the true halfword byte count of data
+*--->               following this header.
+*--->       HDRPREV contains the true halfword byte count of data
+*--->               preceding this header.
+*--->
+*--->       In case fullword versions of these quantities are
+*--->       needed, HDRFULLS and HDRPFULS are supplied too.
+*--->
+         MVC   SAVEHDR(6),HEADER      Save a copy of the current header
+         MVC   HDRFILL(2),=X'0000'    Fill in zeros
+         MVC   HDRPRVF(2),=X'0000'      for
+         MVC   HDRLENFL(2),=X'0000'        fullword values
+         MVC   HDRPRVFL(2),=X'0000'           of halfwords.
+         MVC   HDRLENG+1(1),HDRCURLN     REVERSE
+         MVC   HDRLENG(1),HDRCURLN+1        BYTES
+         MVC   HDRPREV+1(1),HDRPRVLN     REVERSE
+         MVC   HDRPREV(1),HDRPRVLN+1        BYTES
+*
+         MVC   PRTLINE,PRTLINE-1      CLEAR PRINT LINE
+         HEX   PRTLINE+8,6,HEADER     UNFAREA at GOTHEADR time display
+         HEX   PRTLINE+28,4,UNFSCARD                            .
+         HEX   PRTLINE+38,4,UNFECARD                            .
+         HEX   PRTLINE+48,4,UNFOFFST                            .
+         HEX   PRTLINE+58,4,UNFBYTES                            .
+         HEX   PRTLINE+68,4,UNFBYMVD                            .
+         HEX   PRTLINE+78,4,UNFBUFFR                            .
+         HEX   PRTLINE+88,4,UNFBSTRT                            .
+         HEX   PRTLINE+98,7,UNFINRCD                            .
+* ---------------------------------------------------------------- *
+*              DETERMINE THE TYPE OF HEADER YOU HAVE
+*                    AND COUNT HOW MANY OF EACH
+* ---------------------------------------------------------------- *
+KINDAHDR DS    0H
+         CLI   HDRFLAG1,X'00'         IS THIS A MIDDLE CHUNK IN BLOCK?
+         BNE   KCHKBEG                NO. TEST IF BEG CHUNK OF BLOCK
+         AP    INTYPE3,=P'1'          YES. COUNT THIS TYPE
+         B     KINDAHEN               IF IT'S 00 IT'S NOT ANOTHER TYPE
+KCHKBEG  DS    0H
+         TM    HDRFLAG1,X'80'         BEGINNING OF BLOCK?
+         BNO   KCHKEND                NO. CHECK FURTHER FOR END OF BLK.
+         AP    INTYPE1,=P'1'          YES. COUNT THIS TYPE
+KCHKEND  DS    0H
+         TM    HDRFLAG1,X'20'         END OF BLOCK?
+         BNO   KINDAH40               NO. CHECK IF END OF FILE
+         AP    INTYPE2,=P'1'          YES. COUNT THIS TYPE
+KINDAHA0 DS    0H
+         CLI   HDRFLAG1,X'A0'         BOTH BEGINNING AND END OF BLOCK?
+         BNE   KINDAH40               NO. TEST FOR EOF HEADER.
+         AP    INTYPE5,=P'1'          YES. COUNT IT FOR REPORTING.
+         B     KINDAHEN               AND DON'T TEST MORE BITS.
+KINDAH40 DS    0H
+         TM    HDRFLAG1,X'40'         END OF FILE HEADER?
+         BNO   KINDAHEN               NO. NOT A TYPE THAT WE KNOW.
+         AP    INTYPE4,=P'1'          YES. COUNT THIS TYPE
+*
+*     Invalid types were already caught by the VALIDHDR routine.
+*
+KINDAHEN DS    0H
+         HEX   PRTLINE+22,1,HDRFLAG1                            .
+         TM    FLAGSYST,X'01'         ARE WE PRINTING THE TRACE REPORT?
+         BNO   NOSYSTR1               TAKE APPROPRIATE ACTION
+         PUT   SYSTRACE,PRTLINE
+NOSYSTR1 DS    0H
+         CLC   SAVEHDR(6),EOTMARK     IS THE HEADER AN EOT MARK?
+         BNE   NOFIN                  NO. DON'T STOP THE PROGRAM.
+         NI    UNEXFLAG,FF-X'01'      TURN OFF UNIT EXCEPTION FLAG
+         TM    FLAGHDRL,X'01'         YES. BUT TEST IF AFTER HDR 1 OR 2
+         BO    NOFIN                  AFTER HDR1 OR HDR2, DON'T END PGM
+         B     FIN                    OTHERWISE END THE PROGRAM.
+NOFIN    DS    0H
+*------------------------------>  Validate Header Quantities  <-- below
+*
+*   This validation checks if the bytes in the "previous" byte count
+*   field match the byte count in the "forward" field of the previous
+*   header.  If there is an error, it is reported now.
+*
+         CLC   HDRLENGS(2),HDRPREV    Is Prev Length = Last Current ?
+         BE    HDRVALID               Yes. As it should be.
+         MVC   OUTLINE,OUTLINE-1      No. Corrupted headers.
+         MVC   OUTLINE,ERRMESS6       Write nasty message.
+         MVI   OUTLINE+58,C'P'        Display prev hdr quantity.
+         HEX   OUTLINE+60,2,HDRPREV
+         MVI   OUTLINE+66,C'C'        Display last current hdr amount.
+         HEX   OUTLINE+68,2,HDRLENGS
+         ZAP   FERCOUNT,FILCOUNT      Get File number in error
+         AP    FERCOUNT,=P'1'         By adding 1 to last valid file
+         MVC   OUTLINE+77(4),=C'File'    Put literal into message
+         MVC   OUTLINE+82(9),FILEPAT     Get file number in error
+         ED    OUTLINE+82(9),FERCOUNT+3  And print it in message.
+         ZAP   BLERRCNT,BLOCKCNT      Get Block number in error
+         AP    BLERRCNT,=P'1'         By adding 1 to last valid block
+         MVC   OUTLINE+96(5),=C'Block'   Put literal into message
+         MVC   OUTLINE+102(11),BLOKPAT   And print bad block number
+         ED    OUTLINE+102(11),BLERRCNT+2   in the error message.
+         MVC   OURRC(4),=F'12'        Set RC = 12
+         CLC   MAXRC,OURRC            Is MAXRC higher?
+         BH    SAXERC02               Yes. Keep it.
+         MVC   MAXRC,OURRC            No.  Raise MAXRC to this one.
+SAXERC02 DS    0H
+         TM    FLAGSYST,X'01'         Write nastygram to SYSTRACE.
+         BZ    NOERRX1
+         PUT   SYSTRACE,OUTLINE
+NOERRX1  DS    0H
+         TM    FLAGSYST,X'02'         Write nastygram to SYSMOVED.
+         BZ    NOERRX2
+         PUT   SYSMOVED,OUTLINE
+NOERRX2  DS    0H
+         TM    FLAGSYST,X'04'         Write nastygram to SYSFILES.
+         BZ    NOERRX4
+         PUT   SYSFILES,OUTLINE
+NOERRX4  DS    0H
+         PUT   SYSPRINT,OUTLINE       Write nastygram to SYSPRINT.
+*
+*       Maybe think of ending the program operation here.
+*       REPLACE REPLACE REPLACE REPLACE REPLACE REPLACE REPLACE
+*
+HDRVALID DS    0H
+*------------------------------>  Validate Header Quantities  <-- above
+*
+*
+* - - - - - - - >>>>>   End of Header Operations....
+* - - - - - - - >>>>>   Now go move the data afterward.
+* ---------------------------------------------------------------- *
+*     At this point, we will begin moving the data that is after
+*     the first header.  Future OFFSETs will be supplied by the
+*     previous call to the UNFOLDEM program.
+* ---------------------------------------------------------------- *
+LOOKINIT DS    0H                Start looking for the data at the
+*                                beginning of the AWSIN tape file.
+         TM    INITFLAG,X'01'    Not the first time here?
+         BO    LOOKIEND          Bypass initializations.
+         OI    INITFLAG,X'01'    Do this only once for the entire tape.
+         MVC   UNFOFFST,=F'6'    Initialize OFFSET to be just past
+*                                the first header in the file.
+         MVC   UNFBUFFR,UNFBSTRT  Init buffer loc to start of buffer
+LOOKIEND DS    0H
+* ---------------------------------------------------------------- *
+MOVEDATA DS    0H                This is the call to UNFOLDEM.
+*                                We fill in the necessary fields.
+*
+*    UNFOLDEM is only intended to move the data between the AWS
+*    headers.  "After processing" is controlled by the flags in
+*    the headers.  After each header is processed, we again point
+*    to the data after the headers (if any) and call UNFOLDEM to
+*    move it.
+*
+         MVC   PREVHDR,SAVEHDR     Copy of last header for action later
+         MVC   UNFSCARD,SAVEBEGC   Beginning address of input card
+         MVC   UNFECARD,SAVEENDC   End address of input card
+         XC    UNFBYTES,UNFBYTES   Zero out fullword bytes to be moved
+         MVC   UNFBYTES+2(2),HDRLENG   And move in halfword value
+         L     R1,SVINAREA         Point to address of buffer
+         ST    R1,UNFBSTRT         Store it in beginning buffer field
+         TM    NOWRTFLG,X'01'      Continue data move in same buffer?
+         BO    MOVEBUFF            Yes. Don't reinitialize in buffer.
+         ST    R1,UNFBUFFR         Store it in current buffer field
+MOVEBUFF DS    0H
+*        MVC   LINE+1(8),=C'BEFCALL '
+*        BAL   R9,UNFIMAGE
+         LA    R1,UNFAREA          Point to UNFAREA control block
+         L     R15,SVUNFOLD        Load entry point of UNFOLDEM pgm
+         BALR  R14,R15             Call the program and move data.
+         MVC   UNFAREA(UNFLENTH),0(R1)  Move modified UNFAREA to pgm
+*        MVC   LINE+1(8),=C'AFTCALL '
+*        BAL   R9,UNFIMAGE
+* -- Test for call of LABELCHK -- >   below
+*   We have just moved the bytes.  Now we check if the file is a label.
+         NI    ISLBLFLG,FF-X'01'   Initially assume it's not a label.
+         L     R1,UNFBYMVD         The number of bytes moved just now.
+         C     R1,=X'00000050'     Was it exactly 80?
+         BNE   NOLBLCHK            No. Assume it can't be a label.
+         L     R1,UNFBSTRT         Grab address of data buffer.
+         MVC   TESTLABL(80),0(R1)  Move 80 bytes to the testing area.
+         BAL   R9,LABELCHK         Test to see if it is a label.
+         TM    ISLBLFLG,X'01'      Is it a label?
+         BZ    NOLBLCHK            No. Assume entire file is not labels
+         OI    FILBLFLG,X'01'      Yes. Turn on label flag at the
+*                                   file level.
+NOLBLCHK DS    0H
+* -- Test for call of LABELCHK -- >   above
+* ---------------------------------------------------------------- *
+         BAL   R9,AFTRMOVE       Housekeeping after the data move.
+*        MVC   LINE+1(8),=C'AFTAFTR '
+*        BAL   R9,UNFIMAGE
+         BAL   R9,CHKHEADR       Get new header ready for handling.
+*        MVC   LINE+1(8),=C'AFTCHKH '
+*        BAL   R9,UNFIMAGE
+         B     GOTHEADR          Assume you've got another header.
+* ---------------------------------------------------------------- *
+*          END OF INPUT AWS DATA                                   *
+* ---------------------------------------------------------------- *
+FIN      DS    0H                   PROGRAM EXIT ROUTINE
+         BAL   R9,WRITTPMK          WRITE FINAL TAPE MARK
+         B     AGLE                 Finish processing
+* ---------------------------------------------------------------- *
+HEADRERR DS    0H
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,ERRMESS5
+         HEX   OUTLINE+58,6,HEADER
+         ZAP   FERCOUNT,FILCOUNT      Get File number in error
+         AP    FERCOUNT,=P'1'         By adding 1 to last valid file
+         ZAP   BLERRCNT,BLOCKCNT      Get Block number in error
+         AP    BLERRCNT,=P'1'         By adding 1 to last valid block
+         MVC   OUTLINE+77(4),=C'File'    Put literal into message
+         MVC   OUTLINE+82(9),FILEPAT     Get file number in error
+         ED    OUTLINE+82(9),FERCOUNT+3  And print it in message.
+         MVC   OUTLINE+96(5),=C'Block'   Put literal into message
+         MVC   OUTLINE+102(11),BLOKPAT   And print bad block number
+         ED    OUTLINE+102(11),BLERRCNT+2   in the error message.
+         MVC   OURRC(4),=F'12'    RC = 12 for header error.
+         CLC   MAXRC,OURRC        Is MAXRC higher?
+         BH    SAMERC02           Yes. Keep it.
+         MVC   MAXRC,OURRC        No.  Raise MAXRC to this one.
+SAMERC02 DS    0H
+         TM    FLAGSYST,X'01'
+         BZ    NOERR01
+         PUT   SYSTRACE,OUTLINE
+NOERR01  DS    0H
+         TM    FLAGSYST,X'02'
+         BZ    NOERR02
+         PUT   SYSMOVED,OUTLINE
+NOERR02  DS    0H
+         TM    FLAGSYST,X'04'
+         BZ    NOERR04
+         PUT   SYSFILES,OUTLINE
+NOERR04  DS    0H
+         PUT   SYSPRINT,OUTLINE
+* ---------------------------------------------------------------- *
+AGLE     DS    0H                   Print the Summary Report
+         BAL   R9,SUMMREPT
+* ---------------------------------------------------------------- *
+*     Close the files that were OPENed
+* ---------------------------------------------------------------- *
+         CLOSE AWSIN
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+6(7),=C'MaxRC ='
+         HEX   OUTLINE+14,1,MAXRC+3
+         CLC   MAXRC(4),=F'4'
+         BNH   NOERRPRT
+         MVC   OUTLINE+18(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+33(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+48(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+63(13),=C'<+> ERROR <+>'
+NOERRPRT DS    0H
+         PUT   SYSPRINT,OUTLINE
+         CLOSE SYSPRINT
+         TM    READFLAG,X'01'       If READ ONLY, don't CLOSE tape.
+         BO    NOTAPCLS
+         CLOSE TAPOUT
+NOTAPCLS DS    0H
+         TM    FLAGSYST,X'01'       DID WE OPEN THE SYSTRACE DDNAME?
+         BNO   SYSTRNOP             CLOSE ONLY IF WE OPENED IT.
+         CLOSE SYSTRACE
+SYSTRNOP DS    0H
+         TM    FLAGSYST,X'02'       DID WE OPEN THE SYSMOVED DDNAME?
+         BNO   SYSFILNO             CLOSE ONLY IF WE OPENED IT.
+         CLOSE SYSMOVED
+SYSFILNO DS    0H
+         TM    FLAGSYST,X'04'       DID WE OPEN THE SYSFILES DDNAME?
+         BNO   SYSMVDNO             CLOSE ONLY IF WE OPENED IT.
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSFILES,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+6(7),=C'MaxRC ='
+         HEX   OUTLINE+14,1,MAXRC+3
+         CLC   MAXRC(4),=F'0'
+         BE    NOERRFIL
+         MVC   OUTLINE+18(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+33(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+48(13),=C'<+> ERROR <+>'
+         MVC   OUTLINE+63(13),=C'<+> ERROR <+>'
+NOERRFIL DS    0H
+         PUT   SYSFILES,OUTLINE
+         CLOSE SYSFILES
+SYSMVDNO DS    0H
+FIN1     DS    0H                   RETURN TO THE OPERATING SYSTEM
+         L     R13,4(,R13)
+         MVC   16(4,R13),MAXRC      Load Maximum Return Code
+         LM    R14,R12,12(R13)
+         BR    R14
+         EJECT
+* ----------------------------------------------------------------- *
+* ---       SUBROUTINES                                         --- *
+* ----------------------------------------------------------------- *
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+UNFIMAGE DS    0H                 Take a picture of the UNFAREA now.
+         HEX   LINE+10,4,UNFSCARD    Starting card address.
+         HEX   LINE+20,4,UNFECARD    Ending card address.
+         HEX   LINE+30,4,UNFOFFST    Offset (starting and ending)
+         HEX   LINE+40,4,UNFBYTES    Number of bytes to be moved.
+         HEX   LINE+50,4,UNFBYMVD    Number of bytes that were moved.
+         HEX   LINE+60,4,UNFBUFFR    Current start location in buffer.
+         HEX   LINE+70,4,UNFBSTRT    Location of beginning of buffer.
+         HEX   LINE+80,7,UNFINRCD    Number of GETs done to AWSIN file.
+         PUT   SYSPRINT,LINE
+         MVC   LINE,LINE-1           Clear LINE after PUT.
+         BR    R9
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+CHKHEADR DS    0H                 Position to the next header
+*                                 The idea is to fill the INHEADER
+*                                 field with the correct value.
+         ST    R9,SAVER9CH        Save BAL register
+         L     R1,UNFOFFST        New offset, returned from UNFOLDEM.
+         C     R1,=F'74'          Bigger or equal to 74?
+         BL    CHKHOFSL           No. Just copy header straight.
+CHKHOFSH DS    0H                 Yes. Need to combine with next card.
+         MVC   INCARDP,INCARD     Copy this card to prev 80 byte area.
+         GET   AWSIN,INCARD       GET another card adjacent to previous
+         AP    UNFINRCD,=P'1'     Update UNFAREA field too.
+         LA    R7,INCARDP         Point to two consecutive cards.
+         A     R7,UNFOFFST        Add the returned offset.
+         MVC   INHEADER(6),0(R7)  Move the new header to staging area.
+         LA    R7,6(,R7)          Bump R7 past the new header.
+         S     R7,=A(INCARD)      Get new offset for next UNFOLDEM call
+         ST    R7,UNFOFFST        Store it in the UNFAREA control block
+         B     CHKHEND            Finish this processing.
+CHKHOFSL DS    0H
+         LA    R7,INCARD          < 74. Header is in original card.
+         LA    R7,0(R1,R7)        Bump by offset - point to new header
+         MVC   INHEADER(6),0(R7)  And move it to staging area.
+         LA    R7,6(,R7)          Bump R7 past the new header.
+         L     R1,=A(INCARD)      Address of current card
+         SR    R7,R1              Get new offset for next UNFOLDEM call
+         ST    R7,UNFOFFST        Store it in the UNFAREA control block
+CHKHEND  DS    0H
+         L     R9,SAVER9CH        Restore BAL register
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+AFTRMOVE DS    0H                 After the move, we act on the
+*                                 information from the previous
+*                                 AWS header.
+         ST    R9,SAVER9AF        Save BAL register
+         NI    NOWRTFLG,FF-X'01'  Turn off flag initially
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+AFTTST40 DS    0H                 X'40' means END-OF-FILE
+*                                 So we finish off the file-level stuff
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*   TEST TEST TEST:  CHECK IF THERE CAN BE A VALID X'4x'  -------
+         CLI   PRVHFLGS,X'40'     Is there an end-of-file condition?
+         BNE   AFTTSTA0           No. Do next test.
+         BAL   R9,WRITTPMK        Yes. Write a tape mark.
+         AP    FILCOUNT,=P'1'     Count number of files written.
+         BAL   R9,REPTFILE        Report on this file in SYSFILES.
+         ZAP   BLOCKCNT,=P'0'     Zero block count for next file
+         ZAP   FILEBYTS,=P'0'     Zero bytes moved for next file
+         NI    FILBLFLG,FF-X'01'  Turn off Label File indicator
+         XC    DBINF,DBINF        Zero byte count at file level
+         XC    DAINF,DAINF        Zero data bytes at file level
+         XC    LBINF,LBINF        Zero label bytes at file level
+** - SYSMOVED ->>    Record the number of files written  -  BELOW
+         TM    FLAGSYST,X'02'     Is SYSMOVED here and open?
+         BNO   AFTT40WM           No. Don't attempt a print.
+         MVC   OUTLINE,OUTLINE-1         Clear line.
+         MVC   OUTLINE,MESSAG12          Mark END-OF-FILE in SYSMOVED
+         MVC   OUTLINE+38(9),FILEPAT     Move in edit pattern
+         ED    OUTLINE+38(9),FILCOUNT+3  Tell which file number ended
+         PUT   SYSMOVED,OUTLINE
+AFTT40WM DS    0H
+** - SYSMOVED ->>    Record the number of files written  -  ABOVE
+*        MVC   LINE+1(8),=C'AFT-40: '
+*        BAL   R9,UNFIMAGE
+         B     AFTRMEND           No more processing after this.
+*
+AFTTSTA0 DS    0H                 X'A0' means beg and end of block
+         CLI   PRVHFLGS,X'A0'     Is chunk equal block?
+         BNE   AFTTST80           No. Test for first chunk in block.
+         L     R1,BLOKBYTS        Increment
+         A     R1,UNFBYMVD          total byte count
+         ST    R1,BLOKBYTS            in this block, from chunk bytes.
+         L     R1,FILEBYTS        Increment
+         A     R1,UNFBYMVD          total file bytes
+         ST    R1,FILEBYTS            in this block, from chunk bytes.
+         BAL   R9,WRITBUFF        Write buffer and reset UNFBUFFR
+** ---------- >>
+         XC    BLOKBYTS,BLOKBYTS  Zero bytes moved after write
+         XC    UNFBYMVD,UNFBYMVD  Zero bytes moved in control block too
+*        MVC   LINE+1(8),=C'AFT-A0: '
+*        BAL   R9,UNFIMAGE
+         B     AFTRMEND
+AFTTST80 DS    0H                 X'80' means beginning of block
+         CLI   PRVHFLGS,X'80'     Beginning chunk of bigger block?
+         BNE   AFTTST00           No. Do next test.
+         OI    NOWRTFLG,X'01'     Must move buffer start location up
+         L     R1,BLOKBYTS        Increment
+         A     R1,UNFBYMVD          total byte count
+         ST    R1,BLOKBYTS            in this block, from chunk bytes.
+         L     R1,FILEBYTS        Increment
+         A     R1,UNFBYMVD          total file bytes
+         ST    R1,FILEBYTS            in this block, from chunk bytes.
+** ---------- >>    Record the number of bytes written  -  BELOW
+         TM    FLAGSYST,X'02'           SYSMOVED ddname present?
+         BNO   AFTT80WM                 No, can't write data to it.
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MESSAG11         Only if chunk less than block
+         HEX   OUTLINE+34,4,UNFBYMVD    PRINT BYTES MOVED IN THIS MOVE
+         HEX   OUTLINE+44,2,HDRLENG     PRINT HEADER MOVE LENGTH
+         HEX   OUTLINE+52,2,BLOKBYTS+2  PRINT TOTAL BYTES TILL NOW
+         PUT   SYSMOVED,OUTLINE
+AFTT80WM DS    0H
+** ---------- >>    Record the number of bytes written  -  ABOVE
+*        MVC   LINE+1(8),=C'AFT-80: '
+*        BAL   R9,UNFIMAGE
+         B     AFTRMEND
+AFTTST00 DS    0H                 X'00' means middle chunk of block
+         CLI   PRVHFLGS,X'00'     Is this a middle chunk?
+         BNE   AFTTST20           No. Try next test.
+         OI    NOWRTFLG,X'01'     Must move buffer start location up
+         L     R1,BLOKBYTS        Increment
+         A     R1,UNFBYMVD          total byte count
+         ST    R1,BLOKBYTS            in this block, from chunk bytes.
+         L     R1,FILEBYTS        Increment
+         A     R1,UNFBYMVD          total file bytes
+         ST    R1,FILEBYTS            in this block, from chunk bytes.
+** ---------- >>    Record the number of bytes written  -  BELOW
+         TM    FLAGSYST,X'02'           SYSMOVED ddname present?
+         BNO   AFTT00WM                 No, can't write data to it.
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MESSAG11         Only if chunk less than block
+         HEX   OUTLINE+34,4,UNFBYMVD    PRINT BYTES MOVED IN THIS MOVE
+         HEX   OUTLINE+44,2,HDRLENG     PRINT HEADER MOVE LENGTH
+         HEX   OUTLINE+52,2,BLOKBYTS+2  PRINT TOTAL BYTES TILL NOW
+         PUT   SYSMOVED,OUTLINE
+AFTT00WM DS    0H
+** ---------- >>    Record the number of bytes written  -  ABOVE
+*        MVC   LINE+1(8),=C'AFT-00: '
+*        BAL   R9,UNFIMAGE
+         B     AFTRMEND           Get out - not X'80' or X'20'
+AFTTST20 DS    0H                 X'20' means last chunk of block
+         CLI   PRVHFLGS,X'20'     Is end-of-block on?
+         BNE   AFTRMERR           No. Must be error. Tested all types.
+         L     R1,BLOKBYTS        Increment
+         A     R1,UNFBYMVD          total byte count
+         ST    R1,BLOKBYTS            in this block, from chunk bytes.
+         L     R1,FILEBYTS        Increment
+         A     R1,UNFBYMVD          total file bytes
+         ST    R1,FILEBYTS            in this block, from chunk bytes.
+         BAL   R9,WRITBUFF        Write buffer and reset UNFBUFFR
+*                                 Byte stats accumulated by WRITBUFF
+** ---------- >>    Record the number of bytes written  -  BELOW
+         TM    FLAGSYST,X'02'           SYSMOVED ddname present?
+         BNO   AFTT20WM                 No, can't write data to it.
+         TM    BWRITFLG,X'01'           Already written MESSAGE3?
+         BO    AFTT20NW                 Yes. Don't repeat info here.
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MESSAG11         Only if chunk less than block
+         HEX   OUTLINE+34,4,UNFBYMVD    PRINT BYTES MOVED IN THIS MOVE
+         HEX   OUTLINE+44,2,HDRLENG     PRINT HEADER MOVE LENGTH
+         HEX   OUTLINE+52,2,BLOKBYTS+2  PRINT TOTAL BYTES TILL NOW
+         PUT   SYSMOVED,OUTLINE
+AFTT20NW DS    0H
+         NI    BWRITFLG,FF-X'01'        Write MESSAG11 from here on.
+AFTT20WM DS    0H
+** ---------- >>    Record the number of bytes written  -  ABOVE
+         XC    BLOKBYTS,BLOKBYTS  Zero byte count moved after write.
+         XC    UNFBYMVD,UNFBYMVD  Zero bytes moved in control block too
+*        MVC   LINE+1(8),=C'AFT-20: '
+*        BAL   R9,UNFIMAGE
+         B     AFTRMEND
+AFTRMERR DS    0H                 Code any error handling here.
+AFTRMEND DS    0H
+         L     R9,SAVER9AF        Restore BAL register
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+WRITBUFF DS    0H
+         ST    R9,SAVER9WR        BAL register save for WRITBUFF
+         TM    READFLAG,X'01'     READ ONLY run?
+         BO    WRITREAD           Yes. Don't do the EXCP.
+         LA    R1,TAPOUT          R1=address of current DCB
+         ST    R1,OUTDCBPT        Put it in IOB
+         MVC   OUTCCW+1(3),UNFBSTRT+1   PRIME OUTPUT CCW
+         MVC   OUTCCW+6(2),BLOKBYTS+2    Move length of block
+         MVI   OUTECB,X'00'       Initialize ECB
+         EXCP  OUTIOB             Write out the buffer
+         WAIT  ECB=OUTECB         Wait for write to complete
+         CLI   OUTECB,X'7F'       Write completed normally?
+         BNE   WRITBERR           No - error
+WRITREAD DS    0H
+         AP    BLOCKCNT,=P'1'     Block count for this file
+         AP    BLOCKTOT,=P'1'     Block count for entire tape
+         MVC   UNFBUFFR,UNFBSTRT  Reset buffer start in UNFAREA
+         B     WRITBUFE           OK
+WRITBERR DS    0H
+* --- >  handle eov on output - below
+         NI    UNEXFLAG,FF-X'01'  Clear bit on unit exception flag
+         TM    OUTCSW+4,X'02'     Unit check?
+         BO    OUTERUC            Yes. Handle it.
+         TM    OUTCSW+4,X'01'     Unit exception on write?
+         BZ    OUTERR1            No. Assume data check.
+         OI    UNEXFLAG,X'01'     Flag that we have unit exception
+         MVC   LINE,LINE-1        Clear output line
+         MVC   LINE(133),OUTUNEX  Set unit exception error message
+         B     OUTERR2
+OUTERUC  MVC   LINE(133),OUTEQC   Set unit check error message
+         B     OUTERR2            Continue
+OUTERR1  DS    0H
+         MVC   LINE(133),OUTDCK   Set data check error message
+OUTERR2  DS    0H
+         ST    R2,SAVER2E         Save Registers
+         ST    R4,SAVER4E
+         ST    R5,SAVER5E
+         L     R2,OUTDCBPT        Load DCB address
+         LH    R4,40(,R2)         R4=TIOT offset
+         L     R5,16              R5=CVT
+         L     R5,0(,R5)          R5=TCB words
+         L     R5,4(,R5)          R5=My TCB
+         L     R5,12(,R5)         R5=TIOT
+         AR    R4,R5              R4=TIOT Entry for this output
+         MVC   LINE+34(6),4(R4)   Move DDNAME to message
+         L     R4,16(,R4)         R4=UCB for this output
+         MVC   LINE+47(4),12(R4)  Move unit address to message
+         MVC   LINE+60(6),36(R4)  Move VOLSER to message
+         L     R2,SAVER2E         Restore Registers
+         L     R4,SAVER4E
+         L     R5,SAVER5E
+         TM    UNEXFLAG,X'01'     Was this a Unit Exception only?
+         BNO   OTHERERR           No. Just go on.
+HANDLEOV DS    0H            If Unit Exception, then ask for new volume
+         PUT   SYSPRINT,LINE      Write message
+         BAL   R9,SUMMREPT        Print summary report before doing EOV
+         TM    READFLAG,X'01'     If Read Only, skip EOV macro.
+         BO    OTHERERR
+         MVC   OURRC,=F'4'        Indicate scratch volumes asked for
+         CLC   MAXRC,OURRC        Is MAXRC higher?
+         BH    SAMERC03           Yes. Keep it.
+         MVC   MAXRC,OURRC        No.  Raise MAXRC to this one.
+SAMERC03 DS    0H
+         EOV   TAPOUT
+OTHERERR DS    0H
+* --- >  handle eov on output - above
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,ERRMESS2
+         HEX   OUTLINE+34,4,UNFBYMVD    Print Reg 2
+         HEX   OUTLINE+44,2,HDRLENG     Pring Header Length
+         TM    FLAGSYST,X'02'           SYSMOVED ddname present?
+         BNO   WRITBUFE                 No, can't write data to it.
+         PUT   SYSMOVED,OUTLINE
+WRITBUFE DS    0H                       Stats for data moved
+** ---------- >>    Record the number of bytes written
+         ST    R2,SAVER2N           Save prev contents of Register 2
+         ST    R3,SAVER3N           Save prev contents of Register 3
+         XR    R2,R2                High order is zero
+         L     R2,BLOKBYTS          Load Current Written Byte Count
+         LA    R3,DBIN              Point Register to Counter
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+         LA    R3,DBINF             Point Register to Counter
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+** -->   label byte counts and data byte counts  <-- **  below
+         TM    ISLBLFLG,X'01'       This is a label file?
+         BO    ADLABCNT             If so, go count its bytes
+         LA    R3,DAIN              This is a data file--count bytes
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+         LA    R3,DAINF             This is a data file--count bytes
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+         B     NOLABCNT             Don't count twice
+ADLABCNT DS    0H
+         LA    R3,LBIN              Count the label file's bytes
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+         LA    R3,LBINF             Count the label file's bytes
+         BAL   R9,ADDCOUNT          Increment Doubleword Count
+NOLABCNT DS    0H
+** -->   label byte counts and data byte counts  <-- **  above
+         L     R2,SAVER2N           Restore prev contents of Register 2
+         L     R3,SAVER3N           Restore prev contents of Register 3
+** ---------- >>    Record the number of bytes written
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,MESSAGE3
+         HEX   OUTLINE+34,4,UNFBYMVD    PRINT TOTAL BYTES MOVED
+         HEX   OUTLINE+44,2,HDRLENG     PRINT HEADER LENGTH
+         HEX   OUTLINE+52,2,BLOKBYTS+2  PRINT PREVIOUS LENGTH
+         TM    FLAGSYST,X'02'           SYSMOVED ddname present?
+         BNO   WRITBUFX                 No, can't write data to it.
+         PUT   SYSMOVED,OUTLINE
+         OI    BWRITFLG,X'01'           Show you've been here
+WRITBUFX DS    0H
+         L     R9,SAVER9WR          BAL register restore for WRITBUFF
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+WRITTPMK DS    0H               Routine to write a tape mark
+         ST    R9,SAVER9WR      BAL register save for WRITTPMK
+         TM    READFLAG,X'01'   Is this run READ ONLY ?
+         BO    WRITTPME         Yes. Bypass entire routine.
+         LA    R1,TAPOUT        R1=address of current DCB
+         ST    R1,OUTDCBPT      Put it in IOB
+         MVI   OUTCCW,X'1F'     Tape Mark opcode
+         MVC   OUTCCWST(2),OUTCCW+6   Store previous move value
+         MVC   OUTCCW+6(2),X'0000'    Shove zeros into length field
+*                                     so AWSTAPE emulator doesn't barf
+         MVI   OUTECB,X'00'     Initialize ECB
+         EXCP  OUTIOB           Write the tape mark
+         WAIT  ECB=OUTECB       Wait for write to complete
+         CLI   OUTECB,X'7F'     Write completed normally?
+         BNE   WRITTPER         No. Indicate tape mark write error.
+         MVI   OUTCCW,X'01'     Reset CCW opcode to WRITE
+         MVC   OUTCCW+6(2),OUTCCWST   Restore bytes moved field in CCW
+         B     WRITTPME         Don't indicate error condition
+WRITTPER DS    0H               Tape mark write error display
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE,ERRMESS4
+         HEX   OUTLINE+34,4,OUTECB
+         HEX   OUTLINE+44,8,OUTCSW
+         PUT   SYSPRINT,OUTLINE
+         MVI   OUTCCW,X'01'     Reset CCW opcode to WRITE
+         MVC   OUTCCW+6(2),OUTCCWST    Restore byte moved field in CCW
+WRITTPME DS    0H
+         L     R9,SAVER9WR      BAL register restore for WRITTPMK
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+*   R2 HAS TO CONTAIN THE FULLWORD BYTE COUNT FOR THE LAST READ
+*   R3 HAS TO POINT TO THE DOUBLEWORD COUNTER TO BE INCREMENTED
+* --------------------------------------------------------- *
+ADDCOUNT DS    0H                  Add Byte Count subroutine
+         ST    R9,SAVER9AD         BAL register save for ADDCOUNT
+         ST    R4,SAVER4N          Save and Restore
+         ST    R5,SAVER5N             Work Registers
+         L     R4,0(,R3)           Load high order counter
+         L     R5,4(,R3)           Load low order counter
+         AR    R5,R2               Add to byte count
+         BNO   ADDCNOOV            No overflow, then branch
+         LA    R4,1(,R4)           Else, overflow to high word
+         X     R5,=X'7FFFFFFF'     Get rid of sign bit
+ADDCNOOV DS    0H
+         ST    R4,0(,R3)           Put updated counter in storage
+         ST    R5,4(,R3)           Put updated counter in storage
+         L     R4,SAVER4N          Save and Restore
+         L     R5,SAVER5N             Work Registers
+ADDCOUNE DS    0H                  End of routine - Return
+         L     R9,SAVER9AD         BAL register restore for ADDCOUNT
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+SUMMREPT DS    0H                        Write Summary Totals
+         ST    R9,SAVER9SU               Save BAL register
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+* >---- --- --- --->
+         TM    FLAGNEWV,X'01'
+         BZ    NOCHGVSR
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+3(130),MESSAGE7
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+NOCHGVSR DS    0H
+* >---- --- --- --->
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+14(21),=C'AWS HEADER STATISTICS'
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG01
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),UNFINRCD   NUMBER OF INPUT RECORDS READ
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG02
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INHDRS     NUMBER OF HEADERS ENCOUNTERED
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG03
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INTYPE1    BEGINNING OF RECORD HEADERS
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG04
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INTYPE2    MIDDLE OF RECORD HEADERS
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG05
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INTYPE3    END OF RECORD HEADERS
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG06
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INTYPE4    END OF TAPE HEADERS
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE(34),PRMSG07
+         MVC   OUTLINE+36(18),EDPAT
+         ED    OUTLINE+36(18),INTYPE5    END OF TAPE HEADERS
+         PUT   SYSPRINT,OUTLINE
+* >---->
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         MVC   OUTLINE+14(21),=C'TAPE BYTE COUNT STATS'
+         PUT   SYSPRINT,OUTLINE
+         MVC   OUTLINE,OUTLINE-1
+         PUT   SYSPRINT,OUTLINE
+* >---->
+         TM    FLAGSYST,X'04'
+         BNO   NOSUMM01
+         PUT   SYSFILES,CNTLINE
+NOSUMM01 DS    0H
+* >---->
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG04
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,DBINH
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DBINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+         L     R4,SAVER4Q
+         PUT   SYSPRINT,CNTLINE
+* >---->
+         TM    FLAGSYST,X'04'
+         BNO   NOSUMM02
+         PUT   SYSFILES,CNTLINE
+NOSUMM02 DS    0H
+* >---->
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG05
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,LBINH
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,LBINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+         L     R4,SAVER4Q
+         PUT   SYSPRINT,CNTLINE
+* >---->
+         TM    FLAGSYST,X'04'
+         BNO   NOSUMM03
+         PUT   SYSFILES,CNTLINE
+NOSUMM03 DS    0H
+* >---->
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG06
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,DAINH
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DAINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+         L     R4,SAVER4Q
+         PUT   SYSPRINT,CNTLINE
+* >---->
+         TM    FLAGSYST,X'04'
+         BNO   NOSUMM04
+         PUT   SYSFILES,CNTLINE
+NOSUMM04 DS    0H
+* >---->
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG08
+         MVC   FILEBYTE,BYTESPAT
+         MVC   CNTLINE+54(11),BLOKPAT
+         ED    CNTLINE+54(11),BLOCKTOT+2
+         MVC   CNTLINE+65(6),=C'Blocks'
+         PUT   SYSPRINT,CNTLINE
+* >---->
+         TM    FLAGSYST,X'04'
+         BNO   NOSUMM05
+         PUT   SYSFILES,CNTLINE
+* >---->
+*** -------- >>>
+         TM    UNEXFLAG,X'01'
+         BZ    NOMIDDLE
+         MVC   CNTLINE,CNTLINE-1
+         PUT   SYSFILES,CNTLINE
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE+1(37),=C' - VOLUME SWITCH HAS OCCURRED HERE - '
+         PUT   SYSFILES,CNTLINE
+         MVC   CNTLINE,CNTLINE-1
+         PUT   SYSFILES,CNTLINE
+NOMIDDLE DS    0H
+*** -------- >>>
+NOSUMM05 DS    0H
+* >---->
+*** -------- >>>
+         TM    UNEXFLAG,X'01'
+         BZ    NOMIDDPR
+         MVC   CNTLINE,CNTLINE-1
+         PUT   SYSPRINT,CNTLINE
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE+1(37),=C' - VOLUME SWITCH HAS OCCURRED HERE - '
+         PUT   SYSPRINT,CNTLINE
+         MVC   CNTLINE,CNTLINE-1
+         PUT   SYSPRINT,CNTLINE
+NOMIDDPR DS    0H
+*** -------- >>>
+SUMMREPE DS    0H                  END OF ROUTINE - RETURN
+         L     R9,SAVER9SU         Restore BAL register
+         BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+LABELCHK DS    0H         Check for the presence of tape labels
+*                         and set label flags, accordingly,
+*                         in the LBLFLAG byte.
+*
+*              X'01'    HDR1 HAS BEEN SEEN
+*              X'02'    HDR2 HAS BEEN SEEN
+*              X'04'    VOL1 HAS BEEN SEEN
+*              X'08'    HDR1 IS FROM AN INITTED TAPE
+*              X'10'    EOF1 HAS BEEN SEEN
+*              X'20'    EOF2 HAS BEEN SEEN
+*              X'40'    EOV1 HAS BEEN SEEN
+*              X'80'    EOV2 HAS BEEN SEEN
+*
+* --------------------------------------------------------- *
+         ST    R9,SAVER9LC          Save BAL register
+         NI    ISLBLFLG,FF-X'01'    Turn off "Is Label" flag at start
+         LA    R1,TESTLABL          Point to 80 bytes to be tested.
+         CLC   =C'VOL1',0(R1)       Is this a VOL1 ?
+         BE    CVOL1                Process THE VOL1
+         CLC   =C'HDR1',0(R1)       Is this a HDR1 ?
+         BE    CHDR1                Process HDR1
+         CLC   =C'HDR2',0(R1)       This a HDR2 ?
+         BE    CHDR2                Process HDR2
+         CLC   =C'EOF1',0(R1)       This an EOF1 ?
+         BE    CEOF1                Process EOF1
+         CLC   =C'EOF2',0(R1)       This an EOF2 ?
+         BE    CEOF2                Process EOF2
+         CLC   =C'EOV1',0(R1)       This an EOV1 ?
+         BE    CEOV1                Process EOV1
+         CLC   =C'EOV2',0(R1)       This an EOV2 ?
+         BE    CEOV2                Process EOV2
+         CLC   =C'UHL',0(R1)        This a User Header Label?
+         BE    CUHL                 Process UHL
+         CLC   =C'UTL',0(R1)        This a User Trailer Label?
+         BE    CUTL                 Process UTL
+         B     NOTLABEL             80 byte record is not an IBM SL
+*        ------------------------------------------------------ *
+CVOL1    DS    0H                   PROCESS VOL1 LABEL
+         OI    LBLFLAG,X'04'        YES. FLAG VOL1 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+* ----- >    CHANGE OUTPUT VOLUME NAME - below
+         CLC   SVNEWVOL(6),=C'      '    IS SVNEWVOL BLANK?
+         BE    NOCHGVOL                  Yes. Don't change the volser.
+         CLI   FLAGNEWV,X'01'            Is the flag on, to change vol?
+         BNE   NOCHGVOL                  No. Don't change it.
+         L     R1,SVINAREA               Point to INAREA
+         MVC   4(6,R1),SVNEWVOL          NO. PLUG IN NEW VALUE.
+         MVC   MESSAGE7+28(6),SVNEWVOL   AND MOVE IT TO THE MESSAGE.
+NOCHGVOL DS    0H
+* ----- >    CHANGE OUTPUT VOLUME NAME - above
+         B     LABCHEND
+CHDR1    DS    0H
+         NI    LBLFLAG,X'0F'        TURN OFF EOV, EOF FLAGS
+         OI    LBLFLAG,X'01'        FLAG HDR1 SEEN.
+         L     R1,SVINAREA               Point to INAREA
+         CLC   4(23,R1),ZERO23      WAS TAPE INITTED?
+         BNE   CHDR1A               NO. THIS IS A HDR1 FOR DATASET
+         OI    LBLFLAG,X'08'        YES. ZERO DSN AND VOLSER HERE
+         OI    FLAGHDRL,X'01'
+CHDR1A   OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         B     LABCHEND
+CHDR2    DS    0H
+         NI    LBLFLAG,X'0F'        TURN OFF EOV, EOF FLAGS IF HDR2
+         OI    LBLFLAG,X'02'        FLAG HDR2 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         OI    FLAGHDRL,X'01'
+         B     LABCHEND
+CEOF1    DS    0H
+         NI    LBLFLAG,X'F8'        TURN OFF HDR FLAGS IF EOF1
+         OI    LBLFLAG,X'10'        FLAG EOF1 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         NI    FLAGHDRL,FF-X'01'  Initially not after HDR1 or HDR2.
+         B     LABCHEND
+CEOF2    DS    0H
+         NI    LBLFLAG,X'F8'        TURN OFF HDR FLAGS IF EOF2
+         OI    LBLFLAG,X'20'        FLAG EOF2 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         NI    FLAGHDRL,FF-X'01'  Initially not after HDR1 or HDR2.
+         B     LABCHEND
+CEOV1    DS    0H
+         NI    LBLFLAG,X'F8'        TURN OFF HDR FLAGS IF EOV1
+         OI    LBLFLAG,X'40'        FLAG EOV1 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         NI    FLAGHDRL,FF-X'01'  Initially not after HDR1 or HDR2.
+         B     LABCHEND
+CEOV2    DS    0H
+         NI    LBLFLAG,X'F8'        TURN OFF HDR FLAGS IF EOV2
+         OI    LBLFLAG,X'80'        FLAG EOV2 SEEN.
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         NI    FLAGHDRL,FF-X'01'  Initially not after HDR1 or HDR2.
+         B     LABCHEND
+*- USER LABEL HANDLING CODE  ------  BELOW  --------------- *
+CUHL     DS    0H                   HANDLE USER HEADER LABELS
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         B     LABCHEND
+CUTL     DS    0H                   HANDLE USER TRAILER LABELS
+         OI    ISLBLFLG,X'01'       INDICATE WE JUST READ A LABEL
+         B     LABCHEND
+*- USER LABEL HANDLING CODE  ------  ABOVE  --------------- *
+NOTLABEL NI    ISLBLFLG,FF-X'01'    TURN OFF "IS LABEL" FLAG
+         L     R9,SAVER9LC          Restore BAL register
+LABCHEND BR    R9
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+REPTFILE DS    0H       Routine to write block and byte counts
+*                       for each file in the SYSFILES ddname.
+* --------------------------------------------------------- *
+         ST    R9,SAVER9RP
+*----------->>
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG07
+         MVC   CNTLINE+29(9),FILEPAT
+         ED    CNTLINE+29(9),FILCOUNT+3
+         MVC   CNTLINE+54(11),BLOKPAT
+         ED    CNTLINE+54(11),BLOCKCNT+2
+         MVC   CNTLINE+65(6),=C'Blocks'
+         MVC   CNTLINE+90(11),BLOKPAT
+         ED    CNTLINE+90(11),BLOCKTOT+2
+         MVC   CNTLINE+102(10),=C'Cum Blocks'
+         TM    FLAGSYST,X'04'     SYSFILES DD NAME THERE?
+         BNO   NOFILE00
+         PUT   SYSFILES,CNTLINE
+NOFILE00 DS    0H
+*--->                   Block counts first  -  above
+         TM    FILBLFLG,X'01'            Is this a label file?
+         BO    LBLSMSG0                  Yes. Show labels, not data.
+         MVC   CNTLINE,CNTLINE-1         Clear line.
+         MVC   CNTLINE(38),CTMSG01A      Tell it's labels written.
+         B     ENDSMSG0
+LBLSMSG0 DS    0H
+         MVC   CNTLINE,CNTLINE-1         Clear line.
+         MVC   CNTLINE(38),CTMSG01B      Tell it's data written.
+ENDSMSG0 DS    0H
+         MVC   CNTLINE+29(9),FILEPAT
+         ED    CNTLINE+29(9),FILCOUNT+3  Put file count in message
+*--->
+         TM    FILBLFLG,X'01'            Is this a label file?
+         BO    DISLABLS                  Yes. Do the label treatment.
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,DAINFH          Bytes moved counts for this file
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DAINFL          LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+* >--->
+         MVC   DATBYTES,BYTESPAT
+         L     R4,DAINH           Cumulative data bytes written
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DAINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    DATBYTES,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+74(43),DATDISPL
+         L     R4,SAVER4Q
+         B     DISPDATA
+* >--->
+DISLABLS DS    0H
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,LBINFH          Bytes moved counts for this file
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,LBINFL          LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+* >--->
+         MVC   LABBYTES,BYTESPAT
+         L     R4,LBINH           Label bytes written, cumulative
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,LBINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    LABBYTES,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+74(43),LABDISPL
+         L     R4,SAVER4Q
+         B     DISPDATA
+* >--->
+DISPDATA DS    0H
+         TM    FLAGSYST,X'04'     SYSFILES DD NAME THERE?
+         BNO   NOFILE01
+         PUT   SYSFILES,CNTLINE
+NOFILE01 DS    0H
+* >---->
+         MVC   CNTLINE,CNTLINE-1
+         MVC   CNTLINE(38),CTMSG02
+         MVC   CNTLINE+29(9),FILEPAT
+         ED    CNTLINE+29(9),FILCOUNT+3
+         MVC   FILEBYTE,BYTESPAT
+         ST    R4,SAVER4Q
+         L     R4,DBINFH          Bytes written for this file
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DBINFL          LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    FILEBYTE,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+38(32),FILEBYT
+* >--->
+         MVC   CUMBYTES,BYTESPAT
+         L     R4,DBINH           Bytes written, cumulative
+         CVD   R4,DWORD
+         ZAP   QWORD,DWORD
+         MP    QWORD,TWO31        MULT BY 2 TO THE 31ST
+         L     R4,DBINL           LOAD REG WITH LOW ORDER
+         CVD   R4,DWORD           CONVERT LOW ORDER TO PACKED
+         AP    QWORD,DWORD        AND ADD IT IN
+         ED    CUMBYTES,QWORD+6   DISPLAY COUNT IN LINE
+         MVC   CNTLINE+74(43),CUMDISPL
+* >--->
+         TM    FLAGSYST,X'04'     SYSFILES DD NAME THERE?
+         BNO   NOFILE02
+         PUT   SYSFILES,CNTLINE
+NOFILE02 DS    0H
+         L     R4,SAVER4Q
+         MVC   CNTLINE,CNTLINE-1
+         TM    FLAGSYST,X'04'     SYSFILES DD NAME THERE?
+         BNO   NOFILE03
+         PUT   SYSFILES,CNTLINE
+NOFILE03 DS    0H
+REPTFEND DS    0H
+         L     R9,SAVER9RP
+         BR    R9
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+*    BAL REGISTER IS R9.
+* --------------------------------------------------------- *
+VALIDHDR DS    0H                     VALIDATE HEADER GOTTEN
+         NI    HDRVFLAG,FF-X'01'      Turn off invalid header flag.
+         CLI   HEADER+4,X'A0'
+         BE    VALIDHEN               Yes. Header is OK.
+         CLI   HEADER+4,X'80'
+         BE    VALIDHEN               Yes. Header is OK.
+         CLI   HEADER+4,X'20'
+         BE    VALIDHEN               Yes. Header is OK.
+         CLI   HEADER+4,X'00'
+         BE    VALIDHEN               Yes. Header is OK.
+         CLI   HEADER+4,X'40'
+         BE    VALIDHEN               Yes. Header is OK.
+         OI    HDRVFLAG,X'01'         Flag found header as invalid.
+VALIDHEN DS    0H
+         BR    R9
+* ----------------------------------------------------------------- *
+*      CCWs and IOB for the EXCP operations.
+* ----------------------------------------------------------------- *
+OUTCCW   DC    X'01',AL3(0),X'2000',X'FFFF'     OUTPUT AREA OVERLAID
+OUTECB   DC    F'0'
+OUTIOB   DC    X'02000000'
+         DC    A(OUTECB)
+OUTCSW   DC    2F'0'
+OUTCCWPT DC    A(OUTCCW)
+OUTDCBPT DC    A(TAPOUT)
+         DC    F'0'
+         DC    X'00010000'
+         DC    XL44'00'            PADDING
+         SPACE 3
+* ----------------------------------------------------------------- *
+         ENTRY AWSIN
+AWSIN    DCB   DDNAME=AWSIN,MACRF=GM,EODAD=FIN,DSORG=PS,LRECL=80
+TAPOUT   DCB   MACRF=(E),DDNAME=TAPOUT,DEVD=TA,DSORG=PS,RECFM=U
+         ENTRY SYSPRINT
+SYSPRINT DCB   DDNAME=SYSPRINT,DSORG=PS,MACRF=PM,LRECL=133,RECFM=FBA
+SYSTRACE DCB   DDNAME=SYSTRACE,DSORG=PS,MACRF=PM,LRECL=133,RECFM=FBA
+SYSMOVED DCB   DDNAME=SYSMOVED,DSORG=PS,MACRF=PM,LRECL=133,RECFM=FBA
+SYSFILES DCB   DDNAME=SYSFILES,DSORG=PS,MACRF=PM,LRECL=133,RECFM=FBA
+SYSIN    DCB   MACRF=GM,DDNAME=SYSIN,DSORG=PS,RECFM=FB,LRECL=80,       X 05677
+               EODAD=SYSINEND                                            05678
+         DC    CL8' '
+FF       EQU   X'FF'
+* ----------------------------------------------------------------- *
+*
+* AWSTAPE BLOCK HEADER
+*
+* ----------------------------------------------------------------- *
+HEADER   DS    0CL6                     BLOCK HEADER
+HDRCURLN DC    XL2'0000'                CURRENT BLOCK LENGTH
+HDRPRVLN DC    XL2'0000'                PREVIOUS BLOCK LENGTH
+HDRFLAG1 DC    X'00'                    FLAGS BYTE 1...
+HDRF1BOR EQU   X'80'                    ...BEGINNING OF RECORD
+HDRF1MOR EQU   X'00'                    ...MIDDLE OF RECORD
+HDRF1EOR EQU   X'20'                    ...END OF RECORD
+HDRF1TMK EQU   X'40'                    ...TAPE MARK
+HDRFLAG2 DC    X'00'                    FLAGS BYTE 2
+* ----------------------------------------------------------------- *
+*
+INHEADER DC    XL6'00'
+UNEXFLAG DC    X'00'                    FLAGS BYTE 1...
+         DC    XL80'00'                 PADDING
+HDRFULL  DS    0F                  LOOK AT HDRLENG AS A FULLWORD
+HDRFILL  DC    XL2'00'             FILLER TO MAKE A FULLWORD
+HDRLENG  DC    XL2'00'             HEADER LENGTH UNREVERSED
+HDRPFUL  DS    0F                  LOOK AT PREVIOUS AS A FULLWORD
+HDRPRVF  DC    XL2'00'
+HDRPREV  DC    XL2'00'             PREVIOUS BLOCK LENGTH UNREVERSED
+HDRFULLS DS    0F                  LOOK AT HDRLENG AS A FULLWORD
+HDRLENFL DC    XL2'00'
+HDRLENGS DC    XL2'00'             SAVED LENGTH VALUE FROM HEADER
+HDRPFULS DS    0F                  LOOK AT PREVIOUS AS A FULLWORD
+HDRPRVFL DC    XL2'00'
+HDRPREVS DC    XL2'00'             SAVED PREVIOUS VALUE FROM HEADER
+OUTCCWST DC    XL2'00'             Byte count in CCW - saved during WTM
+         DC    XL2'00'
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEX      DS    0H
+         MVC   1(1,R15),0(R1)        Move byte
+         UNPK  0(3,R15),1(2,R15)     Unpack
+         TR    0(2,R15),HEXTAB-240
+         LA    R15,2(,R15)           Increment output pointer
+         LA    R1,1(,R1)             Increment input pointer
+         BCT   R0,HEX                Decrement length, then loop
+         MVI   0(R15),C' '           Blank the trailing byte
+         BR    R4                    Return to caller
+HEXTAB   DC    C'0123456789ABCDEF'   Translate table
+         SPACE
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEXSAVE  DS    3F                    Register save for HEX macro
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+         EJECT
+* -------------------------------------------- *
+* ---------- *      F L A G S     * ---------- *
+* -------------------------------------------- *
+* ---------- *
+BWRITFLG DC    X'00'    MESSAGE3 was already written flag.
+*              X'01'    Don't have to write SYSMOVED message now.
+* ---------- *
+INITFLAG DC    X'00'    First invocation of UNFOLDEM at beg of tape.
+*              X'01'    After the first invocation of UNFOLDEM.
+* ---------- *
+HDRVFLAG DC    X'00'    HEADER IS VALID IF X'00'
+*              X'01'    HEADER IS INVALID--FILE MUST BE CORRUPTED
+* ---------- *
+LBLFLAG  DC    X'00'    FLAG WHEN TAPE LABELS ARE BEING READ IN
+*              X'01'    HDR1 HAS BEEN SEEN
+*              X'02'    HDR2 HAS BEEN SEEN
+*              X'04'    VOL1 HAS BEEN SEEN
+*              X'08'    HDR1 IS FROM AN INITTED TAPE
+*              X'10'    EOF1 HAS BEEN SEEN
+*              X'20'    EOF2 HAS BEEN SEEN
+*              X'40'    EOV1 HAS BEEN SEEN
+*              X'80'    EOV2 HAS BEEN SEEN
+* ---------- *
+READFLAG DC    X'00'               This run is "READ ONLY"  ?
+*              X'01'         Yes, read only.
+* ---------- *
+ISLBLFLG DC    X'00'               80 BYTE BLOCK IS NOT A LABEL
+*              X'01'         80 BYTE BLOCK IS A LABEL
+* ---------- *
+FILBLFLG DC    X'00'               IS THE FILE A LABEL FILE?
+*              X'01'         THIS FILE IS A LABEL FILE
+* ---------- *
+FLAGHDRL DC    X'00'               HEADER LABEL FLAG
+*              X'01'         EOT HEADER IS FOLLOWING A HEADER LABEL
+* ---------- *
+FLAGSYST DC    X'00'           FLAG TO SHOW IF SYSTRACE DD IS THERE
+*              X'01'         //SYSTRACE DD IS THERE
+*              X'02'         //SYSMOVED DD IS THERE
+*              X'04'         //SYSFILES DD IS THERE
+*              X'08'         //SYSIN    DD IS THERE
+* ---------- *
+FLAGNEWV DC    X'00'           FLAG TO SHOW IF A NEW VOLSER PLUGGED IN
+*              X'01'         SVNEWVOL FIELD HAS BEEN SUBSTITUTED.
+* ---------- *
+NOWRTFLG DC    X'00'           FLAG TO SHOW NOT END OF BLOCK
+*              X'01'           ON - HAVE TO CONTINUE IN SAME BUFFER
+* ---------- *
+UNFAREA  DS    0F                   UNFOLD AREA CONTROL BLOCK
+*                                   ------ ---- ------- -----
+UNFSCARD DC    F'0'                 Start address of 80-byte card
+UNFECARD DC    F'0'                 End address of 80-byte card
+UNFOFFST DC    F'0'                 OFFSET of data to be moved
+UNFBYTES DC    F'0'                 Number of bytes to be unfolded
+UNFBYMVD DC    F'0'                 Number of bytes that were moved
+UNFBUFFR DC    F'0'                 Current start address in buffer
+UNFBSTRT DC    F'0'                 Original start address of buffer
+UNFINRCD DC    PL7'0'               Number of GETs for AWSIN records
+UNFLENTH EQU   *-UNFAREA
+* -------------------------------------------- *
+BLOKBYTS DC    F'0'                Count of bytes for block.
+FILEBYTS DC    F'0'                Count of bytes for file.
+* -------------------------------------------- *
+SVNEWVOL DC    CL6' '              SAVED NEW VOLUME
+CHKNWVOL DC    CL6' '              Raw saved volser before syntax check
+DWORD    DC    D'0'
+SAVR2T5  DC    4F'0'
+QWORD    DS    PL16
+TWO31    DC    P'2147483648'       2 TO THE 31ST
+INHDRS   DC    PL7'0'
+INTYPE1  DC    PL7'0'
+INTYPE2  DC    PL7'0'
+INTYPE3  DC    PL7'0'
+INTYPE4  DC    PL7'0'
+INTYPE5  DC    PL7'0'
+FILCOUNT DC    PL7'0'
+FERCOUNT DC    PL7'0'
+BLOCKCNT DC    PL7'0'
+BLERRCNT DC    PL7'0'
+BLOCKTOT DC    PL7'0'
+DECVALUE DS    CL8
+FILEPAT  DC    X'402020202020202120'
+BLOKPAT  DC    X'4020202020202020212020'
+EDPAT    DC    X'40206B2020206B2020206B2020206B202120'
+BYTESPAT DC    X'40206B2020206B2020206B2020206B2020206B2020206B202120'
+FILEBYT  DS    0CL32
+FILEBYTE DC    C' 9,999,999,999,999,999,999'
+         DC    C' Bytes'
+CUMDISPL DS    0CL43
+CUMBYTES DC    C' 9,999,999,999,999,999,999'
+         DC    C'  Cum Total Bytes'
+LABDISPL DS    0CL43
+LABBYTES DC    C' 9,999,999,999,999,999,999'
+         DC    C'  Cum Label Bytes'
+DATDISPL DS    0CL43
+DATBYTES DC    C' 9,999,999,999,999,999,999'
+         DC    C'  Cum Data Bytes '
+*
+SAVEEN80 DS    F         Addresses:  80 bytes past record end
+SAVEENDC DS    F                     Record end location
+SAVEBEGC DS    F                     Record beginning location
+BEGDATA  DS    F                     Where this record's data begins
+*
+* below - - - - - - - - - - - - -  Various Save Areas - - - - - - - - *
+* ------                      Move count for bytes in the buffer
+BYTEBFWD DS    0F
+BYTEFILL DC    H'0'
+BYTEMOVE DC    H'0'
+* ------
+SVUNFOLD DC    F'0'           Entry point of UNFOLDEM subprogram
+SVINAREA DS    F
+SAVER2E  DS    F
+SAVER4E  DS    F
+SAVER5E  DS    F
+SAVER2N  DS    F              Has to do with byte counting subroutine
+SAVER3N  DS    F              Has to do with byte counting subroutine
+SAVER4B  DS    F              HEX print register save
+SAVER4N  DS    F              Has to do with byte counting subroutine
+SAVER4Q  DS    F              Has to do with byte counting subroutine
+SAVER5N  DS    F              Has to do with byte counting subroutine
+* --- below                   SAVE BAL REGISTER for each subroutine
+SAVER9HV DS    F              Has to do with Header Validation
+SAVER9AD DS    F              Has to do with ADDCOUNT routine
+SAVER9AF DS    F              Has to do with AFTRMOVE routine
+SAVER9WR DS    F              Has to do with WRITBUFF routine
+SAVER9WT DS    F              Has to do with WRITTPMK routine
+SAVER9CH DS    F              Has to do with CHKHEADR routine
+SAVER9LC DS    F              Has to do with LABELCHK routine
+SAVER9RP DS    F              Has to do with REPTFILE routine
+SAVER9SU DS    F              Has to do with SUMMREPT routine
+* --- above                   SAVE BAL REGISTER for each subroutine
+*
+* above - - - - - - - - - - - - -  Various Save Areas - - - - - - - - *
+OURRC    DC    F'0'
+MAXRC    DC    F'0'
+HDRBYTES DS    F
+HDRBSAVE DS    F
+SAVER8C2 DS    F
+         DC    C' '
+ZERO23   DC    23C'0'         TEST FOR IEHINITTED HDR1
+*
+*  -----------------            Error Message Texts
+ERRMESS1 DC    CL133'    BUFFER OVERFLOW ERROR  '
+ERRMESS2 DC    CL133'    TAPE OUTPUT WRITE ERROR'
+ERRMESS3 DC    CL133'    OFFSET ERROR           '
+ERRMESS4 DC    CL133'    TAPE MARK WRITE ERROR  '
+ERRMESS5 DC    CL133' >> AWS HEADER IS INVALID - CORRUPTION AT THIS POI-
+               NT >> '
+ERRMESS6 DC    CL133' >> AWS HEADER IS INVALID - PREV BYTES - CURR BYTE-
+               S  >> '
+*
+*  -----------------            Tape Output Error Message Texts
+OUTEQC   DC    C' ********** EQUIPMENT CHECK ON DD XXXXXX, UNIT '
+         DC    C' XXX, VOLUME XXXXXX -- THIS OUTPUT TERMINATED '
+         DC    40C'*'
+OUTUNEX  DC    C' *********** TAPE HAS ENDED ON DD XXXXXX, UNIT '
+         DC    C' XXX, VOLUME XXXXXX -- PRIVATE SCRATCH REQUESTED '
+         DC    37C'*'
+OUTDCK   DC    C' **********      DATA CHECK ON DD XXXXXX, UNIT '
+         DC    C' XXX, VOLUME XXXXXX -- THIS OUTPUT TERMINATED '
+         DC    40C'*'
+*
+*  -----------------            Header Message Texts
+MESSAGE1 DC    CL133'1VTT2TAPE - AWS TAPE FILE TO ACTUAL TAPE CONVERSIO-
+               N PROGRAM  '
+MESSAGE4 DC    CL133'1VTT2TAPE  -  AWS TAPE HEADER TRACE REPORT  '
+MESSAGE5 DC    CL133'1VTT2TAPE - AWS TAPE DATA MOVE - TRACE AND ERROR R-
+               EPORT  '
+MESSAGE6 DC    CL133'1VTT2TAPE - AWS TAPE FILE REPORT - MOVE AND WRITE -
+               STATS  '
+MESSAGE8 DS    0CL133
+         DC    CL8' '
+         DC    CL12'HEADER TEXT '
+         DC    CL1' '
+         DC    CL4'TYPE'
+         DC    CL3' '
+         DC    CL10'UNFSCARD'
+         DC    CL10'UNFECARD'
+         DC    CL10'UNFOFFST'
+         DC    CL10'UNFBYTES'
+         DC    CL10'UNFBYMVD'
+         DC    CL10'UNFBUFFR'
+         DC    CL10'UNFBSTRT'
+         DC    CL14'UNFINRCD'
+         DC    CL21' '
+MESSAGE9 DC    CL133'        A TRACE IS TAKEN EVERY TIME THAT A HEADER -
+               IS GOTTEN BY THE PROGRAM, IN READING THROUGH A TAPE.'
+MESSAG10 DC    CL133'        THE UNFAREA (UNFOLD AREA CONTROL BLOCK) FI-
+               ELDS ARE SHOWN AS OF THE TIME THE HEADER IS JUST GOTTEN.-
+               '
+*  -----------------            Diagnostic Info Message Texts
+MESSAGE2 DC    CL133'  OFFSET SIZE AND LOCATION '
+MESSAGE3 DC    CL133'  NUMBER OF BYTES WRITTEN  '
+MESSAGE7 DC    CL133'  VOLSER OVERRIDDEN TO:    '
+MESSAG11 DC    CL133'  NUMBER OF CHUNK BYTES    '
+MESSAG12 DC    CL133'  -- End of File Marker - File Number'
+*
+*  -----------------            Summary Totals Message Texts
+PRMSG01  DC    CL34'     TOTAL NUMBER OF RECORDS IN:  '
+PRMSG02  DC    CL34'     TOTAL NUMBER OF HEADERS IN:  '
+PRMSG03  DC    CL34'     TOTAL BEG BLOCK HEADERS   :  '
+PRMSG04  DC    CL34'     TOTAL END BLOCK HEADERS   :  '
+PRMSG05  DC    CL34'     TOTAL MID BLOCK HEADERS   :  '
+PRMSG06  DC    CL34'     TOTAL END OF FILE HEADERS :  '
+PRMSG07  DC    CL34'     TOTAL BEGIN AND END BLOCK :  '
+*
+*  -----------------            Byte Count Message Texts
+CTMSG01A DC    CL38'     DATA   WRITTEN FOR FILE:         '
+CTMSG01B DC    CL38'     LABELS WRITTEN FOR FILE:         '
+CTMSG02  DC    CL38'     BYTES  WRITTEN FOR FILE:         '
+CTMSG03  DC    CL38'     TOTAL BYTES   MOVED  FOR TAPE  : '
+CTMSG04  DC    CL38'     TOTAL BYTES  WRITTEN FOR TAPE  : '
+CTMSG05  DC    CL38'     TOTAL BYTES  WRITTEN FOR LABELS: '
+CTMSG06  DC    CL38'     TOTAL BYTES  WRITTEN FOR DATA  : '
+CTMSG07  DC    CL38'     BLOCKS WRITTEN FOR FILE:         '
+CTMSG08  DC    CL38'     TOTAL BLOCKS WRITTEN FOR TAPE  : '
+*
+*    ------------------------ >   Output Line Buffers  -  below
+         DC    C' '
+LINE     DC    CL133' '
+         DC    C' '
+CNTLINE  DC    CL133' '
+         DC    C' '
+OUTLINE  DC    CL133' '
+         DC    C' '
+PRTLINE  DC    CL133' '
+*    ------------------------ >   Output Line Buffers  -  above
+         LTORG
+* --- >
+SAVEHDR  DS    0CL6
+SAVCURLN DS    XL2
+SAVPRVLN DS    XL2
+SAVHFLGS DS    X
+SAVHREST DS    X
+* --- >
+PREVHDR  DS    0CL6
+PRVCURLN DS    XL2
+PRVPRVLN DS    XL2
+PRVHFLGS DS    X
+PRVHREST DS    X
+* --- >
+EOTMARK  DC    XL6'000000004000'
+DBINF    DS    0D          BYTE COUNT SAVE AREA FOR OUTPUT FILE
+DBINFH   DC    F'0'
+DBINFL   DC    F'0'
+DBIN     DS    0D          BYTE COUNT SAVE AREA FOR OUTPUT TOTAL
+DBINH    DC    F'0'
+DBINL    DC    F'0'
+LBIN     DS    0D          BYTE COUNT SAVE AREA FOR LABEL BYTES
+LBINH    DC    F'0'
+LBINL    DC    F'0'
+LBINF    DS    0D          BYTE COUNT SAVE AREA FOR LABEL BYTES
+LBINFH   DC    F'0'
+LBINFL   DC    F'0'
+DAIN     DS    0D          BYTE COUNT SAVE AREA FOR DATA BLOCK BYTES
+DAINH    DC    F'0'
+DAINL    DC    F'0'
+DAINF    DS    0D          BYTE COUNT SAVE AREA FOR DATA BLOCK BYTES
+DAINFH   DC    F'0'
+DAINFL   DC    F'0'
+         DC    CL8' '
+*    ------------------------ >   Constants for Date and Time - below
+SAVE1402 DS    6F                 Extra fullword for safety
+TIMED    DS    CL7
+DATED    DS    CL9
+DATETIME DS    4F
+         ORG   DATETIME
+TIME     DS    CL4
+         DS    CL4
+DATE     DS    CL5
+         DS    CL3
+HEADDLIT DS    0CL31              Literal for headings - date and time
+         DC    CL6'Today:'
+         DC    CL2' '
+HEADDATE DC    CL23' '
+LEVELLIT DS    0CL21              Level number display for headings
+         DC    CL6'Level '
+LEVELL   DC    CL4'&LLEV'
+         DC    CL2' ('
+LEVDATE  DC    CL8' '             Assembly date for this program
+         DC    CL1')'
+*    ------------------------ >   Constants for Date and Time - above
+*      Uppercase alpha and only allow printable characters.
+TRTBLPRT DS    0D
+         DC    XL16'40404040404040404040404040404040'
+         DC    XL16'40404040404040404040404040404040'
+         DC    XL16'40404040404040404040404040404040'
+         DC    XL16'40404040404040404040404040404040'
+         DC    XL16'404040404040404040404A4B4C4D4E4F'
+         DC    XL16'504040404040404040405A5B5C5D5E5F'
+         DC    XL16'606140404040404040406A6B6C6D6E6F'
+         DC    XL16'404040404040404040407A7B7C7D7E7F'
+         DC    XL16'40C1C2C3C4C5C6C7C8C9404040404040'
+         DC    XL16'40D1D2D3D4D5D6D7D8D9404040404040'
+         DC    XL16'4040E2E3E4E5E6E7E8E9404040404040'
+         DC    XL16'40404040404040404040404040404040'
+         DC    XL16'C0C1C2C3C4C5C6C7C8C9404040404040'
+         DC    XL16'D0D1D2D3D4D5D6D7D8D9404040404040'
+         DC    XL16'E040E2E3E4E5E6E7E8E9404040404040'
+         DC    XL16'F0F1F2F3F4F5F6F7F8F9404040404040'
+*
+TESTLABL DC    CL80' '
+GETSYSIN DC    CL80' '
+INCARDP  DC    XL80'00'           Previous card-image read
+INCARD   DC    XL80'00'           Current  card-image read
+INCAEND  EQU   *
+         DC    XL80'00'           Room for another card-image
+         DS    0F
+         DC    CL8' '
+INAREA   DS    CL65535            Buffer to hold tape blocks
+         DS    CL800              Padding, so as not to overrun
+*                                 somebody else's storage by mistake.
+         IEZIOB DSECT=YES
+         END
+   TITLE 'UNFOLDEM -- UNFOLD FB-80 DATA INTO A LONG BUFFER'
+UNFOLDEM CSECT
+*                           -------------------------------------
+*                           It is probably not necessary to run
+*                           this program in 24-bit mode.  But
+*                           it works when it is run that way.
+*                           -------------------------------------
+*                           We do want old MVS systems to be able
+*                           to run this routine.
+*                           -------------------------------------
+*
+*  ---------------------------------------------------------------  *
+*                                                                   *
+*  SUBROUTINE:    UNFOLDEM                                          *
+*                                                                   *
+*  DESCRIPTION:                                                     *
+*                                                                   *
+*      This program is the heart of the process of creating a       *
+*      real tape from an AWS-format tape file, which has been       *
+*      folded over into an FB-80 dataset.  The AWS header           *
+*      contains the number of bytes in the next chunk (complete     *
+*      or partial block) of tape data.  Once this quantity is       *
+*      known, and the beginning position of the data has been       *
+*      established (it starts just after the header ends), then     *
+*      the data itself has to be moved into a buffer, in            *
+*      preparation for that data block being written out to a       *
+*      tape.  This program unfolds the correct amount of data,      *
+*      beginning at a known position in the FB-80 file, into        *
+*      the buffer.  The position in the FB-80 file which marks      *
+*      the beginning of the data to be moved, is called the         *
+*      OFFSET into the 80-byte card, and it starts with position    *
+*      +0.                                                          *
+*                                                                   *
+*  INPUTS and OUTPUTS:   Described below.                           *
+*                                                                   *
+*  FILES NEEDED:                                                    *
+*                                                                   *
+*      This program assumes that the caller has opened DCBs for     *
+*      an FB-80 file called AWSIN, which contains its input         *
+*      "virtual tape" data, and for SYSPRINT.  This program         *
+*      needs to do GETs from AWSIN, and if necessary, it needs      *
+*      to write messages to SYSPRINT.  The caller has to provide    *
+*      ENTRY AWSIN and ENTRY SYSPRINT statements in front of        *
+*      the AWSIN and SYSPRINT DCBs, respectively.                   *
+*                                                                   *
+*  METHOD OF OPERATION:                                             *
+*                                                                   *
+*      This program operates using a control block, called the      *
+*      UNFAREA, which is passed from the caller and back to the     *
+*      caller.  Both the caller and this program update the         *
+*      UNFAREA.  Upon entry to this program, R1 is expected to      *
+*      point to the UNFAREA.                                        *
+*                                                                   *
+*      The caller does one GET of the FB-80 file, to read an        *
+*      AWS header (that has tape data following it).  Once the      *
+*      AWS header has been read, there should be enough data to     *
+*      supply to the UNFAREA control block, and then this           *
+*      program is called, to complete the move of that tape data    *
+*      to a buffer, and position the FB-80 input just past the      *
+*      data moved, so it should point to the next AWS header.       *
+*                                                                   *
+*      This program does more GETs from the FB-80 input file,       *
+*      until the request for the number of bytes to be moved,       *
+*      is satisfied.                                                *
+*                                                                   *
+*      The following is the layout of the UNFAREA.  Fields          *
+*      marked with an arrow must be supplied upon input to this     *
+*      program.                                                     *
+*                                                                   *
+*      UNFAREA  DS    0F          UNFOLD AREA CONTROL BLOCK         *
+*      *                          ------ ---- ------- -----         *
+*  --> UNFSCARD DC    F'0'        Start address of 80-byte card     *
+*  --> UNFECARD DC    F'0'        End address of 80-byte card       *
+*  --> UNFOFFST DC    F'0'        OFFSET of data to be moved        *
+*  --> UNFBYTES DC    F'0'        Number of bytes to be unfolded    *
+*      UNFBYMVD DC    F'0'        Number of bytes that were moved   *
+*  --> UNFBUFFR DC    F'0'        Current start address in buffer   *
+*  --> UNFBSTRT DC    F'0'        Original start address of buffer  *
+*      UNFINRCD DC    PL7'0'      Number of GETs for AWSIN records  *
+*      UNFLENTH EQU   *-UNFAREA                                     *
+*      *                                                            *
+*                                                                   *
+*      The rest of the fields are calculated by this program        *
+*      and returned to the caller.                                  *
+*                                                                   *
+*      UNFBUFFR and UNFOFFST are updated by this program, and       *
+*      upon return to the caller, they point to the output data     *
+*      and input data positions, respectively, that are just        *
+*      after the moved data, so as to wait for the next call,       *
+*      to be able to move more data.  UNFBSTRT preserves the        *
+*      very beginning address of the output buffer, whereas         *
+*      UNFBUFFR is a place somewhere within the buffer, which       *
+*      is the start of where the new data is expected to be         *
+*      moved.                                                       *
+*                                                                   *
+*      Since both the caller and this program do GET operations     *
+*      from the input FB-80 file, the count of the number of GETs   *
+*      done, UNFINRCD, is updated by BOTH the caller and by this    *
+*      program.                                                     *
+*                                                                   *
+*  ---------------------------------------------------------------  *
+         MACRO
+*  ---------------------------------------------------------------  *
+*    This macro is used to display hex values in a printed report.
+*  ---------------------------------------------------------------  *
+&NAME    HEX   &TO,&LEN,&FROM
+&NAME    DS    0H
+         ST    R4,SAVER04
+         STM   15,1,HEXSAVE
+         LA    1,&FROM
+         LA    0,&LEN
+         LA    15,&TO
+         BAL   4,HEX
+         L     R4,SAVER04
+         LM    15,1,HEXSAVE
+         MEND
+         SPACE
+         YREGS
+UNFOLDEM AMODE 24
+UNFOLDEM RMODE 24
+         USING *,R15
+         B     EYECATCH
+         DC    C'--- '            MAKE EYECATCHER VISIBLE
+         DC    C'UNFOLDEM '
+         DC    C' - '
+SYSDAT   DC    C'&SYSDATE'
+         DC    C'  ',C'&SYSTIME '
+SAVEAREA DC    18F'0'
+EYECATCH DS    0D                    ENSURE ALIGNMENT
+         STM   R14,R12,12(R13)
+         LR    R5,R1                 SAVE PARM POINTER
+         LA    R1,SAVEAREA           NEW SAVE-AREA ADDR
+         ST    R1,8(,R13)            FORWARD SAVE-AREA CHAIN PTR
+         ST    R13,4(,R1)            BACKWARD SAVE-AREA CHAIN PTR
+         LR    R13,R1                NEW SAVE AREA ADDRESS
+         DROP  R15
+* -----                              SET UP BASE REGISTERS
+         USING UNFOLDEM,R12,R11
+         LR    R12,R15
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+         LR    R1,R5                 RESTORE PARM POINTER
+         ST    R1,SAVEPARM
+         L     R0,SYSPRINV           SYSPRINT DCB address in caller
+         ST    R0,SYSPRDCB             store for the program's use
+         L     R0,AWSINV             AWSIN    DCB address in caller
+         ST    R0,AWSINDCB             store for the program's use
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*                                                                   *
+*   Routine to unfold FB-80 data starting at an OFFSET from the     *
+*   beginning of a card, for a certain number of bytes, to a data   *
+*   buffer area whose beginning address is supplied.  More 80-byte  *
+*   records can be read with the GET macro from the FB-80 file, to  *
+*   fulfill the move request.                                       *
+*                                                                   *
+*   Input:   UNFAREA fields are all supplied by the calling         *
+*            program, except for UNFBYMVD which is calculated       *
+*            by this program and returned to the caller.  The       *
+*            UNFAREA is pointed to by Register 1.                   *
+*                                                                   *
+*            The initial card image which is supplied by the        *
+*            calling program, already is primed with data to be     *
+*            moved (one card's worth of it).  This card contains    *
+*            the starting point for the data to be moved, at an     *
+*            OFFSET (displacement) from the beginning of the card.  *
+*                                                                   *
+*            The input data also contains the address of an         *
+*            output buffer area, which is the target for the        *
+*            (segmented) data moves.  Data will be strung out       *
+*            into this area, one card (or a partial card) at a      *
+*            time.  The current card which is in the input file,    *
+*            which contains the beginning of the data to be         *
+*            moved, has already been loaded into a card image       *
+*            work area pointed to by the calling program.  The      *
+*            OFFSET into this card is where the data to be moved    *
+*            will start.                                            *
+*                                                                   *
+*            It is the responsibility of the calling program to     *
+*            ensure that this routine has access to all of the      *
+*            buffer storage where the data is supposed to be        *
+*            moved to.                                              *
+*                                                                   *
+*   Output:  Data is moved, for the required number of bytes, to    *
+*            the output buffer area.  When more that one card       *
+*            image's worth of data has to be moved, more cards      *
+*            are obtained with the GET macro, from the input file.  *
+*                                                                   *
+*            Ending OFFSET in the FB-80 input file, pointing to     *
+*            just after the data which was moved, in the final      *
+*            card image gotten, is returned to the UNFOFFST field   *
+*            and reported to the caller, in anticipation of the     *
+*            next call to this routine.                             *
+*                                                                   *
+*            Ending address of data in buffer - one byte after      *
+*            the end of the moved data - is returned in the         *
+*            UNFBUFFR field.  The UNFBSTRT field preserves the      *
+*            address of the beginning of the data buffer.           *
+*                                                                   *
+*            A count of bytes actually moved from the FB-80 file    *
+*            to the output buffer area is reported in the UNFBYMVD  *
+*            field.  This must match the byte count of bytes which  *
+*            needed to be moved initially.  That count had been     *
+*            initially supplied by the calling program in the       *
+*            UNFBYTES field.                                        *
+*                                                                   *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+UNFOLD   DS    0H
+         ST    R1,PARMPTR
+         L     R2,=A(UNFBLOCK)
+         USING UNFBLOCK,R2
+         MVC   UNFAREA(UNFLENTH),0(R1)      Move input block to pgm
+         LA    R2,UNFAREA                   And address it.
+         MVC   SAVEBEGC,UNFSCARD    Save "start of card" address
+         MVC   SAVEENDC,UNFECARD    Save "end of card" address
+         L     R1,UNFSCARD          Address of card
+         MVC   WORKPREV(80),ZEROCARD   Zero prev work area
+         MVC   WORKCURR(80),0(R1)   Move card image to curr work area
+         MVC   UNFBYMVD,=F'0'       Initialize count of bytes moved
+         L     R7,UNFSCARD          Point to beginning of card
+         A     R7,UNFOFFST          Add OFFSET to start of input
+         ST    R7,SAVEBEGI          Save where input starts
+         L     R8,SAVEBEGI          Copy beg of input address
+         A     R8,UNFBYTES          Make hypothetical end address,
+*                                   by adding the bytes to be moved.
+* - - - - - - - - - - - - - - >>    This may be way past the address
+*             of the end of the FB-80 card.  We will decrease this
+*             address as we move bytes from successive cards to the
+*             data buffer, by 80 bytes at a time, as we GET new cards,
+*             until R8 actually falls within the end-of-card address.
+*             We will then use this address to calculate the new
+*             OFFSET for the next piece of data in the FB-80 file.
+*             The new OFFSET is returned to the caller by modifying
+*             the UNFOFFST field in the control block.
+*
+* <--------- SET UP LOOP TO START MOVING THE DATA ------->
+LOOPSET  DS    0H                   Start moving data
+         L     R3,UNFBUFFR          Point to beginning of buffer
+         ST    R3,SAVEBEGD          Save location in the program.
+         LR    R4,R3                Point R4 to end of data by adding
+         A     R4,UNFBYTES          the number of bytes to the start.
+         ST    R4,SAVEENDD          Save potential end of data location
+         ST    R8,SAVER8TR          Save R8 for trace.
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*  Cases:  1.  Current move is within the current card.           *
+*              Covered by LOOPSHRT routine.                       *
+*                                                                 *
+*          2.  Current move is past the current card.             *
+*              Covered by LOOPMORE routine.                       *
+*                                                                 *
+*        R6 always contains the number of bytes to be moved       *
+*        for this segment.                                        *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+LOOPINIT DS    0H
+         C     R8,SAVEENDC          Is R8 still past end-of-card?
+         BH    LOOPMORE             Yes. Copy till end and GET.
+LOOPSHRT DS    0H                   The move is short, not past end.
+         LR    R6,R8                No. Get byte count to move NOW.
+         SR    R6,R7                Bytes to move
+         C     R6,=F'80'            More than 80?
+         BH    LOOPERR1             Yes. Has to be error, so flag it.
+         BCTR  R6,0                 No. One less for EXECUTE.
+         EX    R6,MOVEBUFF          Move the data to the buffer.
+         LA    R6,1(,R6)            Restore count of bytes moved
+         L     R1,UNFBYMVD          Increment
+         AR    R1,R6                  total
+         ST    R1,UNFBYMVD          Store it away for later.
+         LA    R3,0(R6,R3)          Bop past beginning buffer address.
+*        MVC   LINE+1(8),=C'LSHRT1: '
+*        BAL   R9,UNFIMAGE
+         CR    R3,R4                Not equal to predicted end?
+         BNE   LOOPERR2             Error, so flag it.
+         ST    R3,UNFBUFFR          Return modified new buffer address.
+         LR    R6,R8                Calculate new OFFSET - save R8
+         S     R6,UNFSCARD          Subtract beginning of card address
+         ST    R6,UNFOFFST          Store the result as new OFFSET
+*        MVC   LINE+1(8),=C'LSHRT2: '
+*        BAL   R9,UNFIMAGE
+         B     RETURN
+*
+LOOPMORE DS    0H                   Data move if more than one card
+*
+         L     R6,SAVEENDC          We're going past end-of-card
+         SR    R6,R7                Subtract beg address of data
+         C     R6,=F'80'            Still bigger than 80?
+         BH    LOOPERR1             Yes. Has to be error.
+         BCTR  R6,0                 Subtract one for EXECUTE
+         EX    R6,MOVEBUFF          Move data into buffer
+         LA    R6,1(,R6)            Restore byte count
+         L     R1,UNFBYMVD          Increment
+         AR    R1,R6                  total
+         ST    R1,UNFBYMVD              bytes moved
+         LA    R3,0(R6,R3)          Bop past data moved in buffer
+*        MVC   LINE+1(8),=C'LMORE1: '
+*        BAL   R9,UNFIMAGE
+         CR    R3,R4                Test if past end
+         BH    LOOPERR3             Yes. Has to be an error.
+         ST    R3,UNFBUFFR          Re-point current buffer address.
+         S     R8,=F'80'            -80 bytes because new card gotten
+         MVC   WORKPREV,WORKCURR    Save card image to previous
+         ST    R10,SAVER10          Save register for safety
+         L     R10,AWSINDCB         Point to AWSIN DCB in caller
+         GET   (10),WORKCURR        Get a new card image
+         L     R10,SAVER10          Restore R10
+         AP    UNFINRCD,=P'1'       Increment count of AWSIN rcrds read
+         L     R7,SAVEBEGC          Point to beginning addr of workarea
+         MVC   0(80,R7),WORKCURR    Overlay caller's card image
+*        MVC   LINE+1(8),=C'LMORE2: '
+*        BAL   R9,UNFIMAGE
+         C     R8,SAVEENDC          Is R8 within the card image end?
+         BH    LOOPMORE             No. Do the LOOPMORE routine.
+         B     LOOPSHRT             Yes. Do the LOOPSHRT routine.
+         SPACE 3
+* ----------------------------------------------------------------- *
+MOVEBUFF MVC   0(*-*,R3),0(R7)      << EXECUTED >>
+* --------------------------------------------------------- *
+LOOPERR1 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR1 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR2 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR2 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR3 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR3 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+* --------------------------------------------------------- *
+RETURN   DS    0H                   RETURN TO THE OPERATING SYSTEM
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SAVEPARM         Address of UNFAREA in caller
+         MVC   0(UNFLENTH,R10),UNFAREA    Copy changed UNFAREA back
+         L     R10,SAVER10          Restore R10
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'0'      Load Maximum Return Code
+         MVC   24(4,R13),=A(UNFBLOCK)  Return address of UNFAREA in R1.
+         LM    R14,R12,12(R13)
+         BR    R14
+         EJECT
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+* ---      S U B R O U T I N E S                        --- *
+* --------------------------------------------------------- *
+UNFIMAGE DS    0H          Diagnostic Data - State of UNFAREA currently
+*
+         HEX   LINE+10,4,UNFSCARD
+         HEX   LINE+20,4,UNFECARD
+         HEX   LINE+30,4,UNFOFFST
+         HEX   LINE+40,4,UNFBYTES
+         HEX   LINE+50,4,UNFBYMVD
+         HEX   LINE+60,4,UNFBUFFR
+         HEX   LINE+70,4,UNFBSTRT
+         HEX   LINE+80,4,SAVER8TR
+         HEX   LINE+90,7,UNFINRCD
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+         BR    R9
+* - - - - - - - -  D A T A   A R E A S  - - - - - - - - *
+UNFBLOCK CSECT
+UNFAREA  DS    0F                   UNFOLD AREA CONTROL BLOCK
+*                                   ------ ---- ------- -----
+UNFSCARD DC    F'0'                 Start address of 80-byte card
+UNFECARD DC    F'0'                 End address of 80-byte card
+UNFOFFST DC    F'0'                 OFFSET of data to be moved
+UNFBYTES DC    F'0'                 Number of bytes to be unfolded
+UNFBYMVD DC    F'0'                 Number of bytes that were moved
+UNFBUFFR DC    F'0'                 Current start address in buffer
+UNFBSTRT DC    F'0'                 Original start address of buffer
+UNFINRCD DC    PL7'0'               Number of GETs for AWSIN records
+UNFLENTH EQU   *-UNFAREA
+*
+UNFOLDEM CSECT
+WORKPREV DS    CL80                 Contiguous previous card image
+WORKCURR DS    CL80                 Card image work area
+         DC    C' '
+LINE     DC    CL133' '
+         DC    C' '
+LINE2    DC    CL133' '
+*
+FF       EQU   X'FF'
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEX      DS    0H
+         MVC   1(1,R15),0(R1)        Move byte
+         UNPK  0(3,R15),1(2,R15)     Unpack
+         TR    0(2,R15),HEXTAB-240
+         LA    R15,2(,R15)           Increment output pointer
+         LA    R1,1(,R1)             Increment input pointer
+         BCT   R0,HEX                Decrement length, then loop
+         MVI   0(R15),C' '           Blank the trailing byte
+         BR    R4                    Return to caller
+HEXTAB   DC    C'0123456789ABCDEF'   Translate table
+         SPACE
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEXSAVE  DS    3F                    Register save for HEX macro
+SAVER04  DS    H                     Register save for HEX macro
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+ZEROCARD DC    80X'00'
+SAVEBEGD DC    F'0'                 Save beg of buffer data address
+SAVEENDD DC    F'0'                 Save end of buffer data address
+SAVEBEGI DC    F'0'                 Save beg address of card input
+SAVEBEGC DC    F'0'                 Save beg address of card
+SAVEENDC DC    F'0'                 Save end address of card
+SAVER8TR DC    F'0'                 Save floating Reg 8 which decreases
+SAVEPARM DC    F'0'                 Save CALLER'S UNFAREA ADDRESS
+PARMPTR  DC    F'0'
+SYSPRINV DC    V(SYSPRINT)
+AWSINV   DC    V(AWSIN)
+SYSPRDCB DC    F'0'
+AWSINDCB DC    F'0'
+SAVER10  DC    F'0'
+         END

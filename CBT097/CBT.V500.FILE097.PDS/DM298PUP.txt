@@ -1,0 +1,1350 @@
+DM298PUP CSECT
+         REGS
+         USING DM298PUP,R15   ADDRESSASBILITY
+         B     MAINEP         BRANCH AROUND LIT
+         DC    AL1(L'CSECTLIT)
+CSECTLIT DC    C'DM298PUP - MOVE/REALLOC DATASETS &SYSDATE &SYSTIME'
+*
+*        READS CARDS AND MOVES/REALLOCATES ONE DATASET PER CARD.
+*        'CMD' IS USED IN MESSAGES. 'F' IS THE 1 CHAR CMD FIELD USED
+*        IN THE CONTROL CARD.
+*
+*        PROCESSING (NORMAL):
+*      STEP  CMD F PROCESSING
+*        1)  --- - SCAN CONTROL CARD.
+*        2)  MOV M DYNA A DD=FILEDD OF THE CURRENT VERSION OF DATASET.
+*        3)  PH1 1 COPY TO WORK.
+*        4)  PH2 2 DYND - THIS WILL KEEP THE CURRENT VERSION.
+*        5)  PH3 3 DYNA A DD=FILEDD WITH A DISP=(,DELETE).
+*        6)  PH3 3 DYND - THIS WILL DELETE THE CURRENT VERSION.
+*        7)  PH4 4 DYNA A DD=FILEDD WITH DISP=(,CATLG),SPACE=ETC.
+*                  THIS WILL ALLOCATE THE NEW VERSION OF THE FILE.
+*        8)  PH5 5 COPY WORK BACK TO THE NEW VERSION.
+*        9)  PH5 5 DYND - THIS WILL CATALOG THE NEW VERSION
+*                  THE DATA IS NOW IN THE NEW VERSION OF THE FILE.
+*       10)  --- - LOOP BACK TO STEP 1 ON NEXT CONTROL CARD.
+*
+*        CARDIN MUST POINT TO A DISK FILE.  THE CMD FIELD IS UPDATED
+*        AND THE BLOCK CONTAINING THE INPUT CARD IS REWRITTEN AS EACH
+*        PHASE IS STARTED SO THAT RESTART IS POSSIBLE.  TWO SPECIAL
+*        CMD VALUES ARE USED:
+*
+*        CMD=ERR AN ERROR WAS DETECTED BUT THE OLD FILE IS INTACT.
+*        CMD=OK  ALL PROCESSING ON THIS FILE WAS COMPLETED OK.
+*
+*        RESTART IS AUTOMATICALLY INITIATED BASED ON THE VALUE IN
+*        CMD.  EACH CONTROL CARD IS SEPARATELY CHECKED.
+*
+*          CMD F DESCRIPTION                    RESTART ACTION
+*          MOV M PROCESS NORMALLY             - PROCESS AS NON-RESTART
+*          OK    MOVED OK                     - SKIP TO NEXT CARD
+*          ERR E FATAL ERROR OCCURED          - SKIP TO NEXT CARD
+*          PH1 1 RESET CMD TO MOV             - START OVER FROM MOV
+*          PH2 2 ASSUME FILE IS OUT THERE     - SKIP TO PH3
+*          PH3 3 ASSUME FILE IS OUT THERE     - PROCESS FROM HERE
+*          PH4 4 ASSUME FILE IS NOT OUT THERE - PROCESS FROM HERE
+*          PH5 5 ASSUME FILE IS OUT THERE     - DYNA DISP=OLD THEN
+*           "  " CONTINUED                    - PROCESS FROM HERE
+*
+*        IF THIS JOB ABENDS CHECK THE CMD FIELD OF THE FILE BEING
+*        PROCESSED.  NO SPECIAL ACTION SHOULD BE REQUIRED EXCEPT
+*        FOR PH3 AND PH4.  IN THIS CASE CHECK THE FILE TO SEE
+*        IF IT IS PRESENT.  IF IT HAS BEEN DELETED SET CMD TO PH4.
+*        IF IT IS PRESENT WITH THE OLD ALLOCATION SET CMD TO PH3.
+*        IF IT IS PRESENT WITH THE NEW ALLOCATION SET CMD TO PH5.
+*
+*        WORK POINTS TO A WORK FILE.  IT SHOULD BE DISP=(,KEEP/CATLG)
+*        RATHER THAN DISP=(,DELETE) SO THAT RESTART IS POSSIBLE IN
+*        CASE OF ABEND.  EACH FILE AS IT IS PROCESSED IS COPIED TO WORK
+*        WITH THE DCB INFO SPECIFIED IN THE CONTROL CARD SO MAKE SURE
+*        IT IS LARGE ENOUGH TO ACCOMODATE THE SINGLE LARGEST FILE.
+*
+*        MVS OPERATOR COMMANDS ARE SUPPORTED FOR THIS PROGRAM:
+*
+*        P JOBNAME   - STOP JOB AT END OF CURRENT PHASE
+*        F JOBNAME,D - DISPLAY CMD AND DSN OF CURRENT PHASE
+*        F JOBNAME,P - STOP JOB AT END OF CURRENT CONTROL CARD
+*
+         EJECT
+MAINEP   DS    0H
+         SAVE  (14,12)        STANDARD LINKAGE
+         LR    R12,R15        MOVE BASE
+         LA    R11,2048(R12)
+         LA    R11,2048(R11)
+         LA    R10,2048(R11)
+         LA    R10,2048(R10)
+         DROP  R15
+         USING DM298PUP,R12,R11,R10  ADDRESSABILITY
+         LR    R2,R13         OLD SAVE AREA
+         LA    R13,SAVEAREA   NEW SAVE AREA
+         USING SAVEAREA,R13   MORE ADDRESSABILITY
+         ST    R13,8(R2)      CHAIN
+         ST    R2,4(R13)      CHAIN
+         LA    R6,SYSIN       A(DCB)
+         USING IHADCB,R6      ADDRESSABILITY
+         OPEN  ((R6),UPDAT)   OPEN
+         TM    DCBOFLGS,X'10' OK
+         BZ    ERROPIN        NO -- ERROR
+         LH    R1,DCBLRECL    POST LRECL
+         CH    R1,=H'80'      OK
+         BNE   ERRLRECL       NO -- ERROR
+         LH    R0,DCBBLKSI    POST BLKSIZE
+         ST    R0,CTLBUFCL    POST CTL BUFF CURR LEN
+         ST    R0,CTLBUFL     POST CTL BUFF LEN
+         GETMAIN R,LV=(0)
+         ST    R1,CTLBUFAD    POST CTL BLOCK ADDR
+         A     R1,CTLBUFL     NOW ADDR OF END OF BUF
+         ST    R1,CTLBUFE     POST
+         SH    R1,=H'80'      BACK UP 1 REC
+         ST    R1,CTLBUFCR    POST AS CURR REC (BUF EMPTY)
+         MVI   SWOPCTL,C'O'   POST SYSIN OPEN
+         LA    R6,SYSPRINT    A(DCB)
+         OPEN  ((R6),OUTPUT)  OPEN
+         TM    DCBOFLGS,X'10' OK
+         BZ    ERROPOU        NO -- ERROR
+         MVI   SWOPLOG,C'O'   POST SYSPRINT OPEN
+         DROP  R6
+         BAL   R14,VOLI       INITIALIZE VOL TABLE
+         BAL   R14,QINIT      INITIALIZE QEDIT TABLE
+*
+*  INITIALIZATION COMPLETE -- PROCESS
+*
+MAINLOOP EQU   *
+         CLI   SWSTOP,C'Y'    GRACEFUL STOP
+         BE    EXIT           YES
+         BAL   R14,CRDGET     READ CONTROL CARD
+         BAL   R14,CHKCMD     CHECK FOR RESTART/ERROR
+         B     *+4(R15)       START AT PROPER PLACE
+         B     MAINMOV        00
+         B     MAINOK         04
+         B     MAINERR        08
+         B     MAINPH1        0C
+         B     MAINPH2        10
+         B     MAINPH3        14
+         B     MAINPH4        18
+         B     MAINPH5        1C
+MAINMOV  EQU   *
+         BAL   R14,XMOV       DYNALLOC OLD FILE
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINPH1
+MAINOK   EQU   *
+         BAL   R14,XOK        SKIP THIS CONTROL CARD
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINLOOP
+MAINERR  EQU   *
+         BAL   R14,XERR       SKIP THIS CONTROL CARD
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINLOOP
+MAINPH1  EQU   *
+         BAL   R14,XPH1       COPY OLD TO WORK
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINPH2
+MAINPH2  EQU   *
+         BAL   R14,XPH2       DYNDEALLOC OLD FILE
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINPH3
+MAINPH3  EQU   *
+         BAL   R14,XPH3       DELETE OLD FILE
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINPH4
+MAINPH4  EQU   *
+         BAL   R14,XPH4       DYNALLOC ALLOC NEW FILE
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINPH5
+MAINPH5  EQU   *
+         BAL   R14,XPH5       COPY WORK TO NEW
+         BAL   R14,QGET       CHECK FOR OPR CMD
+         B     MAINLOOP
+         TITLE 'VOLI   -- INITIALIZE VOLSER TABLE'
+VOLI     EQU  *
+         ST    R14,VOLIR14    SAVE RETURN ADDR
+         LA    R6,VOLSERIN    A(DCB)
+         USING IHADCB,R6      ADDRESSABILITY
+         OPEN  ((R6))
+         TM    DCBOFLGS,X'10' OK
+         BZ    ERRVOLO        NO -- ERROR
+         MVI   SWOPVOL,C'O'   POST FILE OPEN
+         LA    R5,VOLTAB      A(FIRST ENTRY IN TABLE)
+VOLILOOP EQU   *
+         GET   (R6)
+         CLC   VOLTABE,0(R5)  END OF TABLE
+         BE    ERRVOLF        YES -- ERROR
+         USING VOLREC,R1      ADDRESSABILITY
+         MVC   0(6,R5),VOLRECVS POST VOLSER
+         PACK  WORKDW,VOLRECTC  PACK TRKS/CYL
+         CVB   R15,WORKDW     NOW BIN
+         STH   R15,6(R5)      POST TO TABLE
+         LA    R5,8(R5)       BUMP TO NEXT ENTRY
+         B     VOLILOOP       LOOP BACK
+         DROP  R1
+VOLIEOF  EQU   *
+         CLOSE ((R6))
+         FREEPOOL ((R6))
+         MVI   SWOPVOL,C'C'   POST FILE CLOSED
+         L     R14,VOLIR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'CRDGET -- GET NEXT CONTROL CARD'
+CRDGET   EQU  *
+         ST    R14,CRDGR14    SAVE RET ADDR
+         L     R14,CTLBUFCR   POST ADDR OF CURR REC
+         AH    R14,=H'80'     BUMP TO NEXT REC
+         ST    R14,CTLBUFCR   NEW CURR REC ADDR
+         C     R14,CTLBUFE    IS BUFF EMPTY
+         BL    CRDGET1        NO -- USE THIS REC
+         BAL   R14,CTLREAD    GET NEXT REC
+         L     R14,CTLBUFAD   POST A(FIRST REC)
+         ST    R14,CTLBUFCR   POST A(CURR REC)
+CRDGET1  EQU   *
+         LA    R15,80         REC LEN
+         LR    R1,R15         AGAIN FOR MVCL
+         LA    R0,FIXC        REC AREA
+         MVCL  R0,R14         COPY REC
+         SR    R1,R1          CLEAR FOR TRT
+         SR    R2,R2          CLEAR FOR TRT
+         TRT   FIXCALC,NUMTAB CHECK FOR BAD DIGITS
+         BNZ   ERRTRTAL       HIT -- ERROR
+         TRT   FIXCLR,NUMTAB  CHECK FOR BAD DIGITS
+         BNZ   ERRTRTLR       HIT -- ERROR
+         TRT   FIXCBLK,NUMTAB CHECK FOR BAD DIGITS
+         BNZ   ERRTRTBL       HIT -- ERROR
+         PACK  WORKDW,FIXCALC NOW PACKED
+         CVB   R1,WORKDW      NOW BIN
+         STH   R1,HWALC       POST ALLOC
+         PACK  WORKDW,FIXCLR  NOW PACKED
+         CVB   R1,WORKDW      NOW BIN
+         STH   R1,HWLR        POST RECORD LEN
+         PACK  WORKDW,FIXCBLK NOW PACKED
+         CVB   R1,WORKDW      NOW BIN
+         STH   R1,HWBLK       POST BLKSIZE
+         L     R14,CRDGR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'CTLREAD -- READ NEXT CTL REC'
+CTLREAD  EQU   *
+         ST    R14,CTLRR14    SAVE RETURN ADDR
+         L     R7,CTLBUFAD    POST BUFFER ADDR
+         READ  CTLDECB,SF,,(R7),,MF=E
+         CHECK CTLDECB
+         L     R9,CTLDECB+16  POINT TO IOB
+         L     R14,CTLBUFL    BUFFER LEN
+         SH    R14,14(R9)     MINUS RESIDUAL = CURR BLOCK SIZE
+         ST    R14,CTLBUFCL   POST CURR BLOCK SIZE
+         A     R14,CTLBUFAD   PLUS A(BUF)
+         ST    R14,CTLBUFE    NEW END OF BUF
+         SR    R14,R14        CLEAR
+         L     R15,CTLBUFCL   POST CURRENT LENGTH
+         D     R14,=F'80'     IS IT OK
+         LTR   R14,R14        REMIANDER ZERO
+         BNZ   ERRBLKSI       NO -- ERROR
+         L     R14,CTLRR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'CHKCMD -- CHECK COMMAND'
+CHKCMD   EQU   *
+         ST    R14,CHKCR14    SAVE RETURN ADDR
+         CLI   FIXCCMD,C'M'
+         BE    CHKCMOV
+         CLI   FIXCCMD,C' '
+         BE    CHKCOK
+         CLI   FIXCCMD,C'E'
+         BE    CHKCERR
+         MVC   LOGMSG(L'MSGR01),MSGR01
+         BAL   R14,LOG        LOG RESTART MSG
+         CLI   FIXCCMD,C'1'
+         BE    CHKCPH1
+         CLI   FIXCCMD,C'2'
+         BE    CHKCPH2
+         CLI   FIXCCMD,C'3'
+         BE    CHKCPH3
+         CLI   FIXCCMD,C'4'
+         BE    CHKCPH4
+         CLI   FIXCCMD,C'5'
+         BE    CHKCPH5
+         B     ERRCMD         ERROR
+CHKCMOV  EQU   *
+         LA    R15,0          POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCOK   EQU   *
+         LA    R15,4          POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCERR  EQU   *
+         LA    R15,8          POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCPH1  EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RETURN CODE
+         B     CHKCPH10       00 - OK
+         B     ERRCHKRF       04 - RECORD FORMAT BAD
+CHKCPH10 EQU   *
+         LA    R15,0          POST RETURN CODE FOR MOV
+         B     CHKCEXIT       EXIT
+CHKCPH2  EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RETURN CODE
+         B     CHKCPH20       00 - OK
+         B     ERRCHKRF       04 - RECORD FORMAT BAD
+CHKCPH20 EQU   *
+         LA    R15,20         POST RETURN CODE FOR PH3
+         B     CHKCEXIT       EXIT
+CHKCPH3  EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RETURN CODE
+         B     CHKCPH30       00 - OK
+         B     ERRCHKRF       04 - RECORD FORMAT BAD
+CHKCPH30 EQU   *
+         LA    R15,20         POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCPH4  EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RETURN CODE
+         B     CHKCPH40       00 - OK
+         B     ERRCHKRF       04 - RECORD FORMAT BAD
+CHKCPH40 EQU   *
+         LA    R15,24         POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCPH5  EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RETURN CODE
+         B     CHKCPH50       00 - OK
+         B     ERRCHKRF       04 - RECORD FORMAT BAD
+CHKCPH50 EQU   *
+         MVC   DYNAT2,FIXCDSN POST DATASET NAME
+         LA    R1,DYNAUPL1    DISP=OLD PARAM LIST
+         ST    R1,DYNATADR    POST
+         LA    R1,DYNARBPT    POST PARAM LIST POINTER
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    CHKCPH51       NO
+         MVC   DYNERBP,=A(DYNARB)  POST RB ADDR TO DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+CHKCPH51 EQU   *
+         LA    R15,28         POST RETURN CODE
+         B     CHKCEXIT       EXIT
+CHKCEXIT EQU   *
+         L     R14,CHKCR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XMOV -- PROCESS MOV PHASE'
+XMOV     EQU   *
+         ST    R14,XMOVR14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'M'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   LOGMSG(L'MSGM01),MSGM01
+         BAL   R14,LOG        LOG STATUS
+         CLC   FIXCDSO,=C'PS ' DSO OK
+         BE    XMOVOKDS       YES
+         MVC   LOGMSG(L'MSGM03),MSGM03
+         BAL   R14,LOG        LOG STATUS
+         B     XMOVEREX       ERROR EXIT
+XMOVOKDS EQU   *
+         BAL   R14,ERFM       EDIT RECORD FORMAT
+         B     *+4(R15)       CHECK RECORD FORMAT
+         B     XMOVOKRF       00 - OK
+*                             04 - ERROR
+         B     XMOVEREX       ERROR EXIT
+XMOVOKRF EQU   *
+         MVC   DYNAT2,FIXCDSN POST DATASET NAME
+         LA    R1,DYNAUPL1    DISP=OLD PARAM LIST
+         ST    R1,DYNATADR    POST
+         LA    R1,DYNARBPT    DYNA PARAM LIST
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XMOVOKEX       NO
+         MVC   DYNERBP,=A(DYNARB)  POST RB ADDR TO DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         CLC   DYNER15,=F'4'  ERROR IN CURRENT ENVIRONMENT
+         BNE   ABEND          NO -- NO RECOVERY POSSIBLE
+         CLI   DYNARBER,X'02' UNAVAILABLE
+         BE    XMOVUNAV       YES
+         CLI   DYNARBER,X'04' ENVIRONMENTAL
+         BE    XMOVENVR       YES
+         CLI   DYNARBER,X'17' NOT FOUND
+         BE    XMOVNOTF       YES
+         B     ABEND          UNSUPPORTED ERROR -- QUIT
+XMOVUNAV EQU   *              UNAVAILABLE
+         CLI   DYNARBER+1,X'10' CHECK FOR IN USE
+         BE    XMOVINUS       YES -- POST MSG
+         B     ABEND          OTHER ERROR -- QUIT
+XMOVENVR EQU   *              UNAVAILABLE
+         CLI   DYNARBER+1,X'10' CHECK FOR IN USE
+         BE    XMOVINUS       YES -- POST MSG
+         CLI   DYNARBER+1,X'20' CHECK FOR OPEN
+         BE    XMOVINUS       YES -- POST MSG
+         B     ABEND          OTHER ERROR -- QUIT
+XMOVNOTF EQU   *              NOT FOUND
+         CLI   DYNARBER+1,X'FF' ANYTHING ELSE OK
+         BE    ABEND          UNKNOWN ERROR -- QUIT
+         MVI   FIXCCMD,C'E'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   LOGMSG(L'MSGM06),MSGM06
+         BAL   R14,LOG        LOG STATUS
+         B     MAINLOOP       LOOP BACK
+XMOVINUS EQU   *              NOT FOUND
+         MVC   LOGMSG(L'MSGM05),MSGM05
+         BAL   R14,LOG        LOG STATUS
+         B     MAINLOOP       LOOP BACK
+XMOVEREX EQU   *
+         MVI   FIXCCMD,C'E'   POST ERROR
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   LOGMSG(L'MSGM04),MSGM04
+         BAL   R14,LOG        LOG ERROR
+         B     MAINLOOP       GET NEXT CARD
+XMOVOKEX EQU   *
+         MVC   LOGMSG(L'MSGM02),MSGM02
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XMOVR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XOK  -- PROCESS OK  PHASE'
+XOK      EQU   *
+         ST    R14,XOKR14     SAVE RETURN ADDR
+         MVC   LOGMSG(L'MSGO01),MSGO01
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XOKR14     RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XERR -- PROCESS OK  PHASE'
+XERR     EQU   *
+         ST    R14,XERRR14    SAVE RETURN ADDR
+         MVC   LOGMSG(L'MSGE01),MSGE01
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XERRR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XPH1 -- PROCESS PH1 PHASE'
+XPH1     EQU   *
+         ST    R14,XPH1R14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'1'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         LA    R6,INDCB       A(DCB)
+         USING IHADCB,R6      ADDRESSABILITY
+         MVC   0(MDLLEN,R6),MDLDCB REFRESH
+         MVC   DCBDDNAM,=C'FILEDD  ' POST DDNAME
+         LA    R6,OUTDCB      A(DCB)
+         MVC   0(MDLLEN,R6),MDLDCB REFRESH
+         MVC   DCBDDNAM,=C'WORK    ' POST DDNAME
+         DROP  R6
+         BAL   R14,COPY       COPY DATA
+         B     *+4(R15)       PROCESS RETURN CODE
+         B     XPH1OKEX       00 - OK
+*                             04 - ERROR
+         LA    R1,DYNDRBPT    POST PARAM LIST POINTER
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH1LOGE       NO -- LOG COPY ERROR
+         MVC   DYNERBP,=A(DYNDRB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH1LOGE EQU   *
+         MVI   FIXCCMD,C'E'   POST ERROR
+         BAL   R14,POST
+         MVC   LOGMSG(L'MSG102),MSG102
+         BAL   R14,LOG        LOG STATUS
+         B     MAINLOOP       GET NEXT CARD
+XPH1OKEX EQU   *
+         MVC   LOGMSG(L'MSG101),MSG101
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XPH1R14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XPH2 -- PROCESS PH2 PHASE'
+XPH2     EQU   *
+         ST    R14,XPH2R14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'2'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         LA    R1,DYNDRBPT    POST PARAM LIST POINTER
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH2OKEX       NO -- DONE
+         MVC   DYNERBP,=A(DYNDRB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH2OKEX EQU   *
+         MVC   LOGMSG(L'MSG201),MSG201
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XPH2R14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XPH3 -- PROCESS PH3 PHASE'
+XPH3     EQU   *
+         ST    R14,XPH3R14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'3'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   DYNAT2,FIXCDSN POST DATASET NAME
+         LA    R1,DYNAUPL2    DISP=(,DELETE) PARAM LIST
+         ST    R1,DYNATADR    POST
+         LA    R1,DYNARBPT    DYNA PARAM LIST
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH3DYND       NO -- DO DEALLOCATE
+         MVC   DYNERBP,=A(DYNARB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH3DYND EQU   *
+         LA    R1,DYNDRBPT    POST PARAM LIST POINTER
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH3OKEX       NO -- DONE
+         MVC   DYNERBP,=A(DYNDRB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH3OKEX EQU   *
+         MVC   LOGMSG(L'MSG301),MSG301
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XPH3R14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XPH4 -- PROCESS PH4 PHASE'
+XPH4     EQU   *
+         ST    R14,XPH4R14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'4'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   DYNAT2,FIXCDSN POST DATASET NAME
+         MVC   DYNATD,FIXCVOL POST VOLSER
+         BAL   R14,VOLL       LOCATE VOLSER
+         SR    R14,R14        CLEAR
+         LH    R15,HWALC      ALLOCATION
+         D     R14,FWTRK      CONVERT TO CYLS
+         LTR   R14,R14        ANY REMAINDER
+         BZ    XPH4COK        NO -- CYLS OK
+         LA    R15,1(R15)     ROUND UP
+XPH4COK  EQU   *
+         C     R15,=F'10'     MORE THAN 10 CYLS
+         BL    XPH4TRK        NO -- USE TRACKS
+         STCM  R15,7,DYNATB   POST CYL PRIMARY ALLOCATION
+         LA    R1,DYNATAP     ALLOCATION IN CYLS
+         ST    R1,DYNAPL3X    POST IN DYNA LIST
+         B     XPH4SEC        CALCULATE SECONDARY
+XPH4TRK  EQU   *
+         LH    R15,HWALC      REFRESH
+         STCM  R15,7,DYNATB   POST TRK PRIMARY ALLOCATION
+         LA    R1,DYNAT9P     ALLOCATION IN TRKS
+         ST    R1,DYNAPL3X    POST IN DYNA LIST
+XPH4SEC  EQU   *
+         SR    R14,R14        CLEAR
+         SR    R15,R15        CLEAR
+         ICM   R15,7,DYNATB   POST PRIMARY ALLOCATION
+         D     R14,=F'10'     SEC = 10% OF PRIMARY
+         LTR   R14,R14        REMAINDER 0
+         BE    XPH4SOK        YES -- NO ROUND
+         LA    R15,1(R15)     ROUND UP
+XPH4SOK  EQU   *
+         STCM  R15,7,DYNATC   POST SECONDARY
+         LA    R1,DYNAUPL3    DISP=NEW PARAM LIST
+         ST    R1,DYNATADR    POST
+         LA    R1,DYNARBPT    DYNA PARAM LIST
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH4OKEX       NO -- DONE
+         MVC   DYNERBP,=A(DYNDRB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH4OKEX EQU   *
+         MVC   LOGMSG(L'MSG401),MSG401
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XPH4R14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'XPH5 -- PROCESS PH5 PHASE'
+XPH5     EQU   *
+         ST    R14,XPH5R14    SAVE RETURN ADDR
+         MVI   FIXCCMD,C'5'   POST COMMAND
+         BAL   R14,POST       REWRITE CONTROL REC
+         LA    R6,INDCB       A(DCB)
+         USING IHADCB,R6      ADDRESSABILITY
+         MVC   0(MDLLEN,R6),MDLDCB REFRESH
+         MVC   DCBDDNAM,=C'WORK    ' POST DDNAME
+         LA    R6,OUTDCB      A(DCB)
+         MVC   0(MDLLEN,R6),MDLDCB REFRESH
+         MVC   DCBDDNAM,=C'FILEDD  ' POST DDNAME
+         DROP  R6
+         BAL   R14,COPY       COPY DATA
+         B     *+4(R15)       PROCESS RETURN CODE
+         B     XPH5DYND       00 - OK
+*                             04 - ERROR
+         B     ABEND          FATAL ERROR
+XPH5DYND EQU   *
+         LA    R1,DYNDRBPT    POST PARAM LIST POINTER
+         DYNALLOC
+         LTR   R15,R15        ERROR
+         BE    XPH5OKEX       NO -- DONE
+         MVC   DYNERBP,=A(DYNDRB)  POST RB ADDR FOR DAIRFAIL
+         BAL   R14,MSGDAIR    EXECUTE DAIRFAIL
+         B     ABEND          QUIT
+XPH5OKEX EQU   *
+         MVI   FIXCCMD,C' '   POST SUCCESSFUL
+         BAL   R14,POST       REWRITE CONTROL REC
+         MVC   LOGMSG(L'MSG501),MSG501
+         BAL   R14,LOG        LOG STATUS
+         L     R14,XPH5R14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'COPY -- COPY FROM IN TO OUT'
+COPY     EQU   *
+         ST    R14,COPYR14    SAVE RETURN ADDR
+         LA    R6,INDCB       A(DCB)
+         USING IHADCB,R6      ADDRESSABILITY
+         OPEN  ((R6))         OPEN FILE
+         TM    DCBOFLGS,X'10' OPEN OK
+         BNZ   COPYOK1        YES
+         MVC   LOGMSG(L'MSGC01),MSGC01
+         B     COPYEREX
+COPYOK1  EQU   *
+         MVI   SWOPIN,C'O'    POST FILE OPEN
+         CLC   DCBRECFM,RECFM RECORD FORMAT OK
+         BE    COPYOK2        YES
+         MVC   LOGMSG(L'MSGC02),MSGC02
+         B     COPYEREX
+COPYOK2  EQU   *
+         CLC   DCBLRECL,HWLR  LRECL OK
+         BE    COPYOK3        YES
+         MVC   LOGMSG(L'MSGC03),MSGC03
+         B     COPYEREX
+COPYOK3  EQU   *
+         LA    R6,OUTDCB      A(DCB)
+         MVC   DCBRECFM,RECFM POST RECORD FORMAT
+         MVC   DCBLRECL,HWLR  POST LRECL
+         MVC   DCBBLKSI,HWBLK POST BLOCK SIZE
+         OPEN  ((R6),OUTPUT)  OPEN FILE
+         TM    DCBOFLGS,X'10' OPEN OK
+         BNZ   COPYOK4        YES
+         MVC   LOGMSG(L'MSGC04),MSGC04
+         B     COPYEREX
+COPYOK4  EQU   *
+         MVI   SWOPOUT,C'O'   POST FILE OPEN
+         DROP  R6
+COPYLOOP EQU   *              COPY THE RECORDS
+         GET   INDCB          READ REC
+         LR    R0,R1          POST A(REC)
+         PUT   OUTDCB,(0)     WRITE REC
+         B     COPYLOOP       LOOP BACK
+COPYEOF  EQU   *              EOF ON IN FILE
+         BAL   R14,CCLS       CLOSE FILES
+         SR    R15,R15        CLEAR
+         B     COPYEXIT       DONE
+COPYEREX EQU   *
+         BAL   R14,LOG        LOG MSG
+         BAL   R14,CCLS       CLOSE FILES
+         LA    R15,4          POST ERR
+COPYEXIT EQU   *
+         L     R14,COPYR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'CCLS -- CLOSE FILES USED IN COPY'
+CCLS     EQU   *
+         ST    R14,CCLSR14    SAVE RETURN ADDR
+         CLI   SWOPIN,C'C'    IS FILE CLOSED
+         BE    CCLSO          YES -- CHECK OUTPUT FILE
+         CLOSE INDCB
+         FREEPOOL INDCB
+         MVI   SWOPIN,C'C'    POST FILE CLOSED
+CCLSO    EQU   *
+         CLI   SWOPOUT,C'C'   IS FILE CLOSED
+         BE    CCLSEXIT       YES -- DONE
+         CLOSE OUTDCB
+         FREEPOOL OUTDCB
+         MVI   SWOPOUT,C'C'   POST FILE CLOSED
+CCLSEXIT EQU   *
+         L     R14,CCLSR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'POST -- REWRITE THE UPDATED CTL BLOCK'
+POST     EQU   *
+         ST    R14,POSTR14    SAVE RETURN ADDR
+         L     R0,CTLBUFCR    A(CURRENT REC IN BUF)
+         LA    R1,80          REC LEN
+         LA    R14,FIXC       A(CURRENT REC)
+         LR    R15,R1         REPOST REC LEN
+         MVCL  R0,R14         UPDATE REC IN BUFF
+         WRITE CTLDECB,SF,,(R7),,MF=E
+         CHECK CTLDECB
+POSTEXIT EQU   *
+         L     R14,POSTR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'ERFM -- EDIT RECORD FORMAT'
+ERFM     EQU   *
+         ST    R14,ERFMR14    SAVE RETURN ADDR
+         MVI   RECFM,X'00'    CLEAR NEW RECFM
+         MVI   SWRECFMC,X'00' CLEAR CHAR CONT OPTION
+         MVI   SWRECFMF,X'00' CLEAR FORMAT OPTION
+         LA    R1,L'FIXCRFM   LEN OF RECFM FIELD
+         LA    R2,FIXCRFM     A(RECFM FIELD)
+ERFMLOOP EQU   *
+         CLI   0(R2),C' '     SPACE
+         BE    ERFMBUMP       YES -- BUMP TO NEXT CHAR
+         CLI   0(R2),C'A'     ASA CHAR CONT
+         BE    ERFMA          YES -- PROCESS
+         CLI   0(R2),C'B'     BLOCKED
+         BE    ERFMB          YES -- PROCESS
+         CLI   0(R2),C'F'     FIXED
+         BE    ERFMF          YES -- PROCESS
+         CLI   0(R2),C'M'     MCH CHAR CONT
+         BE    ERFMM          YES -- PROCESS
+         CLI   0(R2),C'V'     VARIABLE
+         BE    ERFMV          YES -- PROCESS
+         MVC   LOGMSG(L'MSGM51),MSGM51
+         BAL   R14,LOG
+         B     ERFMEREX       UNSUPPORTED OPTION
+ERFMA    EQU   *
+         CLI   SWRECFMC,X'00' FIRST CHAR CONT OPTION
+         BNE   ERFMERRC       NO -- ERROR
+         MVI   SWRECFMC,C'A'
+         OI    RECFM,RECFMA   POST
+         B     ERFMBUMP
+ERFMB    EQU   *
+         OI    RECFM,RECFMB   POST
+         B     ERFMBUMP
+ERFMF    EQU   *
+         CLI   SWRECFMF,X'00' FIRST FORMAT OPTION
+         BNE   ERFMERRF       NO -- ERROR
+         MVI   SWRECFMF,C'F'
+         OI    RECFM,RECFMF   POST
+         B     ERFMBUMP
+ERFMM    EQU   *
+         CLI   SWRECFMC,X'00' FIRST CHAR CONT OPTION
+         BNE   ERFMERRC       NO -- ERROR
+         MVI   SWRECFMC,C'M'
+         OI    RECFM,RECFMM   POST
+         B     ERFMBUMP
+ERFMV    EQU   *
+         CLI   SWRECFMF,X'00' FIRST FORMAT OPTION
+         BNE   ERFMERRF       NO -- ERROR
+         MVI   SWRECFMF,C'V'
+         OI    RECFM,RECFMV   POST
+         B     ERFMBUMP
+ERFMBUMP EQU   *
+         LA    R2,1(R2)       BUMP TO NEXT CHAR
+         BCT   R1,ERFMLOOP    LOOP BACK
+         SR    R15,R15        POST NO ERROR
+         CLI   RECFM,X'00'    DID WE FIND ANYTHING
+         BNE   ERFMEXIT       YES -- EXIT
+         MVC   LOGMSG(L'MSGM52),MSGM52
+         BAL   R14,LOG
+         B     ERFMEREX       UNSUPPORTED OPTION
+ERFMERRC EQU   *
+         MVC   LOGMSG(L'MSGM53),MSGM53
+         BAL   R14,LOG
+         B     ERFMEREX       UNSUPPORTED OPTION
+ERFMERRF EQU   *
+         MVC   LOGMSG(L'MSGM54),MSGM54
+         BAL   R14,LOG
+         B     ERFMEREX       UNSUPPORTED OPTION
+ERFMEREX EQU   *
+         LA    R15,4          POST ERROR
+ERFMEXIT EQU   *
+         L     R14,ERFMR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         TITLE 'QINIT -- INITIALIZE QEDIT LOGIC'
+QINIT    EQU   *
+         ST    R14,QINIR14    SAVE RETURN ADDR
+QINILOOP EQU   *
+         EXTRACT COMMADDR,FIELDS=COMM
+         L     R8,COMMADDR    POST A(COMM POINTERS)
+         USING IEZCOMM,R8     ADDRESSABILITY
+         CLC   IEZCCIB,=F'0'  IS A CIB PRESENT
+         BE    QINISETN       NO -- SET MAX CIB NUMBER
+         L     R9,IEZCCIB     POST A(CIB)
+         USING IEZCIBDS,R9    ADDRESSABILITY
+         QEDIT ORIGIN=IEZCCIB,BLOCK=(R9) FREE CIB
+         B     QINILOOP       CHECK FOR MORE
+         DROP  R9
+QINISETN EQU   *
+         QEDIT ORIGIN=IEZCCIB,CIBCTR=4  MAX OF 4 CIBS
+QINIEXIT EQU   *
+         L     R14,QINIR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         DROP  R8
+         TITLE 'QGET -- GET NEXT MODIFY COMMAND USING QEDIT'
+QGET     EQU   *
+         ST    R14,QGETR14    SAVE RETURN ADDR
+QGETLOOP EQU   *
+         EXTRACT COMMADDR,FIELDS=COMM
+         L     R8,COMMADDR    POST A(COMM POINTERS)
+         USING IEZCOMM,R8     ADDRESSABILITY
+         L     R6,IEZCECB     A(QEDIT ECB FROM OS)
+         TM    0(R6),X'40'    IS IT POSTED
+         BZ    QGETEXIT       NO -- DONE
+         L     R9,IEZCCIB     A(CIB)
+         USING IEZCIBDS,R9    ADDRESSABILITY
+         CLI   CIBVERB,CIBMODFY  IS VERB MODIFY
+         BE    QGETF          YES -- PROCESS
+         CLI   CIBVERB,CIBSTOP  IS VERB STOP
+         BE    QGETS          YES -- PROCESS
+         B     QGETI          IGNORE
+QGETF    EQU   *
+         LH    R14,CIBDATLN   LENGTH OF RESPONSE
+         CH    R14,=H'1'      LONG ENOUGH
+         BL    QGETI          NO -- IGNORE
+         CLI   CIBDATA,C'D'   DISPLAY
+         BE    QGETD          YES -- PROCESS
+         CLI   CIBDATA,C'P'   STOP WHEN THIS FILE DONE
+         BE    QGETP          YES -- PROCESS
+         B     QGETI          INVALID -- IGNORE
+QGETD    EQU   *               DISPLAY CURRENT STATUS
+         MVC   QWTOCMD,FIXCCMD POST COMMAND
+         MVC   QWTODSN,FIXCDSN POST DATASET NAME
+         MVC   QWTOVOL,FIXCVOL POST VOLSER
+         WTO   MF=(E,QWTO)
+         B     QGETI          DONE
+QGETP    EQU   *              STOP WHEN THIS FILE DONE
+         MVI   SWSTOP,C'Y'    POST
+         B     QGETI          DONE
+QGETS    EQU   *              STOP NOW
+         B     EXIT
+QGETI    EQU   *
+         QEDIT ORIGIN=IEZCCIB,BLOCK=(R9) FREE CIB
+         B     QGETLOOP
+QGETEXIT EQU   *
+         L     R14,QGETR14    RESTORE RETURN ADDR
+         BR    R14
+         DROP  R8
+         DROP  R9
+         TITLE 'VOLL -- LOCATE VOLSER IN VOLTAB'
+VOLL     EQU   *
+         ST    R14,VOLLR14    SAVE RETURN ADDRILES
+         LA    R5,VOLTAB      A(FIRST ENTRY IN VOLTAB)
+VOLLLOOP EQU   *
+         CLC   FIXCVOL,0(R5)  IS THIS THE ENTRY
+         BE    VOLLHIT        YES -- USE IT
+         CLC   =D'0',0(R5)    EMPTY SLOT
+         BE    ERRVOLL        YES -- NOT FOUND - ERROR
+         CLC   VOLTABE,0(R5)  END OF TABLE
+         BE    ERRVOLL        YES -- NOT FOUND - ERROR
+         LA    R5,8(R5)       BUMP TO NEXT ENTRY
+         B     VOLLLOOP       LOOP BACK
+VOLLHIT  EQU   *
+         LH    R15,6(R5)      POST TRKS/CYL
+         ST    R15,FWTRK      POST AS A FULL WORD
+VOLLEXIT EQU   *
+         L     R14,VOLLR14    RESTORE RETURN ADDR
+         BR    R14
+MSGDAIR  EQU   *
+         ST    R14,MSGDR14    SAVE RETURN ADDRESS
+         ST    R15,DYNER15    SAVE DAIR RETURN CODE
+         LA    R1,DYNERBP     POST DAIRFAIL CB
+         LINK  EP=IKJEFF18    GENERATE ERROR MSG
+         LTR   R15,R15        CHECK FOR SUCCESS
+         BNZ   MSGDERR        DOUBLE ERROR
+         MVC   LOGMSG(L'MSGD01),MSGD01
+         BAL   R14,LOG
+         B     MSGDEXIT
+MSGDERR  EQU   *              DAIR FAILED AFTER DYNA/DYND FAILED
+         MVC   LOGMSG(L'MSGD02),MSGD02
+         BAL   R14,LOG
+         MVC   DYNER15,=X'FFFFFFFF' FORCE SERIOUS ERROR
+MSGDEXIT EQU   *              DAIR FAILED AFTER DYNA/DYND FAILED
+         L     R14,MSGDR14    RESTORE RETURN ADDR
+         BR    R14
+         TITLE 'LOG  -- LOG MSG TO SYSPRINT'
+LOG      EQU   *
+         ST    R14,LOGR14     SAVE RETURN ADDRILES
+         AP    LINECT,=P'1'   BUMP TO NEXT LINE
+         CP    LINECT,LINEMAX PAST END OF PAGE
+         BNH   LOGPRT         NO -- CONTINUE
+         AP    PAGECT,=P'1'   BUMP PAGE COUNT
+         UNPK  TIT1PAGE,PAGECT NOW CHAR
+         OI    TIT1PAGE+L'TIT1PAGE-1,X'F0' FIX SIGN
+         PUT   SYSPRINT,TIT1
+         PUT   SYSPRINT,TIT2
+         PUT   SYSPRINT,SPACES
+         ZAP   LINECT,=P'4'   RESET LINE COUNT
+LOGPRT   EQU   *
+         MVC   LOGCRD,FIXC    POST CURRENT COMMAND
+         PUT   SYSPRINT,LOGLINE
+         MVC   LOGMSG,SPACES
+         L     R14,LOGR14     RESTORE RETURN ADDR
+         BR    R14
+         TITLE 'EXIT -- ALL DONE'
+EXIT     EQU   *
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         L     R13,4(R13)     RESTORE A(SAVE AREA)
+         RETURN (14,12),RC=0  RETURN
+         TITLE 'ERROR LOGIC'
+ERRBLKSI EQU   *
+         WTO   'BLKSIZE NOT MULTIPLE OF 80 FOR SYSIN',                 X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRCHKRF EQU   *
+         WTO   'RECORD FORMAT INVALID ON RESTART',                     X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRCMD   EQU   *
+         WTO   'COMMAND FIELD INVALID',                                X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRLRECL EQU   *
+         WTO   'LRECL NOT EQUAL 80 FOR SYSIN',                         X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERROPIN  EQU   *
+         WTO   'OPEN FAILED FOR SYSIN',                                X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERROPOU  EQU   *
+         WTO   'OPEN FAILED FOR SYSPRINT',                             X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRTRTAL EQU   *
+         WTO   'INVALID DIGITS IN CONTROL CARD - ALLOC',               X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRTRTBL EQU   *
+         WTO   'INVALID DIGITS IN CONTROL CARD - BLKSIZE',             X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRTRTLR EQU   *
+         WTO   'INVALID DIGITS IN CONTROL CARD - LRECL',               X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRVOLF  EQU   *
+         WTO   'VOLSER TABLE FULL',                                    X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRVOLL  EQU   *
+         WTO   'VOLSER NOT IN TABLE',                                  X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+ERRVOLO  EQU   *
+         WTO   'OPEN FAILED FOR VOLSERIN',                             X
+               ROUTCDE=11,DESC=7
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         B     ABEND
+         TITLE 'ABEND -- DUMP PROGRAM'
+ABEND    EQU   *
+         BAL   R14,CLOSEFIL   CLOSE ANY OPEN FILES
+         LH    R1,ABCODE
+         ABEND (1),DUMP
+         TITLE 'CLOSEFIL -- CLOSE ANY OPEN FILES'
+CLOSEFIL EQU   *
+         ST    R14,CLOSR14    SAVE RETURN ADDR
+         CLI   SWOPCTL,C'O'   CONTROL FILE (SYSIN) OPEN
+         BNE   CLOSCTL        NO -- SKIP CLOSE
+         CLOSE SYSIN
+CLOSCTL  EQU   *
+         CLI   SWOPLOG,C'O'   LOG FILE (SYSPRINT) OPEN
+         BNE   CLOSLOG        NO -- SKIP CLOSE
+         CLOSE SYSPRINT
+CLOSLOG  EQU   *
+         CLI   SWOPIN,C'O'    IN FILE OPEN
+         BNE   CLOSIN         NO -- SKIP CLOSE
+         CLOSE INDCB
+CLOSIN   EQU   *
+         CLI   SWOPOUT,C'O'   OUT FILE OPEN
+         BNE   CLOSOU         NO -- SKIP CLOSE
+         CLOSE OUTDCB
+CLOSOU   EQU   *
+         CLI   SWOPVOL,C'O'   VOLUME FILE OPEN
+         BNE   CLOSVL         NO -- SKIP CLOSE
+         CLOSE VOLSERIN
+CLOSVL   EQU   *
+CLOSEXIT EQU   *
+         L     R14,CLOSR14    RESTORE RETURN ADDR
+         BR    R14            RETURN
+         EJECT
+         LTORG
+         TITLE 'DATA AREAS'
+SAVEAREA DS    9D              REG SAVE AREA
+*
+*        MISC DOUBLEWORDS
+*
+WORKDW   DS    D               WORK AREA
+*
+*        R14 (SUBROUTINE RETURN ADDR) SAVE AREAS
+*
+CCLSR14  DS    F               CCLS
+CHKCR14  DS    F               CHKCRD
+CLOSR14  DS    F               CLOSEFIL
+COPYR14  DS    F               COPY
+CRDGR14  DS    F               CRDGET
+CTLRR14  DS    F               CTLREAD
+ERFMR14  DS    F               ERFM
+LOGR14   DS    F               LOG
+MSGDR14  DS    F               MSGDAIR
+POSTR14  DS    F               POST
+QGETR14  DS    F               QGET
+QINIR14  DS    F               QINIT
+VOLIR14  DS    F               QINIT
+VOLLR14  DS    F               QINIT
+XERRR14  DS    F               XERR
+XMOVR14  DS    F               XMOV
+XOKR14   DS    F               XMOV
+XPH1R14  DS    F               XPH1
+XPH2R14  DS    F               XPH2
+XPH3R14  DS    F               XPH3
+XPH4R14  DS    F               XPH4
+XPH5R14  DS    F               XPH5
+*
+*        MISC FULLWORDS
+*
+CTLBUFAD DS    F               A(CTL DATA BLOCK)
+CTLBUFCL DS    F               LENGTH OF CURRENT BLOCK
+CTLBUFCR DS    F               A(CURR REC IN BUF)
+CTLBUFE  DS    F               A(END OF CURRENT BLOCK)
+CTLBUFL  DS    F               LENGTH OF BUFFER
+COMMADDR DS    F               A(EXTRACT COMM FIELD)
+FWTRK    DS    F               TRKS/CYL
+*
+*        MISC HALFWORDS
+*
+ABCODE   DC    H'1000'         DEFAULT ABEND CODE
+HWALC    DS    H               ALLOCATION
+HWLR     DS    H               LRECL
+HWBLK    DS    H               BLKSIZE
+         EJECT
+*
+*        SKELETON WTO FOR QEDIT
+*
+QWTO     WTO  'C 12345678901234567890123456789012345678901234 VVVVVV', X
+               DESC=7,                                                 X
+               ROUTCDE=2,                                              X
+               MF=L
+QWTOCMD  EQU   QWTO+04,1
+QWTODSN  EQU   QWTO+06,44
+QWTOVOL  EQU   QWTO+51,6
+         EJECT
+*
+*        MESSAGES
+*
+*                         1         2         3         4         5
+*                123456789012345678901234567890123456789012345678901
+MSGC01   DC    C'OPEN FAILED FOR COPY FROM DCB'
+MSGC02   DC    C'FROM DCB RECFM WRONG'
+MSGC03   DC    C'FROM DCB LRECL WRONG'
+MSGC04   DC    C'OPEN FAILED FOR COPY TO DCB'
+MSGD01   DC    C'DYNA/DYND FAILURE - SEE MSG'
+MSGD02   DC    C'DYNA/DYND + DAIR FAILURE - SEE DUMP'
+MSGE01   DC    C'PROCESSING SKIPPED - FILE IN ERROR'
+MSGM01   DC    C'START PROCESSING FOR THIS FILE'
+MSGM02   DC    C'MOV PHASE COMPLETED OK'
+MSGM03   DC    C'CONTROL CARD DSORG MUST BE PS'
+MSGM04   DC    C'CONTROL CARD CMD SET TO ERR'
+MSGM05   DC    C'PROCESSING SKIPPED - FILE IN USE'
+MSGM06   DC    C'CONTROL CARD CMD SET TO ERR - FILE NOT FOUND'
+MSGM51   DC    C'CONTROL CARD RECFM OPTION NOT SUPPORTED'
+MSGM52   DC    C'CONTROL CARD RECFM NOT SUPPLIED'
+MSGM53   DC    C'CONTROL CARD RECFM HAS MULTIPLE CHAR CONT'
+MSGM54   DC    C'CONTROL CARD RECFM HAS MULTIPLE FORMATS'
+MSGO01   DC    C'PROCESSING SKIPPED - FILE OK'
+MSGR01   DC    C'RESTARTING THIS FILE'
+MSG101   DC    C'PH1 PHASE COMPLETED OK'
+MSG102   DC    C'CONTROL CARD CMD SET TO ERR'
+MSG201   DC    C'PH2 PHASE COMPLETED OK'
+MSG301   DC    C'PH3 PHASE COMPLETED OK'
+MSG401   DC    C'PH4 PHASE COMPLETED OK'
+MSG501   DC    C'PH5 PHASE COMPLETED OK'
+*
+*        MISCELLANEOUS
+*
+RECFM    DS    X               HEX RECFM FOR DCB
+SWRECFMC DS    X               RECFM CHAR CONT SW
+SWRECFMF DS    X               RECFM FORMAT    SW
+*                              OR APPROPRIATE OPTIONS TOGETHER
+RECFMM   EQU   X'02'           MCH CHAR CONT
+RECFMA   EQU   X'04'           ASA CHAR CONT
+RECFMB   EQU   X'10'           BLOCKED
+RECFMV   EQU   X'40'           VARIABLE
+RECFMF   EQU   X'80'           FIXED
+*
+SWOPCTL  DC    C'C'            SYSIN    OPEN/CLOSED SWITCH
+SWOPLOG  DC    C'C'            SYSORINT OPEN/CLOSED SWITCH
+SWOPIN   DC    C'C'            INCDB    OPEN/CLOSED SWITCH
+SWOPOUT  DC    C'C'            OUTDCB   OPEN/CLOSED SWITCH
+SWOPVOL  DC    C'C'            VOLSERIN OPEN/CLOSED SWITCH
+SWSTOP   DC    C'N'            SOFT STOP SWITCH
+*
+LINECT   DC    PL2'57'
+LINEMAX  DC    PL2'57'
+PAGECT   DC    PL2'0'
+         EJECT
+FIXC     DS   0CL80           DATA AREA OF CONTROL REC
+FIXCCMD  DS   C               COMMAND
+FIXCDSN  DS   CL44            DATASET NAME
+FIXCVOL  DS   CL6             NEW VOLSER
+FIXCALC  DS   CL5             NEW ALLOCATION (TRACKS)
+FIXCDSO  DS   CL3             DSORG
+FIXCRFM  DS   CL3             RECORD FORMAT
+*        ANY COMBINATION OF THE FOLLOWING SUPPORTED
+*                             A = ASA CHAR CONTROL
+*                             M = MCH CHAR CONTROL
+*                             F = FIXED
+*                             V = VARIABLE
+*                             B = BLOCKED
+FIXCLR   DS   CL5             LOGICAL RECORD LEN
+FIXCBLK  DS   CL5             BLOCK SIZE
+FIXCFILL DS   CL8             FILLER (TSO SEQ NUM)
+*
+LOGLINE  DS   0CL133          PRINT LINE
+LOGCC    DC   C' '            CHAR CONT
+LOGCRD   DS   CL80            CARD IMAGE
+         DC   C' '            FILL
+LOGMSG   DC   CL51' '         MESSAGE AREA
+*
+SPACES   DC   CL133' '
+*
+TIT1     DS   0CL133
+         DC   CL40'1DM289-01'
+         DC   CL36'DISK MANAGMENT FILE MOVE UTILITY LOG'
+         DC   CL49' '
+         DC   CL05'PAGE '
+TIT1PAGE DS   CL3
+*
+TIT2     DS   0CL133
+         DC   CL82' CONTROL CARD'
+         DC   CL51'MESSAGE'
+         EJECT
+*
+*        FOR DYNALLOC:
+*        R1       ==> S99RBPTR (REQ BLK POINTER)
+*        S99RBPTR ==> S99RB    (REQUEST BLOCK)
+*        S99RB    ==> S99TUPL  (TEXT POINTER LIST)
+*        S99TUPL  ==> TEXT1    (DYNA OR JCL PARM)
+*                 ==> TEXT2    (DYNA OR JCL PARM)
+*                 ETC
+*
+*
+*        ALLOC LIST
+*
+DYNARBPT DS    0F
+         DC    XL1'80'         END OF LIST
+         DC    AL3(DYNARB)     RB POINTER
+*
+DYNARB   DS    0F
+         DC    AL1(20)         CONTROL BLOCK LENGTH
+         DC    XL1'01'         DSNAME ALLOCATE
+         DC    XL2'0000'       FLAGS 1
+DYNARBER DC    XL2'0000'       ERROR CODE
+         DC    XL2'0000'       INFO CODE
+DYNATADR DC    A(0)            TEXT LIST POINTER
+         DC    XL4'00000000'   RESERVED
+         DC    XL4'00000000'   FLAGS2
+*
+DYNAUPL1 DS    0F               DISP=OLD
+         DC    A(DYNAT1P)       TEXT1 POINTER - DDNAME
+         DC    A(DYNAT2P)       TEXT2 POINTER - DSNAME
+         DC    XL1'80'          END OF LIST
+         DC    AL3(DYNAT3P)     TEXT3 POINTER - DISP=OLD
+*
+DYNAUPL2 DS    0F               DISP=(OLD,DELETE,DELETE)
+         DC    A(DYNAT1P)       TEXT1 POINTER - DDNAME
+         DC    A(DYNAT2P)       TEXT2 POINTER - DSNAME
+         DC    A(DYNAT3P)       TEXT3 POINTER - DISP=(OLD)
+         DC    A(DYNAT6P)       TEXT4 POINTER - DISP=(,DELETE)
+         DC    XL1'80'          END OF LIST
+         DC    AL3(DYNAT8P)     TEXT5 POINTER - DISP=(,,DELETE)
+*
+DYNAUPL3 DS    0F               DISP=(NEW,CATLG,CATLG),ETC.
+         DC    A(DYNAT1P)       TEXT1 POINTER - DDNAME
+         DC    A(DYNAT2P)       TEXT2 POINTER - DSNAME
+         DC    A(DYNAT4P)       TEXT3 POINTER - DISP=(NEW)
+         DC    A(DYNAT5P)       TEXT4 POINTER - DISP=(,CATLG)
+         DC    A(DYNAT7P)       TEXT5 POINTER - DISP=(,,CATLG)
+DYNAPL3X DC    A(0)             TEXT6 POINTER - SPACE=(XXX)
+         DC    A(DYNATBP)       TEXT7 POINTER - SPACE=(,(XXX))
+         DC    A(DYNATCP)       TEXT9 POINTER - SPACE=(,(,XXX))
+         DC    A(DYNATDP)       TEXTA POINTER - VOL=SER=XXXXXX
+         DC    XL1'80'          END OF LIST
+         DC    AL3(DYNATEP)     TEXTB POINTER - UNIT=SYSALLDA
+*
+DYNAT1P  DS    0C               DDNAME
+         DC    XL2'0001'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT1)    LENGTH OF TEXT
+DYNAT1   DC    C'FILEDD  '      DDNAME
+*
+DYNAT2P  DS    0C               DSNAME
+         DC    XL2'0002'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT2)    LENGTH OF TEXT
+DYNAT2   DC    CL44' '          DSNAME
+*
+DYNAT3P  DS    0C               DISP=OLD
+         DC    XL2'0004'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT3)    LENGTH OF TEXT
+DYNAT3   DC    X'01'            DISP=OLD
+DYNAT4P  DS    0C               DISP=NEW
+         DC    XL2'0004'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT4)    LENGTH OF TEXT
+DYNAT4   DC    X'04'            DISP=NEW
+DYNAT5P  DS    0C               DISP=(,CATLG)
+         DC    XL2'0005'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT5)    LENGTH OF TEXT
+DYNAT5   DC    X'02'            DISP=(,CATLG)
+DYNAT6P  DS    0C               DISP=(,DELETE)
+         DC    XL2'0005'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT6)    LENGTH OF TEXT
+DYNAT6   DC    X'04'            DISP=(,DELETE)
+DYNAT7P  DS    0C               DISP=(,,CATLG)
+         DC    XL2'0006'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT7)    LENGTH OF TEXT
+DYNAT7   DC    X'02'            DISP=(,,CATLG)
+DYNAT8P  DS    0C               DISP=(,,DELETE)
+         DC    XL2'0006'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNAT8)    LENGTH OF TEXT
+DYNAT8   DC    X'04'            DISP=(,,DELETE)
+DYNAT9P  DS    0C               SPACE=(TRK)
+         DC    XL2'0007'        TEXT KEY
+         DC    XL2'0000'        TEXT NUMBER
+         DC    AL2(L'DYNAT9)    LENGTH OF TEXT  (IGNORED)
+DYNAT9   DC    X'00'            SPACE=(TRK)     (IGNORED)
+DYNATAP  DS    0C               SPACE=(CYL)
+         DC    XL2'0008'        TEXT KEY
+         DC    XL2'0000'        TEXT NUMBER
+         DC    AL2(L'DYNATA)    LENGTH OF TEXT  (IGNORED)
+DYNATA   DC    X'00'            SPACE=(CYL)     (IGNORED)
+DYNATBP  DS    0C               SPACE=(,(XXX))
+         DC    XL2'000A'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNATB)    LENGTH OF TEXT
+DYNATB   DC    X'000000'        SPACE=(,(XXX))
+DYNATCP  DS    0C               SPACE=(,(,XXX))
+         DC    XL2'000B'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNATC)    LENGTH OF TEXT
+DYNATC   DC    X'000000'        SPACE=(,(,XXX))
+DYNATDP  DS    0C               VOL=SER=XXXXXX
+         DC    XL2'0010'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNATD)    LENGTH OF TEXT
+DYNATD   DC    C'      '        VOL=SER=XXXXXX
+DYNATEP  DS    0C               UNIT=SYSALLDA
+         DC    XL2'0015'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNATE)    LENGTH OF TEXT
+DYNATE   DC    C'SYSALLDA'      UNIT=SYSALLDA
+         EJECT
+*
+*        DEALLOC LIST
+*
+DYNDRBPT DS    0F
+         DC    XL1'80'         END OF LIST
+         DC    AL3(DYNDRB)     RB POINTER
+*
+DYNDRB   DS    0F
+         DC    AL1(20)         CONTROL BLOCK LENGTH
+         DC    XL1'02'         DEALLOCATE
+         DC    XL2'0000'       FLAGS 1
+         DC    XL2'0000'       ERROR CODE
+         DC    XL2'0000'       INFO CODE
+         DC    A(DYNDTUPL)     TEXT LIST POINTER
+         DC    XL4'00000000'   RESERVED
+         DC    XL4'00000000'   FLAGS2
+*
+DYNDTUPL DS    0F
+         DC    XL1'80'          END OF LIST
+         DC    AL3(DYNDT1P)     TEXT1 POINTER
+*
+DYNDT1P  DS    0C               DDNAME
+         DC    XL2'0001'        TEXT KEY
+         DC    XL2'0001'        TEXT NUMBER
+         DC    AL2(L'DYNDT1)    LENGTH OF TEXT
+DYNDT1   DC    C'FILEDD  '      DDNAME
+*
+*        DAIRFAIL DATA
+*
+*                                DAIRFAIL PARAM LIST
+DYNERBP  DS    F                 A(DYNA/DYND RB)
+         DC    A(DYNER15)        A(R15 RETURN CODE FROM DYNA/DYND)
+         DC    A(DYNEZERO)       A(IKJEFF02 OR 0)
+         DC    A(DYNEIDP)        A(DAIRFAIL PARAMETERS)
+*                                OTHER DATA
+DYNEZERO DC    A(0)              NO IKJEFF02 ADDR
+DYNER15  DS    F                 R15 RETURN CODE FROM DYNA/DYND
+DYNEIDP  DS    0XL2              PARAMETERS
+         DC    X'80'             WTP (WRITE TO PROGRAMMER) ONLY
+         DC    X'32'             SVC99 ERROR
+         EJECT
+VOLTAB   DC    200D'0'
+VOLTABE  DC    X'FFFFFFFFFFFFFFFF' END OF TABLE
+*
+NUMTAB   EQU   *
+*                 0 1 2 3 4 5 6 7 8 9 A B C D E F
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  0
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  1
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  2
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  3
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  4
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  5
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  6
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  7
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  8
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  9
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  A
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  B
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  C
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  D
+         DC    X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'  E
+         DC    X'00000000000000000000FFFFFFFFFFFF'  F
+*                 0 1 2 3 4 5 6 7 8 9 A B C D E F
+         TITLE 'DCBS AND DECBS'
+         PRINT NOGEN
+         DS    0D
+MDLDCB   DCB   DDNAME=MDLDCB,                                          X
+               DSORG=PS,                                               X
+               EODAD=COPYEOF,                                          X
+               MACRF=(GL,PM)
+         DS    0D
+MDLLEN   EQU   *-MDLDCB
+*
+INDCB    DC    (MDLLEN)X'00'
+         DS    0D
+*
+OUTDCB   DC    (MDLLEN)X'00'
+         DS    0D
+*
+         READ  CTLDECB,SF,SYSIN,,'S',MF=L
+*
+SYSIN    DCB   DDNAME=SYSIN,                                           X
+               DEVD=DA,                                                X
+               DSORG=PS,                                               X
+               EODAD=EXIT,                                             X
+               LRECL=80,                                               X
+               MACRF=(R,W),                                            X
+               RECFM=FB
+*
+SYSPRINT DCB   DDNAME=SYSPRINT,                                        X
+               DSORG=PS,                                               X
+               LRECL=133,                                              X
+               MACRF=PM,                                               X
+               RECFM=FBA
+*
+VOLSERIN DCB   DDNAME=VOLSERIN,                                        X
+               DSORG=PS,                                               X
+               EODAD=VOLIEOF,                                          X
+               LRECL=80,                                               X
+               MACRF=GL,                                               X
+               RECFM=FB
+         TITLE 'DSECTS'
+*
+*        OTHER DSECTS
+*
+VOLREC   DSECT
+VOLRECVS DS   CL6
+         DS   C
+VOLRECBT DS   CL7
+         DS   C
+VOLRECTC DS   CL3
+         DS   C
+VOLRECCV DS   CL5
+         DS   C
+VOLRECPL DS   CL3
+         DS   C
+VOLRECDS DS   C
+         DS   CL50
+*
+IEZCOMM  DSECT
+IEZCECB  DS   F
+IEZCCIB  DS   F
+*
+*        IBM SUPPLIED DSECTS
+*
+         DCBD  DSORG=PS
+         IKJEFFDF DFDSECT=YES
+         CVT   DSECT=YES
+IEZCIBDS DSECT
+         IEZCIB
+         END

@@ -1,0 +1,226 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;;; Reference: Steele, pp. 385-407.
+
+;;;
+;;; The FORMAT string parser (part of the new implementation of FORMAT).
+;;;
+;;; This function takes 1 arg, a FORMAT string, and returns a parsed
+;;; FORMAT spec.  Its format (n.p.i.) is a list of which each element
+;;; is either:
+;;;      a string, representing literal data
+;;; or:
+;;;      a list of the following, of which the first is always present
+;;;      but the rest may be omitted:
+;;;
+;;;      * a character fixnum representing the FORMAT directive
+;;;      * the "colon" (:) flag, T or NIL
+;;;      * the "atsign"(@) flag, T or NIL
+;;;      * a list of FORMAT modifiers.  Each modifier in the list
+;;;        is one of the following:
+;;;          - a fixnum
+;;;          - a one-character string, representing a "quoted" modifier
+;;;          - the symbol V, representing the presence of V or v
+;;;          - the symbol #, representing the presence of #
+;;;
+;;; In general, null strings are optimized out, though this shouldn't
+;;; be depended upon in general.
+;;;
+;;; For example:
+;;;
+;;; (zfmpars "~2%foo ~a bar ~:S~10,v,'*@F")
+;;;
+;;;  ===>
+;;;
+;;;  (
+;;;   (#\% nil nil (2))
+;;;   "foo "
+;;;   (#\A)
+;;;   " bar "
+;;;   (#\S t nil)
+;;;   (#\F nil t (10 V "*"))
+;;;  )
+;;;
+;;; This structure (well, list) is usually passed to ZFMEXEC for
+;;; execution.  Note that characters are uppercased no matter how
+;;; they appear in the original FORMAT string.
+;;;
+
+(defmacro substring (string start &optional end)
+ `(substr ,string ,start ,(if end `(if ,end (- ,end ,start)))))
+
+(defmacro newline ()               ; Returns a one-character string.
+ (symbol-name (ebcdic #\newline)))
+
+(defmacro nullstringp (x)
+  ;;; (eql ,x "") ; We could do this in ZIL, but not in Common LISP.
+ `(zerop (string-length ,x)))
+
+(defmacro spush (s z)
+ (let ((g (gensym)))
+      `(let ((,g ,s))
+            (unless (nullstringp ,g)
+                    (if (stringp (car ,z))
+                        (setf (car ,z) (string-append (car ,z) ,g))
+                        (push ,g ,z))))))
+
+(defun zfmpars (string)
+ (cond
+  ((symbolp string)
+   (setq string (symbol-name string)))
+  ((not (stringp string))
+   (zerror "Invalid FORMAT string detected by ZFMPARS" string)))
+ (prog (c i l n s z modifiers colon atsign whitespace-eaten)
+       (setq l (string-length string)
+             n 1)
+  loop
+       (setf modifiers nil colon nil atsign nil)
+
+       (when whitespace-eaten
+             (setf whitespace-eaten nil)
+             (setq n
+              (or (verify string
+                          #.(tostring (implode
+                                   '(#/space #/cr #/newline #/null)))
+                          n)
+                  (1+ l))))
+
+       (setq i (index string "~" n))    ; Locate FORMAT directive.
+       (spush (substring string n i) z) ; Add string to format spec.
+       (or i (go finish))               ; End of string, return.
+
+       (setq n (1+ i))                  ; Point to stuff following ~.
+
+ extract-format-modifiers
+
+        ; Scan for FORMAT modifiers if any.
+        ; i is the one-based index of the ~ introducer character.
+
+       (if (> n l)
+           (zerror "Missing FORMAT directive character" string))
+
+       (case (getcharn string n) ; char following ~ or ,
+             ((#\')
+                    (push (substr string (1+ n) 1) modifiers)
+                    (setq n (+ n 2)))
+             ((#\#)
+                    (push '|#| modifiers)
+                    (setq n (1+ n)))
+             ((#\v
+               #\V)
+                    (push 'v modifiers)
+                    (setq n (1+ n)))
+             (t
+                    (setq s (verify string "-+0123456789" n))
+                    (if (eql s n)
+                     (push nil modifiers)
+                     (let* (
+                            (snum (substring string n s))
+                            (num (make-number snum))
+                           )
+                           (unless (fixnump num)
+                                   (zerror "Invalid FORMAT modifier"
+                                           string snum))
+                           (push num modifiers)
+                           (setq n s)))))
+
+ extract-format-flags
+
+       ; At this point, string(n) should begin with "," ":" "@" or the
+       ; format directive character itself.
+
+       (if (or (null n) (> n l))
+           (zerror "Missing FORMAT directive character" string))
+
+       (case (getcharn string n)
+             ((#\,)
+                    (if (or colon atsign)
+                        (zerror "FORMAT syntax error" string))
+                    (setq n (1+ n))
+                    (go extract-format-modifiers))
+             ((#\:)
+                    (when colon (zerror "Too many FORMAT :'s" string))
+                    (setf colon t)
+                    (setq n (1+ n))
+                    (go extract-format-flags))
+             ((#\@)
+                    (when atsign (zerror "Too many FORMAT @'s" string))
+                    (setf atsign t)
+                    (setq n (1+ n))
+                    (go extract-format-flags))
+       )
+
+;
+; If there is only one format modifier and it is NIL,
+; then there are no format modifiers.  Otherwise,
+; reverse the modifiers.
+;
+       (setf modifiers
+             (if  (and (null (car modifiers))
+                       (null (cdr modifiers)))
+                  nil
+                  (nreverse modifiers)))
+
+       (if (> n l)
+           (zerror "Missing FORMAT directive character" string))
+
+       ;;; Get the format directive character.
+
+       (setq c (char-upcase (getcharn string n))) ; The directive char.
+
+       ;;; Certain directives can be optimized at parse time.
+       ;;; Let's try to see if we can do it.
+
+       (case c
+ ;
+ ; This processes the <newline> directive.
+ ;
+ ; ~?, where ? is a newline, ignores the newline and any following
+ ; non-newline whitespace characters.
+ ;
+ ; ~:?, where ? is a newline, ignores the newline, but any following
+ ; whitespace is left in place.
+ ;
+ ; ~@?, where ? is a newline, leaves the newline in place, but any
+ ; following whitespace is ignored.
+ ;
+ ; By my inference, ~@:? (where ? is a newline) leaves both the newline
+ ; and the whitespace in place.
+ ;
+             ((#\cr #\nl)   ; Newline following tilde?
+              (when atsign (spush (newline) z))
+              (unless colon (setf whitespace-eaten t))
+              (go continue)
+             )
+
+             ;;; No optimizations for the rest at this time.
+
+            )
+
+       ;;; Add the format directive spec to the format spec.
+
+       (push (if (null modifiers)
+                 (if (and (null colon) (null atsign))
+                     (list c)
+                     (list c colon atsign))
+                 (list c colon atsign modifiers))
+             z)
+
+ continue
+
+       (setq n (1+ n))
+       (go loop)
+
+ finish
+
+       (return (nreverse z))
+
+ )
+)
+

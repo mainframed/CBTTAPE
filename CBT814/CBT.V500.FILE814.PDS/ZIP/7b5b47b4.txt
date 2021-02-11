@@ -1,0 +1,264 @@
+Automatic mounting of direct access volumes
+BACKGROUND
+Most large installations will have a considerable number of DASD volumes which
+must be mounted with a use attribute of PRIVATE or STORAGE.  This can present a
+problem, because the MVS default use attribute is PUBLIC.
+For volumes requiring the PRIVATE or STORAGE attribute, the only standard way to
+override the default is to name the volumes explicitly in the VATLSTnn member of
+SYS1.PARMLIB.  This method has two drawbacks: firstly, the need to update
+SYS1.PARMLIB whenever a volume is created or deleted imposes a disproportionate
+change management overhead.  Secondly, the VATLIST only takes effect at IPL
+time; volumes brought on-line after IPL require an explicit mount command to
+give them the correct attribute.
+The manageability problems associated with large VATLISTs and manually-entered
+mount commands mean that it is easy for volumes to acquire the wrong use
+attribute.  This can cause jobs to fail (JCL errors, X37 abends, etc) as a
+result of datasets being allocated on the wrong volumes.
+One method of overcoming these problems is to provide a program which will
+automatically mount all on-line volumes with the correct attribute.  The program
+can be started by the operator after IPL or after volumes have been varied on-
+line.  This article presents a specification for such a program.  The techniques
+used are valid for all releases of MVS and MVS/XA, and are presented in
+sufficient detail for any Assembler language programmer to be able to write the
+program.
+PROGRAM OVERVIEW
+This program will mount all on-line DASD devices with the correct attributes as
+specified in the installation’s VATLIST, or in an extension to the VATLIST
+called the ‘Generic/Exempt’ list.  Two key usability features are provided by
+the program:
+1    The Generic/Exempt list allows the specification of generic volume serial
+numbers (eg SYS***), so that the same use attribute can be assigned to a range
+of volumes without specifying each volume individually.
+2    The program will provide a default use attribute of PRIVATE for any volumes
+that are absent from the VATLIST and the Generic/Exempt list.  The
+Generic/Exempt list can designate volumes which are to be exempt from mount
+processing.
+Together, these features can substantially reduce the size of the installation’s
+VATLIST.
+OPERATING ENVIRONMENT
+The program will be invoked by a start command from the operator console:
+     S MOUNTER
+This command invokes the MOUNTER started task procedure which must be placed in
+SYS1.PROCLIB:
+     //MOUNTER  PROC
+     //IEFPROC  EXEC  PGM=MOUNTPGM
+     //VATLIST   DD   DSN=SYS1.PARMLIB(VATLST00),DISP=SHR
+     //          DD   DSN=USER.PARMLIB(VAXLST00),DISP=SHR
+In this procedure, VATLST00 is the installation’s standard VATLIST, and VAXLST00
+contains the Generic/Exempt volume serial numbers (which are not valid in the
+standard VATLIST).
+Format of the Generic/Exempt list
+The Generic/Exempt list is a new member which must be created in SYS1.PARMLIB.
+It contains 80-byte records similar in format to the records in the VATLST00
+member, which is described in the Initialisation and Tuning manual.
+Columns 1-6 of each Generic/Exempt list record contain the volume serial number.
+Asterisks can be used to denote a range of volumes: for example, SYS*** denotes
+all volumes whose first three letters are SYS, while S*MVS* will be considered
+to match any of SOMVS0, SAMVS1, SBMVS0, etc.
+Column 10 of the Generic/Exempt list record contains the use attribute, which
+can have one of the following values:
+•    ‘0’ = use attribute STORAGE
+•    ‘1’ = use attribute PUBLIC
+•    ‘2’ = use attribute PRIVATE
+•    ‘X’ = exempt volume - do not mount.
+The remaining columns of the Generic/Exempt list record are unused.
+METHOD
+Reading the VATLIST
+The program starts by reading the VATLIST and the Generic/Exempt list.  These
+datasets are concatenated together in the JCL, and are therefore read by the
+program as a single sequential dataset.
+To read the dataset the program requires a DCB specifying the following:
+     DSORG=PS,MACRF=GM,DDNAME=VATLIST,RECFM=FB,LRECL=80
+An EODAD should also be specified.  The EODAD is a label in the program that
+will be branched to when end of file is reached.  The program will OPEN the DCB,
+use the GET macro to read the records, and CLOSE the DCB at end of file.  Refer
+to the MVS/XA Data Administration Guide and Data Administration Macro
+Instructions manuals for details of using the OPEN, GET, and CLOSE macros to
+read a QSAM file.  (In MVS/370, these manuals are called Data Management
+Services Guide and Data Management Macro Instructions.)  Each record will
+contain a volume serial number in columns 1-6, and a use attribute in column 10.
+The other columns are only used when the VATLIST is processed at IPL time and
+are ignored by this program.
+As the records are read, the program will store the 6-byte volume serial number
+and the 1-byte use attribute (total 7 bytes) in the 4K Volume List Pages.  Each
+Volume List Page will contain up to 584 seven-byte entries, plus a pointer to
+the next Volume List Page.  The Volume List Pages thus form a chain as
+illustrated in Figure 1.
+How to build the Volume List Pages
+Before opening the dataset, obtain a 4K page (using the GETMAIN RU macro with
+the BNDRY=PAGE operand, as described in Supervisor Services and Macro
+Instructions), and store its address in a fullword in the program.  Use the MVCL
+instruction to fill the page with binary zeros.
+Leave the first 4 bytes as zero for the time being, and start storing the 7-byte
+VOLSER/attribute entries into the page starting at page + 4.  After reading 584
+records from the VATLIST, you will have stored 584 entries, and the page will be
+full.  At this point you must GETMAIN another page, zeroise it, and store its
+address into the first 4 bytes of the original page.  You can then continue to
+read the VATLIST records, storing them as 7-byte entries starting at + 4 in the
+new page.  When this page is full, a third page must be obtained, and its
+address must be stored into the first 4 bytes of the second page, and so on.
+Thus, a chain of as many pages as are necessary will be formed to contain all
+the entries from the VATLIST dataset, and each page will contain the address of
+the next page.
+Mounting the volumes
+Now that the table of VOLSERs/attributes has been built, the program can enter
+its second phase.  This phase will scan every on-line DASD device and determine
+whether it has got the correct mount attribute.
+Determining the eligibility of each unit
+To find all on-line DASD devices, the program must scan through the Unit Control
+Blocks (UCBs) held in virtual storage.  There is one UCB for each I/O device in
+the system.
+For MVS/XA, you can use the UCB Scan Service (IOSVSUCB) described in SPL: System
+Macros and Facilities to obtain the address of each UCB in turn.
+For MVS/370, you will need to scan the UCB look-up table, which is pointed to by
+field CVTILK2 in the CVT.  The table is a list of halfwords: each halfword is
+the address of a UCB.  Halfwords of X‘0000’ may be embedded in the list and
+these should be ignored.  The end of the list is marked by a halfword of
+X‘FFFF’.  In large systems some UCB addresses may exceed X‘7FFF’, so it is
+advisable to use the Insert Characters Under Mask instruction rather than Load
+Halfword to load the UCB addresses from the table into a register.  The formats
+of the CVT and UCB are in the SPL: Data Areas manuals.
+For each UCB, the program will need to do the following processing:
+1    Check UCBTBYT3.  If the device class is not equal to X‘20’ (UCB3DACC), it
+is a non-DASD device, so ignore it and go on to the next UCB.
+2    Check UCBTBYT2.  If the X‘08’ (UCBRVDEV) bit is on, the device is an MSS
+Virtual Unit Address (VUA), so ignore it and go on to the next UCB.
+3    Check UCBSTAT.  If the X‘80’(UCBONLI) bit is zero, the device is off-line,
+so ignore it and go on to the next UCB.
+4    Check UCBVOLI.  If it is 6 blanks or 6 bytes of binary zeros, there is no
+volume on this device, so ignore it and go on to the next UCB.
+If the unit passes all these checks, it is eligible for mounting.
+Finding the volumes’s use attribute
+
+The program will check through all its GETMAINed pages to determine if there is
+a VATLIST entry for the volume.  Starting from the first page, the program will
+do a byte by byte comparison of the serial number in each entry against the
+volume serial number in the UCB.  Any asterisks in the VATLIST volume serial
+number will be considered to match the corresponding byte in the UCB volume
+serial.
+If all 584 entries in the first page have been checked without finding an entry
+which matches UCBVOLI, the program will load the address of the next page
+(stored in the first 4 bytes of each page), and will continue the search.  The
+search continues until either a match is found, or the end of the page is
+reached.  The last page is the one which has zeros instead of a pointer to the
+next page.
+If a matching entry is found, the program will check the saved use attribute
+byte.  If this byte is ‘X’, the volume is exempt from mount processing, so the
+program will do no further processing for this UCB.  If the byte is ‘0’, ‘1’, or
+‘2’, the volume requires a use attribute of STORAGE, PUBLIC, or PRIVATE.  If the
+byte has any other value, or if no matching entry was found for this volume, the
+program assumes a default of PRIVATE, and continues as if a matching entry with
+an attribute byte of ‘2’ had been found.
+Deciding whether mount action is necessary
+Once the required use attribute has been determined (either from the stored
+values or by taking the default), the program will check the UCB to see if the
+volume is already mounted with the correct attribute.  The volume is correctly
+mounted if either the UCBRESV (X‘20’) bit or the UCBPRES (X‘04’) bit is on in
+the device status byte (UCBSTAT), and the appropriate bit in the volume status
+byte (UCBSTAB) is on - UCBBPRV (X‘10’) for PRIVATE, UCBBPUB (X‘08’) for PUBLIC,
+or UCBBSTR (X‘04’) for STORAGE.
+Calling the system mount processor
+If the volume is found not to be mounted (UCBRESV and UCBPRES are both zero), or
+mounted with the wrong use bit (eg UCBBPUB on when use should be PRIVATE), then
+the system mount processor, IEEVMNT2, must be called to set the correct
+attributes into the UCB.
+Before calling IEEVMNT2, the program must dynamically allocate the volume.  For
+MVS/XA, dynamic allocation is described in the SPL: System Macros and Facilities
+manual.  For MVS/370, it is described in SPL: Job Management.  You will need an
+SVC99 request block with a verb code of 01 (DSNAME allocation) and the following
+text units:
+1    DDNAME (key X‘0001’) = IEFRDER
+2    DSNAME (key X‘0002’) = SYSMOUNT
+3    Dataset status (X‘0004’) = OLD
+4    Volume serial (key X‘0010’) = 6-character VOLSER from UCBVOLI field
+5    Unit (key X‘0015’) = 3-character device number from UCBNAME field.
+Having constructed the parameter list, issue SVC99 to allocate the volume.
+Register 15 on return from SVC99 contains the return code.  If register 15 is
+non-zero, display a message on the operator console and go on to the next UCB.
+The operator message is displayed using the WTO macro instruction described in
+the Supervisor Services and Macro Instructions manual, and should be of the
+following format:
+     MNT001E cuu ALLOCATION FAILED, CODE=rc-errc-infc
+where cuu is the device number from UCBNAME, rc is the return code from register
+15, errc is the error code from the SVC99 request block, and infc is the
+information code from the request block.  The error codes and information codes
+are 2-byte numbers and should be displayed as four hexadecimal digits each.  An
+example might be CODE=08-043C-0000.  Keep a count of the number of allocation
+failures.  If this exceeds a reasonable number (say 50), abend the program with
+a dump.
+If the SVC99 allocation is successful, the program will use the SVC form of the
+MODESET macro instruction to enter key zero, and will then call the IEEVMNT2
+module using the LINK macro.  On return from IEEVMNT2, the program will again
+use the MODESET macro to return to its normal non-zero key.  The MODESET macro
+is described in the SPL: System Macros and Facilities manual for MVS/XA, and in
+SPL: Supervisor for MVS/370.  The LINK macro is described in Supervisor Services
+and Macro Instructions.
+The program will need to pass IEEVMNT2 a parameter on the LINK macro.  This
+parameter specifies the required use attribute of the volume.  To pass a
+parameter to IEEVMNT2, you should load register 1 with the address of a fullword
+whose high order bit is on and which points to a halfword containing the number
+of characters in the parameter (7, 6, or 7 respectively) followed immediately by
+the characters ‘PRIVATE’, ‘PUBLIC’, or ‘STORAGE’, as appropriate.
+When IEEVMNT2 has been called, the volume has been mounted with the correct
+attributes.  The program should now deallocate the volume using an SVC99 request
+block with a verb code of 02 (deallocation) and the following text units:
+     DDNAME (key X‘0001’) = IEFRDER
+If SVC99 returns a non-zero return code, the following message should be issued:
+     MNT002E cuu DEALLOCATION FAILED, CODE=rc-errc-infc
+where cuu is the device number from UCBNAME, rc is the return code from register
+15, errc is the error code from the SVC99 request block, and infc is the
+information code from the request block.  Then abend with a dump.
+Processing the next UCB
+Assuming that we have reached this point with no errors, we have correctly
+processed one volume.  The program will now find the address of the next UCB (by
+calling the IOSVSUCB Scan Service for MVS/XA, or by using the UCB look-up table
+for MVS/370) and the process repeats from eligibility processing for the new
+UCB.  When all UCBs have been processed, the program will terminate with a
+return code of zero.
+PROGRAMMING NOTES
+Because the program uses the MODESET macro instruction to enter protect key
+zero, it must be link-edited with an authorisation code of 1 into an APF-
+authorised library.  The Linkage Editor and Loader manual explains how to assign
+an authorisation code to a load module.  The IEAAPFxx member of SYS1.PARMLIB
+contains a list of APF-authorised libraries.
+The program should reference all control block fields by symbolic names and not
+by explicit displacements.  Similarly, bit settings should be symbolically
+referenced (eg UCB3DACC not X‘20’, UCBONLI not X‘80’).  The mapping macros which
+define the necessary symbols are available in SYS1.AMODGEN and SYS1.MACLIB.
+These macros are shown in Figure 2.
+
+Roger Bowler (UK)   © Roger Bowler 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

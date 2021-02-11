@@ -1,0 +1,338 @@
+Repairing spanned SMF records
+
+
+BACKGROUND
+
+We have automated our handling of SMF data to the point
+where no operator intervention is required. Dumps of SMF data
+are performed several times a day, concatenating the data into a
+single sequential dataset. Twice a day, the concatenated data is
+dumped to cartridge. Once a week, the collected cartridges are
+consolidated into a weekly archive of SMF data. These
+collections are maintained in a GDG for eight generations, so
+we have eight weeks' worth of SMF data on hand at any given
+time.
+
+Recently, a vendor requested our RMF data for this period of
+time, to help judge the performance characteristics of a cached
+array DASD device. When we went to create a cartridge for
+this vendor, we found that we could not read the data. Instead
+we received various messages indicating that a partial variable
+spanned record had been encountered. It turned out that some
+of the SMF dumps had terminated with B37 abends. These
+abends had not been reported by the operations personnel, as
+they did not truly understand what the SMF data was, and did
+not think these abends were significant.
+
+
+THE PROBLEM
+
+The partial spanned records occurred because, in some
+instances, the last block successfully written ended with a first
+or a middle segment of a spanned record. When no more
+extents could be acquired, the B37 occurred, leaving the last
+block ending in a partial record. Concatenating data after this
+block (when the next SMF dump occurred) caused problems
+that were not detected until the whole concatenated dataset was
+read as a unit. By this time, the data had been rendered
+unusable.
+
+I perceived the writing of partial records as a bug in DFP and
+logged onto IBMLink to determine if any fixes were available.
+Sure enough, some other installations had encountered the
+same problem. However, the response was that the cause was
+'user error' and the advice was to make sure that you didn't get
+B37 abends while dumping SMF data. This doesn't help after
+the fact, and doesn't address the concept that knowingly
+writing out partial records doesn't do much for data integrity.
+
+
+THE SOLUTION
+
+To access the SMF data we needed to be able to drop the
+spanned record segments that were not correctly sequenced.
+This risks losing a few records, but salvaging 800,000 records
+by sacrificing two or three is not a bad trade-off. To be able to
+read the data at all, it was necessary to abandon QSAM
+processing, and use BSAM. This means that no logical record
+processing would be performed by DFP.
+
+Our utility is handed an image of the physical block and must
+build the logical records itself. The physical blocks contain
+record segments which make up the spanned logical records.
+The logical records are reconstructed in storage, and written to
+an output file (which does use QSAM). The record segments
+look fundamentally like a standard variable record, except the
+third byte of the Record Descriptor Word (RDW) contains two
+bits which identify the current record segment as being a whole
+record, the first segment of a spanned record, the middle
+segment of a spanned record, or the last segment of a spanned
+record. We look for bad segments by verifying the sequencing
+of the record segments. For example, two consecutive first
+segments would indicate a missing last segment, and possibly
+some missing middle segments. In this case, the first 'first
+segment' must be dropped, but we can try to salvage the
+second 'first segment'. Another example would be a last
+segment, followed by another last segment. Here we would
+keep the first 'last segment' and discard the second 'last
+segment'.
+
+There are other situations where several segments may have to
+be dropped when a record spans three or more physical blocks.
+The following utility addresses all of the different possible bad
+segment sequences, even though some are only very remote
+possibilities, given the scenario described above.
+
+
+REFERENCES
+
+For MVS/DFP 3.2, the primary reference on the structure of
+spanned records is MVS/DFP 3.2: Managing Non-VSAM Data
+Sets (SC26-4557). This manual also provides some good
+information on BSAM processing.
+
+
+SOURCE CODE FOR SMFFIX
+
+SMFFIX   PROLOG                    STANDARD ENTRY LINKAGE MACRO
+         BAL   R14,B1HSKP          PERFORM HOUSEKEEPING FUNCTIONS
+         BAL   R14,B2MAIN          PERFORM MAIN PROCESSING
+         BAL   R14,B3WRAPUP        PERFORM CLEAN UP PROCESSING
+         EPILOG                    STANDARD EXIT LINKAGE MACRO
+* B1 - HOUSEKEEPING *
+B1HSKP   ST    R14,BHOLD
+         OPEN  (INFILE,(INPUT))    OPEN INPUT SMF FILE
+         OPEN  (OUTFILE,(OUTPUT))  OPEN OUTPUT SMF FILE
+         OPEN  (SYSPRINT,(OUTPUT)) OPEN PRINT FILE
+         ZAP   RECKTR(8),=P'0'     INITIALIZE TOTAL RECORD COUNTER
+         ZAP   RECKTR2(8),=P'0'    INITIALIZE RMF RECORD COUNTER
+B1EXIT   L     R14,BHOLD
+         BR    R14
+* B2 - MAIN PROCESSING *
+B2MAIN   ST    R14,BHOLD
+         MVI   STATUS,COMPLETE     INITIALIZE STATUS BYTE
+         LA    R10,SMFREC          R10 IS INDEX TO SMFREC
+         MVC   BYTEKTR(4),=4X'00'  ZERO OUT THE SMF REC BYTE COUNTER
+B2TOP    BAL   R14,X1GET           GET THE FIRST PHYSICAL BLOCK
+         CLI   EOFLAG,C'Y'         END OF FILE?
+         BE    B2EXIT               Y: WE'RE DONE
+         LH    R6,SMFBUFF          R6 CONTAINS BYTES IN THIS BLOCK
+         S     R6,=A(4)            SUBTRACT BDW FROM BYTES IN BLOCK
+         LH    R7,SMFBUFF+4        R7 PTS TO SDW OF 1ST REC SEG IN BLK
+         LA    R8,SMFBUFF+4        R8 IS INDEX WITHIN BLK (SKIPS BDW)
+B2JUMPIN IC    R9,2(,R8)           GET 3RD BYTE OF SEGMENT DESC WORD
+         N     R9,=A(3)            MASK OFF ALL BUT SEG CONTROL CDES
+         C     R9,=A(0)            IS IT A COMPLETE RECORD?
+         BE    B2WHOLE               Y: PROCESS AS A WHOLE RECORD
+         C     R9,=A(1)            IS IT A FIRST SEGMENT?
+         BE    B2FIRST               Y: PROCESS AS A FIRST SEGMENT
+         C     R9,=A(2)            IS IT A LAST SEGMENT?
+         BE    B2LAST                Y: PROCESS IS AS A LAST SEGMENT
+* PROCESS A RECORD SEGMENT MARKED AS 'MIDDLE'
+B2MIDSEG CLI   STATUS,FIRSTSEG     WAS LAST-READ SEG A FIRST SEG?
+         BE    B2MIDMVE              Y: SEGMENT IS IN PROPER SEQUENCE
+         CLI   STATUS,MIDSEG       WAS LAST-READ SEG A MIDDLE SEG?
+         BNE   B2DROPIT              N: SEGMENT OUT OF SEQ, DROP IT
+B2MIDMVE LH    R11,0(,R8)          PUT LENGTH OF SEGMENT IN R11
+         S     R11,=A(4)           REDUCE BY LENGTH OF DESCRIPTOR
+         LR    R1,R11              COPY LENGTH FOR SOURCE LENGTH
+         LR    R0,R8               GET ADDRESS OF SOURCE SEG
+         A     R0,=A(4)            BUMP PAST SDW
+         ST    R11,SAVE11          R11 IS MODIFIED BY MVCL, SAVE IT
+         MVCL  R10,R0              DO THE MOVE
+         L     R11,SAVE11          PUT R11 BACK, R10 SHOULD BE ALL SET
+         L     R1,BYTEKTR          GET PREVIOUS LEN OF THIS RECORD
+         AR    R1,R11              ADD LENGTH OF THIS SEGMENT
+         ST    R1,BYTEKTR          SAVE THE NEW LENGTH
+         AR    R8,R7               BUMP UP THE SMFBUFF PTR TO NEXT SDW
+         SR    R6,R7               DECREMENT BLK-BYTE COUNTER
+         LH    R7,0(,R8)           PRIME R7 WITH NEXT SDW LENGTH
+         MVI   STATUS,MIDSEG       INDICATE WHAT LAST SEGMENT WAS
+         C     R6,=A(0)            END OF BLOCK?
+         BNH   B2TOP                Y: GO DO IT ALL AGAIN
+         B     B2JUMPIN             N: GO PROCESS NEXT SEGMENT
+*                                      (IF WE GO TO JUMPIN FROM HERE,
+*                                       THEN I SERIOUSLY MISUNDERSTAND
+*                                       HOW ALL THIS WORKS, BUT THIS
+*                                       IS JUST INSURANCE).
+* PROCESS A RECORD SEGMENT MARKED AS 'WHOLE'
+B2WHOLE  CLI   STATUS,COMPLETE     WAS LAST RECORD COMPLETE?
+         BNE   B2DROPIT             N: SEGMENT OUT OF SEQ, DROP IT
+         MVI   STATUS,COMPLETE     INDICATE THAT WE HAVE A COMPLETE REC
+         LR    R11,R7              IN THIS CASE, THE SDW IS THE RDW
+         LR    R0,R8               SET UP SOURCE FLD REGISTER
+         LR    R1,R11              SET UP SOURCE FLD LENGTH
+         ST    R11,SAVE11          R11 IS MODIFIED BY MVCL, SAVE IT
+         MVCL  R10,R0              MOVE THE RECORD
+         L     R11,SAVE11          PUT R11 BACK, R10 SHOULD BE ALL SET
+         BAL   R14,X2PUT           WRITE OUT THE COMPLETE SMF REC
+         AP    RECKTR(8),=P'1'     BUMP THE SMF RECORD COUNTER
+         CP    RECKTR+6(2),=P'0'   IS IT A MULTIPLE OF 1000?
+         BNE   B2RECSK1             N: DON'T LOG IT
+         MVC   PRTLINE+1(37),=C'XXX,XXX,XXX,XXX,XXX RECORDS PROCESSED'
+         MVC   PRTLINE(20),EDPAT1  TELL USER HOW MANY RECORDS DONE
+         ED    PRTLINE(20),RECKTR
+         MVC   PRTLINE+40(37),=C'XXX,XXX,XXX,XXX,XXX RMF RECORDS FOUND'
+         MVC   PRTLINE+39(20),EDPAT1 TELL USER HOW MANY RMF RECS FOUND
+         ED    PRTLINE+39(20),RECKTR2
+         BAL   R14,X3PRINT          PRINT THE RECORD
+B2RECSK1 MVC   BYTEKTR(4),=4X'00'   ZERO OUT THE SMF-REC BYTE COUNTER
+         LA    R10,SMFREC           RESET R10 TO START OF O/P RECORD
+         AR    R8,R7                BUMP R8 TO NEXT SDW/RDW
+         SR    R6,R7                DECREMENT BLOCK BYTE COUNT
+         LH    R7,0(,R8)            GET NEXT SDW LENGTH
+         C     R6,=A(0)             END OF BLOCK?
+         BNH   B2TOP                 Y: GO DO IT ALL AGAIN
+         B     B2JUMPIN              N: GO PROCESS NEXT SEGMENT
+* PROCESS A RECORD SEGMENT MARKED AS 'FIRST'
+B2FIRST  CLI   STATUS,COMPLETE      WAS LAST RECORD COMPLETE?
+         BNE   B2DROPIT              N: DEATH TO PARTIAL RECORDS
+         MVI   STATUS,FIRSTSEG       Y: WE'RE HAPPY, MARK THE STATUS
+         LA    R10,SMFREC           REDUNDANT, BUT IT MAKES ME HAPPY
+         LR    R11,R7               LENGTH OF SEG IS LENGTH OF MOVE
+         LR    R0,R8                PRIME R0 WITH SOURCE ADDRESS
+         LR    R1,R11               PRIME R1 WITH SOURCE LENGTH
+         ST    R11,SAVE11           R11 IS MODIFIED BY MVCL, SAVE IT
+         MVCL  R10,R0               MOVE THE RECORD SEGMENT
+         L     R11,SAVE11           PUT R11 BACK, R10 SHOULD BE ALL SET
+         ST    R7,BYTEKTR           SAVE LENGTH OF INITIAL SEGMENT
+         AR    R8,R7                BUMP UP TO NEXT SDW
+         SR    R6,R7                DECREMENT BLOCK BYTE COUNT
+         LH    R7,0(,R8)            GET NEXT SEG LENGTH
+         C     R6,=A(0)             END OF BLOCK?
+         BNH   B2TOP                 Y: GO DO IT ALL AGAIN
+         B     B2JUMPIN             SHOULDN'T HAPPEN, INSURANCE AGAIN
+* PROCESS A RECORD SEGMENT MARKED AS 'LAST'
+B2LAST   CLI   STATUS,FIRSTSEG      WAS THE LAST SEGMENT A FIRST ONE?
+         BE    B2LASTOK              Y: SEQUENCE IS PROPER
+         CLI   STATUS,MIDSEG        WAS THE LAST SEGMENT A MIDDLE ONE?
+         BNE   B2DROPIT              N: GET RID OF THE BAD SEGMENT
+B2LASTOK LH    R11,0(,R8)           PUT SEGMENT LENGTH IN R11
+         S     R11,=A(4)            ALLOW FOR SDW (IT GETS DROPPED)
+         LR    R1,R11               GET LENGTH FOR SOURCE FLD
+         LR    R0,R8                GET ADDR OF SRC SEGMENT
+         A     R0,=A(4)             BUMP PAST SDW
+         ST    R11,SAVE11           R11 IS MODIFIED BY MVCL, SAVE IT
+         MVCL  R10,R0               DO THE MOVE
+         L     R11,SAVE11           PUT R11 BACK, R10 SHOULD BE ALL SET
+         L     R1,BYTEKTR           GET PREVIOUS LENGTH OF THIS RECORD
+         AR    R1,R11               ADD IN LENGTH OF THIS SEGMENT
+         ST    R1,BYTEKTR           SAVE THE NEW LENGTH
+         STH   R1,SMFREC            PUT THE NEW LENGTH IN THE REC
+         MVC   SMFREC+2(2),=2X'00'  GET RID OF SEGMENT DESCRIPTOR BITS
+         AR    R8,R7                BUMP UP TO NEXT SEGMENT
+         SR    R6,R7                DECREMENT BLOCK BYTE COUNTER
+         LH    R7,0(,R8)            GET NEW SDW LENGTH
+         MVI   STATUS,COMPLETE      INDICATE COMPLETE RECORD PROCESSED
+         BAL   R14,X2PUT            WRITE OUT THE COMPLETE SMF RECORD
+         AP    RECKTR(8),=P'1'      BUMP THE TOTAL SMF REC COUNTER
+         CP    RECKTR+6(2),=P'0'    IS IT A MULTIPLE OF 1000?
+         BNE   B2RECSK2              N: DON'T LOG IT
+         MVC   PRTLINE+1(37),=C'XXX,XXX,XXX,XXX,XXX RECORDS PROCESSED'
+         MVC   PRTLINE(20),EDPAT1   TELL USER HOW MANY RECS PROCESSED
+         ED    PRTLINE(20),RECKTR
+         MVC   PRTLINE+40(37),=C'XXX,XXX,XXX,XXX,XXX RMF RECORDS FOUND'
+         MVC   PRTLINE+39(20),EDPAT1 TELL USER HOW MANY RMF RECS FOUND
+         ED    PRTLINE+39(20),RECKTR2
+         BAL   R14,X3PRINT          PRINT THE RECORD
+B2RECSK2 MVC   BYTEKTR(4),=4X'00'   ZERO OUT THE BYTE COUNTER
+         LA    R10,SMFREC           RESET R10 TO START IF RECORD
+         C     R6,=A(0)             END OF BLOCK?
+         BNH   B2TOP                 Y: GO DO IT ALL AGAIN
+         B     B2JUMPIN              N: GO PROCESS REST OF BLOCK
+* DROP BAD SEGMENTS
+B2DROPIT C     R9,=A(0)            IS CURRENT A WHOLE RECORD?
+         BE    B2DROPOK             Y: DROP PREVIOUSLY STARTED RECORD
+         C     R9,=A(1)            IS THIS A FIRST SEGMENT?
+         BE    B2DROPOK             Y: DROP PREVIOUSLY STARTED RECORD
+         AR    R8,R7               DROP THIS SEGMENT, BUMP TO NEXT ONE
+         SR    R6,R7               DECREMENT BLK BYTE COUNTER
+         LH    R7,0(,R8)           GET NEW SEGMENT LENGTH
+         MVC   PRTLINE+1(37),=C'PREVIOUS AND CURRENT SEGMENTS DROPPED'
+         BAL   R14,X3PRINT         TELL USER ABOUT THE BAD SEGMENTS
+         B     B2DRPOK1            GO DROP PREVIOUS SEGMENT(S) ALSO
+B2DROPOK MVC   PRTLINE+1(24),=C'PREVIOUS SEGMENT(S) DROPPED'
+         BAL   R14,X3PRINT        TELL USER ABOUT PREVIOUS SEGMENT(S)
+B2DRPOK1 LA    R10,SMFREC          RESET TO START OF SMFREC BUFFER
+         MVC   BYTEKTR(4),=4X'00'  RESET SMF RECORD BYTE COUNTER
+         MVI   STATUS,COMPLETE     ASSUME A COMPLETED RECORD
+         C     R6,=A(0)            END OF BLOCK?
+         BNH   B2TOP                Y: GO DO IT ALL AGAIN
+         B     B2JUMPIN             N: FINISH PROCESSING BLOCK
+B2EXIT   L     R14,BHOLD             (IF PREV SEG ONLY, RETRY THIS SEG)
+         BR    R14
+* B3 - WRAP UP *
+B3WRAPUP ST    R14,BHOLD
+         CLOSE INFILE              CLOSE UP SHOP
+         CLOSE OUTFILE
+         CLOSE SYSPRINT
+B3EXIT   L     R14,BHOLD
+         BR    R14
+*** X LEVEL ROUTINES ****
+* X1 - READ THE DATA SET *
+X1GET    ST    R14,XHOLD
+         READ  INDECB,SF,INFILE,SMFBUFF  BSAM READ OF SMF INPUT
+         CHECK INDECB                    MAKE SURE READ OP COMPLETES
+         B     X1EXIT                    BYPASS EOF LOGIC
+X1EOF    MVI   EOFLAG,C'Y'               FOUND EOF, SET INDICATOR
+X1EXIT   L     R14,XHOLD
+         BR    R14
+* X2 - WRITE AN OUTPUT RECORD *
+X2PUT    ST    R14,XHOLD
+         CLI   SMFREC+5,X'46'            CAPTURE ONLY RMF RECORDS
+         BL    X1EXIT                      (TYPES 70 THROUGH 79)
+         CLI   SMFREC+5,X'4F'
+         BH    X1EXIT
+         PUT   OUTFILE,SMFREC           WRITE A REBUILT RMF RECORD
+         AP    RECKTR2(8),=P'1'         BUMP UP RMF RECORD COUNTER
+X2EXIT   L     R14,XHOLD
+         BR    R14
+* X3 - PRINT A RECORD *
+X3PRINT  ST    R14,XHOLD
+         PUT   SYSPRINT,PRTLINE        WRITE OUT A PRINT LINE
+         MVI   PRTLINE,X'40'           CLEAR THE LINE TO SPACES
+         MVC   PRTLINE+1(132),PRTLINE
+X3EXIT   L     R14,XHOLD
+         BR    R14
+*** DCBS ***
+INFILE   DCB   DDNAME=INFILE,DSORG=PS,RECFM=VBS,BLKSIZE=4096,          X
+               LRECL=32767,EODAD=X1EOF,MACRF=R
+OUTFILE  DCB   DDNAME=OUTFILE,DSORG=PS,RECFM=VBS,BLKSIZE=4096,         X
+               LRECL=32767,MACRF=PM
+SYSPRINT DCB   DDNAME=SYSPRINT,DSORG=PS,RECFM=FB,BLKSIZE=1330,         X
+               LRECL=133,MACRF=PM
+*** STORAGE ***
+         DS    0F
+         LTORG
+BHOLD    DS    F                REGISTER HOLD FOR 'B' LEVEL ROUTINES
+XHOLD    DS    F                REGISTER HOLD FOR 'X' LEVEL ROUTINES
+PRTLINE  DC    CL133' '         PRINT LINE FOR SYSPRINT
+RECKTR   DC    PL8'0'           TOTAL RECORDS PROCESSED COUNTER
+RECKTR2  DC    PL8'0'           RMF RECORD COUNTER
+EDPAT1   DC    X'402020206B2020206B2020206B2020206B202120'
+SAVE11   DS    F                STORAGE FOR R11 FOR MVCL INSTRUCTIONS
+STATUS   DC    CL1'C'           STATUS INDICATOR FOR PREVIOUS SEGMENT
+COMPLETE EQU   C'C'             LAST SEGMENT COMPLETED A RECORD
+FIRSTSEG EQU   C'F'             LAST SEGMENT WAS START OF A NEW RECORD
+MIDSEG   EQU   C'M'             LAST SEGMENT WAS A MIDDLE SEGMENT
+EOFLAG   DC    CL1'N'           INPUT SMF DATA EOF INDICATOR
+         DS    0F
+BYTEKTR  DC    F'0'             LENGTH OF RECORD CURRENTLY BEING BUILT
+SMFBUFF  DC    256XL16'00000000000000000000000000000000'
+SMFREC   DS    256CL128         BUFFER FOR RECORD BEING BUILT
+         END
+
+
+JOBSTREAM TO EXECUTE THIS UTILITY
+
+//S010     EXEC PGM=SMFFIX,REGION=4M
+//SYSUDUMP DD   SYSOUT=*
+//SYSPRINT DD   SYSOUT=*
+//INFILE   DD   DSN=SYS0.SMF.WEEKLY.ARCHIVE,DISP=SHR
+//OUTFILE  DD   DSN=TSTGDT.MIS.RMFDATA,DISP=SHR
+
+
+Guy D Trag
+Manager Technical Services
+Kay-Bee Toy and Hobby Shops Inc (USA)                  c Xephon 1992
+

@@ -1,0 +1,915 @@
+BSPGMADD TITLE 'B S P G M A D D  ***  MVS/380 Init and SVC 120 repl'
+         MACRO ,                                                GP08239
+&NM      SETMAXCC &CODE                                         GP08239
+&NM      CLC   MAXCC,=F'&CODE'        , chk MAXCC               GP08239
+         BH    *+4+6                  , skip unless higher      GP08239
+         MVC   MAXCC,=F'&CODE'        , set MAXCC               GP08239
+         MEND  ,                                                GP08239
+         SPACE 1
+         MACRO ,                                                GP08242
+&NM      MINH  &R,&INT                                          GP08242
+&NM      CH    &R,=AL2(&INT) NOT TOO HIGH ?                     GP08242
+         BNH   *+4+4                                            GP08242
+         LH    &R,=AL2(&INT) USE LOWER VALUE                    GP08242
+         MEND  ,                                                GP08242
+         SPACE 1
+         PUNCH '  ORDER BSPGMADD(P)'  EASIER DUMPS              GP08222
+         PUNCH '  SETCODE AC(1) '                               GP08222
+***********************************************************************
+*                                                                     *
+*  This program will look at the address of SVC 120. If not ours,     *
+*  it obtains permanent, fixed system storage, moves the MVS/380      *
+*  above-the-line-intercept code, saves the old SVC address, and      *
+*  replaces it with the intercept.                                    *
+*                                                                     *
+*  The old IBM SVC code is called except when :                       *
+*  1) Request length >= 16MiB                                         *
+*  2) FREEMAIN returns to caller with CC=0                            *
+*  3) GETMAIN returns a real address above 16MiB, treated as key 8    *
+*     V=R/V=V storage by the Hercules/380 mods.                       *
+*                                                                     *
+*  JCL Execution Parameters are specified via the                     *
+*  PARM statement on the EXEC card:                                   *
+*                                                                     *
+*  DISPLAY (default) - SVC 120 status is checked, and                 *
+*    (SHOW)       a WTO is issued showing whether we're using         *
+*                 the IBM or MVS/380 version.                         *
+*  LIST           Show address spaces with ATL memory.                *
+*    (USER)       assignments ASId, Name, Step, Chunk#, Address       *
+*  INSTALL        The MVS/380 code overlays the IBM code,             *
+*    (ADD,INTERCEPT,INSTALL)   unless previously installed.           *
+*  REMOVE         The IBM SVC address is restored, and the            *
+*    (DELETE)     MVS/380 intercept storage is freed.                 *
+*  UPDATE         The intercept is removed if present, and            *
+*    (REPLACE)    replaced by the current code (to avoid IPL).        *
+*  SIZE=nnnnn     The size of each ATL partition in MiB.              *
+*  RESERVE=nnnnn  MiB size, + the 16MiB for MVS, not allocated.       *
+*  OVERHEAD=nnnnn bytes in each partition reserved for MVS/380 use.   *
+*                 (minimum 4096; default 1048576)                     *
+*                                                                     *
+*  When adding or removing the intercept, the program needs to        *
+*  run authorized                                                     *
+*                                                                     *
+*  Required DD statement: none                                        *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*   This version supports multiple concurrent users, providing that   *
+*   the Hercules .conf file specifies sufficient storage. Current     *
+*   MVS/380 MAINSIZE setting is 200 Meg. Number of users is:          *
+*    (MAINSIZE - &CHUNK0 - 16MiB) / &CHUNKS                           *
+*                                                                     *
+*   The address of an assigned partition + the partition number is    *
+*   stored in ASCBRV44. Current only address space termination        *
+*   frees this space (being researched).                              *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*   As an added function, this program, when authorized, will set     *
+*   the 2-byte field preceding CVTMDL to x'0370', '0380', or '0390'.  *
+*   For 380, it also sets CVTJESCT+4 (free in MVS)                    *
+*   to the address of an MVS/380 vector table. +0 'V380', +4 size     *
+*   of Hercules real storage (MAINSIZE conf parameter).               *
+*                                                                     *
+***********************************************************************
+         GBLC  &CHUNK0,&CHUNKS,&CHUNKO  RESERVE,SIZE,OVHD       GP08239
+         GBLC  &DEBUG,&SUBPOOL,&BSPAUTH,&ASCBWRD,&CVTWORD       GP08239
+&BSPAUTH SETC  'G. Postpischil'                                 GP08239
+&ASCBWRD SETC  'ASCBRV44'    ATL OWNERSHIP WORD                 GP08239
+&CVTWORD SETC  'CVTJESCT+4'    MVS/380 VECTOR TABLE POINTER     GP08239
+&CHUNK0  SETC  '16'  +16MVS  SPACE FOR MVS/380 (+16 for MVS)    GP08248
+&CHUNKS  SETC  '32'          SIZE ALLOCATED 32 MiB per PART.    GP08239
+&CHUNKO  SETC  '4096'        MVS/380 CHUNK OVERHEAD Bytes       GP08239
+&DEBUG   SETC  'NO'                   , debug code not included
+&SUBPOOL SETC  '245'         SYSTEM, FIXED, KEY 0 STORAGE       GP08222
+         SPACE 1
+         PRINT ON,NOGEN
+         TITLE 'Main Processing'
+BSPGMADD BSPENTER BASE=R12,RENT=YES,BNDRY=PAGE                  GP08222
+***********************************************************************
+* Main processing                                                     *
+*    R4 - SVC TABLE SLOT FOR SVC 120 (IEAVGM00)                       *
+*    R5 - COPY OF INTERCEPT CODE                                      *
+***********************************************************************
+*DEBUG*  PRINT ON,GEN
+         SPACE 1
+***********************************************************************
+*  Initialize our work area, validate the environment, and get        *
+*  SVC 120 addresses. Note that code is not interlocked because no    *
+*  concurrent executions are planned.                                 *
+***********************************************************************
+         MVC   PATSYS,=A((16+&CHUNK0)*1024*1024)  SYSTEM OVHD   GP08248
+         MVC   PATCHK,=A(&CHUNKS*1024*1024)  CHUNK SIZE         GP08239
+         MVC   PATOHD,=A((&CHUNKO+4095)/4096*4096) OVERHEAD     GP08248
+         TESTAUTH FCTN=1     ARE WE AUTHORIZED?                 GP08222
+         IF    (LTR,R15,R15,Z)                                  GP08239
+          OI   PARMFLAG,PARMAUTH  REMEMBER WE'RE AUTHORIZED     GP08239
+         ENDIF (LTR,R15,R15,Z)                                  GP08239
+         BAL   R14,PROCPARM           , go analyse PARM statement
+         BAL   R14,SETINIT            , go for setup and init calls
+         EJECT ,                                                GP08242
+***********************************************************************
+*  Locate the SVC table entry. For PARM=SHOW just display status.     *
+*  Show status if IBM code and PARM=REMOVE, and intercept and PARM=   *
+*  INSTALL. Otherwise install or delete as requested.                 *
+***********************************************************************
+         L     R3,=A(INTSECT)     POINT TO PATTERN INTERCEPT    GP08222
+         L     R4,PATSLOT    GET SVC TABLE SLOT                 GP08239
+         USING SVCENTRY,R4   GLOBAL DEFINITION                  GP08222
+         L     R5,SVCEP      GET ENTRY POINT                    GP08222
+         USING INTSECT,R5    DECLARE INTERCEPT CODE             GP08222
+         SPACE 1
+*--------------------------------------------------------------------*
+*   REMOVE - VERIFY CODE IS OURS, REPLACE, AND FREE STORAGE          *
+*--------------------------------------------------------------------*
+         TM    PARMFLAG,PARMDEL   REMOVE REQUESTED ?            GP08239
+         BZ    TESTREP       NO; TEST FOR REPLACE               GP08239
+         CLC   EYECATCH,EYECATCH-INTCPT(R3)   OURS ?            GP08239
+         BNE   TESTREP       NO; TEST FOR REPLACE               GP08239
+         BAL   R14,SHOWUSE   COUNT CURRENT USERS                GP08239
+         LTR   R6,R15        ANY ?                              GP08239
+         BZ    GODEL         NO; DELETE                         GP08239
+          SETMAXCC 8         ERROR                              GP08239
+         WTO   MF=(E,MSG70E)   NOT SAFE TO DELETE NOW           GP08239
+         NI    PARMFLAG,255-(PARMREP+PARMDEL+PARMUSE)  RESET    GP08239
+         TM    PARMFLAG,PARMVALS   REQUEST TO CHANGE VALUES?    GP08248
+         BZ    SHOWOFF       NO                                 GP08248
+         WTO   MF=(E,MSG71W)   ALERT - CHANGES IGNORED          GP08248
+         B     SHOWOFF       IGNORE DELETE AND REPLACE          GP08239
+         SPACE 1
+GODEL    MODESET KEY=ZERO    GET PRIVIED                        GP08222
+         MVC   SVCEP,INT@120    RESTORE IBM'S ADDRESS           GP08222
+         LH    R0,INTSIZE    GET DOUBLE-WORD COUNT              GP08222
+         SLL   R0,3          ORIGINAL GETMAIN SIZE              GP08222
+         FREEMAIN RC,A=(R5),LV=(0),SP=&SUBPOOL  FREE CSA        GP08222
+         MODESET KEY=NZERO   GET NORMAL                         GP08222
+         L     R5,SVCEP      FIX UP                             GP08239
+         SPACE 1
+*--------------------------------------------------------------------*
+*   INSTALL - VERIFY CODE IS NOT OURS, GET STORAGE, AND INSTALL      *
+*--------------------------------------------------------------------*
+TESTREP  TM    PARMFLAG,PARMREP   UPDATE REQUESTED ?            GP08239
+         BZ    SHOWOFF       NO, JUST DISPLAY                   GP08239
+         CLC   EYECATCH,EYECATCH-INTCPT(R3)   OURS ?            GP08222
+         BE    SHOWOFF       YES; NOTHING TO DO                 GP08222
+         MODESET KEY=ZERO    GET PRIVIED                        GP08222
+         LA    R2,INTCPTLN   GET INTERCEPT LENGTH               GP08222
+         GETMAIN R,LV=(R2),SP=&SUBPOOL  GET CSA                 GP08222
+         LR    R14,R5        SAVE IBM'S ADDRESS                 GP08222
+         LR    R5,R1         PRESERVE GOTTEN ADDRESS            GP08222
+         MVC   0(256,R5),0(R3)  COPY INTERCEPT CODE 1/2         GP08239
+         MVC   256(INTCPTLN-256,R5),256(R3)  COPY   2/2         GP08239
+         MVC   INTMOVE(INTMOVLN),PATMOVE  FILL DATA             GP08239
+         ST    R14,INT@120   SAVE IBM'S ADDRESS                 GP08222
+         SRL   R2,3          ORIGINAL GETMAIN SIZE              GP08222
+         STH   R2,INTSIZE    SET DOUBLE-WORD COUNT              GP08222
+         ST    R5,SVCEP      REPLACE IBM'S ADDRESS              GP08222
+         TM    PARMFLAG,PARMVALS  DID USER CHANGE VALUES ?      GP08248
+         BZ    REPNZERO      NO; JUST GET DOWN                  GP08248
+         L     R1,CVTPTR     GET THE CVT BACK                   GP08248
+         ICM   R1,15,&CVTWORD-CVTMAP(R1)  GET OUR HOOK          GP08248
+         BZ    REPNZERO      OR OUT                             GP08248
+         USING V380SECT,R1   DECLARE IT                         GP08248
+         MVC   V380#CHK+2(2),INT#CHK   NUMBER OF PARTITIONS     GP08248
+         MVC   V380RSVD,INTSYS         SYSTEM RESERVED >= 16MiB GP08248
+         MVC   V380PART,INTCHK         PARTITION SIZE           GP08248
+         MVC   V380OVHD,INTOHD         OVERHEAD IN BYTES        GP08248
+         DROP  R1                                               GP08248
+REPNZERO MODESET KEY=NZERO   GET NORMAL                         GP08222
+         EJECT ,                                                GP08242
+*--------------------------------------------------------------------*
+*   REPORT CURRENT STATUS OF SVC 120 INTERCEPT                       *
+*--------------------------------------------------------------------*
+SHOWOFF  MVC   WTOWORK(LOCMSGLN),MSG79I   MOVE PATTERN MESSAGE  GP08239
+         CLC   EYECATCH,EYECATCH-INTCPT(R3)  OURS?              GP08222
+         BNE   SHOWMSG       NO                                 GP08222
+         MVC   WTOWORK+M79WHO(L'M79WHO),M79INT  SHOW INTERCEPT  GP08239
+SHOWMSG  UNPK  WTOWORK+M79ADDR(9),SVCEP(5)                      GP08222
+         TR    WTOWORK+M79ADDR(8),HEXTRTAB   MAKE PRINTABLE     GP08222
+         MVI   WTOWORK+M79ADDR+8,C';'        KILL CRUD          GP08239
+         WTO   MF=(E,WTOWORK)        DISPLAY MESSAGE            GP08222
+         TM    PARMFLAG,PARMUSE   SHOW USERS ?                  GP08239
+         BZ    EXIT          NO                                 GP08239
+         BAL   R14,SHOWUSE   LIST USERS                         GP08239
+         B     EXIT                  AND QUIT                   GP08222
+         SPACE 2
+***********************************************************************
+*   EXIT - normal return    EXIT12 - error exit                       *
+***********************************************************************
+         SPACE 1
+BADWTOEX WTO   MF=(E,(1))    WRITE MESSAGE; QUIT WITH ERROR     GP08242
+EXIT12   SETMAXCC 12                  , Set return code
+EXIT     TM    PARMFLAG,PARMINFO      , need HELP ?             GP08249
+         BZ    EXITNOW                , NO?                     GP08249
+         SR    R0,R0         PER DOC                            GP08249
+         WTO   ('BSPGMADD SVC 120 Intercept Options:',C),              *
+               ('PARM=ADD to install the intercept',D),                *
+               ('PARM=REP to replace the intercept',D),                *
+               ('PARM=DEL to delete the intercept',D),                 *
+               ('PARM=USE to show current ATL use',D),                 *
+               ('PARM=''rep,SIZE=nnn'' to change ATL size',DE),        *
+               ROUTCDE=2,DESC=(5,9,12)                          GP08249
+EXITNOW  L     R15,MAXCC              , get return code
+         BSPRET RC=(15)               , and return with rc in r15
+         TITLE 'Subroutines: SETINIT - Initialize some variables'
+***********************************************************************
+* Setup and Initialization                                            *
+*                                                                     *
+*   Test for MVS/380: BSM works; get available storage size           *
+*   Not 380 if CVTDCB x'80' is on (390 or later machine)              *
+*   Save x'3x0' into CVTMDL-2                                         *
+*   If 380, get and initialize 380 Vector table; root in CVTJESCT+4   *
+*   Write warning message if not 380                                  *
+*                                                                     *
+***********************************************************************
+         PUSH  USING                                            GP08239
+SETINIT  STM   R14,R9,SUBSAVER        , save registers
+         SPACE 1
+***********************************************************************
+**   IF WE'RE RUNNING UNDER HERCULES AS A S/380, DETERMINE JUST HOW  **
+**   MUCH REAL STORAGE IS AVAILABLE (ELSE SPIE KEEPS R7=0)           **
+***********************************************************************
+         SR    R7,R7         NO H-380 STORAGE                   GP08222
+         LA    R9,X'0390'    PRESET FOR ALMOST MODERN MACHINE   GP08248
+         L     R3,CVTPTR     GET CVT                            GP08222
+         USING CVTMAP,R3     DECLARE IT                         GP08239
+         TM    CVTDCB,X'80'  EXPANDED MEMORY ?                  GP08239
+         BNZ   SKIPMEM       YES; DON'T NEED IT                 GP08239
+         LA    R9,X'0370'    PRESET FOR ANTEDILUVIAN MACHINE    GP08239
+         SPIE  EXITSPIE,(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)   GP08222
+         ST    R1,OLDSPIE                                       GP08222
+         LA    R15,GETHIGH                                      GP08222
+         O     R15,=X'80000000'                                 GP08222
+         DC    X'0B0F'       BSM   0,R15                        GP08222
+GETHIGH  LA    R9,X'0380'    SET FOR MODERN OLD MACHINE         GP08239
+         DROP  R3                                               GP08248
+         LM    R3,R5,=A(16,1,2047)  START AT THE 16M BOUNDARY   GP08249
+         LR    R7,R3         SAVE START VALUE                   GP08222
+GETLOOP  LR    R6,R3         COPY MEGABYTE VALUE                GP08222
+         SLL   R6,20         CONVERT TO MEGABYTES               GP08222
+         AL    R6,=X'000FFFFF' TEST LAST BYTE IN MEG (Paul's)   GP08239
+         CLI   0(R6),X'00'   REAL STORAGE ?                     GP08222
+         LA    R7,1(,R3)     SAVE LAST VALID VALUE              GP08222
+         BXLE  R3,R4,GETLOOP   TRY AGAIN                        GP08222
+DONSTOR  LA    R15,DONSTOR2                                     GP08222
+         DC    X'0B0F'       BSM   0,R15                        GP08222
+DONSTOR2 L     R2,OLDSPIE    RESET ERROR RECOVERY               GP08222
+         SPIE  MF=(E,(R2))   RESET ERROR RECOVERY               GP08222
+         SPACE 1
+SKIPMEM  SLL   R7,20         CONVERT TO BYTES                   GP08239
+         SPACE 1
+HAVE3X0  CL    R9,=X'00000380'   HYPED SYSTEM ?                 GP08239
+         BNH   GOODSYS       YES                                GP08222
+BADSYS   LA    R1,MSG38E     POINT TO ERROR MESSAGE             GP08242
+         B     BADWTOEX      QUIT WITH MESSAGE                  GP08242
+         SPACE 1
+GOODSYS  L     R3,CVTPTR     GET CVT                            GP08248
+         USING CVTMAP,R3     DECLARE IT                         GP08239
+         L     R4,CVTABEND   GET SCVT                           GP08248
+         L     R4,SCVTSVCT-SCVTSECT(,R4)  LOAD SVC TABLE BASE   GP08222
+         AL    R4,=A(120*SVCENTLN) ADDRESS OF 120 SLOT          GP08222
+         ST    R4,PATSLOT    SAVE IT                            GP08239
+         MVC   PAT@120,SVCEP      SAVE ENTRY ADDRESS            GP08239
+         LA    R1,MSG39E     BSM FAILED - ERROR                 GP08242
+         LTR   R7,R7         ANY REAL MEMORY ?                  GP08222
+         BZ    BADWTOEX      QUIT WITH MESSAGE                  GP08242
+         ST    R7,PATLIM     SAVE FOR TEST IN INTERCEPT         GP08222
+         ICM   R0,15,PATCHK  GET CHUNK SIZE                     GP08239
+         BP    MEMCHUNK      DEFINED                            GP08239
+         LR    R0,R7         CHUNK=0 IS REQUEST FOR MAX         GP08239
+         SL    R0,PATSYS       LESS OVERHEAD                    GP08239
+         ST    R0,PATCHK     UPDATE                             GP08239
+MEMCHUNK AL    R0,PATSYS     PLUS OVERHEAD                      GP08239
+         LA    R1,MSG78E     NOT ENOUGH MEM                     GP08242
+         CLR   R7,R0         MINIMUM OF ONE CHUNK ?             GP08239
+         BL    BADWTOEX      QUIT WITH ERROR                    GP08239
+         LR    R0,R7         COPY TOTAL STORAGE SIZE            GP08239
+         SRL   R0,20         CONVERT STORAGE SIZE TO MiB        GP08239
+         CVD   R0,DB         PACK                               GP08239
+         MVC   WTOWORK(MSG40ILN),MSG40I    MOVE PATTERN         GP08242
+         MVC   WTOWORK+MOSZ(6),=X'402020202120'                 GP08239
+         ED    WTOWORK+MOSZ(6),DB+5  FORMAT SIZE                GP08239
+         WTO   MF=(E,WTOWORK)   DISPLAY IT                      GP08239
+         S     R7,PATSYS     BASE SYSTEM OVERHEAD               GP08239
+         BNM   MEMSOK        OK                                 GP08239
+         SR    R7,R7         NO GOOD                            GP08239
+MEMSOK   L     R0,PATCHK     GET CHUNK SIZE BACK                GP08239
+         SR    R6,R6         FOR DIVIDE                         GP08239
+         DR    R6,R0           GET WHOLE CHUNKS                 GP08239
+         MINH  R7,32         CURRENT DESIGN LIMIT               GP08248
+         CVD   R7,DB         PACK                               GP08239
+         STH   R7,PAT#CHK    SAVE FOR INTERCEPT                 GP08239
+         MVC   WTOWORK(MSG41ILN),MSG41I    MOVE PATTERN         GP08242
+         MVC   WTOWORK+MO#P(6),=X'402020202120'                 GP08239
+         ED    WTOWORK+MO#P(6),DB+5  FORMAT CHUNK COUNT         GP08239
+         SRL   R0,20         CONVERT TO MiB                     GP08239
+         CVD   R0,DB         PACK                               GP08239
+         MVC   WTOWORK+MO##(6),=X'402020202120'                 GP08239
+         ED    WTOWORK+MO##(6),DB+5  FORMAT CHUNK SIZE          GP08239
+         WTO   MF=(E,WTOWORK)   DISPLAY IT                      GP08239
+         LR    R6,R3         COPY CVT                           GP08222
+         SH    R6,=H'256'    GET PREFIX                         GP08239
+         USING CVTFIX,R6                                        GP08239
+         ICM   R0,3,CVTMDL-2      DID WE STASH SERIES BEFORE ?  GP08239
+         BNZ   SETINIX       YES                                GP08248
+         TM    PARMFLAG,PARMAUTH  AUTHORIZED ?                  GP08239
+         BZ    SETINIX       NO; SKIP THIS                      GP08248
+         MODESET KEY=ZERO    GET PRIVIED                        GP08239
+         STCM  R9,3,CVTMDL-2   SAVE SERIES                      GP08239
+         CLI   CVTMDL-2+1,X'80'  380 ?                          GP08239
+         BNE   RESMODE       NO; DON'T NEED IT                  GP08239
+         ICM   R1,15,&CVTWORD    ALREADY STASHED ?              GP08239
+         BNZ   RESMODE       DEFER UPDATE UNTIL INTERCEPT REPL  GP08248
+         GETMAIN RC,LV=V380VLEN,SP=245  FIXED CSA               GP08239
+         BXH   R15,R15,RESMODE    FAILED                        GP08239
+         USING V380SECT,R1   DECLARE IT                         GP08239
+         XC    V380SECT(V380VLEN),V380SECT  CLEAR IT            GP08239
+         ST    R1,&CVTWORD   MAKE IT AVAILABLE                  GP08239
+         MVCIN V380ID,VECT+3      MOVE EYE CATCHER              GP08239
+         MVC   V380REAL,PATLIM         SAVE STORAGE SIZE        GP11142
+         MVC   V380#CHK+2(2),PAT#CHK   NUMBER OF PARTITIONS     GP08248
+         MVC   V380RSVD,PATSYS         SYSTEM RESERVED >= 16MiB GP08248
+         MVC   V380PART,PATCHK         PARTITION SIZE           GP08248
+         MVC   V380OVHD,PATOHD         OVERHEAD IN BYTES        GP08248
+         DROP  R1                                               GP08239
+RESMODE  MODESET KEY=NZERO   THIS IS NORMAL ?                   GP08239
+SETINIX  LM    R14,R9,SUBSAVER        , restore registers
+         BR    R14                    , and return to caller
+VECT     DC    C'083V'         REVERSED CATCH EYE               GP08239
+         POP   USING                                            GP08248
+         SPACE 1                                                GP08222
+         PUSH  USING                                            GP08222
+         USING EXITSPIE,R15                                     GP08222
+EXITSPIE LA    R2,DONSTOR2   GET RESTART LOCATION               GP08222
+         ST    R2,PIEPSW+4-PIE(,R1)  RESTART; AM24              GP08222
+         BR    R14                                              GP08222
+         POP   USING                                            GP08222
+         TITLE 'Analyze JCL PARM value'
+***********************************************************************
+* Analyse the JCL EXEC parameter                                      *
+***********************************************************************
+PROCPARM STM   R14,R9,SUBSAVER        , Save registers          GP08222
+         L     R1,4(,R13)             , Get old save area       GP08222
+         L     R1,24(,R1)             , Address of passed parm  GP08222
+         L     R8,0(,R1)              , Point to parm           GP08242
+         LH    R9,0(,R8)              , PARM LENGTH             GP08242
+         LA    R8,2(,R8)     MAKE TRT LOGIC EASIER              GP08242
+         LTR   R9,R9                  , ANY TEST ?              GP08242
+         BP    NNULPARM                                         GP08222
+         OI    PARMFLAG,PARMSHOW      , set default of DISPLAY  GP08222
+         B     DONEPARM                                         GP08248
+NNULPARM CH    R9,=H'256'               LENGTH OK ?             GP08242
+         BNH   INITPARM                 YES                     GP08222
+         WTO   MF=(E,MSG99W)          , insert message          GP08222
+         SETMAXCC 4                   , insert return code      GP08239
+         LA    R9,256        SET MAX SUPPORTED                  GP08242
+INITPARM AR    R9,R8         END + 1                            GP08242
+         BCTR  R9,0          SET TO LAST INPUT ADDRESS          GP08242
+         SPACE 1
+SCANPARM SR    R2,R2         FOR TRT STOPPER IC                 GP08242
+         MVC   WTOWORK(MSG94WLN),MSG94W  PRELOAD WARNING MSG    GP08242
+         LR    R6,R9         SET PARM END                       GP08242
+         SR    R6,R8           LESS SCAN START                  GP08242
+         BM    DONEPARM      ALL DONE                           GP08248
+         LA    R1,1(R6,R8)   SCAN STOPPER IF NONE               GP08242
+         LR    R7,R8         REMEMBER THE START                 GP08242
+         EX    R6,EXTRTPRM   FIND END OF ITEM                   GP08242
+         LR    R14,R1        SCAN END                           GP08242
+         SR    R14,R8        LENGTH OF ITEM                     GP08242
+         LA    R8,1(,R1)     RESUME SCAN POINT                  GP08242
+         BNP   SCANPARM        SKIP SEPARATOR OR WHAT-NOT       GP08242
+         BCTR  R14,0         EXECUTE LENGTH                     GP08248
+         LR    R3,R14        COPY LENGTH                        GP08242
+         MINH  R3,L'M94ITEM-1   NOT TOO LONG                    GP08248
+         EX    R3,EXMVCPRM   COPY AND UPPER CASE ITEM           GP08248
+         CH    R14,=H'8'     TOO LONG FOR VALID PARM ?          GP08242
+         BH    SKIPBADP      YES; FAIL WITH MESSAGE             GP08242
+         LM    R3,R5,=A(ABBRPARM,ABBRPAR2-ABBRPARM,ABBRPARN)    GP08242
+LOOPPARM EX    R14,EXCLCPRM  MATCHING OPTION ?                  GP08242
+         BE    FLAGPARM      YES; SET FLAG                      GP08242
+         BXLE  R3,R4,LOOPPARM  TRY ANOTHER                      GP08242
+         LM    R3,R5,=A(ABBRKEYW,ABBRKEY2-ABBRKEYW,ABBRKEYN)    GP08242
+LOOPKEYW EX    R14,EXCLCPRM  MATCHING OPTION ?                  GP08242
+         BE    HAVEKEY       YES; GET OPERAND                   GP08242
+         BXLE  R3,R4,LOOPKEYW  TRY ANOTHER                      GP08242
+SKIPBADP WTO   MF=(E,WTOWORK)   SHOW PROBLEM                    GP08242
+         SETMAXCC 4                                             GP08242
+         OI    PARMFLAG,PARMINFO  SHOW HELP INFO                GP08249
+         B     SCANPARM      TRY FOR MORE                       GP08242
+         SPACE 1                                                GP08242
+FLAGPARM OC    PARMFLAG(*-*),9(R3)   SET PARM OPTION BIT(S)     GP08242
+         CLM   R2,1,TRTPARM+C'='  FLAG AS KEYWORD?              GP08242
+         BNE   SCANPARM      NO; GO FOR MORE                    GP08242
+         LA    R1,MSG91E       SHOW ERROR                       GP08248
+         OI    PARMFLAG,PARMINFO  SHOW HELP INFO                GP08249
+         B     BADWTOEX      FAIL NOW                           GP08248
+         SPACE 1                                                GP08242
+HAVEKEY  OI    PARMFLAG,PARMVALS  SHOW NUMERIC REDEFINED        GP08248
+         CLM   R2,1,TRTPARM+C'='  REALLY KEYWORD ?              GP08242
+         BE    GETVALUE      NO                                 GP08242
+         BH    DEFVALUE      NOT KEYWORD; RESET TO DEFAULT      GP08242
+         LA    R1,MSG92E       SHOW ERROR                       GP08248
+         OI    PARMFLAG,PARMINFO  SHOW HELP INFO                GP08249
+         B     BADWTOEX      FAIL THIS                          GP08248
+EXCLCPRM CLC   WTOWORK+M94ITEM(0),0(R3)  VERB MATCHES TABLE ?   GP08242
+EXMVCPRM OC    WTOWORK+M94ITEM(0),0(R7)  MOVE AND UPPER CASE    GP08242
+EXTRTPRM TRT   0(0,R8),TRTPARM  LOOK FOR STOPPER                GP08242
+EXTRTNUM TRT   0(0,R8),TRTNUMB  LOOK FOR NON-NUMERIC            GP08242
+EXMVCDIG MVC   0(0,R1),WTOWORK+M94ITEM   MOVE TO DB RIGHT-JUST  GP08242
+         SPACE 2                                                GP08242
+GETVALUE SR    R2,R2         FOR TRT STOPPER IC                 GP08242
+         MVC   WTOWORK(MSG94WLN),MSG95W  PRELOAD WARNING MSG    GP08242
+         LR    R6,R9         PARM END                           GP08242
+         SR    R6,R8           LESS CURRENT START               GP08242
+         LR    R7,R8         REMEMBER THE START                 GP08242
+         BM    DEFVALUE      NO MORE; SET DEFAULT               GP08242
+         MINH  R6,L'M94ITEM-1  NOT TOO LONG                     GP08248
+         LA    R1,1(R6,R8)   SCAN STOPPER IF NONE               GP08242
+         EX    R6,EXTRTNUM   FIND END OF ITEM                   GP08242
+         LR    R14,R1        SCAN END                           GP08242
+         SR    R14,R8        LENGTH OF ITEM                     GP08242
+         LR    R8,R1         RESCAN WITH STOPPER                GP08242
+         BNP   DEFVALUE      NONE; RESET TO DEFAULT             GP08242
+         BCTR  R14,0         EXECUTE LENGTH                     GP08242
+         LR    R15,R14       COPY LENGTH                        GP08248
+         MINH  R15,9         NOT TOO LONG                       GP08248
+         EX    R15,EXMVCPRM  COPY AND UPPER CASE ITEM           GP08248
+         CH    R14,=H'7'     TOO LONG FOR VALID PARM ?          GP08242
+         BH    SKIPBADP      YES; FAIL WITH MESSAGE             GP08242
+         XC    DB,DB         PREPARE FOR THE WORST              GP08242
+         LA    R1,DB+L'DB-1  END                                GP08242
+         SR    R1,R14        MOVE LOCATION                      GP08242
+         EX    R14,EXMVCDIG  MOVE DIGITS                        GP08242
+         PACK  DB2,DB        CONVERT TO INTEGER                 GP08242
+         CVB   R0,DB2        MAKE BINARY                        GP08242
+GOTORTNE MVC   DB(2),9(R3)     GET PROCESSING ROUTINE OFFSET    GP08242
+         LH    R15,DB          LOAD OFFSET                      GP08242
+         B     BSPGMADD(R15)   INVOKE IT                        GP08242
+         SPACE 1                                                GP08242
+DEFVALUE SR    R0,R0                                            GP08242
+         BCTR  R0,0          SIGNAL DEFAULT REQUEST             GP08242
+         B     GOTORTNE                                         GP08242
+         SPACE 1                                                GP08242
+SIZEPART LTR   R0,R0         TEST INPUT                         GP08242
+         BNM   SIZEPARN      NOT RESET                          GP08242
+         LA    R0,&CHUNKS    SET DEFAULT CHUNK SIZE             GP08242
+SIZEPARN CH    R0,=H'2048'   PHYSICAL MEM LIMIT ( 2GiB >> 20)   GP08242
+         BH    SKIPBADP      TOO HIGH; TOO BAD                  GP08242
+         SLL   R0,20         CONVERT                            GP08242
+         ST    R0,PATCHK     SET NEW CHUNK SIZE                 GP08242
+         B     SCANPARM      GO FOR MORE                        GP08242
+         SPACE 1                                                GP08242
+SIZERSVD LTR   R0,R0         TEST INPUT                         GP08242
+         BP    SIZERSVN      NOT RESET                          GP08242
+         LA    R0,&CHUNK0    SET DEFAULT RESERVE                GP08248
+SIZERSVN AH    R0,=H'16'     MVS SYSTEM BASE                    GP08242
+         CH    R0,=H'2048'   PHYSICAL MEM LIMIT ( 2GiB >> 20)   GP08242
+         BNL   SKIPBADP      TOO HIGH; TOO BAD                  GP08242
+         SLL   R0,20         CONVERT                            GP08242
+         ST    R0,PATSYS     SET NEW CHUNK SIZE                 GP08242
+         B     SCANPARM      GO FOR MORE                        GP08242
+         SPACE 1                                                GP08242
+SIZEOVER LTR   R0,R0         TEST INPUT                         GP08242
+         BP    SIZEOVEN      NOT RESET                          GP08242
+         L     R0,=A((&CHUNKO+4095)/4096*4096) OVERHEAD         GP08248
+SIZEOVEN AH    R0,=AL2(4095) ROUND TO PAGE BOUNDARY             GP08248
+         SRL   R0,12         /4096                              GP08248
+         SLL   R0,12         *4096 = PAGE BOUNDARY              GP08248
+         C     R0,=X'00100000'  LARGEST OVERHEAD WANTED ?       GP08242
+         BH    SKIPBADP      TOO HIGH; TOO BAD                  GP08242
+         ST    R0,PATOHD     SET NEW OVERHEAD                   GP08242
+         B     SCANPARM      GO FOR MORE                        GP08242
+         SPACE 1                                                GP08242
+DONEPARM ICM   R0,15,PATCHK  LOAD AND TEST PARTITION SIZE       GP08248
+         BZ    DONEPAR2      SIZE=0 -> MAINSIZE; NO CHECK       GP08248
+         CL    R0,PATOHD     OVERHEAD NOT TOO LARGE ?           GP08248
+         BH    DONEPAR2      OK ?                               GP08248
+         LA    R1,MSG17E     POINT TO MESSAGE                   GP08248
+         B     BADWTOEX      FAIL                               GP08248
+         SPACE 1
+DONEPAR2 TM    PARMFLAG,PARMAUTH  RUNNING AUTHORIZED?           GP08239
+         BNZ   EXITPARM                                         GP08239
+         TM    PARMFLAG,PARMREP+PARMDEL  CHANGE REQUESTED ?     GP08239
+         BZ    EXITPARM      NO; DOING FINE                     GP08239
+          OI   PARMFLAG,PARMSHOW  RUN IN DISPLAY MODE           GP08222
+          NI   PARMFLAG,255-PARMREP-PARMDEL   RESET CHANGES     GP08222
+          SETMAXCC 16        SET MAJOR ERROR                    GP08222
+          WTO  MF=(E,MSG47E)      AND LET USER KNOW             GP08222
+EXITPARM ICM   R0,15,MAXCC        WARNING SET ?                 GP08249
+         BP    EXIT12        YES; DON'T CONTINIE                GP08249
+         LM    R14,R9,SUBSAVER        , restore registers       GP08222
+         BR    R14                    , return to caller
+         TITLE 'Subroutines: SHOWUSE - Count/Display ATL users' GP08239
+         PUSH  USING                                            GP08239
+SHOWUSE  STM   R0,R14,SUBSAVER    SAVE ENTRY REGISTERS          GP08239
+         SR    R6,R6         CLEAR HIT COUNTER                  GP08239
+         L     R3,CVTPTR     GET CVT BACK                       GP08239
+         USING CVTMAP,R3     DECLARE IT                         GP08239
+         L     R10,CVTASVT   GET THE ASCB VECTOR TABLE          GP08239
+         USING ASVT,R10      DECLARE IT                         GP08239
+         LA    R9,ASVTFRST   POINT TO ASCB ADDRESS LIST         GP08239
+         L     R10,ASVTMAXU  NUMBER OF SLOTS                    GP08239
+         SPIE  SPIESHOW,(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)   GP08239
+         ST    R1,OLDSPIE    PROTECT A LITTLE                   GP08239
+NEXTASCB LA    R9,4(,R9)     POINT TO NEXT ASCB POINTER         GP08239
+         ICM   R8,15,0(R9)   LOAD AND TEST THE ASCB ADDRESS     GP08239
+         BNP   SKIPASCB      NOT ACTIVE; SKIP                   GP08239
+         USING ASCB,R8       DECLARE THE ASCB                   GP08239
+         ICM   R0,15,&ASCBWRD  ATL ASSIGNED ?                   GP08239
+         BZ    SKIPASCB      NO; IGNORE                         GP08239
+         MVC   DSPRDW(DSPWEND-DSPRDW),MSG69I    MOVE PATTERN    GP08239
+         LA    R15,BLANKS    SET POINTER TO STEP NAME           GP08239
+         ICM   R4,15,ASCBJBNI  INITIATED JOBNAME ?              GP08239
+         BZ    NOTJCSCB      NO                                 GP08239
+         SH    R4,=H'8'      MAKE IT INTO FAKE CSCB             GP08239
+         B     HAVECSCB                                         GP08239
+NOTJCSCB ICM   R4,15,ASCBCSCB  GET THE CSCB                     GP08239
+         BZ    NONECSCB      NONE; SKIP DISPLAY                 GP08239
+         USING CHAIN,R4      DECLARE THE CSCB                   GP08239
+HAVECSCB LA    R14,CHCLS     POINT TO PRESUMED JOBNAME          GP08239
+         LA    R15,CHSTEP    AND PRESUMED STEPNAME              GP08239
+         CLI   CHVCD,X'0C'   MOUNT COMMAND ?                    GP08239
+         BE    SKIPASCB      YES; IGNORE                        GP08239
+         SPACE 1                                                GP08239
+         CLI   CHVCD,X'98'   TIME-SHARING TASK ?                GP08239
+         BNE   NOTTCSCB      NO                                 GP08239
+         LA    R14,CHKEY     POINT TO USER ID                   GP08239
+         TM    0(R14),255-C' '  ANY USERID ?                    GP08239
+         BNZ   *+8           YES                                GP08239
+         LA    R14,=CL8'Logon'  MAKE PLAIN LOGON                GP08239
+         LA    R15,CHCLS     POINT TO PROCNAME                  GP08239
+         B     MOVECSCB                                         GP08239
+NOTTCSCB TM    CHTRKID,CHINITID  INITIATOR CSCB ?               GP08239
+         BNO   NOTICSCB      NO                                 GP08239
+         LA    R15,BLANKS    NO STEPNAME                        GP08239
+         B     MOVECSCB      GO TO MOVE NAMES                   GP08239
+NOTICSCB TM    0(R15),255-C' '  ANYTHING IN THE STEPNAME ?      GP08239
+         BNZ   MOVECSCB      YES; DISPLAY IT                    GP08239
+         LA    R15,CHPROCSN  POINT TO PROCSTEP                  GP08239
+         TM    0(R15),255-C' '  ANYTHING IN IT ?                GP08239
+         BZ    NOTPCSCB      NO; TRY FOR UNIT                   GP08239
+         CLC   =C'IEFPROC ',0(R15)  START STEP NAME ?           GP08239
+         BNE   MOVECSCB      NO; DISPLAY IT                     GP08239
+NOTPCSCB LA    R15,BLANKS    POINT TO BLANKS                    GP08239
+         TM    CHUNIT,X'C0'  VALID CONTENTS IN UNIT ?           GP08239
+         BNO   MOVECSCB      NO; LEAVE BLANK                    GP08239
+         MVC   DSPSTEP(3),CHUNIT  USE UNIT NAME                 GP08239
+         B     MOVECSCB                                         GP08239
+NONECSCB ICM   R14,15,ASCBJBNS  ANYTHING AT ALL ?               GP08239
+         BZ    JUSTSHOW      SHOULD NOT GET HERE                GP08242
+MOVECSCB MVC   DSPJOB,0(R14)  MOVE PRESUMED JOBNAME             GP08239
+         TM    0(R15),255-C' '  ANYTHING IN STEPNAME ?          GP08239
+         BZ    *+10          NO; SKIP THE MOVE                  GP08239
+         MVC   DSPSTEP,0(R15)  MOVE THE STEPNAME                GP08239
+JUSTSHOW LA    R6,1(,R6)     INCREASE ACTIVE COUNT              GP08239
+         LH    R0,ASCBASID   WHO ?                              GP08239
+         CVD   R0,DB                                            GP08239
+         ED    DSPASID,DB+5                                     GP08239
+         SR    R0,R0                                            GP08239
+         IC    R0,&ASCBWRD+3  WHICH CHUNK                       GP08239
+         CVD   R0,DB                                            GP08239
+         ED    DSPCHK,DB+5                                      GP08239
+         UNPK  DSPATL(7),&ASCBWRD.(4)  ADDR LESS CHUNK #        GP08239
+         TR    DSPATL(6),HEXTRTAB      MAKE PRINTABLE           GP08239
+         MVI   DSPATL+6,C'0'           KILL CRUD                GP08239
+         WTO   MF=(E,DSPRDW)                                    GP08239
+SKIPASCB BCT   R10,NEXTASCB  GET NEXT SLOT                      GP08239
+         L     R2,OLDSPIE                                       GP08239
+         SPIE  MF=(E,(R2))   CANCEL MY SPIE                     GP08239
+         LR    R15,R6        RETURN COUNT                       GP08239
+         LM    R0,R14,SUBSAVER                                  GP08239
+         BR    R14                                              GP08239
+         SPACE 1                                                GP08239
+         USING SPIESHOW,R15                                     GP08239
+SPIESHOW LA    R2,SKIPASCB   RECOVER FROM ERROR                 GP08239
+         ST    R2,PIEPSW+4-PIE(,R1)  RESTART                    GP08239
+         BR    R14           RETURN TO SLIH                     GP08239
+         POP   USING                                            GP08239
+BLANKS   DC    CL8' '        SPACES                             GP08239
+         SPACE 2                                                GP08239
+         LTORG                                                  GP08239
+         TITLE 'Intercept code'                                 GP08222
+         PUSH  USING                                            GP08222
+         DROP  ,                                                GP08222
+INTSECT  CSECT ,
+***********************************************************************
+**                                                                   **
+**   SVC 120 INTERCEPT CODE (GETMAIN RC/RU)                          **
+**   1) IN FIXED SYSTEM STORAGE, KEY=0  (CSA)                        **
+**   2) SELF-RELOCATING (NO ADDRESS CONSTANTS).                      **
+**   3) BRANCHES TO IBM CODE FOR INVALID OR BELOW THE LINE REQ.      **
+**      REQUIRES ORIGINAL R14-R7                                     **
+***********************************************************************
+**                                                                   **
+**   FIRST VERSION:                                                  **
+**       IF R0 (LENGTH) < 16MB, SEND REQUEST TO IBM                  **
+**       IF R1(1:7)<>0, RETURN TO CALLER WITH R15=0 (FREEMAIN)       **
+**       IF R1 = 0, RETURN R1 W/ABOVE THE LINE ADDRESS, SET R15=0    **
+**         UNLESS R0 + START ADDRESS > MAX.MEM - SEND TO IBM         **
+**                                                                   **
+***********************************************************************
+         USING CVTMAP,R3     SET BY SYSTEM                      GP08239
+*        USING TCB,R4        SET BY SYSTEM                      GP08239
+*        USING RBBASIC,R5    SET BY SYSTEM (PRB,SVRB,none)?     GP08239
+         USING INTCPT,R6     SET BY SYSTEM                      GP08239
+         USING ASCB,R7       SET BY SYSTEM                      GP08239
+INTCPT   B     INTBEG  1/10  SKIP EYE CATCHER                   GP08222
+IDLINE   DC    AL1(15),CL15'MVS/380 &SYSDATE'                   GP08229
+EYECATCH EQU   IDLINE+1,8,C'C'    EYE CATCHER IN DUMP           GP08229
+INTSIZE  DC    AL2((INTCPTLN+7)/8)    GETMAIN DOUBLE WORDS      GP08222
+INTMOVE  DS    0H            START OF MOVED DATA                GP08239
+INT#CHK  DC    AL2(0)  4/10   NUMBER OF CHUNKS                  GP08239
+INTSLOT  DC    AL4(0)  5/10   SVC TABLE SLOT                    GP08222
+INT@120  DC    AL4(0)  6/10   IBM'S SVC ADDRESS                 GP08222
+INTLIM   DC    AL4(0)  7/10  MAXIMUM HERCULES-380 MEMORY        GP08222
+INTSYS   DC    AL4(0)  8/10  RESERVED FOR SYSTEM AND MVS/380    GP08239
+INTCHK   DC    AL4(0)  9/10  SIZE OF MEMORY CHUNK               GP08239
+INTOHD   DC    AL4(0) 10/10  SIZE OF IN CHUNK FOR SVC120 MGMT.  GP08239
+INTMOVLN EQU   *-INTMOVE       SIZE OF PATTERN MOVE             GP08239
+         SPACE 1
+INTBEG   C     R0,=X'00FFFFFF'  LENGTH > 16MB-1  ?              GP08222
+         BNH   GO2IBM        NO; LET IBM HANDLE IT              GP08239
+*--------------------------------------------------------------------*
+*   LATER CHECK THAT CALLER IS IN AMODE 31                           *
+*--------------------------------------------------------------------*
+         LTR   R1,R1         IS R1 ZERO ?                       GP08222
+         BZ    INTGET        YES; GETMAIN REQUEST               GP08222
+         L     R3,=X'7F000000'    MASK FOR LENGTH CHECK         GP08222
+         NR    R3,R1         DID USER SUPPLY ADDRESS>=16MB ?    GP08222
+         BZ    FIXIBM        NO; LET IBM HANDLE                 GP08222
+******* FREEMAIN ABOVE THE LINE - RESET ASCBRV44   ***********  GP08239
+         SR    R15,R15       CLEAR ADDRESS                      GP08239
+         ST    R15,&ASCBWRD  RESET OWNERSHIP                    GP08239
+         BR    R14           RETURN TO CALLER                   GP08239
+         EJECT ,                                                GP08242
+*--------------------------------------------------------------------*
+* CHECK THAT REQUESTED LENGTH IS AVAILABLE. FIND AVAILABLE PARTITION *
+*--------------------------------------------------------------------*
+INTGET   L     R8,INTCHK     GET PARTITION SIZE                 GP08242
+         S     R8,INTOHD       LESS HOUSEKEEPING SPACE          GP08242
+         CLR   R0,R8         USER'S REQUEST < PARTITION?        GP08242
+         BNL   FIXIBM        NO; SEND TO IBM TO FAIL            GP08222
+         ICM   R1,14,&ASCBWRD   ALREADY HAVE A PARTITION?       GP08248
+         BNZ   HAVEPART      YES; JUST RE-INITIALIZE            GP08239
+         SPACE 1
+*--------------------------------------------------------------------*
+*   LOOP THROUGH ALL ASCBS AND BUILD BIT MASK OF PARTITIONS IN USE   *
+*   IF ALL ARE IN USE, PASS THE REQUEST TO IBM GETMAIN               *
+*   IF AVAILABLE ONE FOUND, SET THE ADDRESS AND NUMBER INTO ASCBRV44 *
+*   CLEAR OUR RESERVE (4K) AND RETURN START ADDRESS IN R1            *
+*--------------------------------------------------------------------*
+*   N.B.: CODE SUPPORTS 32 PARTITIONS. IF NEEDED, CAN EXPAND TO      *
+*         63 USING R10/R11 AND USING DOUBLE SHIFTS.                  *
+*--------------------------------------------------------------------*
+         LR    R8,R14        SAVE RETURN ADDRESS                GP08239
+         SETLOCK OBTAIN,TYPE=CMS,MODE=UNCOND,RELATED=AUNT       GP08239
+         LR    R14,R8        REGAIN RETURN                      GP08239
+         L     R3,CVTPTR     GET CVT BACK                       GP08239
+         SR    R10,R10       MASK BITS                          GP08239
+         L     R9,CVTASVT    GET THE ASCB VECTOR TABLE          GP08239
+         USING ASVT,R9       DECLARE IT                         GP08239
+         L     R13,ASVTMAXU  GET NUMBER OF ASCB SLOTS           GP08239
+         LA    R9,ASVTFRST   POINT TO FIRST ASCB POINTER -1     GP08239
+         DROP  R9                                               GP08239
+LOOPASCB LA    R9,4(,R9)     NEXT ASCB SLOT                     GP08239
+         ICM   R8,15,0(R9)   LOAD AND TEST THE ASCB ADDRESS     GP08239
+         BNP   BUMPASCB      NOT ACTIVE; SKIP                   GP08239
+         L     R8,&ASCBWRD-ASCB(,R8)  OUR PARTITION ADDR OR 0   GP08239
+         N     R8,=X'000000FF'  LEAVE ONLY PARTITION NUMBER     GP08239
+         BZ    BUMPASCB      NONE; SKIP                         GP08239
+         BCTR  R8,0          FINAGLE                            GP08239
+         LA    R12,1         MAKE MASK BIT                      GP08239
+         SLL   R12,0(R8)     SHIFT BIT                          GP08239
+         OR    R10,R12       REMEMBER THE BIT(S) USED           GP08239
+BUMPASCB BCT   R13,LOOPASCB  TRY FOR MORE                       GP08239
+         LA    R9,1          LOOP START                         GP08239
+LOOPFREE EX    R10,EXTM01    IS LOW BIT ON ?                    GP08239
+         BZ    HAVEFREE      YES; R9 HAS CHUNK NUMBER           GP08239
+         SRL   R10,1         SHIFT                              GP08239
+         LA    R9,1(,R9)                                        GP08239
+         CH    R9,INT#CHK    OVER MAX ?                         GP08239
+         BNH   LOOPFREE                                         GP08239
+         LR    R8,R14        SAVE RETURN ADDRESS                GP08239
+         SETLOCK RELEASE,TYPE=CMS,RELATED=UNCLE                 GP08239
+         LR    R14,R8        REGAIN RETURN                      GP08239
+         B     GO2IBM        NOT FOUND; GO TO IBM GETMAIN       GP08239
+EXTM01   TM    =X'01',*-*    TEST LOW BIT                       GP08239
+         SPACE 1                                                GP08239
+HAVEFREE STC   R9,&ASCBWRD+3   SAVE CHUNK IN ASCB               GP08239
+         BCTR  R9,0          CHUNK LESS ONE                     GP08239
+         L     R1,INTSYS     CHUNK 0 : SYSTEM + MVS/380         GP08239
+         M     R8,INTCHK     (#-1) * CHUNK SIZE                 GP08239
+         AR    R1,R9         PARTITION START ADDRESS            GP08239
+         STCM  R1,B'1110',&ASCBWRD   ADD TO CHUNK NUMBER        GP08239
+         LR    R8,R14        SAVE RETURN ADDRESS                GP08239
+         SETLOCK RELEASE,TYPE=CMS,RELATED=COUSIN                GP08239
+         LR    R14,R8        REGAIN RETURN                      GP08239
+         SPACE 1                                                GP08239
+HAVEPART LA    R13,HAVEPARP  GO TO CLEAR REAL MEMORY            GP08239
+         O     R13,=X'80000000'   NEED AMODE 31                 GP08239
+         DC    X'0B0D'       SWITCH MODE                        GP08239
+HAVEPARP LR    R8,R1         START OF PARTITION                 GP08239
+         AL    R1,INTOHD     KEEP A LITTLE FOR ME               GP08239
+         L     R9,INTOHD     SIZE RESERVED FOR OUR 120, ETC.    GP08239
+         SR    R11,R11       ZERO FILL                          GP08239
+         MVCL  R8,R10        CLEAR CONTROL SPACE                GP08239
+         LA    R13,INTEXIT   GET NEXT ADDRESS                   GP08239
+         DC    X'0B0D'       BSM 0,13 - SET AM 24               GP08239
+INTEXIT  SR    R15,R15       CLEAR RETURN CODE                  GP08222
+         BR    R14           RETURN TO CALLER                   GP08222
+         SPACE 1
+FIXIBM   L     R3,CVTPTR     RESTORE R3                         GP08222
+GO2IBM   L     R6,INT@120    GET IBM SVC 120 ADDRESS            GP08222
+         BR    R6            INVOKE IT W/R7-R5 INTACT           GP08222
+         SPACE 1
+         LTORG ,
+         DS    0D              ENSURE CORRECT DOUBLEWORD COUNT  GP08239
+INTCPTLN EQU   *-INTCPT      LENGTH OF FIXED CSA STORAGE        GP08222
+BSPGMADD CSECT ,                                                GP08222
+         POP   USING                                            GP08222
+         TITLE 'Constants - Messages - Tables'                  GP08242
+**********************************************************************
+*  BSPGMADD Version 1.1
+*
+*          ¦l      _,,,---,,_
+*    ZZZzz /,:.-':''  . -.  ;-;;,
+*         ¦,4-  ) )-,_. ,( (  :'-
+*        '---''(_/--'  :-')_)
+*
+*  Macros and some code placed into the Hercules Domain
+*  by Volker Bandke, BSP GmbH'
+*
+*  Remainder released into public domain by Gerhard Postpischil,
+*  based on supporting Hercules and MVS mods by Paul Edwards.
+**********************************************************************
+**********************************************************************
+*   Messages and stuff
+**********************************************************************
+*        DC   C'-+----1----+----2----+----3----+----4----+----5----+---
+MSG17E   WTO   'BSPGM17E - Overhead must be less than Partition size', *
+               MF=L                                             GP08248
+MSG18E   WTO   'BSPGM18E - Unrecognized PARM value',MF=L        GP08239
+MSG19E   WTO   'BSPGM19E - Invalid PARM operand length',MF=L
+MSG38E   WTO   'BSPGM38E - Base system not MVS 3.8',MF=L        GP08222
+MSG39E   WTO   'BSPGM39E - Hercules and MVS 380 mods required',MF=L
+MSG40I   WTO   'BSPGM40I - nnnnn MiB MAINSIZE memory available',MF=L
+MOSZ     EQU    MSG40I+4+10-MSG40I,6,C'C'  SIZE IN MESSAGE      GP08239
+MSG40ILN EQU   *-MSG40I      LENGTH OF PATTERN                  GP08239
+MSG41I   WTO   'BSPGM41I - nnnnn Partitions of nnnnn MiB each',MF=L
+MO#P     EQU    MSG41I+4+10-MSG41I,6,C'C'  PARTITION NUMBER     GP08239
+MO##     EQU    MSG41I+4+30-MSG41I,6,C'C'  PARTITION COUNT      GP08239
+MSG41ILN EQU   *-MSG41I      LENGTH OF PATTERN                  GP08239
+MSG47E   WTO   'BSPGM47E - Module unauthorized - PARM=SHOW used',MF=L
+         SPACE 1                                                GP08239
+MSG69I   DC    Y(MSG69ND-*,0)                                   GP08239
+         DC    C'BSPGM69I '                                     GP08239
+W69ASID  DC    XL6'402020202120',C' '   ASID                    GP08239
+W69JOB   DC    CL8' ',C' '   JOB/STC/TSU NAME                   GP08239
+W69STEP  DC    CL8' ',C' '   STEP NAME, OR JOB NAME FOR SCHED. INIT
+W69CHK   DC    XL6'402020202120',C' '   CHUNK NUMBER            GP08239
+W69ATL   DC    CL8'00000000'   ABOVE THE LINE MEMORY ADDRESS    GP08239
+MSG69ND  EQU   *                                                GP08239
+         SPACE 1                                                GP08239
+MSG70E   WTO   'BSPGM70E - ATL Users active - try later',MF=L   GP08239
+MSG71W   WTO   'BSPGM71W - Size values not changed',MF=L        GP08248
+MSG78E   WTO   'BSPGM78E - Insufficent MAINSIZE for partition',MF=L
+         SPACE 1
+MSG79I   WTO   'BSPGM78I SVC 120 EP=xxxxxxxx; IBM CODE',MF=L    GP08239
+M79WHO   EQU   *-8-MSG79I,8,C'C'    OVERLAY PORTION             GP08239
+LOCMSGLN EQU   *-MSG79I                                         GP08239
+M79INT   DC    CL(L'M79WHO)'MVS/380'                            GP08239
+M79ADDR  EQU   4+20,8,C'C'   REPLACEABLE PORTION - ADDRESS      GP08239
+MSG91E   WTO   'BSPGM91E - Option invalid with =',MF=L          GP08242
+MSG92E   WTO   'BSPGM92E - Keyword requires =',MF=L             GP08242
+MSG94W   WTO   'BSPGM94W - Invalid request :               ',MF=L
+M94ITEM  EQU   MSG94W+33-MSG94W,10,C'C'     PARM VERB INSERT    GP08242
+MSG94WLN EQU   *-MSG94W                                         GP08242
+MSG95W   WTO   'BSPGM95W - Invalid integer :               ',MF=L
+MSG99W   WTO   'BSPGM99W - Parm was too long, truncated',MF=L
+*        DC   C'-+----1----+----2----+----3----+----4----+----5----+---
+         SPACE 1
+HEXTAB   DC    C'0123456789ABCDEF'                              GP08222
+HEXTRTAB EQU   HEXTAB-C'0'                                      GP08222
+         SPACE 1                                                GP08242
+ABBRPARM DC    CL9'DISPLAY  ',AL1(PARMSHOW)                     GP08242
+ABBRPAR2 DC    CL9'SHOW     ',AL1(PARMSHOW)                     GP08242
+         DC    CL9'LIST     ',AL1(PARMUSE)                      GP08242
+         DC    CL9'HELP     ',AL1(PARMINFO)                     GP08249
+         DC    CL9'?        ',AL1(PARMINFO)                     GP08249
+         DC    CL9'MB       ',AL1(0) POSTFIXED MB ON SIZE       GP08249
+         DC    CL9'USERS    ',AL1(PARMUSE)                      GP08242
+         DC    CL9'INSERT   ',AL1(PARMREP)                      GP08242
+         DC    CL9'INSTALL  ',AL1(PARMREP)                      GP08249
+         DC    CL9'INTERCEPT',AL1(PARMREP)                      GP08242
+         DC    CL9'ADD      ',AL1(PARMREP)                      GP08242
+         DC    CL9'REPLACE  ',AL1(PARMREP+PARMDEL)              GP08242
+         DC    CL9'UPDATE   ',AL1(PARMREP+PARMDEL)              GP08242
+         DC    CL9'DELETE   ',AL1(PARMDEL)                      GP08242
+ABBRPARN DC    CL9'REMOVE   ',AL1(PARMDEL)                      GP08242
+         SPACE 1                                                GP08242
+ABBRKEYW DC    CL9'PARTITION',AL2(SIZEPART-BSPGMADD)            GP08242
+ABBRKEY2 DC    CL9'PARTSIZE ',AL2(SIZEPART-BSPGMADD)            GP08242
+         DC    CL9'SIZE     ',AL2(SIZEPART-BSPGMADD)            GP08242
+         DC    CL9'RESERVE  ',AL2(SIZERSVD-BSPGMADD)            GP08242
+         DC    CL9'OVHD     ',AL2(SIZEOVER-BSPGMADD)            GP08242
+ABBRKEYN DC    CL9'OVERHEAD ',AL2(SIZEOVER-BSPGMADD)            GP08242
+         SPACE 2
+TRTPARM  DC    256AL1(0)     ALLOW EVERYTHING AS PARM           GP08242
+         ORG   TRTPARM+C'='  SPECIAL STOP ON EQUAL SIGN         GP08242
+         DC    AL1(4)        KEYWORD INDICATOR                  GP08242
+         ORG   TRTPARM+C' '  SPECIAL STOP ON BLANK              GP08242
+         DC    AL1(8)        ITEM END                           GP08242
+         ORG   TRTPARM+C','  SPECIAL STOP ON COMMA              GP08242
+         DC    AL1(8)        ITEM END                           GP08242
+         ORG   TRTPARM+C';'  SPECIAL STOP ON SEMI-COLON         GP08242
+         DC    AL1(8)        ITEM END                           GP08242
+         ORG   ,                                                GP08242
+         SPACE 1                                                GP08242
+TRTNUMB  DC    256AL1(8)     EVERYTHING INVALID                 GP08242
+         ORG   TRTNUMB+C'0'                                     GP08242
+         DC    10AL1(0)      EXCEPT DIGITS                      GP08242
+         ORG   ,                                                GP08242
+         TITLE 'Mappings - Variables - Workspace'
+*DEBUG*  PRINT GEN
+         CVT   DSECT=YES,PREFIX=YES,LIST=YES CVT mapping        GP08239
+         SPACE 1
+         PRINT NOGEN
+MYCSCB   DSECT ,                                                GP08239
+         IEECHAIN ,          CSCB Mapping                       GP08239
+         SPACE 1
+         IHAPICA ,           Error recovery control             GP08222
+         SPACE 1
+         IHAPIE  ,           Error recovery work                GP08222
+         SPACE 1
+         IHASCVT ,           Secondary CVT                      GP08222
+         SPACE 1
+         IHAASVT ,           Address Space Vector Table         GP08239
+         SPACE 1
+         IHAASCB ,           Address Space Control Block        GP08239
+         SPACE 1
+         IHAPSA ,            Low Storage                        GP08239
+         SPACE 1
+         IHASVC ,            SVC entry mapping                  GP08239
+SVCENTLN EQU   *-SVCENTRY    LENGTH OF ONE ENTRY IN MVS         GP08222
+         SPACE 2
+***********************************************************************
+* Workspace variables and related stuff                               *
+***********************************************************************
+         SPACE 1
+WORKAREA DSECT
+DEVTYPE  DS    0D            DEVTYPE RESULT                     GP08222
+DB       DS    D                                                GP08242
+DB2      DS    D                                                GP08242
+         SPACE 2
+***********************************************************************
+* Subroutine save areas                                               *
+***********************************************************************
+SUBSAVER DS    16A                    , SUBROUTINE SAVE AREA
+         SPACE ,          'Miscellaneous Variables'
+MAXCC    DC    F'0'                   , returncode given to caller
+OLDSPIE  DS    A             PICA PUSH-DOWN                     GP08222
+         SPACE 1                                                GP08222
+PARMFLAG DC    XL1'0'                 , Flag byte for PARM date
+PARMSHOW EQU   B'10000000'            , X'80' - DISPLAY INFO    GP08222
+PARMREP  EQU   B'01000000'            , X'40' - INSTALL INTERCEPT
+PARMDEL  EQU   B'00100000'            , X'20' - REMOVE INTERCEPT
+PARMUSE  EQU   B'00010000'            , X'10' - list ATL users  GP08239
+PARMAUTH EQU   B'00001000'            , X'08' - running authorized  239
+PARMVALS EQU   B'00000100'            , X'04' - size/rsv/ohd change 248
+PARMINFO EQU   B'00000001'            , X'01' - display HELP    GP08249
+         CNOP  2,4           START OF MOVED DATA                GP08239
+PATMOVE  DS    0H            START OF MOVED DATA                GP08239
+PAT#CHK  DC    AL2(0)  4/10   NUMBER OF CHUNKS                  GP08239
+PATSLOT  DC    AL4(0)  5/10   SVC TABLE SLOT                    GP08222
+PAT@120  DC    AL4(0)  6/10   IBM'S SVC ADDRESS                 GP08222
+PATLIM   DC    AL4(0)  7/10  MAXIMUM HERCULES-380 MEMORY        GP08222
+PATSYS   DC    AL4(0)  8/10  RESERVED FOR SYSTEM AND MVS/380    GP08239
+PATCHK   DC    AL4(0)  9/10  SIZE OF MEMORY CHUNK               GP08239
+PATOHD   DC    AL4(0) 10/10  SIZE OF IN CHUNK FOR SVC120 MGMT.  GP08239
+PATMOVLN EQU   *-PATMOVE       SIZE OF PATTERN MOVE             GP08239
+         SPACE 1                                                GP08222
+WTOWORK  DS    0Y(0),XL80    WORK SPACE FOR WTO                 GP08239
+         ORG   WTOWORK                                          GP08239
+DSPRDW   DC    Y(DSPWEND-*,0)                                   GP08239
+         DC    C'BSPGM69I '                                     GP08239
+DSPASID  DC    CL6' ',C' '   ASID                               GP08239
+DSPJOB   DC    CL8' ',C' '   JOB/STC/TSU NAME                   GP08239
+DSPSTEP  DC    CL8' ',C' '   STEP NAME, OR JOB NAME FOR SCHED   GP08239
+DSPCHK   DC    CL6' ',C' '   CHUNK NUMBER                       GP08239
+DSPATL   DC    CL8'00000000'   ABOVE THE LINE MEMORY ADDRESS    GP08239
+DSPWEND  EQU   *                                                GP08239
+         ORG   ,                                                GP08239
+         SPACE 2
+***********************************************************************
+*   MVS/380 VECTOR TABLE DESCRIPTION                                  *
+V380SECT DSECT ,
+V380ID   DS    CL4'V380'
+V380REAL DS    F             AVAILABLE STORAGE SIZE
+V380#CHK DS    F             NUMERBER OF ATL CHUNKS             GP08248
+V380RSVD DS    F             SIZE RESERVED FOR SYSTEM, 16 MiB+  GP08248
+V380PART DS    F             PARTITION SIZE >= 1 MiB            GP08248
+V380OVHD DS    F             OVERHEAD PER PARTITION; BYTES      GP08248
+         DS    10A             RESERVED
+V380VLEN EQU   *-V380SECT    GETMAIN LENGTH                     GP08242
+         SPACE 2
+         BSPEND                       , of module

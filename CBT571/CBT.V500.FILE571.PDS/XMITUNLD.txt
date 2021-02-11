@@ -1,0 +1,221 @@
+XMITUNLD TITLE 'INVOKE IEBCOPY to unload dataset, write segments'
+*
+* Copyright 2001, 2002 James M. Morrison
+*
+*----------------------------------------------------------------------
+*  To do: NO
+*----------------------------------------------------------------------
+         U#SET FUNC=XMIT
+*----------------------------------------------------------------------
+* Function: Invoke IEBCOPY to unload the input dataset, read the
+*           IEBCOPY unload data, and write segments containing the
+*           unloaded data.  Supports partitioned datasets and
+*           sequential datasets.
+*
+*           Data is written as follows:
+*           XMIT01    INMR01 (always first)
+*           XMIT02A   INMR02 IEBCOPY
+*           XMIT02B   INMR02 INMCOPY
+*           XMIT03    INMR03 (precedes unloaded data)
+*           XMITUNLD  <unloaded data>
+*           XMIT06    INMR06 (trailer, always last)
+*
+* Caller: XMIT370
+*
+* Entry:  AMODE=24, ASC=PRIMARY, KEY=*, STATE=*
+*
+*         R0  =
+*         R1  =
+*
+* Exit:   R15 = return code
+*         R15 = 00 success
+*
+* Abends:
+*
+* Notes:  XMIT370 has opened SYSUT1 (XMTDCBI), and read the SYSUT1
+*         JFCB into XMTJFCB1; XMT@JFCB points at XMTJFCB1
+*----------------------------------------------------------------------
+* R2
+* R3     JFCB
+* R4     length of block read
+* R5
+* R6     length of allocated input buffer
+* R7     IOB
+* R8     input DCB
+* R9     @ input record
+* R10
+* R11    XMTWA
+* R12    base reg
+* R13    savearea
+*----------------------------------------------------------------------
+ERR#1    EQU   1        SYSUT1 invalid DSORG
+         TITLE ' '
+*----------------------------------------------------------------------
+XMITUNLD UPROC L=L$SA,ID=XULD
+         UDIAG 1,'UNLD entered'
+         SLR   R6,R6                        no buffer allocated
+*----------------------------------------------------------------------
+*  Write INMR01 segment
+*----------------------------------------------------------------------
+         UCALL XMIT01,ERR=EXIT
+*----------------------------------------------------------------------
+*  Unload PDS & write INMR02 IEBCOPY segment (DSORG=PO only)
+*----------------------------------------------------------------------
+         L     R3,XMT@JFCB
+         USING INFMJFCB,R3
+         TM    JFCDSORG,JFCORGPS            physical sequential?
+         BO    NOPDS
+         TM    JFCDSORG,JFCORGPO            partitioned?
+         BNO   BADORG
+PDS      UCALL XMIT02A,ERR=EXIT   unload PDS, write IEBCOPY INMR02
+*----------------------------------------------------------------------
+*  Write INMR02 INMCOPY segment for DSORG=PS or DSORG=PO
+*----------------------------------------------------------------------
+NOPDS    UCALL XMIT02B,ERR=EXIT             DCBI ddname = SYSUT1/SYSUT2
+*----------------------------------------------------------------------
+*  Write INMR03 segment prior to outputting data segments
+*----------------------------------------------------------------------
+         UCALL XMIT03,ERR=EXIT
+*----------------------------------------------------------------------
+*  Set EOF routine and allocate input buffer
+*----------------------------------------------------------------------
+SETEOF   DS    0H
+         L     R3,XMT@JFCB                  refresh xmtdcbi's JFCB ptr
+         LA    R8,XMTDCBI                   @ input DCB
+         USING IHADCB,R8
+         LA    R0,EOFRTN
+         STCM  R0,7,DCBEODA                 set EOF exit rtn addr
+         MVC   SADECBI(L$DECB),MODLDECB     copy model DECB
+         LH    R6,DCBBLKSI                  get blksize
+         GETMAIN R,LV=(R6)                  alloc input buffer
+         LR    R9,R1
+*----------------------------------------------------------------------
+* Read block of data from SYSUT1 or SYSUT2
+*----------------------------------------------------------------------
+READ     DS    0H
+         READ  SADECBI,SF,(R8),(R9),'S',MF=E
+*        UDIAG 2,'UNLD: READ issued'
+*
+         CHECK SADECBI
+         L     R7,(DECIOBPT-DECB)+SADECBI    @ IOB
+         USING IOBSTDRD,R7
+*
+*        UDIAG 5,'UNLD: DECB after CHECK',SADECBI,L$DECB
+*        UDIAG 5,'UNLD: DCB after CHECK',(R8),L$DCB
+*        UDIAG 5,'UNLD: IOB after CHECK',(R7),L$IOB
+*
+*  careful, recfm=u = recfm=v + recfm=f
+*
+         TM    DCBRECFM,DCBRECU        RECFM=U, get residual
+         BO    CALCLEN
+         LH    R4,0(R9)                l' RECFM=VB record = BDW
+         TM    DCBRECFM,DCBRECV        guessed wrong?
+         BO    HVLEN
+CALCLEN  DS    0H
+         LH    R4,DCBBLKSI             max l' RECFM=F or U
+         LH    R0,IOBSTBYT+2           residual count
+         SR    R4,R0                   r4 = l' read
+HVLEN    DS    0H
+         UDIAG 3,'UNLD: input record',(R9),(R4)
+*----------------------------------------------------------------------
+* If this is the IEBCOPY COPYR1 record, see if it needs "fixing"
+*----------------------------------------------------------------------
+CKCOPYR1 DS    0H
+         TM    SAFLG1,SAF1FX           already fixed?
+         BO    WRITE
+         CLC   =X'CA6D0F',9(R9)        COPYR1 id?
+         BNE   WRITE                   nope, skip
+FXCOPYR1 DS    0H
+         LR    R1,R9                   @ COPYR1 block
+         UCALL XMITCPR1                call COPYR1-fixer-upper
+         OI    SAFLG1,SAF1FX           show fixed
+         LH    R4,0(,R9)               retrieve new buffer length
+*----------------------------------------------------------------------
+* Write data segments from data read
+*----------------------------------------------------------------------
+WRITE    DS    0H
+         LR    R0,R4                   buffer length
+         LR    R1,R9                   buffer addr
+*
+*  XMIT doesn't transmit BDW & RDW for unloaded DSORG=PO datasets
+*
+         TM    JFCRECFM,JFCVAR         have to fudge recfm=v
+         BNO   WBUF
+         TM    XMTFLG1,XMTF1$U         for unloaded datasets,
+         BNO   WBUF
+         S     R0,=F'8'                fudge length
+         LA    R1,8(,R1)               adjust record ptr
+*
+WBUF     DS    0H
+         UCALL XMITBUF            split buffer into segments, write
+         LTR   R15,R15
+         BZ    READ
+         B     EXIT
+*----------------------------------------------------------------------
+* Write INMR06 segment at End Of File
+*----------------------------------------------------------------------
+EOFRTN   DS    0H
+         UCALL XMIT06,ERR=EXIT
+         SLR   R15,R15
+*----------------------------------------------------------------------
+*  Release gotten storage, close DCB
+*----------------------------------------------------------------------
+EXIT     DS    0H
+         ST    R15,SARC
+         LTR   R0,R6
+         BZ    NOFREE
+         FREEMAIN R,LV=(0),A=(R9)
+NOFREE   DS    0H
+         TM    DCBOFLGS,DCBOFOPN       DCB open?
+         BNO   EXIT99
+         MVC   XMTCLOS(L$CLOS),MODLCLOS
+         UDIAG 1,'UNLD CLOSE XMITDCBI',XMTDCBI,L$DCB
+         CLOSE XMTDCBI,MF=(E,XMTCLOS)  close SYSUT2
+*----------------------------------------------------------------------
+*  Return to caller
+*----------------------------------------------------------------------
+EXIT99   UDIAG 1,'UNLD exited'
+         UPEND RC=*SARC
+*----------------------------------------------------------------------
+BADORG   DS    0H
+         USNAP 'XMITUNLD: JFCB invalid DSORG',(R3),L$JFCB
+         MVI   SAREASON,ERR#1
+DIE      UABEND SAREASON               invalid input file DSORG
+*
+MODLCLOS CLOSE (,),MF=L
+L$CLOS   EQU  *-MODLCLOS
+*
+MODLDECB READ MODLECB,SF,0,0,'S',MF=L
+L$DECB   EQU  *-MODLDECB
+*
+         LTORG ,
+         EJECT ,
+*----------------------------------------------------------------------
+*  Workarea
+*----------------------------------------------------------------------
+SAVEAREA DSECT ,
+SASA     DS    18F
+SAFLG1   DS    X
+SAF1FX   EQU   128                     COPYR1 fixed
+SAREASON DS    X
+SARC     DS    F                       return code
+SADECBI  READ  SAECBI,SF,0,0,'S',MF=L
+         DS    0D
+L$SA     EQU   *-SAVEAREA
+         PRINT NOGEN
+         WAXMIT ,
+*
+         DCBD  DSORG=PS,DEVD=DA
+L$DCB    EQU   *-IHADCB
+*
+JFCB     DSECT ,
+         IEFJFCBN LIST=YES
+L$JFCB   EQU   *-JFCB
+*
+         IHADECB ,
+*
+         IEZIOB ,
+L$IOB    EQU    *-IOB
+*
+XMITUNLD UFINI DXDXUNLD,L$SA
+         END   ,

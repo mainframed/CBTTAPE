@@ -1,0 +1,40 @@
+
+## $$ASMDOC.txt
+```
+CPCMD    - Enables MVS users running under VM to issue CP commands
+           and get the responses back at their TSO terminal. Can also
+           executed as a batch program or started task. Link it with
+           an alias of CP. On TSO then enter CP Q DASD for example, or
+           CP ATT 58A MVS.
+DASDSUB  - Get DASD device information from UCB. (Used by SVTOC in PLI.)
+DISASM3B - The SVC table from the DISASSEMBLER on the CBT tape. Modified
+           for MVSXA and copied into SVCTAB.
+DSSLVL   - Display current DF/DSS program level.
+JULSUB   - Date conversion subroutine. (Fixed for year 20xx. SBG)
+LASTCLPA - Command to display date and time of last CLPA. A companion
+           program to LASTIPL which is on the CBT tape.  (APF authorize)
+           (Needs TODCN and JULSUB programs.)
+LNKLST   - Display names of LINKLST datasets currently in use.
+RACFDS   - Display data about the RACF dataset(s) in use.
+SMFDS    - Display data about current SMF dataset usage.
+SVCTAB   - Program to display SVCTABLE.
+TODCN    - Program to convert timestamps into real dates and times.
+VSAMNAME - Convert and display 'real' dataset names assigned by VSAM
+           for PAGE, MAN etc.
+```
+
+## $$DOC.txt
+```
+This PDS contains the following members:
+
+CLIST    - Some CLISTS to demonstrate the use of some of the utilities
+           included in this file.
+CNTL     - JCL to run some of the utilities included in this file.
+ASM      - Assembler language source for some useful utilities.
+           (Broken out into separate members with userid AFIELD.)
+MACROS   - Macros necessary to assemble source in member ASM.
+           (Broken out into separate members with userid MACRO.)
+PLI      - A PL/I utilitiy to sort IEHLIST LISTVTOC output into address
+           order.
+```
+

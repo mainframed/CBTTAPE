@@ -1,0 +1,256 @@
+Changing case within CICS
+
+The question of how to implement a dynamic change between
+mixed-case and upper-case processing within CICS must surely
+apply to many CICS installations.  However, IBM has yet to
+implement a satisfactory solution, even with its much fanfared
+Version 3.
+
+In a single address space CICS environment, the solution is
+simple - find your own TCTTE and zap a couple of bits - but
+when executing in a region other than the TOR in an MRO
+environment, modifying your remote TCTTE does not have the
+desired effect.  This is the problem with which I was faced
+when our installation chose to create a pure AOR from a single
+CICS region.
+
+I decided the best solution from the application programmer's
+perspective would be a simple routine to which an application
+program could link, passing a parameter specifying whether
+upper case translation (UCTRAN) should be switched on or
+off, and an area for a return code.  The programmer should not
+have to consider whether the application program will execute
+in the TOR or a remote AOR.
+
+The solution is implemented through two programs.  The first,
+TERMCASE, is linked to by the application program and
+executes in the same region as the application.  The second,
+CASE2, performs the actual TCTTE modification and always
+runs in the TOR.  This is achieved by the first program
+invoking the second using an EXEC CICS START command
+for a transaction, TRM2, defined as local in the TOR and
+remote (routing to the TOR) in any other region.  As the
+application task is already running against the terminal in
+question either in the TOR or AOR, the TRM2 transaction runs
+as a background transaction in the TOR, and locates the correct
+TCTTE via the DCA chains.
+
+The second stage is to ensure that the application program can
+be confident that all has gone smoothly, which is quite tricky
+when the application and hence TERMCASE are executing in a
+remote AOR.  I admit that my solution looks rather heavy
+handed but in practice it works extremely well - I would be
+interested in a more elegant and simpler method.  My approach
+puts the application task into an indefinite wait using an EXEC
+CICS DELAY, which can then be cancelled by the CASE2
+program once it is satisfied that the change of case has taken
+place, and TERMCASE running under the application task
+resumes execution and passes back a good return code to the
+application program.  A timing problem can very occasionally
+occur here, in that the CANCEL for the DELAY can actually
+be executed before the DELAY itself, which raises the
+NOTFND condition in CASE2.  This is handled, and the
+CANCEL is retried at one second intervals until successful or a
+loop limit is reached.
+
+The parameter list from the application program to
+TERMCASE is untidy because of the constraint of remaining
+consistent with all our existing programs.  This list could be
+reduced to two bytes from nine by just specifying 'U' or 'L' for
+a switch to upper or lower case, and passing a single byte for a
+return code rather than the four-byte literal 'OK  '.
+Furthermore, the return code could actually be omitted
+altogether, as a successful completion is indicated by the link
+to TERMCASE returning rather than remaining in an indefinite
+wait.  Incidentally, these programs have been in production
+here for several months and no application tasks have been left
+in an indefinite wait.
+
+The programs are currently running successfully under
+MVS/ESA 4.1 and CICS/MVS 2.1.1.  When we migrate to
+CICS/ESA, CASE2 will need to be reworked to find the
+TCTTE.  By that time we will probably be excluded entirely
+from accessing CICS control blocks and hopefully there will be
+an EXEC CICS INQUIRE/SET command to switch the
+UCTRAN function of terminals dynamically.  In fact, this very
+facility was announced in a statement of intent by IBM at the
+September 1991 meeting of the UK GUIDE CICS working
+group.
+
+
+REQUIRED TABLE ENTRIES
+
+PPT
+
+TOR
+
+         DFHPPT TYPE=ENTRY,PROGRAM=TERMCASE
+         DFHPPT TYPE=ENTRY,PROGRAM=CASE2
+
+AOR
+
+         DFHPPT TYPE=ENTRY,PROGRAM=TERMCASE
+
+PCT
+
+TOR
+
+         DFHPCT TYPE=ENTRY,TRANSID=TRM2,PROGRAM=CASE2
+
+AOR
+
+         DFHPCT TYPE=REMOTE,TRANSID=TRM2,SYSIDNT=CICT
+
+where CICT is the CICS SYSID of the TOR as defined in the SIT.
+
+
+TERMCASE SOURCE CODE
+
+***********************************************************************
+*                           T E R M C A S E                           *
+* THIS PROGRAM CAN BE LINKED TO BY ANY CICS APPLICATION PROGRAM       *
+* RUNNING IN ANY REGION IN AN MRO ENVIRONMENT. THE PARAMETER LIST TO  *
+* THE CASE2 PROGRAM IS BUILT, THEN A TRM2 TRANSACTION IS STARTED WHICH*
+* WILL ROUTE TO THE TERMINAL OWNING REGION. WE THEN PUT OURSELVES IN  *
+* AN INDEFINITE WAIT WHICH WILL BE CANCELLED BY CASE2 ON SUCCESSFUL   *
+* MODIFICATION OF OUR TCT ENTRY IN THE TOR.                           *
+***********************************************************************
+         DFHREGS
+COMMAREA DSECT                              INCOMING PARAMETERS
+         USING *,R4
+TERMID   DS    CL4                          TERMINAL ID (IGNORED)
+PARM     DS    C                            'U' OR 'L' FOR UPPER/LOWER
+RETCODE  DS    CL4                          RETURN CODE AREA
+DFHEISTG DSECT
+PARMLIST EQU   *                            OUTGOING PARAMETERS
+PTERMID  DS    CL4                          TERMINAL ID
+PPARM    DS    C                            'U' OR 'L'
+PSYSID   DS    CL4                          CURRENT CICS SYSID
+PREQID   DS    CL8                          REQID OF DELAY
+TERMCASE CSECT
+TERMCASE AMODE 31
+TERMCASE RMODE ANY
+         LH    R4,EIBCALEN                  GET COMMAREA LENGTH
+         LTR   R4,R4                        IS IT ZERO?
+         BZ    RETURN                       YES ... FINISH
+*                                           GET AREA FOR RE-ENTRANCY
+         L     R4,DFHEICAP                  R4 -> COMMAREA
+         MVC   PTERMID,EIBTRMID             COPY TERMID
+         MVC   PPARM,PARM                   COPY PARM
+*                                           GET SYSID
+         EXEC  CICS ASSIGN                                             *
+               SYSID(PSYSID)
+         MVC   PREQID,EIBTASKN              COPY TASK NO AS REQID
+*                                           START BKGND TXN TO FLIP TCT
+         EXEC  CICS START                                              *
+               TRANSID('TRM2')                                         *
+               FROM(PARMLIST)                                          *
+               LENGTH(17)
+*                                           WAIT 4EVA IF NOT OK
+         EXEC  CICS DELAY                                              *
+               INTERVAL(995959)                                        *
+               REQID(EIBTASKN)
+         MVC   RETCODE,=CL4'OK'             IF TASK RESUMES SET RC OK
+RETURN   DS    0H
+         EXEC  CICS RETURN
+         LTORG
+         END
+
+
+CASE2 SOURCE CODE
+
+***********************************************************************
+*                              C A S E 2                              *
+* THIS PROGRAM IS INVOKED BY TERMCASE AND ALWAYS RUNS IN THE TERMINAL *
+* OWNING REGION. IT FINDS THE TCTTE OF THE TERMINAL SPECIFIED AND SETS*
+* THE UCTRAN FACILITY ON OR OFF AS REQUESTED. TO NOTIFY SUCCESSFUL    *
+* COMPLETION, IT CANCELS THE INDEFINITE WAIT INTO WHICH TERMCASE HAS  *
+* PUT ITSELF.                                                         *
+***********************************************************************
+         DFHREGS
+         COPY  DFHTCTTE
+         COPY  DFHTCADS
+         COPY  DFHCSADS
+         COPY  DFHDCADS
+TCTTEAR  EQU   R7
+DCACBAR  EQU   R5
+PARMPTR  EQU   R8
+CSACBAR  EQU   R4
+DFHEISTG DSECT
+ANCHOR   DS    F                            SAVE DCA ANCHOR ADDRESS
+RESPFLD  DS    F                            EXEC RESPONSE FIELD
+PARMLEN  DS    H                            LENGTH OF RETRIEVED DATA
+PARMLIST DSECT                              PARAMETERS FROM TERMCASE
+         USING *,PARMPTR
+TERMID   DS    CL4                          TERMINAL ID
+PARM     DS    C                            U/L FOR UCTRAN ON/OFF
+SYSID    DS    CL4                          AOR OF APPLICATION PROGRAM
+REQID    DS    CL8                          REQUEST ID OF TERMCASE DLY
+CASE2    CSECT
+CASE2    AMODE 31
+CASE2    RMODE ANY
+*                                           RETRIEVE PARMS
+         EXEC  CICS RETRIEVE                                           *
+               SET(PARMPTR)                                            *
+               LENGTH(PARMLEN)
+*                                           FIND CSA
+         EXEC  CICS ADDRESS                                            *
+               CSA(CSACBAR)
+         USING DFHCSADS,CSACBAR             ADDRESS IT
+         L     DCACBAR,CSASUSFA             -> 1ST DCA SUSP CHAIN
+         ST    DCACBAR,ANCHOR               SAVE FOR LOOP CHECK
+         BAL   10,SCANCHN                   SCAN SUSP TASK CHAIN
+         LTR   15,15                        HAVE WE FOUND TCTTE?
+         BZ    FLIPTCT                      YES ... FLIP BIT
+         L     DCACBAR,CSAACTFA             -> 1ST DCA ACT CHAIN
+         ST    DCACBAR,ANCHOR               SAVE FOR LOOP CHECK
+         BAL   10,SCANCHN                   SCAN ACT TASK CHAIN
+         LTR   15,15
+         BZ    FLIPTCT
+         B     RETURN                       NOT FOUND ... FINISH
+FLIPTCT  EQU   *
+         USING DFHTCTTE,TCTTEAR             GOT RIGHT TERMINAL
+         CLI   PARM,C'L'                    LOWER CASE REQUIRED?
+         BNE   UPCASE                       NO ... SKIP OVER
+         NI    TCTTEFIB,X'FF'-TCTTEFTU      TURN OFF UPPER CASE
+         MVI   TCTEUCTB,X'00'
+         B     CANCEL
+UPCASE   NI    TCTTEFIB,TCTTEFTU            TURN ON UPPER CASE
+         MVI   TCTEUCTB,X'01'
+CANCEL   LA    R9,30                        SET LOOP LIMIT TO 30 SECS
+*                                           ALL OK ALLOW PROG TO CONT
+RETRY    EQU   *                            CANCEL DELAY IN TERMCASE
+         EXEC  CICS CANCEL                                             *
+               REQID(REQID)                                            *
+               SYSID(SYSID)                                            *
+               RESP(RESPFLD)
+         CLC   RESPFLD,DFHRESP(NORMAL)      CANCEL OK?
+         BE    RETURN                       YES ... FINISHED
+*                                           ICE NOTFND SO WAIT A SECOND
+         EXEC  CICS DELAY                                              *
+               INTERVAL(000001)
+         BCT   R9,RETRY                     ... AND RETRY THE CANCEL
+RETURN   EQU   *                            END
+         EXEC  CICS RETURN
+*        SUBROUTINE TO CHECK TCT FOR EACH DCA ON CHAIN PASSED         *
+NEXTDCA  L     DCACBAR,DCAKCFA              -> NEXT DCA ON CHAIN
+         C     DCACBAR,ANCHOR               HAVE WE LOOPED?
+         BNE   SCANCHN                      NO ... KEEP GOING
+         LA    15,8
+         BR    10
+SCANCHN  L     TCACBAR,DCATCAA              -> TCA FOR THAT TASK
+         TM    TCAFCAAA,TCAFCTRM            TERMINAL TASK?
+         BNO   NEXTDCA                      NO ... TRY NEXT TASK
+         ICM   TCTTEAR,7,TCAFCAAA+1         -> TCTTE
+         BZ    NEXTDCA                      TRY NEXT TASK IF NO TCTTE
+         CLC   TERMID,0(TCTTEAR)            IS IT OUR TERMINAL?
+         BNE   NEXTDCA                      NO ... TRY NEXT TASK
+         LA    15,0                         SAY GOT TCTTE
+         BR    10                           AND RETURN
+         END
+
+
+Nick Cole
+CICS Systems Programmer
+Direct Line Services (UK)
+

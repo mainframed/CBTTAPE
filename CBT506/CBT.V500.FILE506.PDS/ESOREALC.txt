@@ -1,0 +1,356 @@
+/*-----------------------------( rexx )-------------------------------*/
+/*                                                                    */
+/* ESOREALC -- Realloc/copy datasets as required by HOLD(ACTION) PTFs */
+/*                                                                    */
+/* Function:  ESOREALC can be used to increase the size and/or number */
+/*            of directory blocks of datasets that will need it due   */
+/*            to HOLD(ACTION) PTFs.                                   */
+/*                                                                    */
+/*                                                                    */
+/* Usage:  ESOREALC dsname VOL(volser) < BLOCKS(blks) > < DIR(dir) >  */
+/*                  < RENAME(newdsn) >                                */
+/*                                                                    */
+/*    Where:  "dsname" is the dataset to operate on                   */
+/*            "volser" is the volser where "dataset" lives            */
+/*            "blks"   is the number of blocks to add to dataset      */
+/*            "dir"    is the number of directory blocks to add       */
+/*            "newdsn" is the dsname to rename the dataset to.        */
+/*                                                                    */
+/*            BLOCKS() and DIR() are both optional, but one must be   */
+/*            specified or no action is taken.                        */
+/*                                                                    */
+/* Notes:  .. The dataset to operate on is assumed to be uncataloged. */
+/*            This will cause VOL(******) entries to be left alone.   */
+/*            For this reason ESOREALC won't work right on an SMS-    */
+/*            managed volume.                                         */
+/*         .. ESOREALC doesn't do unmoveable datasets, or VSAM.       */
+/*         .. Some datasets may require renaming, since they may be   */
+/*            in use by MVS or an application.  You may have to zap a */
+/*            VTOC or do something similarly creative to do a rename  */
+/*            before you run ESOREALC.                                */
+/*         .. If you had to rename the dataset before using ESOREALC, */
+/*            use the RENAME() operand to rename it back to its old   */
+/*            name after realloc, copy, etc were successful.  The     */
+/*            exec renames the file with IEHPROGM, which doesn't      */
+/*            follow the normal rules.                                */
+/*         .. The exec uses a local command (CALLSYS) to call stuff   */
+/*            in the linklist like IEBCOPY.  You should change the    */
+/*            refs to CALLSYS to CALL 'SYS1.LINKLIB(...)' instead.    */
+/*                                                                    */
+/*                                                                    */
+/* History:   01/03/2001 jcb -- New                                   */
+/*                                                                    */
+/*                                                                    */
+/*--------------------------------------------------------------------*/
+
+/*--------------------------------------------------------------------*/
+/* Parse the command first;  do a USAGE if it's not right.            */
+/*--------------------------------------------------------------------*/
+cmd_dsname = " ";
+cmd_volser = " ";
+cmd_blocks = 0;
+cmd_dirblk = 0;
+cmd_rename = " ";
+arg cmd_dsname 'VOL(' cmd_volser ')' ,
+  1 'BLOCKS(' cmd_blocks   ')' ,
+  1 'DIR('    cmd_dirblk   ')' ,
+  1 'RENAME(' cmd_rename   ')';
+if cmd_dsname = " " | cmd_volser = " " then signal usage;
+if cmd_blocks = 0 & cmd_dirblk = 0 then signal usage;
+
+/*--------------------------------------------------------------------*/
+/* Get info about the dataset's current attributes.                   */
+/*--------------------------------------------------------------------*/
+cmd_qdsname = "'" || strip(cmd_dsname) || "'";
+x = LISTDSI( cmd_qdsname "VOL(" cmd_volser ") DIRECTORY" );
+if x > 0 then signal listdsi_error;
+current_dirblk = sysadirblk;
+if sysunits ¬= "BLOCK" then do;
+  say "Warning: " cmd_dsname " on" cmd_volser ,
+      " is allocated in" sysunits " units.";
+  if sysunits = "CYLINDER" then do;
+    new_primary = cmd_blocks + (sysprimary * sysblkstrk * systrkscyl);
+    new_seconds = sysseconds * sysblkstrk * systrkscyl;
+  end;
+  else if sysunits = "TRACK" then do;
+    new_primary = cmd_blocks + (sysprimary * sysblkstrk);
+    new_seconds = sysseconds * sysblkstrk;
+  end;
+  else signal terminated;
+end;
+else do;
+  new_primary = sysprimary + cmd_blocks;
+  new_seconds = sysseconds;
+end;
+if current_dirblk = "NO_LIM" then do;
+  say "Warning: " cmd_dsname " on" cmd_volser " is a PDSE.";
+  say "Directory block increase will be ignored.";
+end;
+
+/*--------------------------------------------------------------------*/
+/* Issue messages about stuff that we don't do. Some are terminating. */
+/*--------------------------------------------------------------------*/
+if sysdsorg = 'POU' | sysdsorg = 'PSU' | sysdsorg = 'DAU' then do;
+  say cmd_dsname "is allocated as an unmoveable dataset.";
+  signal terminate;
+end;
+if sysdsorg = 'VS' then do;
+  say cmd_dsname "is a VSAM dataset.";
+  signal terminate;
+end;
+if sysdsorg ¬= 'PO' & cmd_dirblk > 0 then do;
+  say cmd_dsname "is not a PDS; directory blocks ignored.";
+  cmd_dirblk = 0;
+end;
+
+new_blocks = sysprimary + cmd_blocks;
+new_dirblk = sysadirblk + cmd_dirblk;
+
+/*--------------------------------------------------------------------*/
+/* We got this far;  tell caller what we plan to do.                  */
+/*--------------------------------------------------------------------*/
+say " ";
+say cmd_dsname "on" cmd_volser "now uses (" sysprimary sysseconds ,
+") blocks and" sysadirblk "directory blocks.";
+say cmd_dsname "on" cmd_volser "will be reallocated with (" ,
+new_blocks sysseconds ") blocks and" new_dirblk "directory blocks.";
+say " ";
+
+/*--------------------------------------------------------------------*/
+/* Rename the dataset to a temporary name.                            */
+/*--------------------------------------------------------------------*/
+cmd_dsname = strip(cmd_dsname);
+temp_dsname = cmd_dsname || ".TEMP";
+x = function_rename(cmd_dsname,temp_dsname);
+if x > 0 then signal rename_error;
+
+/*--------------------------------------------------------------------*/
+/* Allocate the new dataset by the original name.  Don't catalog it.  */
+/*--------------------------------------------------------------------*/
+cmd_recfm = substr(sysrecfm,1,1) || " " || substr(sysrecfm,2,1);
+cmd = "ALLOC DA(" || cmd_qdsname || ") NEW KEEP UNIT(DISK) SPACE(" || ,
+      new_primary new_seconds || ") BLOCK(" || sysblksize || ,
+      ") DSORG(" || sysdsorg || ") DIR(" || new_dirblk || ,
+      ") RECFM(" || cmd_recfm || ") VOL(" || cmd_volser || ,
+      ") LRECL(" || syslrecl || ")";
+x = issue_command(cmd);
+if x > 0 then signal command_error;
+
+/*--------------------------------------------------------------------*/
+/* Copy the contents from the tempnamed dataset to the new larger one */
+/*--------------------------------------------------------------------*/
+
+x = function_copylib(temp_dsname,cmd_dsname);
+if x > 0 then signal utility_error;
+
+/*--------------------------------------------------------------------*/
+/* If asked, rename the larger dataset to its original name.          */
+/* (The rename routine was lifted from the BACKSYS exec.)             */
+/*--------------------------------------------------------------------*/
+if cmd_rename ¬= " " then do;
+  x = function_rename(cmd_dsname,cmd_rename);
+  if x > 0 then signal rename_error;
+end;
+
+/*--------------------------------------------------------------------*/
+/* Delete the tempnamed dataset and exit.                             */
+/*--------------------------------------------------------------------*/
+temp_qdsname = "'" || strip(temp_dsname) || "'";
+cmd = "ALLOC DA(" || temp_qdsname || ") VOL(" || cmd_volser ,
+      || ") OLD";
+x = issue_command(cmd);
+if x > 0 then signal command_error;
+cmd = "FREE DA(" || temp_qdsname || ") DELETE";
+x = issue_command(cmd);
+if x > 0 then signal command_error;
+
+exit 0;
+
+/*--------------------------------------------------------------------*/
+/* Terminated: General error exit.  Caller says what's wrong.         */
+/*--------------------------------------------------------------------*/
+terminated:
+  say " ";
+  say "ESOREALC terminated.";
+  say " ";
+  exit 8;
+/*--------------------------------------------------------------------*/
+/* Usage:  Tell caller the syntax if they didn't get syntax right.    */
+/*--------------------------------------------------------------------*/
+usage:
+  say " ";
+  say "Usage:  ESOREALC dsname VOL(volser)                          ";
+  say "             < BLOCKS(blks) >                                ";
+  say "             < DIR(dir) >                                    ";
+  say "             < RENAME(newdsn) >                              ";
+  say "                                                             ";
+  say "Where:  'dsname' is the dataset to operate on                ";
+  say "        'volser' is the volser where "dataset" lives         ";
+  say "        'blks'   is the number of blocks to add to dataset   ";
+  say "        'dir'    is the number of directory blocks to add    ";
+  say "        'newdsn' is the dsname to rename the                 ";
+  say "                                                             ";
+  say "        BLOCKS() and DIR() are both optional, but one must   ";
+  say "        be specified or no action is taken.                  ";
+  say " ";
+  exit 8;
+
+/*--------------------------------------------------------------------*/
+/* Listdsi_Error:  Report failures from LISTDSI.                      */
+/*--------------------------------------------------------------------*/
+listdsi_error:
+  say " ";
+  say "LISTDSI error processing" cmd_dsname " on" cmd_volser ":";
+  say sysmsglvl1;
+  say sysmsglvl2;
+  say " ";
+  exit 8;
+
+/*--------------------------------------------------------------------*/
+/* Command_Error:  Report failures from TSO commands.                 */
+/*--------------------------------------------------------------------*/
+command_error:
+  say " ";
+  say "TSO command failed.";
+  say " ";
+  exit 8;
+
+/*--------------------------------------------------------------------*/
+/* Utility_Error:  Report failures from IEBCOPY.                      */
+/*--------------------------------------------------------------------*/
+utility_error:
+  say " ";
+  say "IEBCOPY utility failed.";
+  say " ";
+  exit 8;
+/*--------------------------------------------------------------------*/
+/* Rename_Error:  Report failures from IEHPROGM.                      */
+/*--------------------------------------------------------------------*/
+rename_error:
+  say " ";
+  say "IEHPROGM utility failed.";
+  say " ";
+  exit 8;
+
+/*--------------------------------------------------------------------*/
+/*                                                                   */
+/*  Subroutine:  Function_RENAME                                     */
+/*  Purpose:     Rename the named dataset to its target dataset on   */
+/*               the named volume using IEHPROGM.                    */
+/*  To call:     x = function_rename(old_dsn, new_dsn);              */
+/*  Notes:     . It is assumed that an IEHPROGM RC of 0 is OK.       */
+/*             . Adapted from SYSTEMS.BACKSYS.SOURCE(BACKSYS).       */
+/*                                                                   */
+/*--------------------------------------------------------------------*/
+function_rename: procedure expose(cmd_volser)
+  /* trace results; */
+  blanks = "                                                         ";
+  arg old_name, new_name;
+  old_name = strip(old_name,"B","'");      /* nuke the quotes if any */
+  old_name = strip(old_name,"B"," ");      /* blanks too             */
+  new_name = strip(new_name,"B","'");
+  new_name = strip(new_name,"B"," ");
+  target_volume = strip(cmd_volser);
+  x = issue_command( ,
+    "ALLOC FI(SYSIN) NEW SPACE(2 2) TRACK LRECL(80) RECFM(F B)");
+  if rc > 0 then signal rename_bad_alloc;
+  iehline.0 = 2;   /* 2! */
+  iehline.1 = " RENAME DSNAME=" || old_name || ,
+              ",VOL=3390=" || target_volume || ",";
+  x = overlay("$",blanks,72-length(iehline.1));
+  iehline.1 = strip(iehline.1 || x,TRAILING);
+  iehline.2 = "               NEWNAME=" || new_name;
+  "EXECIO * DISKW SYSIN (STEM iehline. FINIS)";
+  if rc > 0 then signal rename_bad_execio;
+  x = issue_command("ALLOC FI(SYSPRINT) SYSOUT(A) HOLD");
+  x = issue_command( ,
+    "ALLOC FI(" || target_volume || ") UNIT(DISK) VOL(" || ,
+        target_volume || ") NEW SPACE(1) TRACK");
+  if rc > 0 then signal rename_bad_alloc;
+  "CALLSYS IEHPROGM";
+  if rc > 4 then signal rename_bad_rename;
+  say old_name "renamed successfully to" new_name || ".";
+  x = issue_command("FREE FI(SYSIN SYSPRINT " || target_volume || ")");
+  return 0;
+/* ----------------------------------------------------------------- */
+/* RENAME's error routines                                           */
+/* ----------------------------------------------------------------- */
+rename_bad_alloc:
+  say "*** Error: ALLOC failed during RENAME."
+  exit 12
+rename_bad_execio:
+  say "*** Error: EXECIO failed during RENAME."
+  exit 12
+rename_bad_rename:
+  say "*** Error: IEHPROGM failed during RENAME."
+  exit 12
+
+/* ----------------------------------------------------------------- */
+/*                                                                   */
+/*  Function issue_command:  Log and issue a TSO command.            */
+/*                                                                   */
+/* ----------------------------------------------------------------- */
+issue_command: procedure
+  arg command_string
+  echo_commands = 'TRUE';
+  if echo_commands = 'TRUE' then ,
+    say "Command:"  command_string
+  command_string;
+  result = rc;
+  return(result);
+/* ----------------------------------------------------------------- */
+/*                                                                   */
+/*  Subroutine:  Function_COPYLIB                                    */
+/*  Purpose:     Copy the named dataset to its target dataset on     */
+/*               the named volume.                                   */
+/*  Syntax:      backsys copylib dsname.to.copy targetvolume         */
+/*  Notes:     . All mainline variables are available.  There are    */
+/*               no local variables used.                            */
+/*             . It is assumed that an IEBCOPY rc of 0 or 4 is OK.   */
+/*             . COPYLIB works on non-loadlib PDSes.  For loadlibs   */
+/*               use function_COPYMOD.                               */
+/*                                                                   */
+/* ----------------------------------------------------------------- */
+function_copylib: procedure expose(cmd_volser)
+  /* trace results */
+  arg input_lib, output_lib;
+  target_volume = strip(cmd_volser);
+  x = issue_command( ,
+    "ALLOC FI(SYSIN) DUMMY" );
+  x = issue_command( ,
+    "ALLOC FI(SYSPRINT) SYSOUT(A) HOLD" );
+  x = issue_command( ,
+    "ALLOC FI(SYSUT1) DA('" || input_lib || ,
+       "') VOL(" || target_volume || ")" );
+  if rc > 0 then signal copylib_no_libout;
+  x = issue_command( ,
+    "ALLOC FI(SYSUT2) DA('" || output_lib || "') VOL(" ,
+        || target_volume || ") UNIT(DISK)" );
+  if rc > 0 then signal copylib_no_libout;
+  x = issue_command( ,
+    "ALLOC F(SYSUT3) NEW UNIT(DISK) SPACE(50) CYL" );
+  if rc > 0 then signal copylib_no_sysutx;
+  x = issue_command( ,
+    "ALLOC F(SYSUT4) NEW UNIT(DISK) SPACE(50) CYL" );
+  if rc > 0 then signal copylib_no_sysutx;
+  x = issue_command( "CALLSYS IEBCOPY 'COPY,WORK=5M'" );
+  if rc > 4 then signal copylib_bad_copy;
+  say input_lib "copied successfully into" output_lib || ".";
+  x = issue_command( ,
+    "FREE FI(SYSIN SYSPRINT SYSUT1 SYSUT2 SYSUT3 SYSUT4)" );
+  return 0;
+/* ----------------------------------------------------------------- */
+/* COPYLIB's error routines                                          */
+/* ----------------------------------------------------------------- */
+copylib_no_sysutx:
+  say "*** Error: Unable to create SYSUTx work file.";
+  exit 12
+copylib_no_libout:
+  say "*** Error: Unable to allocate to output library" output_lib "."
+  exit 12
+copylib_no_libin:
+  say "*** Error: Unable to allocate to input library" input_lib "."
+  exit 12
+copylib_bad_copy:
+  say "*** Error: IEBCOPY failed while copying" input_lib "."
+  exit 12

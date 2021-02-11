@@ -1,0 +1,367 @@
+PRC      TITLE 'JES2 EXIT9 - OUTPUT EXCEEDED EXIT.'
+********************************************************************
+*                                                                  *
+*   NAME - JESXIT9 - JES2 OUTPUT EXCEEDED EXIT.                    *
+*                                                                  *
+*   DESCRIPTION -                                                  *
+*     THIS IS THE OUTPUT EXCEEDED JES EXIT. OUR INSTALLATION DOES  *
+*     NOT BY DEFAULT CANCEL JOBS THAT EXCEED OUTPUT. THIS EXIT     *
+*     PROMPTS THE OPERATOR ABOUT EVERY 100,000 LINES EXCEEDED TO   *
+*     CANCEL THE JOB OR ALLOW THE JOB TO CONTINUE. THUS WE CAN     *
+*     PREVENT RUNAWAY JOBS FROM FILLING UP SPOOL SPACE.            *
+*                                                                  *
+*     AT PRESENT ALL BATCH WORK IS SUBJECT TO THIS EXIT.           *
+*     WE ONLY USE THIS EXIT FOR PRINT LINES EXCEEDED. WHEN WE      *
+*     HAVE EXCEEDED OUPUT BY ANOTHER 100,000 LINES, THE OPERATOR   *
+*     SEES NON-ROLLABLE MESSAGES SUCH AS THESE:                    *
+*                                                                  *
+*       *JOBNAME : ESTIMATED LINES EXCEEDED BY   100,000.          *
+*       *JOBNAME : CURR.LINES   114,012, EST.LINES    12,000.      *
+*       *JOBNAME : FILE S2      .SYSABEND, CURR.LINE     1,070.    *
+*       *47 JOBNAME : CANCEL JOB?  REPLY "YES" OR "NO".            *
+*                                                                  *
+*     NOTES:                                                       *
+*     1.THIS EXIT MAKES USE OF THE FACT THAT THE SDB ADDRESS       *
+*       IS PASSED IN R10, ALTHOUGH THIS IS NOT DOCUMENTED. IF      *
+*       THIS CHANGES, WE SHOULD BE ABLE TO GET THIS ADDRESS FROM   *
+*       AN RB SAVEAREA (R2 OF SVC111 -> DEB, DEBIRBAD -> SDB).     *
+*     2.IT WAS IMPORTANT TO US TO PREVENT DUMPS (SYSUDUMP, ETC.)   *
+*       FROM FILLING UP SPOOL SPACE. THE HASPAM MODULE THAT CALLS  *
+*       US MAKES A POINT OF IGNORING A ABEND722 REQUEST WHEN RTM2  *
+*       IS IN CONTROL, SO WE SCHEDULE AN ABEND722 FROM WITHIN      *
+*       THIS EXIT.                                                 *
+*     3.THIS EXIT WAS TESTED USING JES2 HJE2330 WITH HASPAM PTF    *
+*       LEVEL UZ40391. MY INFO/MVS DATABASE NOTES SOME PLANNED     *
+*       CHANGES IN HASPAM AND NEW BITS IN THE PARAMETER LIST.      *
+*       THESE CHANGES MAY AFFECT THE PROCESING OF THIS EXIT.       *
+*     4.THERE ARE A SOME FUNNY CALLS TO THIS EXIT I DIDN'T         *
+*       EXPECT. JOBLOG AND SYSMSGS DATASET WRITES                  *
+*       RUN THROUGH THIS EXIT EVEN AFTER THE JOBSTEP ABENDS        *
+*       (POSSIBLY UNDER THE INITIATOR TASK). JES2 IGNORES          *
+*       REQUESTS FROM THIS EXIT FOR THESE DATASETS. WE IGNORE THEM *
+*       BY TESTING SDB1FOPN. THERE ARE OCCASIONAL DUMMY CALLS TO   *
+*       CLOSE DATASETS. WE IGNORE THESE BY TESTING SDB1CLOS.       *
+*                                                                  *
+*   MACROS USED -                                                  *
+*     $MODULE,$ENTRY,SAVE,RETURN,GETMAIN,WTO,WTOR,WAIT,CALLRTM,    *
+*     DOM,FREEMAIN,$MODEND                                         *
+*                                                                  *
+*   INPUTS -                                                       *
+*     R0 = N/A                                                     *
+*     R1 = ADDRESS OF THE 7 WORD PARAMETER LIST                    *
+*       +0  JCTLINES OR JCTPUNCH VALUE                             *
+*       +4  JCTPAGES VALUE                                         *
+*       +8  JCTMXOUT VALUE                                         *
+*       +12 USER'S INCREMENT FOR RECORDS                           *
+*       +16 USER'S INCREMENT FOR PAGES                             *
+*       +20 USER'S INCREMENT FOR BYTES                             *
+*       +24 OUTPUT OVERFLOW FLAG                                   *
+*     R2-R6 = N/A                                                  *
+*     R7  = ADDRESS OF THE JCT                                     *
+*     R8-R10 = N/A                                                 *
+*     R11 = ADDRESS OF THE SSVT                                    *
+*     R12 = N/A                                                    *
+*     R13 = OS-STYLE 18-WORD SAVE AREA                             *
+*     R14 = RETURN ADDRESS                                         *
+*     R15 = ENTRY ADDRESS                                          *
+*                                                                  *
+*   OUTPUTS -                                                      *
+*     R0  = FLAGS                                                  *
+*       BIT 0 = 0 TAKE DEFAULT ACTION IN JESPARMS                  *
+*       BIT 0 = 1 TAKE ACTION BASED ON BITS 24-31                  *
+*       BIT 1 = 0 USE INCREMENT FROM JESPARMS                      *
+*       BIT 1 = 1 USE INCREMENT SUPPLIED BY EXIT IN PLIST          *
+*       BIT 2 = 0 SEND $HASP375 TO OPERATOR                        *
+*       BIT 2 = 1 SUPPRESS $HASP375                                *
+*       BIT 24-31 IF = 0, CONTINUE PROCESSING                      *
+*                 IF = 1, ABEND722, NO DUMP                        *
+*                 IF = 2, ABEND722, DUMP                           *
+*                                                                  *
+*     R15 = A RETURN CODE                                          *
+*       0 = TAKE ADD'L EXITS, OR TAKE DEFAULT ACTIONS IN JESPARMS  *
+*       4 = IGNORE ADD'L EXITS, TAKE DEFAULT ACTIONS IN JESPARMS   *
+*       8 = TAKE ACTION BASED ON FLAGS IN R0                       *
+*                                                                  *
+*   INSTALLATION NOTES -                                           *
+*     INCLUDE THE FOLLOWING IN YOUR JES PARMLIB:                   *
+*       LOAD     JESXIT9                                           *
+*       EXIT009  ROUTINE=(EXIT9)                                   *
+*     THIS MODULE MUST BE PLACED INTO SYS1.LPALIB OR INCLUDED      *
+*     AS AN 'MLPA' OR 'FLPA' IN COMMON STORAGE, ELSE A S0C4 WILL   *
+*     RESULT.                                                      *
+*                                                                  *
+*   CHANGE LOG -                                                   *
+*     05/12/87 PTW L01 IMPLEMENTATION                              *
+*     10/15/87 PTW L02 FORMAT SDBFLGX IN WTO MESSAGES (TEMP).      *L02
+*     12/07/87 PTW L03 JES2 2.1.5                                  *L03
+*                                                                  *
+********************************************************************
+*        COPY  $HASPGBL
+         PRINT  OFF
+         COPY  $HASPGBL
+         PRINT ON
+JESXIT9 $MODULE SYSP=(NOGEN,NOGEN,NODATA,NOGEN,NOGEN),                 X
+               ENVIRON=USER,                                           X
+               TITLE='JES2 EXIT9 - JES2 OUTPUT EXCEEDED EXIT',         X
+               $BUFFER,            GENERATE HASP BUFFER DSECT          X
+               $HASPEQU,           GENERATE HASP EQUATES               X
+               $JCT,               GENERATE HASP JCT DSECT             X
+               $MIT,               GENERATE HASP MIT DSECT             X
+               $SCAT,              GENERATE HASP SCAT DSECT            X
+               $SDB,               GENERATE HASP SCAT DSECT            X
+               $SVT,               GENERATE HASP SVT DSECT             X
+               $TAB,               GENERATE HASP SVT DSECT             X
+               $XECB,              GENERATE HASP XECB DSECT            X
+               ASCB,               GENERATE HASP MIT DSECT             X
+               CVT,                GENERATE HASP MIT DSECT             X
+               PSA,                GENERATE HASP MIT DSECT             X
+               RPL,                GENERATE HASP MIT DSECT          L02X
+               TCB,                GENERATE HASP MIT DSECT             X
+               TIOT                GENERATE HASP MIT DSECT
+         TITLE 'JES2 EXIT9 - JES2 OUTPUT EXCEEDED EXIT'            L02
+***********************************************************************
+*                                                                     *
+*        M A I N   E N T R Y   P O I N T                              *
+*                                                                     *
+***********************************************************************
+EXIT9   $ENTRY BASE=R12
+         SAVE  (14,12)
+         LR    R12,R15            R12 = BASE REG.
+         SR    R15,R15            SET DEFAULT RC.
+         USING PLIST,R1           R1 = A(PLIST).
+         TM    PFLAGS,X'40'       IF NOT ENTERED FOR PRINT LINES,
+         BZ    QWIKEXIT             GET OUT.
+         USING JCT,R7             R7 = A(JCT).                      L02
+         USING SDB,R10            R10 = A(SDB).                     L02
+         USING SVT,R11            R11 = A(SSVT).                    L02
+         TM    SDBFLG1,SDB1FOPN   IF A FAKE-OPENED DS (JLOG,JMSGS,
+         BO    QWIKEXIT             JCLIMAGE), OUT (RC IGNORED).
+         TM    SDBFLG1,SDB1CLOS   FOR DUMMY CLOSE CALL,
+         BZ    NOTCLOS
+         L     R2,PSATOLD-PSA     IF RTM2 IN CONTROL (SYSUDUMP, ETC.),
+         TM    TCBFBYT1-TCB(R2),TCBRTM2
+         BO    QWIKRTM              NO SPURIOUS $HASP375.
+NOTCLOS  DS    0H
+         SLR   R2,R2              IF REMAINDER OF
+         L     R3,PLINES           (CURR.LINES-EST.LINES)/LIMIT
+         S     R3,JCTESTLN          IS < DEF.INCREMENT,
+         D     R2,=A(LIMIT)         THEN WE PROMPT OPERATOR.
+         LTR   R3,R3
+         BZ    QWIKEXIT
+         CL    R2,SVTLNINT                                          L02
+         BL    GOTONE
+QWIKEXIT DS    0H
+         RETURN (14,12),RC=(15)   ELSE WE RETURN.
+QWIKRTM  DS    0H
+         MVC   20(4,R13),=X'A0000000' ELIMINATE SPURIOUS $HASP375.
+         LA    R15,8
+         B     QWIKEXIT
+GOTONE   DS    0H
+         LR    R9,R1              R9 = A(PLIST).
+         USING PLIST,R9
+         GETMAIN RU,LV=DYNLEN,SP=230 DYNAMIC AREA, LSQA.
+         LR    R2,R13             SAVE AREA STUFF.
+         LR    R13,R1
+         USING DYNAMIC,R13
+         LA    R0,DYNAMIC         ZERO
+         L     R1,=A(DYNLEN)        DYNAMIC
+         LR    R14,R0                 STORAGE.
+         SLR   R15,R15
+         MVCL  R0,R14             DO IT.
+         ST    R2,4(,R13)         BACK CHAIN.
+         ST    R13,8(,R2)         FORWARD CHAIN.
+         XC    RC,RC              ASSUME GOOD RC.
+         MVI   MSGAREA,C' '       FORMAT LINES EXCEEDED MSG.
+         MVC   MSGAREA+1(L'MSGAREA-1),MSGAREA
+         MVC   MSGTEXT(L'MSGLINE1),MSGLINE1
+         MVC   MSGJOB,JCTJNAME    JOBNAME.
+         MVI   MSGCOLON,C':'
+         MVC   MSGEXC,EDITLINE
+         SLR   R2,R2              GET LINES EXCEEDED
+         L     R3,PLINES            IN MULTIPLES OF LIMIT.
+         S     R3,JCTESTLN
+         D     R2,=A(LIMIT)
+         SLR   R2,R2
+         M     R2,=A(LIMIT)
+         CVD   R3,DOUBLE
+         ED    MSGEXC,DOUBLE+4
+         MVC   WTO(WTOLEN),XWTO
+         MVC   WTOMSG(L'MSGAREA),MSGAREA
+         WTO   MF=(E,WTO)         WTO MSG.
+         ST    R1,MSGID           SAVE DOMID.
+         MVI   MSGAREA,C' '       FORMAT CURR.LINES MSG.
+         MVC   MSGAREA+1(L'MSGAREA-1),MSGAREA
+         MVC   MSGTEXT(L'MSGLINE2),MSGLINE2
+         MVC   MSGJOB,JCTJNAME    JOBNAME.
+         MVI   MSGCOLON,C':'
+         MVC   MSGCURR,EDITLINE
+         L     R2,PLINES          FORMAT CURR.LINES.
+         CVD   R2,DOUBLE
+         ED    MSGCURR,DOUBLE+4
+         MVC   MSGEST,EDITLINE
+         L     R2,JCTESTLN        FORMAT EST.LINES.
+         CVD   R2,DOUBLE
+         ED    MSGEST,DOUBLE+4
+         MVC   WTO(WTOLEN),XWTO
+         MVC   WTOMSG(L'MSGAREA),MSGAREA
+         WTO   MF=(E,WTO)         WTO MSG.
+         ST    R1,MSGID+4         SAVE DOMID.
+         MVI   MSGAREA,C' '       FORMAT FILE AND CURR.LINE MSG.
+         MVC   MSGAREA+1(L'MSGAREA-1),MSGAREA
+         MVC   MSGTEXT(L'MSGLINE3),MSGLINE3
+         MVC   MSGJOB,JCTJNAME    JOBNAME.
+         MVI   MSGCOLON,C':'
+* TRACE INSTRUCTIONS - FORMAT SDB FLAGS IN WTO TEXT FOR TESTING.    L02
+         LA    R2,=C'0123456789ABCDEF'                              L02
+         SLR   R1,R1                                                L02
+         IC    R1,SDBFLG1                                           L02
+         SRL   R1,4                                                 L02
+         IC    R1,0(R1,R2)                                          L02
+         STC   R1,MSGTEXT                                           L02
+         IC    R1,SDBFLG1                                           L02
+         N     R1,=X'0000000F'                                      L02
+         IC    R1,0(R1,R2)                                          L02
+         STC   R1,MSGTEXT+1                                         L02
+         IC    R1,SDBFLG2                                           L02
+         SRL   R1,4                                                 L02
+         IC    R1,0(R1,R2)                                          L02
+         STC   R1,MSGTEXT+2                                         L02
+         IC    R1,SDBFLG2                                           L02
+         N     R1,=X'0000000F'                                      L02
+         IC    R1,0(R1,R2)                                          L02
+         STC   R1,MSGTEXT+3                                         L02
+         L     R2,PSATOLD-PSA     GET STEPNAME FROM TIOT.
+         L     R2,TCBTIO-TCB(,R2)
+         USING TIOT,R2
+         MVC   MSGSTEP,TIOCSTEP+8
+         CLI   TIOCSTEP+8,C' '
+         BNE   ENDTIOT
+         MVC   MSGSTEP,TIOCSTEP
+         DROP  R2
+ENDTIOT  DS    0H
+         MVC   MSGFILE,SDBDDNM    GET DDNAME FROM SDB.
+         MVC   MSGFCURR,EDITLINE
+         L     R2,SDBRECCT        FORMAT CURR.LINE.
+         CVD   R2,DOUBLE
+         ED    MSGFCURR,DOUBLE+4
+         MVC   WTO(WTOLEN),XWTO
+         MVC   WTOMSG(L'MSGAREA),MSGAREA
+         WTO   MF=(E,WTO)         WTO MSG.
+         ST    R1,MSGID+8         SAVE DOMID.
+         MVI   MSGAREA,C' '       FORMAT WTOR MSG.
+         MVC   MSGAREA+1(L'MSGAREA-1),MSGAREA
+         MVC   MSGTEXT(L'MSGLINE4),MSGLINE4
+         MVC   MSGJOB,JCTJNAME    JOBNAME.
+         MVI   MSGCOLON,C':'
+         MVC   WTOR(WTORLEN),XWTOR
+         MVC   WTORMSG(L'MSGAREA),MSGAREA
+WTORLOOP DS    0H
+         MVC   REPLY,=CL3' '      INIT REPLY.
+         XC    ECB,ECB            ZERO WTOR ECB.
+         WTOR  ,REPLY,L'REPLY,ECB,MF=(E,WTOR) WTOR MSG.
+         WAIT  ECB=ECB            WAIT FOR RESPONSE.
+         CLC   =C'YES',REPLY      WE WANT UPPER OR LOWERCASE "YES".
+         BE    KILLJOB            IF EITHER, ABEND722.
+         CLC   =X'A885A2',REPLY
+         BE    KILLJOB
+         CLC   =C'NO',REPLY       WE WANT UPPER OR LOWERCASE "NO".
+         BE    OKJOB              IF EITHER, ALLOW JOB TO CONTINUE.
+         CLC   =X'9596',REPLY     ELSE, REPROMPT.
+         BNE   WTORLOOP
+OKJOB    DS    0H
+         L     R2,4(,R13)
+         MVC   20(4,R2),=X'80000000'   CONTINUE.
+         MVC   RC,=F'8'
+RETURN   DS    0H
+         BAL   R5,CLEANUP         DO DOMS, FREEMAIN, ETC.
+         RETURN (14,12),RC=(15)      WITH R15 = RC.
+KILLJOB  DS    0H
+         L     R2,PSATOLD-PSA     IF RMT2 IN CONTROL, NEED TO ISSUE
+         TM    TCBFBYT1-TCB(R2),TCBRTM2
+         BO    CALLRTM              OUR OWN CALLRTM (JES IGNORES).
+         L     R2,4(,R13)         ELSE,
+         MVC   20(4,R2),=X'A0000001'   ABEND722, NO DUMP.
+         MVC   RC,=F'8'
+         B     RETURN
+CALLRTM  DS    0H
+         BAL   R5,CLEANUP         DO DOMS, FREEMAIN, ETC.
+         L     R2,PSAAOLD-PSA
+         LH    R2,ASCBASID-ASCB(,R2) R2 = ASID.
+         L     R3,PSATOLD-PSA
+         L     R3,TCBJSTCB-TCB(,R3) R3 = A(JSTCB).
+         LA    R13,SDBSAVE        R13 = RMT SAVEAREA.
+         CALLRTM TYPE=ABTERM,COMPCOD=X'722',ASID=(2),TCB=(3),DUMP=NO
+         MVI   SDBSAVE,0          WAIT FOREVER FOR RTM TO KILL STEP.
+         WAIT  1,ECB=SDBSAVE
+CLEANUP  DS    0H
+         LA    R3,MSGID#          LOOP TO DO DOMS.
+         SLR   R2,R2
+DOMLOOP  DS    0H                 DELETE ALL NON-ROLLABLE MSGS.
+         L     R1,MSGID(R2)
+         DOM   MSG=(1)
+         LA    R2,4(,R2)
+         BCT   R3,DOMLOOP
+         L     R2,RC
+         LR    R1,R13              PREPARE
+         L     R13,4(,R13)         FOR FREEMAIN.
+         FREEMAIN RU,LV=DYNLEN,A=(1),SP=230
+         LR    R15,R2             R15 = RC.
+         BR    R5
+********************************************************************
+*                                                                  *
+*        S T A T I C   A R E A S.                                  *
+*                                                                  *
+********************************************************************
+XWTO     WTO   '                                                       X
+                                            ',ROUTCDE=2,DESC=2,MF=L
+WTOLEN   EQU   *-XWTO
+XWTOR    WTOR  '                                                       X
+                                            ',ROUTCDE=2,DESC=6,MF=L
+WTORLEN  EQU   *-XWTOR
+MSGLINE1 DC    C'ESTIMATED LINES EXCEEDED BY N,NNN,NNN.'
+MSGLINE2 DC    C'CURR.LINES N,NNN,NNN, EST.LINES N,NNN,NNN.'
+MSGLINE3 DC    C'FILE SSSSSSSS.DDDDDDDD, CURR.LINE N,NNN,NNN.'
+MSGLINE4 DC    C'CANCEL JOB?  REPLY "YES" OR "NO".'
+EDITLINE DC    X'40206B2020206B202120'
+         LTORG *
+SRCLEVEL DC    C'                                        '
+        $MODEND
+********************************************************************
+*                                                                  *
+*        D Y N A M I C   A R E A S.                                *
+*                                                                  *
+********************************************************************
+DYNAMIC  DSECT
+SAVE     DS    18F                SAVE AREA.
+DOUBLE   DS    D                  WORK AREA.
+RC       DS    F                  RETURN CODE.
+ECB      DS    A                  WTOR ECB.
+MSGID    DS    3F                 DOM MSGIDS.
+MSGID#   EQU   3
+WTO      DS    0F,CL(WTOLEN)      WTO AREA.
+WTOMSG   EQU   WTO+4,80           MSGTEXT.
+WTOR     DS    0F,CL(WTORLEN)     WTOR AREA.
+WTORMSG  EQU   WTOR+12,80         MSGTEXT.
+MSGAREA  DS    CL80               MSG WORK AREA.
+MSGJOB   EQU   MSGAREA+0,8        JOBNAME.
+MSGCOLON EQU   MSGAREA+8,1        :.
+MSGTEXT  EQU   MSGAREA+10,70      TEXT.
+MSGEXC   EQU   MSGTEXT+27,10      LINES EXCEEDED.
+MSGCURR  EQU   MSGTEXT+10,10      CURRENT LINES.
+MSGEST   EQU   MSGTEXT+31,10      ESTIMATED LINES.
+MSGSTEP  EQU   MSGTEXT+5,8        STEPNAME.
+MSGFILE  EQU   MSGTEXT+14,8       DDNAME.
+MSGFCURR EQU   MSGTEXT+33,10      DD LINE.
+REPLY    DS    CL3                3 CHARACTER REPLY.
+DYNLEN   EQU   *-DYNAMIC          LENGTH.
+*
+PLIST    DSECT                    PARAMETER LIST.
+PLINES   DS    F                  CURRENT LINES.
+PPAGES   DS    F                  CURRENT PAGES.
+PMXOUT   DS    F                  CURRENT BYTES.
+PRECINC  DS    F                  USER LINE INCREMENT.
+LIMIT    EQU   100000             PROMPT EVERY 100,000 LINES OVER.
+PPAGINC  DS    F                  USER PAGE INCREMENT.
+PBYTINC  DS    F                  USER BYTE INCREMENT.
+PFLAGS   DS    F                  FLAGS.
+         END

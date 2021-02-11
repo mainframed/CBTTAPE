@@ -1,0 +1,427 @@
+A cure for DASD fragmentation
+
+One of the biggest problems concerned with DASD space is
+fragmentation.  Unless you are going to have your DASD
+space manager or your operations people monitor this daily -
+which in most cases means at 9.00 am, when a
+defragmentation job cannot be run because of previous
+contention and allocations to the pack - then some sort of
+automatic management is called for.
+
+At our installation, we run HSM and one of its major functions
+is automatic daily space management.  At a user-defined time,
+automatic migration starts on the designated volumes.  At the
+end of migration for each volume, HSM invokes
+ARCMVEXT, the space management volume exit.  This exit
+can be used to record volumes that need to be defragmented or
+invoke a related function such as scheduling a DFDSS job.
+This mechanism can be selective as one of the parameters
+passed to the exit is the fragmentation index of the volume that
+DFHSM has just processed.  This value is calculated after the
+migration or deletion of datasets has completed and will be in
+the range 0 to 1000, where 0 represents a clean pack and 1000
+represents a totally fragmented pack.
+
+Currently, the exit will submit a fragmentation job for any pack
+that has a fragmentation index greater than 299.  It does this by
+allocating an internal reader.  One of the biggest problems was
+finding a way to submit unique job names as these had to run
+in parallel.  This was achieved by using the ARCINEXT exit,
+which is invoked at HSM initialization time to obtain an area of
+storage and prime a single byte of this area with an 'A'.  The
+address of this area is then moved into MCVTUSR1, one of
+four fields set aside for user use in the HSM control block
+MCVT, which is addressable by all HSM exits.  ARCMVEXT
+uses this as the last character of the job name, then updates the
+character with the next one in ascending sequence.
+
+The exit will bypass certain packs because of problems with
+defragmenting packs which have LLA libraries defined on
+them.  Both exits must be link-edited into a LINKLIST load
+library and must be coded as re-entrant.
+
+For further information about HSM exits, refer to DFHSM
+Installation and Customization SH35-0084.
+
+
+ARCMVEXT SOURCE CODE
+
+ARCMVEXT TITLE 'SPACE MANAGEMENT VOLUME EXIT'
+ARCMVEXT CSECT
+***********************************************************************
+*        REMARKS.       THE SPACE MANAGEMENT VOLUME EXIT RECEIVES     *
+*                       CONTROL AFTER DFHSM COMPLETES PROCESSING A    *
+*                       LEVEL 0 VOLUME DURING SPACE MANAGEMENT.       *
+*                       THIS EXIT IS NOT TAKEN WHEN SPACE MANAGEMENT  *
+*                       PROCESSES MIGRATION VOLUMES. WE CURRENTLY USE *
+*                       THIS EXIT TO DETERMINE THE FRAGMENTATION OF   *
+*                       THE CURRENT VOLUME UNDER RAPS. WHEN THE       *
+*                       FRAGMENTATION INDEX IS > .299 AN INTERNAL     *
+*                       READER IS ALLOCATED USING SVC 99, AND A DEFRAG*
+*                       JOB IS SUBMITTED TO CLASS=P.                  *
+*                       SAMPLE JCL IN BIPRD.GENERAL.PROCLIB(DEFRAG)   *
+*                       //DEFRAG   PROC V=                            *
+*                       //DEFRAG EXEC PGM=ADRDSSU                     *
+*                       //SYSPRINT DD SYSOUT=A                        *
+*                       //PRIMARY  DD VOL=SER=&V,UNIT=3380,DISP=OLD   *
+*                       //SYSIN    DD DSN=SYS1.PARMLIB(DEFRAG),       *
+*                       //            DISP=SHR                        *
+*                       SAMPLE CONTROL CARD IN SYS.PARMLIB(DEFRAG)    *
+*                              DEFRAG DDNAME(PRIMARY)                 *
+*        REGISTER CONVENTIONS = STANDARD CONVENTIONS.                 *
+*                    REGISTER  1       = PARAMETER LIST               *
+*                    REGISTER  2       = DSECT FOR INPUT PARAMETERS   *
+*                    REGISTER  3       = @ VOLSER    CHAR(6)          *
+*                    REGISTER  4       = @ DEVTYPE   FIXED(31)        *
+*                    REGISTER  5       = @ FRAG. IN. FIXED(31)        *
+*                    REGISTER  10      = WORK REGISTER                *
+*                    REGISTER  12      = BASE REGISTER                *
+*                    REGISTER  13      = SAVE AREA ADDRESS            *
+*                    REGISTER  14      = RETURN ADDRESS               *
+*                    REGISTER  15      = INITIAL ENTRY ADDRESS        *
+***********************************************************************
+ZERO     EQU   X'00'                   ZERO
+SPACE    EQU   C' '                    CHARARCTER SPACE
+CVTPTR   EQU   X'10'                   CVT PTR
+CVTHSM   EQU   X'3DC'                  QCT PTR
+MQCTMCVT EQU   X'24'                   MCVT PTR
+MCVTUSR1 EQU   X'3D8'                  COMM AREA PTR
+         TITLE 'MAIN PROCESSING LOGIC'
+         SAVE  (14,12),,ARCMVEXT_&SYSDATE-&SYSTIME
+         USING ARCMVEXT,R12             SET UP BASE ADDRESSABILITY
+         LR    R12,R15                  ENTRY POINT ADDRESS
+         LR    R10,R1                   SET UP PARAMETER REGISTER
+GET      EQU   *
+         LA    R0,WORKLEN               LENGTH OF WORKAREA
+         GETMAIN R,LV=(0),RELATED=(FREE,'GET STORAGE')
+         ST    R13,4(,R1)               ADDRESS OF PREVIOUS SA
+         ST    R1,8(,R13)               ADDRESS OF NEXT SA
+         LR    R13,R1                   OUR SAVEAREA ADDRESS
+         USING WORKAREA,R13             ADDRESSABILITY
+PARAMS   EQU   *
+         LM    R3,R5,0(R10)             PICK UP PARAMETER ADDDRESS
+         USING VOLSER,R3                R3 @ VOLSER    CHAR(6)
+         USING DEVTYPE,R4               R4 @ DEVTYPE   FIXED(31)
+         USING FRAGMIDX,R5              R5 @ FRAG. IN. FIXED(31)
+* BYPASS DEFRAG FOR CERTAIN PACKS
+BYPASS   EQU   *
+         LA    R6,VOLSEXC               POINT TO VOL EXCLUSION LIST
+         USING EXCVOLS,R6               INFORM THE ASSEMBLER
+         LA    R7,VOLSENET              NO OF TABLE ENTRIES
+VOLSSCAN EQU   *
+         CLC   VOL,EXCVNO               BYPASS DEFRAG?
+         BE    RETURN                   YES
+         LA    R6,L'EXCVNO(,R6)         NEXT TABLE ENTRY
+         BCT   R7,VOLSSCAN              DO WHILE R7 > 0?
+* CHECK FOR VALUE OF FRAGMENTATION INDEX
+FRAGIN   EQU   *
+         L     R10,FRAGINDX             GET FRAGMENTATION INDEX
+         CH    R10,=H'300'              FRAG INDEX LESS THAN .300
+         BL    RETURN                   GET OUT IF PACK IN GOOD SHAPE
+* DYNAMIC ALLOCATION REQUEST FOR INTERNAL READER
+SVC99    EQU   *
+* SVC 99 ALLOCATION AREA LENGTH ACCUMULATED AS FOLLOWS
+*  NO. OF BYTES                 DESCRIPTION
+*       4                  POINTER TO REQUEST BLOCK
+*       20                 REQUEST BLOCK SPACE
+*       28                 FOUR BYTES PER TEXT UNIT DEFINED
+*       14                 TEXT UNIT SPACE FOR REQUESTED DDNAME
+         LA    R8,SVC99STR              SVC99 AREA ADDRESS
+         USING S99RBP,R8                OBTAIN ADDRESSABILITY
+         LA    R7,S99RBPTR+4            INCREMENT BY 4
+         USING S99RB,R7                 OBTAIN ADDRESSABILITY
+         ST    R7,S99RBPTR              MAKE RBPTR POINT TO RB
+         OI    S99RBPTR,S99RBPND        TURN ON HIGH ORDER BIT IN RBPTR
+         XC    S99RB(RBLEN),S99RB       ZERO OUT RB ENTIRELY
+         MVI   S99RBLN,RBLEN            PUT LEN OF RB IN ITS LEN FIELD
+         MVI   S99VERB,S99VRBAL         SET VERB CODE TO ALLOCATE
+         LA    R9,S99RB+RBLEN           POINT TO START OF TUP LIST
+         USING S99TUPL,R9               OBTAIN ADDRESSABILITY
+         ST    R9,S99TXTPP              STORE ADDR OF TUP LIST IN RB
+         LA    R1,SYSOUTAL              ALLOCATE SYSOUT
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         LA    R1,SYSOUTIR              ALLOCATE INTERNAL READER
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         LA    R1,SYSOUTBK              ALLOCATE BLKSIZE
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         LA    R1,SYSOUTRL              ALLOCATE LRECL
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         LA    R1,SYSOUTRF              ALLOCATE RECFM
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         LA    R1,DEALLOC               DEALLOCATE AT CLOSE
+         ST    R1,S99TUPTR              AND STORE IN TUP
+         LA    R11,S99TUPL+L'S99TUPTR*2 POINT TO TEXT UNITS
+         USING S99TUNIT,R11             ADDRESSABILITY TO TEXT UNITS
+         LA    R9,S99TUPL+L'S99TUPTR    NEXT TUP ENTRY
+         ST    R11,S99TUPTR             AND STORE IN TUP
+         OI    S99TUPTR,S99TUPLN        INDICATE END OF TUP LIST
+         MVC   S99TUNIT(RDDNLEN),RETDDN MOVE RETURN DDNAME TEXT
+         DROP  R7,R9                    INFORM THE ASSEMBLER
+         LR    R1,R8                    RB INTO R1
+         DYNALLOC                       SVC 99 REQUEST
+         LTR   R15,R15                  ALLOCATE OKAY
+         BZ    OPEN                     YES- DO OPEN
+SVC99ERR EQU   *                        START THE DEFRAG
+         MVC   WTOAREA(WTOFAILL),WTOSFAIL  MESSAGE
+         LA    R1,WTOAREA               WTO MESSAGE AREA ADDRESS
+         WTO   MF=(E,(R1))              ISSUE WTO
+         B     RETURN                   FREE STORAGE
+* OPEN SYSOUT AND PASS DEFRAG JOB THROUGH THE INTERNAL READER
+OPEN     EQU   *
+         MVC   DCB,INTRDR               COPY DCB TO GETMAINED AREA
+         LA    R7,DCB                   ADDRESS OF DCB
+         USING IHADCB,R7                INFORM THE ASSEMBLER
+         MVC   DCBDDNAM,S99TUPAR        GENERATED DDNAME
+         DROP  R11                      INFORM THE ASSEMBLER
+         MVC   OPENL,OPENLIST           COPY OPEN LIST
+         LA    R1,OPENL                 REMOTE PARAMETER LIST
+         OPEN  ((R7),OUTPUT),MF=(E,(R1)) OPEN INTERNAL READER
+         TM    DCBOFLGS,X'10'           OPEN OKAY?
+         BNZ   CRTJCL                   YES
+         MVC   WTOAREA(WTOOPENL),WTOOPENF  MESSAGE
+         LA    R1,WTOAREA               WTO MESSAGE AREA ADDRESS
+         WTO   MF=(E,(R1))              ISSUE WTO
+         B     RETURN                   FREE STORAGE
+CRTJCL   EQU   *
+         L     R9,CVTPTR(0,0)           CVT @
+         L     R9,CVTHSM(,R9)           QCT @
+         L     R9,MQCTMCVT(,R9)         MVCT @
+         L     R9,MCVTUSR1(,R9)         COMMUNICATION AREA
+         MVI   JOBSUFF,SPACE            SET SUFF TO A SPACE
+         LTR   R9,R9                    COMMUNICATION AREA AVAILABLE?
+         BZ    CJOBCRD                  NO- USE DPD1011 AS A JOB NAME
+         USING COMMARA,R9               @ THE COMM AREA
+         MVI   NEWSUFF,ZERO             SET TO ZERO
+         MVC   NEWSUFF+1(L'NEWSUFF-1),NEWSUFF ZEROIZE
+         MVC   JOBSUFF,CJOBSUFF         CURRENT JOB SUFFIX
+CHKTAB   EQU   *
+         LA    R6,ALFATAB               POINT TO JOB ALFA SUFFIXES
+         LA    R8,L'ALFATAB(0,0)        LENGTH OF TABLE
+SUFFLOOP EQU   *
+         CLC   JOBSUFF(1),0(R6)         FOUND SUFFIX?
+         BE    NXTSUFF                  YES
+         LA    R6,1(,R6)                NEXT CHARACTER
+         BCT   R8,SUFFLOOP              DO WHILE R8 > 0?
+         B     CJOBCRD                  SEND JOB THRU INTERNAL READER
+NXTSUFF  EQU   *
+         MVC   NEWSUFF(1),1(R6)         TO USE THRU ARCMVEXT
+         ICM   R8,B'1111',JOBSUFF       CURRENT JOB SUFFIX
+         ICM   R10,B'1111',NEWSUFF      NEXT JOB SUFFIX
+         CS    R8,R10,CJOBSUFF          UPDATED NEXT SUFFIX OKAY?
+         BC    8,CJOBCRD                YES
+         STCM  R8,B'1111',JOBSUFF       NO- START LOOKING AGAIN
+         B     CHKTAB                   GO POINT TO ALFA TABLE
+CJOBCRD  EQU   *
+         MVC   JCLSUB,JOBCARD1          JOB CARD
+         MVC   JOBSUF,JOBSUFF           JOB SUFFIX
+         PUT   (R7),JCLSUB              FEED INTO INTERNAL READER
+         MVC   JCLSUB,JOBCARD2          JOB CARD CONTINUATION
+         PUT   (R7),JCLSUB              FEED INTO INTERNAL READER
+         PUT   (R7),JOBPARM             JES2 /*JOBPARM CARD
+         MVC   JCLSUB,PROC              EXEC PROC
+         MVC   VSER,VOL                 OVERRIDE
+         PUT   (R7),JCLSUB              FEED INTO INTERNAL READER
+         PUT   (R7),EOF                 /*EOF INFORM JES2
+         MVC   CLOSEL,CLOSELST          MOVE CLOSE LIST
+         LA    R1,CLOSEL                REMOTE PARAMETER LIST ADDRESS
+         CLOSE ((R7)),MF=(E,(R1))       CLOSE AND DEALLOCATE IR
+INFOP    EQU   *
+         L     R10,FRAGINDX             GET FRAGMENTATION INDEX
+         CVD   R10,DW                   CONVERT INDEX TO DECIMAL
+         UNPK  FICHAR,FIDEC             CONVERT TO CHARACTER
+         OI    FICHAR+L'FICHAR-1,X'F0'  CONVERT SIGN TO F
+         MVC   WTOAREA(WTOLEN),WTOSOKAY  MESSAGE
+         MVC   WTOVOL,VOL               VOLSER
+         MVC   WTOFIDX,FIDXCHAR         FRAGMENTATION INDEX
+         LA    R1,WTOAREA               WTO MESSAGE AREA ADDRESS
+         WTO   MF=(E,(R1))              ISSUE WTO
+RETURN   EQU   *
+         LR    R1,R13                   SAVE NEW SAVEAREA ADDRESS
+         L     R13,PREVSA               SAVE NEW SAVEAREA ADDRESS
+         LA    R0,WORKLEN               LENGTH OF WORKAREA
+         FREEMAIN R,LV=(0),A=(1),RELATED=(GET,'FREE STORAGE')
+         RETURN (14,12),,,RC=0          RESTORE REGS
+RBLEN    EQU   (S99RBEND-S99RB)          REQUEST BLOCK LENGTH
+SYSOUTAL DS     0X
+         DC     AL2(DALSYSOU)            ALLOCATE SYSOUT
+         DC     X'0001'
+         DC     X'0001'
+         DC     C'A'
+SYSOUTIR DS     0X
+         DC     AL2(DALSPGNM)            PROGRAM NAME INTRDR
+         DC     X'0001'
+         DC     X'0006'
+         DC     C'INTRDR'
+SYSOUTBK DS     0X
+         DC     AL2(DALBLKSZ)            BLKSIZE
+         DC     X'0001'
+         DC     X'0002'
+         DC     X'1770'                  6000
+SYSOUTRL DS     0X
+         DC     AL2(DALLRECL)            LRECL
+         DC     X'0001'
+         DC     X'0002'
+         DC     X'0050'                  6000
+SYSOUTRF DS     0X
+         DC     AL2(DALRECFM)            RECFM
+         DC     X'0001'
+         DC     X'0001'
+         DC     X'90'                    FB
+DEALLOC  DS     0X
+         DC     AL2(DALCLOSE)            DEALLOCATE AT CLOSE
+         DC     X'0000'
+RETDDN   DS     0X
+         DC     AL2(DALRTDDN)            RETURN DDNAME
+         DC     X'0001'
+         DC     X'0008'
+         DS     CL8                      DDNAME
+RDDNLEN  EQU    *-RETDDN                 TEXT LENGTH
+INTRDR   DCB   DDNAME=XXXXXX,DSORG=PS,MACRF=(PM)
+DCBLEN   EQU   *-INTRDR
+OPENLIST OPEN  (,),MF=L
+OPENLEN  EQU   *-OPENLIST
+CLOSELST CLOSE (,),MF=L
+CLOSELEN EQU   *-CLOSELST
+JOBCARD1 DC    CL80'//DPD1011  JOB (P0938,05-0000-0655-06-O),''OPERATIOX
+               NS'','
+JOBCARD2 DC    CL80'// TYPRUN=HOLD,CLASS=P,MSGCLASS=A,USER=DCDPROD'
+JOBPARM  DC    CL80'/*JOBPARM P=PROC00'
+PROC     DC    CL80'//DEFRAG EXEC DEFRAG,V=XXXXXX'
+EOF      DC    CL80'/*EOF'
+WTOSOKAY WTO   'JOB SUBMITTED TO DEFRAG PACK XXXXXX. FRAGMENTATION INDEX
+               X = XXXX',ROUTCDE=(2),DESC=(11),MF=L
+WTOLEN   EQU   *-WTOSOKAY              LENGTH OF WTO PARAMETER LIST
+WTOSFAIL WTO   'INTERNAL SUBMIT FAILED FOR DFHSM DEFRAG - PLEASE INFORMX
+               TSD',ROUTCDE=(2),DESC=(11),MF=L
+WTOFAILL EQU   *-WTOSFAIL              LENGTH OF WTO PARAMETER LIST
+WTOOPENF WTO   'INTERNAL READER OPEN FAILED - PLEASE INFORM TSD',      X
+               ROUTCDE=(2),DESC=(11),MF=L
+WTOOPENL EQU   *-WTOOPENF              LENGTH OF WTO PARAMETER LIST
+VOLSEXC  DS    0CL6                    VOLUME EXCLUSION LIST
+         DC    CL6'TSD001'
+         DC    CL6'TSD002'
+         DC    CL6'DBON01'
+VOLSELEN EQU   *-VOLSEXC                 TABLE LENGTH
+VOLSENET EQU   VOLSELEN/L'VOLSEXC        NO OF TABLE ENTRIES
+************************** ALFA TABLE *********************************
+ALFATAB  DC    CL27'ABCDEFGHIJKLMNOPQRSTUVWXYZA'
+         LTORG
+VOLSER   DSECT                         DFHSM DSECTS
+VOL      DS    CL6                     VOLUME SERIAL NUMBER
+DEVTYPE  DSECT
+DTYPE    DS    XL4                     DEVICE TYPE
+FRAGMIDX DSECT
+FRAGINDX DS    XL4                     FRAGMENTATION INDEX
+WORKAREA DSECT                         WORKAREA DSECT
+SAVEAREA DS    CL72                    SAVEAREA
+PREVSA   EQU   SAVEAREA+4,4            ADDRESS OF PREVIOUS SAVEAREA
+JOBSUFF  DS    CL4                     CURRENT JOB SUFFIX
+NEWSUFF  DS    CL4                     NEXT JOB SUFFIX
+DW       DS    D                       DOUBLEWORD
+FIDEC    EQU   DW+5,3                  FRAG INDEX DECIMAL
+FICHAR   EQU   DW,5                    FRAG INDEX CHARACTER
+FIDXCHAR EQU   DW+1,4                  FRAG INDEX CHARACTERS TO MOVE
+WTOAREA  DS    XL(WTOLEN)              WTO LENGTH
+WTOVOL   EQU   WTOAREA+33,6            VOLSER OF PACK TO DEFRAG
+WTOFIDX  EQU   WTOAREA+63,4            FRAGMENTATION INDEX OF PACK
+         DS    0F
+DCB      DS    XL(DCBLEN)              DCB
+OPENL    DS    XL(OPENLEN)             OPEN  LIST
+CLOSEL   DS    XL(CLOSELEN)            CLOSE LIST
+JCLSUB   DS    XL80                    JCL AREA
+JOBSUF   EQU   JCLSUB+9,1              ADD IN THE JOB SUFFIX
+VSER     EQU   JCLSUB+23,6             VOLSER TO DEFRAG
+         DS    0F                      ALIGNMENT
+SVC99STR DS    XL66                    SVC99 STORAGE
+WORKLEN  EQU   *-WORKAREA              WORKAREA LENGTH
+EXCVOLS  DSECT                         VOLUME EXCLUDE DSECT
+EXCVNO   DS    CL6                     EXCLUDE VOLUME SERIAL NO
+COMMARA  DSECT                         COMMAREA DSECT
+COMMAREA DS    0CL20
+CJOBSUFF DS    CL4                     JOB SUFFIX (SF000000)
+CFILLER  DS    CL16                    AVAILABLE
+         IEFZB4D0
+         IEFZB4D2
+         DCBD DSORG=QS,DEVD=DA
+         END  ARCMVEXT
+
+
+ARCINEXT SOURCE CODE
+
+ARCINEXT TITLE 'INITIALIZATION EXIT'
+ARCINEXT CSECT
+***********************************************************************
+*        DFHSM VERSION. DFHSM VERSION 2 RELEASE 5.0.                  *
+*        REMARKS.       THE EXIT WILL GETMAIN AN AREA OF STORAGE 20   *
+*                       BYTES LONG AND STORE THE ADDRESS INTO THE     *
+*                       MCVT. THIS WILL ENABLE OTHER DFHSM EXITS TO   *
+*                       USE THIS AREA AS A COMMUNICATION VEHICLE.     *
+*        REGISTER CONVENTIONS = STANDARD CONVENTIONS.                 *
+*                    REGISTER  1       = PARAMETER LIST               *
+*                    REGISTER  10      = MCVT                         *
+*                    REGISTER  12      = BASE REGISTER                *
+*                    REGISTER  13      = SAVE AREA ADDRESS            *
+*                    REGISTER  14      = RETURN ADDRESS               *
+*                    REGISTER  15      = INITIAL ENTRY ADDRESS        *
+***********************************************************************
+ZERO     EQU   X'00'                   A ZERO
+         TITLE 'MAIN PROCESSING LOGIC'
+         SAVE  (14,12),,ARCINEXT_&SYSDATE-&SYSTIME
+         USING ARCINEXT,R12             SET UP BASE ADDRESSABILITY
+         LR    R12,R15                  ENTRY POINT ADDRESS
+         L     R10,0(,R1)               MVCT @
+GET      EQU   *
+         LA    R0,WORKLEN               LENGTH OF WORKAREA
+         GETMAIN R,LV=(0),RELATED=(FREE,'GET STORAGE')
+         ST    R13,4(,R1)               ADDRESS OF PREVIOUS SA
+         ST    R1,8(,R13)               ADDRESS OF NEXT SA
+         LR    R13,R1                   OUR SAVEAREA ADDRESS
+         USING WORKAREA,R13             ADDRESSABILITY
+         USING MCVT,R10                 ADDRESSABILITY
+         TITLE 'OBTAIN THE COMMUNICATION AREA'
+* OBTAIN A WORKAREA TO USE AS A COMMUNICATION VEHICLE BETWEEN
+* DFHSM EXITS.
+         SR    R15,R15                  SET TO DEFAULT
+         STCM  R15,B'1111',MCVTUSR1     STORE IN MCVT USER 1 FIELD
+         LA    R15,L'COMMAREA           LENGTH TO GETMAIN
+         GETMAIN RC,LV=(15),SP=0,RELATED=(FREECOMM,'GET STORAGE')
+         LTR   R15,R15                  VIRTUAL STORAGE OBTAINED?
+         BNZ   RETURN                   NO- JUST RETURN
+         STCM  R1,B'1111',MCVTUSR1      STORE IN MCVT USER 1 FIELD
+         USING COMMARA,R1               INFORM THE ASSEMBLER
+         MVI   COMMAREA,ZERO            INITIALIZE THE
+         MVC   COMMAREA+1(L'COMMAREA-1),COMMAREA  COMMAREA
+         MVI   CJOBSUFF,C'A'            INITIALIZE JOB SUFFIX
+RETURN   EQU   *
+         LR    R1,R13                   SAVE NEW SAVEAREA ADDRESS
+         L     R13,PREVSA               DFHSM SAVEAREA ADDRESS
+         LA    R0,WORKLEN               LENGTH OF WORKAREA
+FREE     EQU   *
+         FREEMAIN R,LV=(0),A=(1),RELATED=(GET,'FREE STORAGE')
+         RETURN (14,12),,,RC=0          RESTORE REGS
+MCVT     DSECT                         MCVT DSECT
+         DS    CL984
+MCVTUSR1 DS    XL4                     @ OF USER COMMUNICATIONS AREA
+MCVTUSR2 DS    XL4                     RESERVED
+MCVTUSR3 DS    XL4                     RESERVED
+MCVTUSR4 DS    XL4                     RESERVED
+         LTORG
+WORKAREA DSECT                         WORKAREA DSECT
+SAVEAREA DS    CL72                    SAVEAREA
+PREVSA   EQU   SAVEAREA+4,4            ADDRESS OF PREVIOUS SAVEAREA
+WORKLEN  EQU   *-WORKAREA              WORKAREA LENGTH
+COMMARA  DSECT                         COMMAREA DSECT
+COMMAREA DS    0CL20                   COMMAREA
+CJOBSUFF DS    CL1                     JOB SUFFIX
+CFILLER  DS    CL19                    SPARE BYTES
+         END  ARCINEXT
+
+
+R F Perretta
+Chief Systems Programmer (UK)                  c Xephon 1991
+

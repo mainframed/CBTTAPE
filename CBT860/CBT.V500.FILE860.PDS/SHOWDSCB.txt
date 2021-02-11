@@ -1,0 +1,822 @@
+SHOWDSCB TITLE 'S H O W D S C B  ***  DISPLAY FMT1/FMT3 DSCB INFO'
+         PUNCH '  ORDER SHOWDSCB(P) '  MAKE DUMPS EASIER
+         COPY  OPTIONGB
+         SPACE 1
+         SYSPARM LIST=YES
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*    PROGRAM SHOWDSCB USES THE PARM FIELD TO OBTAIN THE NAME OF A     *
+*    DATASET TO BE ANALYZED. ONLY DIRECT ACCESS (DASD) SUPPORTED.     *
+*                                                                     *
+*    A VOLUME SERIAL MAY BE SUPPLIED FOR DATASETS NOT CATALOGED.      *
+*                                                                     *
+*    MULTIPLE REQUESTS MAY BE STACKED, UP TO THE PARM LIMIT OF        *
+*    100 BYTES, BY SEPARATING THEM WITH A SEMI-COLON.                 *
+*                                                                     *
+*    IN ADDITION TO THE PARM FIELD, DATA SET NAMES TO BE ANALYZED     *
+*    MAY BE SUPPLIED ON SYSUTnnn DD CARDS. "nnn" MAY BE 0 TO 3 VALID  *
+*    CHARACTERS, BUT THE NAME MUST BE UNIQUE.                         *
+*                                                                     *
+*    A MEMBER NAME SPECIFICATION IS IGNORED.                          *
+*                                                                     *
+*    SAMPLE JCL:                                                      *
+*                                                                     *
+*    //JOBNAME JOB ....                                               *
+*    /* OR //* AS PER YOUR INSTALLATION                               *
+*    //EXEC PGM=SHOWDSCB,PARM='DSN1;DSN2,VOL2;DSN3(MEM)'              *
+*    //SYSPRINT DD SYSOUT=*  REQUIRED PRINT FILE                      *
+*    //SYSUDUMP DD SYSOUT=*  OPTIONAL DEBUG FILE                      *
+*                                                                     *
+*    SHOWDSCB IS RE-ENTRANT, REFRESHABLE AND RE-USABLE.               *
+*                                                                     *
+*    UNDER MVS 3.8J (AT LEAST), CATALOG DATA SET NAMES ARE NOT        *
+*    RECOGNIZED CORRECTLY - USE THE ACTUAL DSCB NAME.                 *
+*                                                                     *
+*    CODE ADDED TO CHECK VOLUME SERIAL FOR MIGRAT.                    *
+*    THIS PROGRAM WILL NOT ISSUE A RECALL REQUEST.                    *
+*                                                                     *
+***********************************************************************
+*  MAINTENANCE:                                                       *
+* 2005-06-11 GYP ADDED CODE TO ALLOW TSO CP FORMAT PARM FIELD         *
+*                                                                     *
+***********************************************************************
+         EJECT ,
+         PRINT &PRTSOR
+SHOWDSCB PGMHEAD ZERO12,BASE=(R11,R12),PARM=R9,BNDRY=PAGE,             *
+               LOC=BELOW,AM=31,RM=24 (DCB ADDRESSES)
+         SPACE 1
+         EXTRN SUBDSATR,SUBD2J,SUBXTSUM
+         SPACE 1
+         SERVINIT ,
+         SERVLOAD @PRINTER
+         LM    R14,R1,PATDSCB1
+         ALR   R15,R13       RELOCATE DSNAME
+         ALR   R0,R13        RELOCATE VOLSER
+         ALR   R1,R13        RELOCATE WORK AREA
+         STM   R14,R1,CAMDSCB1  COMPLETE OBTAIN REQUEST
+         LM    R14,R1,PATSEEK3
+         ALR   R15,R13       RELOCATE CCHHR
+         ALR   R0,R13        RELOCATE VOLSER
+         ALR   R1,R13        RELOCATE WORK AREA
+         STM   R14,R1,CAMSEEK3  COMPLETE OBTAIN REQUEST
+         LM    R14,R1,PATLOCAT
+         ALR   R15,R13       RELOCATE USER'S DSN
+         ALR   R1,R13        RELOCATE WORK AREA
+         STM   R14,R1,CAMLOCAT
+         SERVCALL TIODD,=CL8'SYSUDUMP'  DOES USER WISH DEBUG MODE ?
+         LTR   R0,R0         TEST RETURN
+         BNZ   SETBUGGY      FOUND - SET DEBUG MODE
+         SERVCALL TIODD,=CL8'SYSMDUMP'  ALTERNATE ?
+         LTR   R0,R0
+         BNZ   SETBUGGY      FOUND
+         SERVCALL TIODD,=CL8'SYSABEND'
+         LTR   R0,R0
+         BZ    NOTBUGGY      NO
+SETBUGGY OI    FLAGS,FGDEBUG  SET DEBUG MODE
+NOTBUGGY PRTOPEN SYSPRINT,OPT=(WTO,ABEND)
+HAVEPRT  PRTLIST HEADER,TITLE=1  PRINT A TITLE
+         LR    R7,R9         PRESERVE SIGN                      GP09218
+         LA    R9,0(,R9)     CLEAN PARM POINTER
+         LTR   R9,R9         ANY ADDRESS ?                      GP09218
+         BZ    PARMNULL      NO; ERROR
+         ICM   R9,15,0(R9)   GET PARM ADDRESS
+         BZ    PARMNULL      NONE; ERROR
+         SLR   R8,R8
+         ICM   R8,3,0(R9)    TEST PARM LENGTH (<100 ?)
+         BNP   PARMNULL      INVALID
+         LTR   R7,R7         POSSIBLE TSO CP INVOCATION ?       GP05162
+         BM    NOTSOCP       NO                                 GP05162
+         CLI   2(R9),0       SECOND COUNT FIELD ?               GP05162
+         BH    NOTSOCP       NO                                 GP05162
+         SH    R8,2(,R9)     ADJUST                             GP05162
+         AH    R9,2(,R9)     POSITION AFTER COMMAND             GP05162
+         SH    R8,=H'4'      ALLOW FOR HEADER LENGTH            GP05162
+         LA    R9,2(,R9)     SKIP DISPLACEMENT                  GP05162
+NOTSOCP  LA    R9,2(,R9)     MAKE SCANNING EASIER
+         STM   R8,R9,PARMPTRS  STASH FOR LOOP
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*    PRELIMINARIES ARE OUT OF THE WAY - LOOP THROUGH PARM FIELD       *
+*    SCANNING FOR TEXT SEPARATED BY SEMI-COLONS. EXPECTED FORMS:      *
+*    'DSNAME;...'   'DSNAME(MEMBER)'   'GDGNAME(-1)'                  *
+*    'DSNAME,VOLSER;...'                                              *
+*    NULL FIELDS ';;' ARE SKIPPED; NULL MEMBER NAMES ARE SKIPPED      *
+*    NULL SERIALS ARE IGNORED;  OTHER NULLS ARE ERRORS.               *
+*                                                                     *
+***********************************************************************
+RESTART  CLRL  WORKBLK,WORKBLKN,FILL=C' '  BLANK THE EBCDIC WORK
+         CLRL  WORKCLR,WORKCLRN        CLEAR THE REST OF THE WORK AREA
+         LM    R8,R9,PARMPTRS  LOAD THE PARM LENGTH AND ADDRESS
+         L     R0,=AL1(0,C',',C'(',C';')  SET SCAN STOPS
+         BAL   R14,SCANNER   LOOK FOR SOMETHING
+         LTR   R15,R15       NULL DSN ?
+         BP    HAVEDSNP      NO
+         CLM   R2,1,SCANTAB+C';'  NULL FIELD ?
+         BNE   HAVEDSNP      NO
+         STM   R8,R9,PARMPTRS  SAVE UPDATED POINTERS
+         B     POSTPRMS      LOOK FOR MORE
+         SPACE 1
+HAVEDSNP CLM   R2,1,SCANTAB+C'('  DID WE FIND A PARENTHESIS ?
+         BNE   PLAINDSN      NO; DO NORMAL DSN PROCESSING
+         LTR   R8,R8         ANY MORE AFTER THIS ?
+         BNP   PARMBAD       NO; MALFORMED PARM
+         CLI   0(R9),C'-'    GDG REFERENCE ?
+         BE    SCANGDG       YES; RESCAN
+         CLI   0(R9),C'+'    INVALID GDG REFERENCE ?
+         BE    SCANGDG
+         CLI   0(R9),C'0'    OTHER FORMAT GDG ?
+         BL    SCANMEM       NO; SCAN FOR MEMBER NAME
+         CLI   0(R9),C'9'    GDG ?
+         BH    SCANMEM       NO; PROBABLY BAD MEMBER NAME
+SCANGDG  LM    R8,R9,PARMPTRS  RELOAD PARM POINTERS
+         L     R0,=A(0,0,C',',C';')  SCAN FOR VOLUME OR END
+         BAL   R14,SCANNER
+         B     PLAINDSN      PROCESS DSNAME ONLY
+         SPACE 1
+SCANMEM  CH    R15,=Y(L'DSNAME)  VALID LENGTH ?
+         BH    PARMBDSN      NO; COMPLAIN
+         SH    R15,=H'1'     MAKE LENGTH FOR EXECUTE
+         BM    PARMNULL      NONE; COMPLAIN
+         EX    R15,MVCDSN    MOVE DSN
+         OI    FLAGS,FGONE   SHOW USER SPECIFIED A DATA SET
+         L     R0,=AL1(C'(',C')',C',',C';')  SET SCAN STOPS
+         BAL   R14,SCANNER   LOOK FOR END
+         CLM   R2,1,SCANTAB+C')'  CORRECT STOP FOR MEMBER NAME ?
+         BNE   PARMBMEM      NO; INVALID MEMBER NAME
+         CH    R15,=Y(L'MEMBER)  VALID LENGTH ?
+         BH    PARMBMEM      NO
+         LTR   R15,R15       VALID LENGTH ?
+         BM    PARMBMEM      NO
+         L     R0,=AL1(0,0,C',',C';')  SCAN FOR POSSIBLE SERIAL
+         BAL   R14,SCANNER   LOOK FOR IT
+         LTR   R15,R15       DID WE HIT ANY TEXT ?
+         BP    PARMBMEM      YES; BAD NAME
+         B     SCANPVOL      SCAN FOR POSSIBLE VOLUME
+         SPACE 1
+PLAINDSN CH    R15,=Y(L'DSNAME)  VALID LENGTH ?
+         BH    PARMBDSN      NO; COMPLAIN
+         SH    R15,=H'1'     MAKE LENGTH FOR EXECUTE
+         BM    PARMNULL      NONE; COMPLAIN
+         EX    R15,MVCDSN    MOVE DSN
+         OI    FLAGS,FGONE   SHOW USER SPECIFIED A DATA SET
+SCANPVOL CLM   R2,1,SCANTAB+C','  POSSIBLE VOLUME SERIAL
+         BNE   SCANNVOL      NO
+         L     R0,=AL1(C'(',C')',C',',C';')  BUT WANT SEMI-COLON ONLY
+         BAL   R14,SCANNER   LOOK FOR END
+         CLM   R2,1,SCANTAB+C';'  EXPECTED FIELD END ?
+         BNE   PARMBVOL      NO; ERROR
+         CH    R15,=Y(L'SERIAL)  VALID LENGTH ?
+         BH    PARMBVOL      NO; FAIL
+         SH    R15,=H'1'     ADJUST FOR EXECUTE
+         BM    SCANNVOL      NO SERIAL; NEED CATALOG ENTRY
+         SPACE 1
+SCANYVOL EX    R15,MVCVOL    MOVE SERIAL
+SCANNVOL DS    0H            NO SERIAL SUPPLIED
+PARMEND  STM   R8,R9,PARMPTRS  SAVE RESIDUAL LENGTH, ETC. FOR NEXT PASS
+*DEBUG*  PRTLIST MGCURPRM    SHOW WHAT WE HAVE SO FAR
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*    FINISHED PARSING OF DSN / MEMBER /VOLUME                         *
+*    CHECK WHETHER THE DATASET IS IN THE CATALOG IF NO SERIAL GIVEN   *
+*                                                                     *
+***********************************************************************
+COMMFORM MVC   TRUENAME,DSNAME  COPY NAME FOR CATALOG MANIPULATION
+         LOCATE CAMLOCAT     IS IT CATALOGED ?
+         BXH   R15,R15,EXAMNLOC   NO, OR ERROR
+         CLC   =H'1',CATVOL#  ONE VOLUME ENTRY ?
+         BH    EXAMNLOC      NO; TREAT AS UNCATALOGED
+         CLC   =C'MIGRAT',CATVOL  MIGRATED DATASET?             GP99062
+         BE    SHOWMIGR      YES; BYPASS DEVICE TYPE CHECK      GP99062
+         CLI   CATDEV+2,UCB3DACC  DASD DEVICE ?
+         BNE   EXAMNLOC      NO; TREAT AS UNCATALOGED
+EXAMNDEV CLC   SERIAL,BLANKS  DID USER SPECIFY A VOLUME ?
+         BNE   EXAMYLOC      YES; LOOK AT IT
+         MVC   SERIAL,CATVOL  USE IT
+EXAMYLOC CLC   CATVOL,SERIAL   SAME VOLSER  ?
+         BE    POSTLOC       YES
+EXAMNLOC MVC   TRUENAME,DSNAME  RESTORE USER'S NAME
+         SPACE 1
+POSTLOC  CLC   SERIAL,BLANKS  HAVE WE A VOLUME SERIAL ?
+         BNE   SEEMOUNT      YES; TRY TO FIND UCB
+         PRTLIST MGNOSER     NOT LOCATED - GONE ?
+         OICC  4,RESULT=RETCODE   SET MINOR ERROR
+         B     POSTPROC      GO TO END OF REQUEST
+         SPACE 1
+SHOWMIGR PRTLIST PLFMIG      SHOW MIGRATED                      GP99062
+         B    POSTPROC       AND IGNORE                         GP99062
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*    LOCATE UCB FOR DATA SET                                          *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+SEEMOUNT LA    R5,PLBADMNT   PRESET MESSAGE FOR FAILED MOUNT
+         SERVCALL UCBDK,SERIAL,ERR=POSTPATE  LOCATE UCB BY VOLSER
+         LTR   R3,R0         FOUND ?
+         BNP   POSTPATE      NO; SET MESSAGE AND ERROR
+         USING UCBOB,R3      DECLARE UCB
+         SERVCALL UCBGN,(R3)  GET GENERIC FOR UNIT
+         MVC   MEMBER,0(R1)
+         SERVCALL DVTBL,(R3) GET DEVICE TABLE
+         LR    R1,R0
+         MVC   HIGHTRK,DVCTRK-DVCT(R1)  TRACKS PER CYLINDER
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*    VERIFY THAT DATASET EXISTS - OBTAIN DSCB                         *
+*                                                                     *
+***********************************************************************
+SEQVER   OBTAIN CAMDSCB1     FIND DSCB 1 FOR DATASET
+         STM   R15,R0,DB     SAVE ERROR CODE FOR MESSAGE
+         LA    R5,PLNOFMT1   NOT FOUND
+         BXH   R15,R15,POSTPATE  ISSUE MESSAGE AND ERROR CODE
+         BAL   R14,FORMDSCB  FORMT THE INFORMATION
+         B     POSTPROC      WRITE DUMP IF DEBUG MODE
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*    THE REQUEST HAS BEEN PROCESSED (SUCCESSFULLY OR OTHERWISE);      *
+*    NOW WE CLEAN UP AND ISSUE MESSAGES, SET RETURN CODE, ETC.        *
+*                                                                     *
+***********************************************************************
+POSTPATE OICC  8             SET ERROR
+         B     POSTLIST      WRITE MESSAGE
+         SPACE 1
+POSTFOUR OICC  4             SET LESSER ERROR
+POSTLIST PRTLIST (R5)        WRITE NON-CRITICAL MESSAGE
+         SPACE 1
+POSTPROC PRTLIST MGCURPRM    DUMP STORAGE AREA IF DEBUG MODE
+POSTPRMS ICM   R8,15,PARMPTRS  ANY MORE TEXT TO SCAN ?
+         BP    RESTART       YES; EXAMINE NEXT REQUEST
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*    FINISHED WITH PARM PROCESSING. NOW LOOP THROUGH THE TIOT AND     *
+*    REPEAT FOR ALL UNIQUE SYSUTxxx DD CARDS.                         *
+*                                                                     *
+***********************************************************************
+PARMNULL L     R2,@TIOT      GET PREVIOUS TIOT ENTRY
+LOOPTIOT SERVCALL TIOLK,(R2) LOOP - GET NEXT TIOT ENTRY
+         LTR   R2,R0         DID WE GET ONE ?
+         BZ    PGMEXIT       NO; ALL DONE
+         USING TIOELNGH,R2   DECLARE IT
+         CLC   =C'SYSUT',TIOEDDNM   ONE OF OURS ?
+         BNE   LOOPTIOT      NO; TRY ANOTHER
+         ST    R2,@TIOT      SAVE FOR NEXT TIME
+         SERVCALL TIODD,TIOEDDNM  DO TIOT LOOKUP
+         CR    R2,R0         SAME ENTRY ?
+         BE    HAVETIOT      YES
+         PRTLIST MGDUPDDN    SIGNAL DUPLICATE DD NAME
+         B     LOOPTIOT      SKIP THIS ONE
+SKIPTIOT PRTLIST MGDBADDD    SIGNAL DUPLICATE DD NAME
+         B     LOOPTIOT      SKIP THIS ONE
+         SPACE 1
+HAVETIOT ICM   R3,7,TIOEFSRT  IS THERE A UCB ?
+         BZ    SKIPTIOT      NO; IGNORE
+         CLI   UCBTBYT3,UCB3DACC   DASD ?
+         BNE   SKIPTIOT      NO; IGNORE
+         OI    FLAGS,FGONE   SHOW USER SPECIFIED A DATA SET
+         SERVCALL UCBGN,(R3)  GET GENERIC FOR UNIT
+         MVC   MEMBER,0(R1)
+         SERVCALL DVTBL,(R3) GET DEVICE TABLE
+         LR    R1,R0
+         MVC   HIGHTRK,DVCTRK-DVCT(R1)  TRACKS PER CYLINDER
+         ICM   R1,7,TIOEJFCB
+         SERVCALL SWAAD,(R1)  GET JFCB ADDRESS
+         BXH   R15,R15,SKIPTIOT
+         USING JFCBDSNM,R1   DECLARE IT
+         MVC   DSNAME,JFCBDSNM
+         MVC   TRUENAME,DSNAME  COPY NAME FOR CATALOG CHECK
+         MVC   SERIAL,JFCBVOLS
+         B     COMMFORM      GO TO COMMON FOMRATTING
+         SPACE 1
+PGMEXIT  TM    FLAGS,FGONE   ANY SPECIFIED ?
+         BNZ   PGMEXITX      OK
+         PRTL  '0No Data Sets specified',CC=ASA
+         OICC  4
+PGMEXITX SERVTERM ,
+         L     R9,RETCODE
+EXITCODE PGMEXIT RC=(R9)     RETURN WITH CONDITION
+         SPACE 1
+PARMBAD  LA    R2,MGPRMSYN
+         B     PARMERR       SYNTAX ERROR
+PARMBVOL LA    R2,MGPRMVOL
+         B     PARMERR
+PARMBMEM LA    R2,MGPRMMEM
+         B     PARMERR
+PARMBDSN LA    R2,MGPRMDSN
+PARMERR  LM    R3,R4,PARMPTRS  GET OLD VALUES FOR MESSAGE
+         STM   R8,R9,PARMPTRS  STORE FOR NEXT PARM
+         LA    R5,PLBADPRM   SET ERROR MESSAGE
+         B     POSTPATE      GO TO PASS END
+         SPACE 1
+MGDUPDDN FDOPT NL,CC=C'0'
+         FD    'DD'
+         FD    TIOEDDNM,PAD
+         FD    'is a duplicate - skipped'
+         FD    *END
+MGDBADDD FDOPT NL,CC=C'0'
+         FD    'DD'
+         FD    TIOEDDNM,PAD
+         FD    'is not usable'
+         FD    *END
+         SPACE 1
+PLBADPRM FD    'PARM error:',NL,PAD
+         FD    0(R2),L'MGPRMSYN,DEB
+         FD    '''',PADL
+         FD    0(R4),(R3)
+         FD    ''''
+         FD    *END
+MGPRMSYN DC    C'Syntax error    '
+MGPRMVOL DC    C'Volume Serial   '
+MGPRMMEM DC    C'Member Name     '
+MGPRMDSN DC    C'Data Set Name   '
+         SPACE 1
+MGCURPRM FDTM  FLAGS,FGDEBUG,BZ=MGCURPRX
+         FD    ' ',NL
+         FDSNAP SAVE,SAVEEND-SAVE,DUAL,NOOFFSET,BASE=0
+MGCURPRX FD    *END
+         SPACE 1
+MGNOSER  FDOPT NL,CC=C'0'
+         FD    DSNAME,DEB,NL
+         FD    'not found in Catalog',PAD
+         FD    *END
+         SPACE 1
+PLFOUND  FDOPT NL,CC=C'0'
+         FD    DSNAME,DEB
+         FD    'found on',PAD
+         FD    SERIAL,DEB
+         FD    MEMBER,PAD    UNIT NAME
+         FDCLC DSNAME,TRUENAME,BE=PLFOUNDX
+         FD    'named',PAD
+         FD    TRUENAME,DEB
+PLFOUNDX FD    *END
+         SPACE 1
+PLFMIG   FDOPT NL,CC=C'0'                                       GP99062
+         FD    DSNAME,DEB                                       GP99062
+         FD    'migrated',PAD                                   GP99062
+         FDCLI CATDEV+2,UCB3DACC,BNE=PLFMIGX                    GP99062
+         FD    'to DASD'                                        GP99062
+PLFMIGX  FD    *END                                             GP99062
+         SPACE 1
+PLNOFMT1 FDOPT NL,CC=C'0'
+         FD    DSNAME,DEB
+         FD    'on',PAD
+         FD    SERIAL,DEB
+         FD    MEMBER,PAD    UNIT NAME
+         FD    'DSCB1 could not be found, return code',PAD
+         FD    DB,4,I,DEB
+         FD    ', reason code X'''
+         FD    DB+4,4,HEX
+         FD    ''''
+         FD    *END
+         SPACE 1
+PLBADMNT FDOPT NL,CC=C'0'
+         FD    SERIAL,NL,DEB
+         FD    MEMBER,PAD    UNIT NAME
+         FD    'could not be mounted for',PAD
+         FD    DSNAME,DEB
+         FD    *END
+         EJECT ,
+*        SCANNER SUBROUTINE
+*        R0 - 1-4 STOP CHARACTERS, FOURTH IS DEFAULT (UNMATCHED)
+*        R8 - RESIDUAL TEXT LENGTH
+*        R9 - START SCAN ADDRESS
+*
+*        RETURN:
+*        R15 - LENGTH OF TEXT BEFORE HIT
+*        R0  - ADDRESS OF HIT CHARACTER OR END OF TEXT+1
+*        R1  - ADDRESS OF TEXT (R9) BEFORE HIT
+*        R2  - HIT CHARACTER OR DEFAULT
+*        R8, R9 UPDATED TO POINT PAST HIT CHARACTER
+SCANNER  XC    SCANTAB,SCANTAB  CLEAR SCANNER TABLE
+         LR    R2,R0         COPY DEFAULT CHARACTER
+         ICM   R2,IIIO,ZEROES  CLEAR REMAINING BYTES
+         LA    R1,0(R8,R9)   POINT TO HIT COLUMN DEFAULT
+         STM   R3,R7,20+3*4(R13)  SAVE WORK REGISTERS
+         LA    R5,4          REPEAT THIS THING FOR FOUR BYTES
+SCANNERC LR    R4,R0         COPY CHRACTERS
+         SRL   R0,8          SHIFT REQUEST TO NEXT ONE
+         ICM   R4,IIIO,ZEROES  CLEAR UNUSED BYTES
+         LA    R6,SCANTAB(R4)  GET ADDRESS OF BYTE INSERTION
+         STC   R4,0(,R6)     ENTER INTO TABLE
+         BCT   R5,SCANNERC   REPEAT FOR ALL FOUR CHARACTERS
+         SPACE 1
+         LTR   R3,R8         GET LENGTH TO SCAN
+         BNP   SCANNER0      TOO BAD
+         EX    R3,SCANNTRT   LOOK FOR SOMETHING
+SCANNER0 LR    R15,R1        COPY HIT COLUMN
+         SR    R15,R9        LESS START = LENGTH OF TEXT BEFORE
+         LR    R0,R1         SAVE HIT ADDRESS FOR USER
+         LR    R1,R9         SAVE START SCAN ADDRESS
+         LR    R9,R0         SET NEW TEXT ADDRESS(HIT)
+         SR    R8,R15        RESIDUAL LENGTH
+         LTR   R2,R2         ANYTHING HIT ?
+         BZ    SCANNERX      NO
+         BCTR  R8,0          SET RESIDUAL LENGTH
+         LA    R9,1(,R9)     SKIP OVER HIT CHARACTER
+SCANNERX LM    R3,R7,20+3*4(R13)  RESTORE OTHER REGISTERS
+         BR    R14           RETURN TO CALLER
+SCANNTRT TRT   0(0,R9),SCANTAB  THE END IS NEAR ?
+MVCDSN   MVC   DSNAME(0),0(R1)  COPY USER'S DSN
+MVCVOL   MVC   SERIAL(0),0(R1)  VOLUME SERIAL
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*    FORMAT THE DSCB 1 AND ANY DSCB 3 INFORMATION                     *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+FORMDSCB STM   R0,R15,SUBSAVE     JUST IN CASE - SAVE EVERYTHING
+         XC    IECSDSL3(DS3END-IECSDSL3),IECSDSL3  CLEAR 3
+         MVC   DATECRD,=C'(YYYY.DDD)'
+         MVC   DATEREF,=C'(YYYY.DDD)'
+         MVC   DATEEXP,=C'(YYYY.DDD)'
+*WRONG   CLI   DS1NOEPV,3    MORE THAN THREE EXTENTS ?
+*DUE TO  BH    *+10          YES
+*LABELS  XC    DS1PTRDS,DS1PTRDS  ELSE PREVENT FMT 2 READ
+         SR    R1,R1
+         ICM   R1,7,DS1LSTAR  GET TRACK PORTION OF HWM          GP09186
+         BZ    SETMAXTK      NO, SKIP ROUND                     GP09186
+         SRL   R1,8                                             GP09186
+         LA    R1,1(,R1)     ROUND UP
+SETMAXTK STH   R1,NUMTRK     AND SAVE IT
+         LA    R0,DS1DSORG   POINT TO DSORG/OPTCD/RECFM.....
+         LA    R1,IECSDSL3   USE DSCB 3 AREA AS WORK SPACE
+         SUBCALL SUBDSATR    MAKE ATTRIBUTES PRINTABLE
+         MVC   RECLN,22(R1)  RECORD LENGTH
+*EXTRA*  MVC   BLKSI,17(R1)  BLOCKSIZE
+         LA    R1,DS1CREDT   GET CREATION DATE
+         SUBCALL SUBD2J      MAKE JULIAN
+         STCM  R0,15,DATECRD+1  SAVE YEAR
+         STCM  R1,15,DATECRD+5  SAVE .DAY
+         LA    R1,DS1EXPDT   GET EXPIRATION DATE
+         SUBCALL SUBD2J      MAKE JULIAN
+         STCM  R0,15,DATEEXP+1  SAVE YEAR
+         STCM  R1,15,DATEEXP+5  SAVE .DAY
+         LA    R1,DS1REFD    GET EXPIRATION DATE
+         SUBCALL SUBD2J      MAKE JULIAN
+         STCM  R0,15,DATEREF+1  SAVE YEAR
+         STCM  R1,15,DATEREF+5  SAVE .DAY
+         MVC   CCHHR(5),DS1PTRDS  SAVE FMT2/FMT3 ADDRESS
+         SLR   R3,R3         TRACK COUNT
+         SLR   R4,R4         EXTENT COUNT
+         IC    R4,DS1NOEPV   NUMBER OF EXTENTS
+         CLI   DS1EXT1+XTTYPE-XTWHOLE,XTTLABEL  USER LABELS ?
+         BNE   *+8
+         LA    R4,1(,R4)     PHYSICAL EXTENTS
+         LA    R1,DS1EXT1    GET FIRST EXTENT
+         LA    R0,3          MAX OF 3
+EX1      LH    R2,HIGHTRK    TRACKS/CYLINDER
+         SUBCALL SUBXTSUM    GET TOTAL TRACKS
+         AR    R3,R15        ACCUMULATE TRACKS
+EX2      OC    CCHHR(5),CCHHR  DSCB EXTENSION ?
+         BZ    DOEXT         NO
+         OBTAIN CAMSEEK3     GET FORMAT 2 OR 3 DSCB
+         MVC   CCHHR(5),DS3PTRDS  SET NEXT READ ADDRESS
+         CLI   DS3FMTID,C'3'     A TYPE 3 ?
+         BNE   EX2           NO, SHOULD BE TWO, TRY AGAIN
+         MVC   DS3FMTID(L'DS3ADEXT),DS3ADEXT  MAKE ENTRIES CONTIGUOUS
+         LA    R1,DS3EXTNT   GET FIRST SET
+         LA    R0,13         THIRTEEN EXTENTS AVAILABLE
+         B     EX1           DO THE REMAINING EXTENTS
+         SPACE
+DOEXT    ST    R3,TRKS       SAVE TRACKS IN DATA SET
+         ST    R4,EXTS       EXTENTS IN DATA SET
+         CLI   DS1DSORG+1,0       PDS ?                         GP09186
+         BNE   FORMEXIT      NO; IGNORE                         GP09186
+         TM    DS1DSORG,X'42'  DSORG = PS OR PO ?
+         BZ    FORMEXIT      NO, NO % DISPLAY
+         LTR   R5,R5         PATTERN DSCB, SPACE = 0  ??
+         BNP   FORMEXIT      YES, SKIP SPACE DISPLAY
+         LH    R1,NUMTRK     GET TRACKS USED
+         SLR   R0,R0         FOR DIVIDE
+         MH    R1,=H'100'    FOR %
+         DR    R0,R3         DIVIDE USED BY ALLOCATED TRACKS
+         LTR   R1,R1         NON-ZERO PERCENTAGE ?
+         BP    PERCON        YES; DISPLAY
+         LTR   R0,R0         ANY REMAINDER ?
+         BZ    PERCON        NO
+         LA    R1,1          SHOW SOME USE
+PERCON   ST    R1,PCNT       SHOW PERCENTAGE
+FORMEXIT PRTLIST MSGDSCB     FORMAT THE INFORMATION
+         LM    R0,R15,SUBSAVE   RESTORE REGISTERS
+         BR    R14           RETURN TO CALLER
+         SPACE 1
+MSGDSCB  FDOPT NL,CC=C'0'    DOUBLE SPACE
+         FD    DSNAME,PADR
+         FD    'on'
+         FD    SERIAL,PAD
+         FD    MEMBER,PAD    GENERIC OR DEVICE TYPE
+         FDOPT IND=3         INDENT SUBSEQUENT LINES
+         FDCLC DSNAME,TRUENAME,BE=MGGUDNAM
+         FD    '  alias of',PAD
+         FD    TRUENAME,DEB
+*        LINE 2
+MGGUDNAM FD    'Created',TURQ,RADJ,NL,DEB
+         FD    DS1CREDT,HEX,RADJ,DEB,PAD,LEN=5
+         FD    DATECRD,PAD
+         FD    'on',TURQ,PAD
+         FD    DS1DSSN,DEB,NULL,UPPER,PAD
+         FD    'seq',PAD
+         FD    DS1VOLSQ,I,PAD,LEN=4
+         FD    'System code',TURQ,RADJ,LEN=13
+         FD    DS1SYSCD,DEB,UPPER,NULL,PAD
+         FD    'Expires',TURQ,RADJ,LEN=9
+         FD    DS1EXPDT,HEX,RADJ,DEB,PAD,LEN=5
+         FD    DATEEXP,PAD
+         FD    'Last ref',TURQ,RADJ,PAD,LEN=10
+         FDINP DS1REFD,HEX,DEB,RADJ,GREEN,LEN=5  ACCESS DATE
+         FD    DATEREF,PAD
+         SPACE 1
+*        LINE 3
+         FD    'DSOrg',TURQ,NL
+         FDINP DS1DSORG,HEX,GREEN,LEN=4
+         FDFLAG DS1DSORG,PAD,TABLE=TABDSORG,SEP=0,LEN=3
+         FD    'RecFm',RADJ,LEN=9
+         FDINP DS1RECFM,HEX,DEB,GREEN,LEN=2
+         FDFLAG DS1RECFM,PAD,TABLE=TABRECFM,SEP=0,LEN=5
+         FD    'LRecL',RADJ,LEN=9
+         FDINP DS1LRECL,I,GREEN,LEN=5
+         FD    'BlkLn',TURQ,RADJ,LEN=9
+         FDINP DS1BLKL,I,GREEN,LEN=5
+         FD    'KeyLn',TURQ,RADJ,LEN=9
+         FDINP DS1KEYL,I,GREEN,LEN=3
+         FD    'RelKeyPos',TURQ,RADJ,LEN=13
+         FD    DS1RKP,I,PAD
+         SPACE 1
+*        LINE 4
+         FD    'LStar',NL
+         FDINP DS1LSTAR,HEX,GREEN,LEN=6
+         FD    'TrkBal',TURQ,RADJ,LEN=12
+         FDINP DS1TRBAL,IA,GREEN,LEN=5
+         FD    'OptCode',RADJ,LEN=13
+         FDINP DS1OPTCD,HEX,GREEN,LEN=2
+         FDTM  DS1DSORG,DS1DSGDA,BZ=OPTNOTDA
+         FDFLAG DS1OPTCD,PAD,TABLE=TABOPTDA,SEP=C',',LEN=64
+         FDGOTO OPTNOTAM
+OPTNOTDA FDTM  DS1DSORG,DS1DSGIS,BZ=OPTNOTIS
+         FDFLAG DS1OPTCD,PAD,TABLE=TABOPTIS,SEP=0,LEN=64
+         FDGOTO OPTNOTAM
+OPTNOTIS FDTM  DS1DSORG,DS1DSGPS+DS1DSGPO,BZ=OPTNOTPS
+         FDFLAG DS1OPTCD,PAD,TABLE=TABOPTPS,SEP=0,LEN=64
+         FDGOTO OPTNOTAM
+OPTNOTPS FDTM  DS1DSORG+1,DS1ORGAM,BZ=OPTNOTAM
+         FDFLAG DS1OPTCD,PAD,TABLE=TABOPTAM,SEP=0,LEN=64
+OPTNOTAM DS    0X
+         SPACE 1
+*        LINE 5
+         FD    'DS Ind',TURQ,NL
+         FDINP DS1DSIND,HEX,GREEN,LEN=2
+         FDFLAG DS1DSIND,PAD,TABLE=TABDSIND,SEP=C',',LEN=64
+         SPACE 1
+*        LINE 5
+         FD    'Sec.Alloc',NL,RADJ
+         FD    DS1SCAL1,HEX,PAD,LEN=2
+         FDCLI DS1SCAL1,0,BE=ABSTRK
+         FD    DS1SCAL3,I,RADJ,PAD,LEN=8
+         FDFLAG DS1SCAL1,PAD,TABLE=TABSCAL1,SEP=C',',LEN=16
+         FDGOTO COMTRK
+ABSTRK   FDINP DS1SCAL3,HEX,LEN=6
+COMTRK   DS    0X
+         FDTM  DS1DSORG,X'02',BZ=NODEBLK
+         FD    DS1NOBDB,I,RADJ,PAD,LEN=5
+         FD    'Bytes in last Dir Blk',TURQ,LEN=25
+NODEBLK  DS    0X
+         SPACE 1
+*        LINE 6
+         FD    TRKS,I,RADJ,NL,GREEN,LEN=10
+         FD    'Tracks allocated, in',TURQ,PAD
+         FD    EXTS,I,PAD
+         FD    'extent(s)'
+         FDTM  DS1DSORG,X'42',BZ=NOPCNT
+         FD    PCNT,I,RADJ,DEB,LEN=6
+         FD    '% used.',TURQ
+         SPACE 1
+*        LINE 15
+NOPCNT   FDOPT NL            FORCE LINE COMPLETION
+         FD    *END
+         SPACE 1
+TABDSORG FLGTAB X'4008',ICF,MLEN=2                              GP09186
+         FLGTAB X'8000',IS
+         FLGTAB X'4000',PS
+         FLGTAB X'2000',DA
+         FLGTAB X'1000',CX
+         FLGTAB X'0800',CQ
+         FLGTAB X'0400',MQ
+         FLGTAB X'0200',PO
+         FLGTAB X'0100',U
+         FLGTAB X'0080',GS
+         FLGTAB X'0040',TX
+         FLGTAB X'0020',TQ
+         FLGTAB X'0010','??'
+         FLGTAB X'0008',AM
+         FLGTAB X'0004',TR
+         FLGTAB X'0002','??'
+         FLGTAB X'0001','??'
+         FLGTAB X'0000','none'
+         FLGTAB *END
+         SPACE 1
+TABRECFM FLGTAB X'C0',U,MLEN=1     DEFINE RECORD FORMAT
+         FLGTAB X'80',F
+         FLGTAB X'40',V
+         FLGTAB X'20',T
+         FLGTAB X'10',B
+         FLGTAB X'08',S
+         FLGTAB X'04',A
+         FLGTAB X'02',M
+         FLGTAB *END
+         SPACE 1
+TABOPTDA FLGTAB X'80','WrtValCk',MLEN=1
+         FLGTAB X'40','TkOvr'
+         FLGTAB X'20','ExtSrch'
+         FLGTAB X'10','Fdbck'
+         FLGTAB X'08','ActAdr'
+         FLGTAB X'04','DynBuf'
+         FLGTAB X'02','RdExc'
+         FLGTAB X'01','RelBkAdr'
+         FLGTAB *END
+         SPACE 1
+TABOPTIS FLGTAB X'80',W,MLEN=1
+         FLGTAB X'40',U
+         FLGTAB X'20',M
+         FLGTAB X'10',I
+         FLGTAB X'08',Y
+         FLGTAB X'04','?'
+         FLGTAB X'02',L
+         FLGTAB X'01',R
+         FLGTAB *END
+         SPACE 1
+TABOPTPS FLGTAB X'80',W,MLEN=1
+         FLGTAB X'40',U
+         FLGTAB X'20',C
+         FLGTAB X'10',H
+         FLGTAB X'08',B
+         FLGTAB X'04',Z
+         FLGTAB X'02',T
+         FLGTAB X'01',J
+         FLGTAB *END
+         SPACE 1
+TABOPTAM FLGTAB X'80','Cat in ICF ctlg'
+         FLGTAB X'40','Is icf ctlg'
+         FLGTAB *END
+         SPACE 1
+TABDSIND FLGTAB X'80','LastVol',MLEN=1
+         FLGTAB X'40',RACF
+         FLGTAB X'20',Blk8
+         FLGTAB X'14','Write Pswd'
+         FLGTAB X'10','Pswd Rd/Wt'
+         FLGTAB X'02','Changed'
+         FLGTAB *END
+         SPACE 1
+TABSCAL1 FLGTAB X'C0','Cyl',MLEN=1
+         FLGTAB X'80','Trk'
+         FLGTAB X'40','Blk'
+         FLGTAB X'20','MSVGp'
+         FLGTAB X'08','Contig'
+         FLGTAB X'04','MXIG'
+         FLGTAB X'02','ALX'
+         FLGTAB X'01','Round'
+         FLGTAB X'00','AbsTrk'
+         FLGTAB *END
+         SPACE 1
+HEXTRAB  DC    C'0123456789ABCDEF'  HEX TRANSLATE
+         SPACE 2
+PATDSCB1 CAMLST SEARCH,TRUENAME-SAVE,SERIAL-SAVE,DS1FMTID-SAVE
+PATSEEK3 CAMLST SEEK,CCHHR-SAVE,SERIAL-SAVE,IECSDSL3-SAVE
+PATLOCAT CAMLST NAME,TRUENAME-SAVE,,CATWORK-SAVE  LOCATE CATALOG
+ZEROES   DC    F'0'          CONSTANCE
+BLANKS   DC    CL80' '       CONSTANCE
+SYSPRINT PRTWORK SYSPRINT,*USER,TITLE=5  TSO OR BATCH OUTPUT
+         SPACE 1
+HEADER   FDOPT NL,CC=C'#'    REQUEST AUTOMATIC PAGINATION
+         FD    'DATA SET CONTROL BLOCK INFORMATION'
+         FDTM  FLAGS,FGDEBUG,BZ=HEADERD
+         FD    '(DEBUG MODE)',PAD
+HEADERD  FD    *END
+         SPACE 1
+SAVE     DSECT ,
+SUBSAVE  DS    16A           SUBROUTINE SAVE AREA
+DB       DS    D
+DB2      DS    D
+         SERVDEFS ,          SERVICE MODULES, ETC.
+@TIOT    DC    A(0)          CURRENT TIOT ENTRY BEING PROCESSED
+FLAGS    DC    X'00'         PROCESSING FLAGS
+FGDEBUG  EQU   X'80'           DEBUG MODE (SNAPS, ETC.)
+FGONE    EQU   X'01'           AT LEAST ONE DS SPECIFIED
+DATECRD  DC    C'(YYYY.DDD)'
+DATEEXP  DC    C'(YYYY.DDD)'
+DATEREF  DC    C'(YYYY.DDD)'
+CAMDSCB1 CAMLST SEARCH,DSNAME,SERIAL,DS1FMTID
+CAMSEEK3 CAMLST SEARCH,CCHHR,SERIAL,IECSDSL3
+CAMLOCAT CAMLST NAME,TRUENAME,,CATWORK  LOCATE CATALOG ENTRIES
+PARMPTRS DS    2A            LENGTH/ADDRESS OF RESIDUAL PARM TEXT
+HIGHTRK  DS    H             TRACKS / CYLINDER
+NUMTRK   DS    H             HOLD AREA FOR LSTAR TRACK COUNT
+         SPACE 1
+WORKBLK  DS    0C            START OF BLANKING
+DSNAME   DC    CL44' '       DATASET NAME FROM PARM
+TRUENAME DC    CL44' '       NAME AFTER CATALOG LOOKUP
+SERIAL   DC    CL6' '        USER'S VOLUME SERIAL
+MEMBER   DC    CL8' '        MEMBER NAME FOR PDS MEMBER DELETE
+SPFLAG   DC    C' '          SPACE PROCESSING FLAG
+RECLN    DC    CL5' '        RECORD LENGTH
+SPLIT    DC    C' '          SPLIT EXTENT FLAG
+WORKBLKN EQU   *-WORKBLK     LENGTH TO MAKE BLANK
+         SPACE 1
+WORKCLR  DS    0D            START OF ZEROING
+TRKS     DC    F'0'          TRACKS IN DATASET
+EXTS     DC    F'0'          EXTENTS
+PCNT     DC    F'0'          PERCENT USED
+CATWORK  DS    35D'0'        CATALOG WORK/RETURN AREA
+CATVOL#  EQU   CATWORK,2,C'H'  NUMBER OF VOLUMES
+CATDEV   EQU   CATWORK+2,4,C'X'  CATALOG DEVICE TYPE
+CATVOL   EQU   CATWORK+6,6,C'C'  VOLUME SERIAL
+         ORG   CATWORK
+         SPACE 1
+CCHHR    DS    XL5           ADDRESS OF FORMAT 3 DSCB
+WORKCLRN EQU   *-WORKCLR     LENGTH TO ZERO
+         SPACE 1
+         IECSDSL1 1          MAP FORMAT 1
+         AIF   (&MVSXA).SYSDEF                                  GP04234
+DS1FLAG1 EQU   DS1NOBDB+1,1,C'X'  MORE FLAGS
+DS1COMPR EQU   X'80'           COMPRESSABLE EXTENDED IF DS1STRP
+DS1CPOIT EQU   X'40'           CHECKPOINTED D S
+DS1SMSFG EQU   DS1FLAG1+17,1,C'X'  SMS FLAG
+DS1SMSDS EQU   X'80'           SMS D S
+DS1SMSUC EQU   X'40'           NO BCS ENTRY
+DS1REBLK EQU   X'20'           MAY BE REBLOCKED
+DS1CRSDB EQU   X'10'           BLKSZ BY DADSM
+DS1PDSE  EQU   X'08'           PDS/E
+DS1STRP  EQU   X'04'           EXTENDED FORMAT D S
+DS1PDSEX EQU   X'02'           HFS D S
+DS1DSAE  EQU   X'01'           EXTENDED ATTRIBUTES EXISY
+DS1SCEXT EQU   DS1SMSFG+1,3,C'X'  SECONDARY SPACE EXTENSION
+DS1SCXTF EQU   DS1SCEXT,1,C'X'  -"- FLAG
+DS1SCAVB EQU   X'80'           SCXTV IS AVG BLOCK LEN
+DS1SCMB  EQU   X'40'                 IS IN MEGBYTES
+DS1SCKB  EQU   X'20'                 IS IN KILOBYTES
+DS1SCUB  EQU   X'10'                 IS IN BYTES
+DS1SCCP1 EQU   X'08'           SCXTV COMPACTED BY 256
+DS1SCCP2 EQU   X'04'                 COMPACTED BY 65536
+DS1SCXTV EQU   DS1SCXTF+1,2,C'X'  SEC SPACE EXTNSION VALUE
+DS1ORGAM EQU   DS1ACBM         CONSISTENT NAMING - VSAM D S
+DS1RECFF EQU   X'80'           RECFM F
+DS1RECFV EQU   X'40'           RECFM V
+DS1RECFU EQU   X'C0'           RECFM U
+DS1RECFT EQU   X'20'           RECFM T   001X XXXX IS D
+DS1RECFB EQU   X'10'           RECFM B
+DS1RECFS EQU   X'08'           RECFM S
+DS1RECFA EQU   X'04'           RECFM A
+DS1RECMC EQU   X'02'           RECFM M
+*   OPTCD DEFINITIONS   BDAM    W.EFA..R
+*                       ISAM    WUMIY.LR
+*             BPAM/BSAM/QSAM    WUCHBZTJ
+DS1OPTIC EQU   X'80'  FOR DS1ORGAM - CATLG IN ICF CAT
+DS1OPTBC EQU   X'40'           ICF CATALOG
+DS1RACDF EQU   DS1IND40
+DS1SECTY EQU   DS1IND10
+DS1WRSEC EQU   DS1IND04
+DS1SCAL1 EQU   DS1SCALO,1,C'X'    SEC. ALLOC FLAGS
+DS1DSPAC EQU   X'C0'         SPACE REQUEST MASK
+DS1CYL   EQU   X'C0'           CYLINDER BOUND
+DS1TRK   EQU   X'80'           TRACK
+DS1AVRND EQU   X'41'           AVG BLOCK + ROUND
+DS1AVR   EQU   X'40'           AVG BLOCK LEN
+DS1MSGP  EQU   X'20'
+DS1EXT   EQU   X'10'           SEC. EXTENSION EXISTS
+DS1CONTG EQU   X'08'           REQ. CONTIGUOUS
+DS1MXIG  EQU   X'04'           MAX
+DS1ALX   EQU   X'02'           ALX
+DS1DSABS EQU   X'00'           ABSOLUTE TRACK
+DS1SCAL3 EQU   DS1SCAL1+1,3,C'X'  SEC ALLOC QUANTITY
+.SYSDEF  SPACE 1
+         IECSDSL1 3          MAP FORMAT 3
+         SPACE 1
+SCANTAB  DC    XL256'00'     TRT SCANNING TABLE
+SAVEEND  EQU   *
+         SPACE 1
+         PRINT NOGEN
+         CVT   DSECT=YES
+         SPACE 1
+         IHACDE ,
+         SPACE 1
+         IHAPSA ,            LOW
+         SPACE 1
+         IKJTCB ,
+         SPACE 1
+         IEFUCBOB ,
+         SPACE 1
+         IEFJFCBN ,
+         SPACE 1
+         IHADVCT ,           FOR BLOCKS/TRACK
+         SPACE 1
+MYTIOT   DSECT  ,
+         IEFTIOT1 ,
+         SPACE 1
+         MAPEXTNT ,          SINGLE EXTENT MAPPING
+         END   ,

@@ -1,0 +1,783 @@
+/***************************** REXX ***********************************
+ This REXX is used to send SMTP Mail via the REXX RXSOCKET API vs the
+      USS /bin/sendmail command. This allows the manipulations of
+      additional SMTP Headers not available when using sendmail.
+
+ This REXX does NOT Require TSO, it will run in batch under IRXJCL.
+
+ To BASE64 encoding requires access to ENCODE64 REXX Function:
+       http://www.homerow.net/asm/index.htm
+
+                           --- EXAMPLE ---
+IRXJCL SENDMAIL <EM_DOM(@default_email_domain)> <EM_TYPE(PLAIN|HTML)>   ,
+      <IMPORT(Normal|High|Low)> <PORT(smtp_port)>                       ,
+      <SERVER(server_dns_name)> <TOKEN(STEMPUSH_token)> <TEST(trace_opt)>
+TSO <%>SENDMAIL <EM_DOM(@default_email_domain)> <EM_TYPE(PLIAN|HTML)>   ,
+      <IMPORT(Normal|High|Low)> <PORT(smtp_port)>                       ,
+      <SERVER(server_dns_name)> <TOKEN(STEMPUSH_token)> <TEST(trace_opt)>
+TSO <%>SENDMAIL -H -- To display help for this REXX
+
+  Arguments: InParms     - Non-Positional parameters
+ ----------------------------- NP-PARMS -------------------------------
+                  EM_DOM - Default Email Domain to add to email address
+                           default: @sccompanies.com
+                 EM_TYPE - Email Body Type, plain text or html
+                           default: PLAIN
+                  IMPORT - Message Importance       default: Normal
+                    PORT - SMTP Server Port Number. default: DEFAULT
+                  SERVER - SMTP Server DNS Name.    default: DEFAULT
+                   TOKEN - Token created by STEMPUSH in calling REXX
+                           and used by STEMPULL to ID stem variable
+                           used to pass email.      default: blank
+                    TEST - Used to control traces.
+
+      Files: EMCNTL - Pre-Allocated EMail Control DD (see PARMs below)
+             EMBODY - Pre-Allocated EMail Body DD
+             ?????? - Pre-Allocated EMail Attachments DDs as defined
+                      in EMail Control DD
+                NOTE: The above files are not used if TOKEN is provided.
+      PARMs: *        - In column 1 indicates a comment.
+             From     - eMail address in message From field.
+             Received - Used in SMTP header to trace path of a message
+                        from its source to its destination.
+             Reply-to - eMail address used when user does a REPLY, if
+                        different then the From address.
+             To       - Primary eMail receipients.
+             Cc       - Carbon Copy eMail receipients.
+             Bcc      - Blind Carbon Copy eMail receipients.
+             Subject  - eMail one line subject.
+             Comment  - Comment embedded in eMail header information.
+             Import   - Set eMail Importance: Normal, High, or Low.
+             Attach   - Attachment file information: DD_name, MIME
+                        Content-type, and attachment file name.
+   STEM Var: em. = ""
+             em.hdr.to.0   = 0; em.hdr.cc.0 = 0; em.hdr.bc.0 = 0
+             em.hdr.to.#   = Ý<email@domain> | name <email@domain>¨
+             em.hdr.cc.#   = Ý<email@domain> | name <email@domain>¨
+             em.hdr.bc.#   = Ý<email@domain> | name <email@domain>¨
+             em.hdr.fm     = Ý<email@domain> | name <email@domain>¨
+             em.hdr.sub    = ""             /* Email Subject line         */
+             em.hdr.com    = ""             /* Hidden Header comment      */
+             em.hdr.imp    = ÝN | H | L¨    /* Email Importance           */
+             em.hdr.rec    = email@domain   /* SMTP Received from address */
+             em.hdr.rep.#  = Ý<email@domain> | name <email@domain>¨
+             em.atch.0     = #              /* Number of attachments      */
+             em.atch.#.dat = ""             /* Attachment file date       */
+             em.atch.#.fnm = ""             /* Attachment filename        */
+             em.atch.#.typ = ÝPLAIN | HTML | OCTET-STREAM | INLINE | BASE64¨
+             em.body.0     = #              /* Number records in body     */
+             em.body.#     = ""             /* Record # of email body     */
+Other EXECS: None
+
+EXEC History
+
+ REXX EXEC Name: SENDMAIL
+         Author: AL FERGUSON - TS ADM (TSAZFA) from version 2.43
+                 Al Ferguson (HUL2353)
+         Writen: 07JUL08
+        History: 06FEB17 - v2.49 - Pick up updated version or ERRINFO
+                           Common Code routines.
+                 01FEB17 - v2.48 - Mass update to Error Handling Fixes.
+                 10MAY16 - v2.43 - Remove NAR support (obsolete)
+                 25APR13 - v2.38 - Fix multiple Reply-to email
+                           address support, while supporting old calls.
+                 09JAN12 - v2.31 - Add support for HTML Based
+                           Email Bodies & Attachments.
+                 16DEC11 - v2.17 - Add support for using SENDMAIL
+                           as a CALLED REXX that passes the email via
+                           stem variables using Rob Scott's STEMPUSH and
+                           STEMPULL REXX Functions (CBT File 411).
+                 14JUL08 - v1.84 - Fixed SET_MSG when being CALLed
+                           from within another REXX EXEC.
+                 09JUL08 - v1.71 - Miscellanious cleanup.
+                 09JUL08 - v1.69 - Fix Socket Error handling and
+                           handle PORT(DEFAULT) or PORT() when the SERVER
+                           is passed.
+                 08JUL08 - v1.66 - Cleanup Mime headers and reduce
+                           CALLs to RXSOCKET. Ensure RANDOM returns valid
+                           values to pick random letters properly.
+                 07JUL08 - v1.0 -- Based off of SCRTML v1.57
+***************************** Rexx ***********************************/
+PARSE ARG InParms                            /* Place arguments here */
+
+IF WORDPOS(InParms,'-h -H') > 0 THEN CALL DISPLAY_HELP
+CALL INITIALIZE_THIS_REXX
+/* COPY ERRINIT */
+/********************************************************************** /*COPY*/
+              Initialize ERROR handling                                 /*COPY*/
+***********************************************************************//*COPY*/
+CALL ON ERROR     NAME ERROR_PROC   /* On RCs > 0 CALL ERROR_PROC     *//*COPY*/
+SIGNAL ON HALT    NAME CLEANUP      /* Cleanup before exiting on HALT *//*COPY*/
+SIGNAL ON SYNTAX  NAME ERROR_PROC   /* On REXX Syntax Error GOTO ...  *//*COPY*/
+SIGNAL ON NOVALUE NAME ERROR_PROC   /* On uninitialized variable GOTO *//*COPY*/
+ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"  /* Is ISPEXEC available?       *//*COPY*/
+IF RC = 0 THEN DO                   /* Yes, then allow REXX to handle *//*COPY*/
+   ok='0';ADDRESS "ISPEXEC" "CONTROL ERRORS RETURN"   /* ISPF errors  *//*COPY*/
+END                                                                     /*COPY*/
+                                                                        /*COPY*/
+TRACE (TEST)
+CALL GET_EMAIL_CNTL
+CALL INIT_SMTP_SOCKET
+
+CALL EMAIL_HEADER
+CALL EMAIL_BODY
+CALL EMAIL_ATTACHMENTS
+CALL CLOSE_EMAIL
+
+CALL CLOSE_SMTP_SOCKET
+
+EXIT ExitError
+/***************************** REXX ***********************************
+                            END of REXX
+****************************** REXX ***********************************
+                       Beginning of PROCEDURES
+****************************** REXX ***********************************/
+/**********************************************************************
+     This Initializes any variables needed for this REXX
+***********************************************************************/
+INITIALIZE_THIS_REXX:
+  TRUE=1; FALSE=0      /* REXX functional values for TRUE and FALSE   */
+                       /* Initialize and process non-positional parms */
+  ValidParms = "EM_DOM(@sccompanies.com) EM_TYPE(PLAIN) IMPORT()",
+                "PORT(DEFAULT) SERVER(DEFAULT) TOKEN() TEST(O)"
+  MatchLength = 4      /* NP-Parms match on first # chars             */
+  AcceptAll = FALSE    /* Allow un-recognized NP-PARMS to be passed   */
+  IF ValidParms ¬= '' THEN CALL DO_NP_PARMS
+
+  SYSUID = USERID()
+  ExitError = 0
+  Lower   = "abcdefghijklmnopqrstuvwxyz"
+  Upper   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  letters = Lower || Upper
+
+RETURN
+/* COPY DISHELP */
+/********************************************************************** /*COPY*/
+            This PROCEDURE displays the Help information in             /*COPY*/
+                 this REXX's HEADER when invoked.                       /*COPY*/
+***********************************************************************//*COPY*/
+DISPLAY_HELP: PROCEDURE                                                 /*COPY*/
+ARG ExitOrReturn .                                                      /*COPY*/
+  DO i = 1 TO SOURCELINE() UNTIL SOURCELINE(i + 2) = 'EXEC History'     /*COPY*/
+     source.i = SOURCELINE(i + 1)   /* Read in HELP from EXEC         *//*COPY*/
+  END                                                                   /*COPY*/
+  ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"                                 /*COPY*/
+  IF RC ¬= 0 THEN DO i = 1 TO i; SAY source.i; END /* No ISPF, so SAY *//*COPY*/
+  ELSE DO              /* ISPF available, use TBDISPL to display help *//*COPY*/
+     PARSE SOURCE . . rname .       /* Get REXX EXEC name             *//*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBCREATE RHELP02 NAMES(source) NOWRITE"  /*COPY*/
+     DO i = 1 TO i     /* Build HELP table to display                 *//*COPY*/
+        source = source.i; ADDRESS "ISPEXEC" "TBADD RHELP02"            /*COPY*/
+     END                                                                /*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBTOP RHELP02"                           /*COPY*/
+     ZTDMARK = CENTER("----> END of Help <----",80)                     /*COPY*/
+     ok='0 4 8';ADDRESS "ISPEXEC" "TBDISPL RHELP02 PANEL(RHELP02)"      /*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBCLOSE RHELP02"                         /*COPY*/
+  END                                                                   /*COPY*/
+                      /* Stay inside current EXEC or EXIT             *//*COPY*/
+IF ABBREV('RETURN',ExitOrReturn,3) THEN RETURN                          /*COPY*/
+   ELSE EXIT 0                                                          /*COPY*/
+/* COPY NPPARMS */
+/********************************************************************** /*COPY*/
+            Initialize and process Non-Positional Parms in a            /*COPY*/
+                method similar to that of CLISTs                        /*COPY*/
+    NOTE: If you use parentheses in the initizing of a NP-Parms, do     /*COPY*/
+          not follow any internal ')' with spaces!!                     /*COPY*/
+**********************************************************************/ /*COPY*/
+DO_NP_PARMS:                                                            /*COPY*/
+  VpList = ValidParms ' '; InList = InParms ' '                         /*COPY*/
+  ParmList = ''; ParmErrorList = ''                                     /*COPY*/
+                                                                        /*COPY*/
+  DO linx = 1 TO WORDS(ValidParms) UNTIL VpList = ''                    /*COPY*/
+     PARSE VALUE VpList WITH parm.linx '(' ParmVal.linx ') ' VpList     /*COPY*/
+     ParmList = ParmList STRIP(LEFT(parm.linx,MatchLength))             /*COPY*/
+  END                                                                   /*COPY*/
+  DO WHILE INDEX(InList, '(') > 0                                       /*COPY*/
+     PARSE VALUE InList WITH parm '(' value ') ' InList                 /*COPY*/
+     UPPER parm            /* Don't want to translate value to UPPER */ /*COPY*/
+     parm = STRIP(parm)                                                 /*COPY*/
+     ParmNumber = WORDPOS(STRIP(LEFT(parm,MatchLength)), ParmList)      /*COPY*/
+     IF ParmNumber > 0 THEN ParmVal.ParmNumber = value                  /*COPY*/
+     ELSE IF INDEX(value,")") > 0 THEN                                  /*COPY*/
+          ParmErrorList = ParmErrorList parm"("value                    /*COPY*/
+     ELSE ParmErrorList = ParmErrorList parm"("value")"                 /*COPY*/
+  END                                                                   /*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN ParmErrorList ¬= '' & AcceptAll = TRUE          THEN           /*COPY*/
+       AnythingElse = STRIP(InList) ParmErrorList                       /*COPY*/
+    WHEN ParmErrorList ¬= ''                             THEN DO        /*COPY*/
+       PARSE SOURCE . . rname .        /* Get REXX EXEC name          *//*COPY*/
+       CALL SET_MSG 'Invalid Parameter(s)',,                            /*COPY*/
+            "'"ParmErrorList"' not valid Parm(s) for" rname"!", "YES"   /*COPY*/
+       EXIT 8                                                           /*COPY*/
+      END                                                               /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+      AnythingElse = STRIP(InList)                                      /*COPY*/
+  END                                                                   /*COPY*/
+  DO ParmInx = 1 TO linx                                                /*COPY*/
+     SELECT                                                             /*COPY*/
+       WHEN ABBREV(ParmVal.ParmInx, "&")                 |,             /*COPY*/
+            ABBREV(ParmVal.ParmInx, "*")                 THEN           /*COPY*/
+           INTERPRET parm.ParmInx "= '"ParmVal.ParmInx"'"               /*COPY*/
+       WHEN DATATYPE(ParmVal.ParmInx, "NUM")             THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+       WHEN WORDPOS(ParmVal.ParmInx, "FALSE TRUE") > 0   THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+       WHEN (LEFT(ParmVal.ParmInx,1) = "'"               & ,            /*COPY*/
+             RIGHT(ParmVal.ParmInx,1) = "'")             | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,':') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'*') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'%') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'=') > 0               THEN           /*COPY*/
+           INTERPRET parm.ParmInx "= ParmVal."ParmInx                   /*COPY*/
+       WHEN INDEX(STRIP(ParmVal.ParmInx), " ") > 0       THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+     OTHERWISE                                                          /*COPY*/
+        ADDRESS "MVS" "SUBCOM TSO"                                      /*COPY*/
+        IF RC = 0 THEN TSO_avail = TRUE; ELSE TSO_avail = FALSE         /*COPY*/
+        PARSE VALUE ParmVal.ParmInx WITH PDS_name '(' rest              /*COPY*/
+        SELECT                                                          /*COPY*/
+          WHEN ¬(TSO_avail) | PDS_name = ""              THEN           /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+          WHEN SYSVAR("SYSNEST") = 'YES'                 THEN           /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+          WHEN (INDEX(rest, ")") > 0                     &,             /*COPY*/
+               (ABBREV(rest, "+") | ABBREV(rest,"-")     |,             /*COPY*/
+                ABBREV(rest, "0)")))                     THEN           /*COPY*/
+              INTERPRET parm.ParmInx "= '"ParmVal.ParmInx"'"            /*COPY*/
+          WHEN (LISTDSI(ParmVal.ParmInx)           <= 4  | ,            /*COPY*/
+                LISTDSI("'"ParmVal.ParmInx"'")     <= 4  | ,            /*COPY*/
+                LISTDSI("'"PDS_name"'")            <= 4  | ,            /*COPY*/
+                LISTDSI(PDS_name)                  <= 4) THEN           /*COPY*/
+              INTERPRET parm.ParmInx "= ParmVal."ParmInx                /*COPY*/
+        OTHERWISE                                                       /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+        END                                                             /*COPY*/
+     END                                                                /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY SETMSG */                                                       /*COPY*/
+/********************************************************************** /*COPY*/
+              Error with DSN, Use ISPF to display Error Message         /*COPY*/
+***********************************************************************//*COPY*/
+SET_MSG: PROCEDURE                                                      /*COPY*/
+PARSE ARG ZERRSM, ZERRLM, ZERRALRM, ZERRHM, ZERRTP, ZERRWN .            /*COPY*/
+  ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"                                 /*COPY*/
+  SELECT                                                                /*COPY*/
+   WHEN RC ¬= 0                   THEN DO                               /*COPY*/
+      SAY ''; SAY ZERRSM ; SAY ZERRLM; SAY ''                           /*COPY*/
+    END                                                                 /*COPY*/
+   WHEN SYSVAR("SYSNEST") = 'YES' &,                                    /*COPY*/
+        SYSVAR('SYSENV') = 'BACK' THEN DO                               /*COPY*/
+      SAY ''; SAY ZERRSM ; SAY ZERRLM; SAY ''                           /*COPY*/
+    END                                                                 /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+      IF ABBREV('YES', ZERRALRM, 1) THEN ZERRALRM = 'YES'               /*COPY*/
+         ELSE ZERRALRM = 'NO'                                           /*COPY*/
+      IF ZERRHM    = ''    THEN ZERRHM   = 'ISR2MACR'                   /*COPY*/
+      ok='0';ADDRESS "ISPEXEC" "SETMSG MSG(ISRZ003)"                    /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY SOCKMAIL */
+/* COPY MAILCNTL */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+     Read eMail Header and Control information,then parse it, and       /*COPY*/
+           build stings for SMTP Header commands.                       /*COPY*/
+                                                                        /*COPY*/
+  The structure of the em. STEM Varaible used here and passed via the   /*COPY*/
+      STEMPUSH & STEMPULL REXX Functions.                               /*COPY*/
+    em. = ""                                                            /*COPY*/
+    em.hdr.to.0 = 0; em.hdr.cc.0 = 0; em.hdr.bc.0 = 0; em.hdr.rep.0 = 0 /*COPY*/
+    em.hdr.to.# = Ý<email@domain> | name <email@domain>¨                /*COPY*/
+    em.hdr.cc.# = Ý<email@domain> | name <email@domain>¨                /*COPY*/
+    em.hdr.bc.# = Ý<email@domain> | name <email@domain>¨                /*COPY*/
+    em.hdr.fm   = Ý<email@domain> | name <email@domain>¨                /*COPY*/
+    em.hdr.sub  = ""               /* Email Subject line              *//*COPY*/
+    em.hdr.com  = ""               /* Hidden Header comment           *//*COPY*/
+    em.hdr.imp  = ÝN | H | L¨      /* Email Importance                *//*COPY*/
+    em.hdr.rec  = email@domain     /* SMTP Received from address      *//*COPY*/
+    em.hdr.rep.# = Ý<email@domain> | name <email@domain>¨ /* Reply-To *//*COPY*/
+    em.atch.0     = #              /* Number of attachments           *//*COPY*/
+    em.atch.#.dat = ""             /* Attachment file date (optional) *//*COPY*/
+    em.atch.#.fnm = ""             /* Attachment filename             *//*COPY*/
+    em.atch.#.typ = ÝPLAIN | OCTET-STREAM | INLINE | BASE64¨            /*COPY*/
+    em.body.0   = #                /* Number of records in email body *//*COPY*/
+***********************************************************************//*COPY*/
+GET_EMAIL_CNTL:                                                         /*COPY*/
+  ok_to = "postmaster POSTMASTER MAILER-DAEMON"                         /*COPY*/
+  crlf = X2C("0D25"); tab = X2C("05")                                   /*COPY*/
+  dte = LEFT(DATE("W"),3)"," DATE("N") TIME("N")                        /*COPY*/
+  _os_ = MVSVAR("SYMDEF","LHHMMSS") - MVSVAR("SYMDEF","HHMMSS")         /*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN LENGTH(_os_) = 5 THEN dte = dte "+0"LEFT(_os_,3)               /*COPY*/
+    WHEN LENGTH(_os_) = 7 THEN dte = dte LEFT(_os_,5)                   /*COPY*/
+    WHEN ABBREV(_os_,"-") THEN dte = dte "-0"SUBSTR(_os_,2,3)           /*COPY*/
+  OTHERWISE;                   dte = dte "+"LEFT(_os_,4); END           /*COPY*/
+  mid = SUBSTR(letters,RANDOM(51)+1,1)||DATE("B") ,                     /*COPY*/
+     || SUBSTR(letters,RANDOM(51)+1,1)            ,                     /*COPY*/
+     || SUBSTR(letters,RANDOM(51)+1,1)            ,                     /*COPY*/
+     || SUBSTR(letters,RANDOM(51)+1,1)            ,                     /*COPY*/
+     || SUBSTR(letters,RANDOM(51)+1,1)||TIME("S")                       /*COPY*/
+  PARSE SOURCE . . rname .               /* Get REXX EXEC name        *//*COPY*/
+  jname = MVSVAR("SYMDEF","JOBNAME")     /* Get Job Name              *//*COPY*/
+  mbound = "USER="SYSUID";JOB="jname";REXX="rname";"mid                 /*COPY*/
+  em. = ""; em.atch.0 = 0; em.body.0 = 0                                /*COPY*/
+  em.hdr.to.0 = 0; em.hdr.cc.0 = 0; em.hdr.bc.0 = 0; em.hdr.rep.0 = 0   /*COPY*/
+                                                                        /*COPY*/
+  IF TOKEN = "" THEN DO                                                 /*COPY*/
+    ADDRESS "MVS" "EXECIO * DISKR EMCNTL (STEM _emcntl_. FINIS"         /*COPY*/
+    DO i = 1 TO _emcntl_.0                                              /*COPY*/
+       PARSE VALUE _emcntl_.i WITH keyword ": " _rest_                  /*COPY*/
+       UPPER keyword; _rest_ = STRIP(_rest_)                            /*COPY*/
+       SELECT                                                           /*COPY*/
+         WHEN ABBREV(keyword,"*")        THEN ITERATE i                 /*COPY*/
+         WHEN ABBREV(keyword,"TO")       THEN DO                        /*COPY*/
+            k = 1 + em.hdr.to.0; em.hdr.to.0 = k                        /*COPY*/
+            SELECT                                                      /*COPY*/
+              WHEN WORDPOS(_rest_,ok_to) THEN em.hdr.to.k = _rest_      /*COPY*/
+              WHEN ABBREV(_rest_,"<")    THEN em.hdr.to.k = _rest_      /*COPY*/
+              WHEN INDEX(_rest_,"@") > 0 THEN em.hdr.to.k = "<"_rest_">"/*COPY*/
+            OTHERWISE; em.hdr.to.k = "<"_rest_||EM_DOM">"; END          /*COPY*/
+           END                                                          /*COPY*/
+         WHEN ABBREV(keyword,"CC")       THEN DO                        /*COPY*/
+            k = 1 + em.hdr.cc.0; em.hdr.cc.0 = k                        /*COPY*/
+            SELECT                                                      /*COPY*/
+              WHEN ABBREV(_rest_,"<")    THEN em.hdr.cc.k = _rest_      /*COPY*/
+              WHEN INDEX(_rest_,"@") > 0 THEN em.hdr.cc.k = "<"_rest_">"/*COPY*/
+            OTHERWISE; em.hdr.cc.k = "<"_rest_||EM_DOM">"; END          /*COPY*/
+           END                                                          /*COPY*/
+         WHEN ABBREV(keyword,"BCC")      THEN DO                        /*COPY*/
+            k = 1 + em.hdr.bc.0; em.hdr.bc.0 = k                        /*COPY*/
+            SELECT                                                      /*COPY*/
+              WHEN ABBREV(_rest_,"<")    THEN em.hdr.bc.k = _rest_      /*COPY*/
+              WHEN INDEX(_rest_,"@") > 0 THEN em.hdr.bc.k = "<"_rest_">"/*COPY*/
+            OTHERWISE; em.hdr.bc.k = "<"_rest_||EM_DOM">"; END          /*COPY*/
+           END                                                          /*COPY*/
+         WHEN ABBREV(keyword,"FROM")     THEN SELECT                    /*COPY*/
+             WHEN ABBREV(_rest_, "<")    THEN em.hdr.fm = _rest_        /*COPY*/
+             WHEN ABBREV(_rest_, "'")    THEN em.hdr.fm = _rest_        /*COPY*/
+             WHEN INDEX(_rest_, "@") > 0 THEN em.hdr.fm = "<"_rest_">"  /*COPY*/
+           OTHERWISE; em.hdr.fm = "<"_rest_||EM_DOM">"; END             /*COPY*/
+         WHEN ABBREV(keyword,"RECEIVED") THEN DO                        /*COPY*/
+             PARSE VALUE _rest_ WITH sid "@" domain .                   /*COPY*/
+             IF domain = "" THEN domain = EM_DOM                        /*COPY*/
+             em.hdr.ret = STRIP(sid"@"domain)                           /*COPY*/
+             em.hdr.rec = "From" sid "at" domain "with SMTP id",        /*COPY*/
+                          mid";"crlf||tab dte                           /*COPY*/
+           END                                                          /*COPY*/
+         WHEN ABBREV(keyword,"REPLY")    THEN DO                        /*COPY*/
+            k = 1 + em.hdr.rep.0; em.hdr.rep.0 = k                      /*COPY*/
+            SELECT                                                      /*COPY*/
+              WHEN ABBREV(_rest_,"<")    THEN em.hdr.rep.k=_rest_       /*COPY*/
+              WHEN INDEX(_rest_,"@") > 0 THEN em.hdr.rep.k="<"_rest_">" /*COPY*/
+            OTHERWISE; em.hdr.rep.k = "<"_rest_||EM_DOM">"; END         /*COPY*/
+           END                                                          /*COPY*/
+         WHEN ABBREV(keyword,"SUBJECT")  THEN em.hdr.sub = STRIP(_rest_)/*COPY*/
+         WHEN ABBREV(keyword,"COMMENT")  THEN em.hdr.com = _rest_       /*COPY*/
+         WHEN ABBREV(keyword,"IMPORT")   &,                             /*COPY*/
+              em.hdr.imp = ""            THEN em.hdr.imp = _rest_       /*COPY*/
+         WHEN ABBREV(keyword,"ATTACH")   THEN DO                        /*COPY*/
+             k = 1 + em.atch.0; em.atch.0 = k                           /*COPY*/
+             PARSE UPPER VALUE _rest_ WITH em.atch.k.dd em.atch.k.typ . /*COPY*/
+             em.atch.k.fnm = WORD(_rest_,3)                             /*COPY*/
+           END                                                          /*COPY*/
+       OTHERWISE; NOP; END                                              /*COPY*/
+    END                                                                 /*COPY*/
+  END                                                                   /*COPY*/
+  ELSE DO                                                               /*COPY*/
+     rc = STEMPULL(TOKEN,"DELETE")                                      /*COPY*/
+     IF em.hdr.rec ¬= "" THEN DO                                        /*COPY*/
+        IF INDEX(em.hdr.rec, "@") > 0 THEN                              /*COPY*/
+                 PARSE VALUE em.hdr.rec WITH sid "@" domain .           /*COPY*/
+        ELSE DO; sid = em.hdr.rec; domain = EM_DOM; END                 /*COPY*/
+        em.hdr.ret = em.hdr.rec                                         /*COPY*/
+        em.hdr.rec = "From" sid "at" domain "with SMTP id",             /*COPY*/
+                     mid";"crlf||tab dte                                /*COPY*/
+     END                                                                /*COPY*/
+  END                                                                   /*COPY*/
+  SELECT                           /* Set email importance level      *//*COPY*/
+    WHEN ABBREV(em.hdr.imp, "N") THEN em.hdr.imp = "Normal"             /*COPY*/
+    WHEN ABBREV(em.hdr.imp, "H") THEN em.hdr.imp = "High"               /*COPY*/
+    WHEN ABBREV(em.hdr.imp, "L") THEN em.hdr.imp = "Low"                /*COPY*/
+  OTHERWISE; em.hdr.imp = "Normal"; END                                 /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY MAILBODY */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+      Read in and then Send eMail Body using inline MIME format.        /*COPY*/
+***********************************************************************//*COPY*/
+EMAIL_BODY:                                  /* Get eMail Body        *//*COPY*/
+  IF TOKEN = "" THEN                                                    /*COPY*/
+     ADDRESS "MVS" "EXECIO * DISKR EMBODY (STEM em.body. FINIS"         /*COPY*/
+  IF em.body.0 = 0 THEN RETURN               /* No body to add        *//*COPY*/
+                                             /* Add body MIME Header  *//*COPY*/
+  sm = SOCKET("WRITE",_sid,crlf||'--'mbound||crlf)                      /*COPY*/
+  IF ABBREV(SYMBOL("EM_TYPE"),"VAR") & ABBREV(EM_TYPE,"HTML") THEN      /*COPY*/
+       sm = SOCKET("WRITE",_sid,'Content-Type: text/html;',             /*COPY*/
+                                'charset="ISO-8859-1"'crlf)             /*COPY*/
+  ELSE sm = SOCKET("WRITE",_sid,'Content-Type: text/plain;',            /*COPY*/
+                                'charset="ISO-8859-1"'crlf)             /*COPY*/
+  sm = SOCKET("WRITE",_sid,'Content-Transfer-Encoding: 7bit'crlf||crlf) /*COPY*/
+  /* Add eMail Body Text                                              *//*COPY*/
+  DO i = 1 TO em.body.0; sm = SOCKET("WRITE",_sid,em.body.i||crlf); END /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY MAILATCH */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+ Read any MIME Attachments identified in the EMCNTL, set MIME Header,   /*COPY*/
+      ENCODE when necessary, and then write as MIME Attachment.         /*COPY*/
+***********************************************************************//*COPY*/
+EMAIL_ATTACHMENTS:                                                      /*COPY*/
+  DO k = 1 TO em.atch.0                                                 /*COPY*/
+      IF TOKEN = "" THEN ADDRESS "MVS",                                 /*COPY*/
+         "EXECIO * DISKR" em.atch.k.dd "(STEM em.atch."k". FINIS"       /*COPY*/
+      IF em.atch.k.0 = 0    THEN ITERATE k  /* Empty Attachement      *//*COPY*/
+      IF em.atch.k.dat = "" THEN em.atch.k.dat = dte                    /*COPY*/
+      SELECT                                /* Add MIME Type info     *//*COPY*/
+        WHEN ABBREV("PLAIN", em.atch.k.typ) THEN DO                     /*COPY*/
+           MimeHeader = crlf'--'mbound || crlf,                         /*COPY*/
+              ||'Content-Type: text/plain; name="'em.atch.k.fnm'"'crlf, /*COPY*/
+              ||'Content-Disposition: attachment; ',                    /*COPY*/
+              ||        'filename="'em.atch.k.fnm'"; ',                 /*COPY*/
+              ||        'modification-date="'em.atch.k.dat'"'crlf,      /*COPY*/
+              ||'Content-Transfer-Encoding: 7bit'crlf                   /*COPY*/
+           sm = SOCKET("WRITE",_sid,MimeHeader||crlf)                   /*COPY*/
+           DO j = 1 TO em.atch.k.0          /* Add Attachment file    *//*COPY*/
+              sm = SOCKET("WRITE",_sid,em.atch.k.j||crlf)               /*COPY*/
+           END                                                          /*COPY*/
+          END                                                           /*COPY*/
+        WHEN ABBREV("HTML", em.atch.k.typ)  THEN DO                     /*COPY*/
+           MimeHeader = crlf'--'mbound || crlf,                         /*COPY*/
+              ||'Content-Type: text/html; name="'em.atch.k.fnm'"'crlf,  /*COPY*/
+              ||'Content-Disposition: attachment; ',                    /*COPY*/
+              ||        'filename="'em.atch.k.fnm'"; ',                 /*COPY*/
+              ||        'modification-date="'em.atch.k.dat'"'crlf,      /*COPY*/
+              ||        'charset=iso-8859-1'crlf                        /*COPY*/
+           sm = SOCKET("WRITE",_sid,MimeHeader||crlf)                   /*COPY*/
+           DO j = 1 TO em.atch.k.0          /* Add Attachment file    *//*COPY*/
+              sm = SOCKET("WRITE",_sid,em.atch.k.j||crlf)               /*COPY*/
+           END                                                          /*COPY*/
+          END                                                           /*COPY*/
+        WHEN ABBREV("OCTET-STREAM", em.atch.k.typ) THEN DO              /*COPY*/
+           MimeHeader = crlf'--'mbound || crlf,                         /*COPY*/
+              ||'Content-Type: application/octet-stream; ',             /*COPY*/
+              ||              'name="'em.atch.k.fnm'"'crlf,             /*COPY*/
+              ||'Content-Disposition: attachment; ',                    /*COPY*/
+              ||        'filename="'em.atch.k.fnm'"; ',                 /*COPY*/
+              ||        'modification-date="'em.atch.k.dat'"'crlf,      /*COPY*/
+              ||'Content-Transfer-Encoding: 7bit'crlf                   /*COPY*/
+           sm = SOCKET("WRITE",_sid,MimeHeader||crlf)                   /*COPY*/
+           DO j = 1 TO em.atch.k.0          /* Add Attachment         *//*COPY*/
+              sm = SOCKET("WRITE",_sid,em.atch.k.j||crlf)               /*COPY*/
+           END                                                          /*COPY*/
+          END                                                           /*COPY*/
+        WHEN k=1 & ABBREV("INLINE", em.atch.k.typ) THEN,                /*COPY*/
+          DO j = 1 TO em.atch.k.0                                       /*COPY*/
+            sm = SOCKET("WRITE",_sid,em.atch.k.j||crlf)                 /*COPY*/
+          END                                                           /*COPY*/
+        WHEN ABBREV("INLINE", em.atch.k.typ)       THEN DO              /*COPY*/
+           MimeHeader = crlf'--'mbound || crlf,                         /*COPY*/
+              ||'Content-Type: text/plain; charset="ISO-8859-1"'crlf,   /*COPY*/
+              ||'Content-Disposition: inline'crlf,                      /*COPY*/
+              ||'Content-Transfer-Encoding: 7bit'crlf                   /*COPY*/
+           sm = SOCKET("WRITE",_sid,MimeHeader||crlf)                   /*COPY*/
+           DO j = 1 TO em.atch.k.0          /* Add Inline file        *//*COPY*/
+              sm = SOCKET("WRITE",_sid,em.atch.k.j||crlf)               /*COPY*/
+           END                                                          /*COPY*/
+          END                                                           /*COPY*/
+      OTHERWISE   /* ENCODE64 CBT Rexx Function must be available     *//*COPY*/
+         MimeHeader = crlf'--'mbound || crlf,                           /*COPY*/
+            ||'Content-Type: application/octet-stream; ',               /*COPY*/
+            ||              'name="'em.atch.k.fnm'"'crlf,               /*COPY*/
+            ||'Content-Disposition: attachment; ',                      /*COPY*/
+            ||        'filename="'em.atch.k.fnm'"; ',                   /*COPY*/
+            ||        'modification-date="'em.atch.k.dat'"'crlf,        /*COPY*/
+            ||'Content-Transfer-Encoding: base64'crlf                   /*COPY*/
+         sm = SOCKET("WRITE",_sid,MimeHeader||crlf)                     /*COPY*/
+         x = ENCODE64("em.atch.k.","_atch_64.")  /* Convert to Base64 *//*COPY*/
+         DO j = 1 TO _atch_64.0                  /* Add ENCODEd file  *//*COPY*/
+            sm = SOCKET("WRITE",_sid,_atch_64.j||crlf)                  /*COPY*/
+         END                                                            /*COPY*/
+      END                                                               /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY MAILSOCK */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+      Initialize Socket and get necessary info from TCP/IP Stack.       /*COPY*/
+***********************************************************************//*COPY*/
+INIT_SMTP_SOCKET:                                                       /*COPY*/
+  sm = SOCKET("INITIALIZE","SMTP01")       /* Init RXSOCKET API       *//*COPY*/
+    IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "INITIALIZE", sm          /*COPY*/
+  sm = SOCKET("SOCKET","AF_INET","STREAM") /* Init IP4 TCP Socket     *//*COPY*/
+    IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "SOCKET", sm              /*COPY*/
+       ELSE _sid = WORD(sm,2)                                           /*COPY*/
+  sm = SOCKET("GETHOSTNAME")               /* Get HOSTNAME            *//*COPY*/
+    IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "GETHOSTNAME", sm         /*COPY*/
+       ELSE HOSTNAME = WORD(sm,2)                                       /*COPY*/
+  sm = SOCKET("GETDOMAINNAME")             /* Get Domain              *//*COPY*/
+    IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "GETDOMAINNAME", sm       /*COPY*/
+       ELSE DOMAINNAME = WORD(sm,2)                                     /*COPY*/
+  IF ABBREV("DEFAULT", SERVER) & ¬(DATATYPE(PORT, "NUM")) THEN DO       /*COPY*/
+      sm = SOCKET("GETSERVBYNAME", "SMTP") /* Get local SMTP Port     *//*COPY*/
+         IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "GETSERVBYNAME", sm  /*COPY*/
+            ELSE PORT = WORD(sm,3)                                      /*COPY*/
+    END                                                                 /*COPY*/
+  ELSE IF ABBREV("DEFAULT",PORT) THEN PORT = 25                         /*COPY*/
+                                           /* Translate to ASCII      *//*COPY*/
+  sm = SOCKET("SETSOCKOPT",_sid,"SOL_SOCKET","SO_ASCII","ON")           /*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "SETSOCKOPT", sm         /*COPY*/
+                                           /* Connect to SMTP Server  *//*COPY*/
+  IF ABBREV("DEFAULT", SERVER) THEN SERVER = HOSTNAME"."DOMAINNAME      /*COPY*/
+  sm = SOCKET("CONNECT",_sid,"AF_INET" PORT SERVER)                     /*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "CONNECT", sm            /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+      Connect to SMTP Server and Send SMTP Header control commands.     /*COPY*/
+***********************************************************************//*COPY*/
+EMAIL_HEADER:                                                           /*COPY*/
+  sm = SOCKET("WRITE",_sid,"HELO" SERVER||crlf) /* Start SMTP Session *//*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm              /*COPY*/
+     ELSE DO                                                            /*COPY*/
+        sm = SOCKET("READ",_sid)                                        /*COPY*/
+        IF WORD(sm,3) ¬= "220" THEN                                     /*COPY*/
+           CALL SOCKET_ERR "HELO" SERVER, WORD(sm,3) sm                 /*COPY*/
+     END                                     /* Set SMTP From:        *//*COPY*/
+  PARSE VALUE em.hdr.fm WITH . "<" _from_ ">" .                         /*COPY*/
+  sm = SOCKET("WRITE",_sid, "MAIL FROM: <"_from_">"crlf)                /*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm              /*COPY*/
+     ELSE DO                                                            /*COPY*/
+        sm = SOCKET("READ",_sid)                                        /*COPY*/
+        IF WORD(sm,3) ¬= "250" THEN                                     /*COPY*/
+           CALL SOCKET_ERR "MAIL FROM:", WORD(sm,3) sm                  /*COPY*/
+     END                                                                /*COPY*/
+  DO i = 1 TO em.hdr.to.0                    /* eMail TO: Addresses   *//*COPY*/
+      PARSE VALUE em.hdr.to.i WITH . "<" _to_ ">" .                     /*COPY*/
+      sm = SOCKET("WRITE",_sid, "RCPT TO: <"_to_">"crlf)                /*COPY*/
+      IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm             /*COPY*/
+      ELSE DO                                                           /*COPY*/
+         sm = SOCKET("READ",_sid)                                       /*COPY*/
+         IF WORDPOS(WORD(sm,3), "250 251") = 0 THEN                     /*COPY*/
+            CALL SOCKET_ERR "RCPT TO:" em.hdr.to.i, WORD(sm,3) sm       /*COPY*/
+      END                                                               /*COPY*/
+  END                                                                   /*COPY*/
+  DO i = 1 TO em.hdr.cc.0                    /* eMail CC: Addresses   *//*COPY*/
+      PARSE VALUE em.hdr.cc.i WITH . "<" _cc_ ">" .                     /*COPY*/
+      sm = SOCKET("WRITE",_sid, "RCPT TO: <"_cc_">"crlf)                /*COPY*/
+      IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm             /*COPY*/
+      ELSE DO                                                           /*COPY*/
+         sm = SOCKET("READ",_sid)                                       /*COPY*/
+         IF WORDPOS(WORD(sm,3), "250 251") = 0 THEN                     /*COPY*/
+            CALL SOCKET_ERR "RCPT TO:" em.hdr.cc.i, WORD(sm,3) sm       /*COPY*/
+      END                                                               /*COPY*/
+  END                                                                   /*COPY*/
+  DO i = 1 TO em.hdr.bc.0                    /* eMail BCC: Addresses  *//*COPY*/
+      PARSE VALUE em.hdr.bc.i WITH . "<" _bc_ ">" .                     /*COPY*/
+      sm = SOCKET("WRITE",_sid, "RCPT TO: <"_bc_">"crlf)                /*COPY*/
+      IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm             /*COPY*/
+      ELSE DO                                                           /*COPY*/
+         sm = SOCKET("READ",_sid)                                       /*COPY*/
+         IF WORDPOS(WORD(sm,3), "250 251") = 0 THEN                     /*COPY*/
+            CALL SOCKET_ERR "RCPT TO:" em.hdr.bc.i, WORD(sm,3) sm       /*COPY*/
+      END                                                               /*COPY*/
+  END                                        /* End SMTP Header       *//*COPY*/
+  sm = SOCKET("WRITE",_sid, "DATA"||crlf)                               /*COPY*/
+  IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm                 /*COPY*/
+  ELSE DO                                                               /*COPY*/
+     sm = SOCKET("READ",_sid)                                           /*COPY*/
+     IF WORDPOS(WORD(sm,3), "250 354") = 0 THEN                         /*COPY*/
+        CALL SOCKET_ERR "DATA", WORD(sm,3) sm                           /*COPY*/
+  END                                                                   /*COPY*/
+  IF em.hdr.rec ¬= ""   THEN DO              /* Start eMail Headers   *//*COPY*/
+       sm = SOCKET("WRITE",_sid, "Received:" em.hdr.rec||crlf)          /*COPY*/
+       sm = SOCKET("WRITE",_sid, "Date:" dte||crlf)                     /*COPY*/
+       PARSE VALUE TIME("S") WITH hh ":" mm ":" ss .                    /*COPY*/
+       sm = SOCKET("WRITE",_sid, "Message-ID:",                         /*COPY*/
+                    DATE("S")||hh||mm||ss"."mid||EM_DOM||crlf)          /*COPY*/
+    END                                                                 /*COPY*/
+  ELSE sm = SOCKET("WRITE",_sid, "Date:" dte||crlf)                     /*COPY*/
+  sm = SOCKET("WRITE",_sid, "From:" em.hdr.fm||crlf)                    /*COPY*/
+  IF em.hdr.rep ¬= "" THEN                                              /*COPY*/
+     sm = SOCKET("WRITE",_sid, "Reply-to:" em.hdr.rep  ||crlf)          /*COPY*/
+  ELSE DO i = 1 TO em.hdr.rep.0                                         /*COPY*/
+     sm = SOCKET("WRITE",_sid, "Reply-to:" em.hdr.rep.i||crlf)          /*COPY*/
+  END                                                                   /*COPY*/
+  DO i = 1 TO em.hdr.to.0                                               /*COPY*/
+     sm = SOCKET("WRITE",_sid,"To:" em.hdr.to.i||crlf)                  /*COPY*/
+  END                                                                   /*COPY*/
+  DO i = 1 TO em.hdr.cc.0                                               /*COPY*/
+     sm = SOCKET("WRITE",_sid,"Cc:" em.hdr.cc.i||crlf)                  /*COPY*/
+  END                                                                   /*COPY*/
+  IF em.hdr.sub ¬= "" THEN                                              /*COPY*/
+       sm = SOCKET("WRITE",_sid, "Subject:" em.hdr.sub||crlf)           /*COPY*/
+  IF em.hdr.com ¬= "" THEN                   /* eMail Header Comment  *//*COPY*/
+       sm = SOCKET("WRITE",_sid, "Comment:" em.hdr.com||crlf)           /*COPY*/
+  sm = SOCKET("WRITE",_sid, "Importance:" em.hdr.imp||crlf)             /*COPY*/
+                                             /* This will use MIME    *//*COPY*/
+  sm = SOCKET("WRITE",_sid, "MIME-Version: 1.0"crlf)                    /*COPY*/
+  sm = SOCKET("WRITE",_sid, "Content-Type: multipart/mixed;",           /*COPY*/
+                            'boundary="'mbound'"'crlf)                  /*COPY*/
+  IF em.hdr.ret ¬= "" THEN                   /* Return-Path           *//*COPY*/
+       sm = SOCKET("WRITE",_sid, "Return-Path:" em.hdr.ret||crlf)       /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+      Send End-of-MIME indicater, SMTP End-of-Message indicator,        /*COPY*/
+      and then close SMTP session.                                      /*COPY*/
+***********************************************************************//*COPY*/
+CLOSE_eMail:                                                            /*COPY*/
+  IF (em.body.0 + em.atch.0) > 0 THEN sm =,                             /*COPY*/
+       SOCKET("WRITE",_sid, crlf||"--"mbound"--"||crlf)                 /*COPY*/
+  sm = SOCKET("WRITE",_sid, crlf"."crlf)     /* SMTP End of Message   *//*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "WRITE", sm              /*COPY*/
+     ELSE DO                                                            /*COPY*/
+        sm = SOCKET("READ",_sid)                                        /*COPY*/
+        IF ¬(ABBREV(sm,"0")) & WORD(sm,3) = "250" THEN                  /*COPY*/
+             CALL SOCKET_ERR "SENDMAIL", sm                             /*COPY*/
+        ELSE CALL SET_MSG "eMail Sent.", sm,"NO"                        /*COPY*/
+     END                                                                /*COPY*/
+  sm = SOCKET("WRITE",_sid, "RSET"crlf)                                 /*COPY*/
+  sm = SOCKET("READ",_sid)                                              /*COPY*/
+  sm = SOCKET("WRITE",_sid, "QUIT"crlf)      /* Complete SMTP Session *//*COPY*/
+  sm = SOCKET("READ",_sid)                                              /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+      Close and Terminate Socket connection.                            /*COPY*/
+***********************************************************************//*COPY*/
+CLOSE_SMTP_SOCKET:                                                      /*COPY*/
+  sm = SOCKET("CLOSE", _sid)                 /* Disconnect Socket     *//*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "CLOSE", sm              /*COPY*/
+  sm = SOCKET("TERMINATE", "SMTP01")         /* End RXSOCKET API      *//*COPY*/
+     IF ¬(ABBREV(sm,"0")) THEN CALL SOCKET_ERR "TERMINATE", sm          /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+    Report RXSOCKET Error and then fall through to CLEANUP              /*COPY*/
+***********************************************************************//*COPY*/
+SOCKET_ERR:                                                             /*COPY*/
+ARG _type_, ExitError _msg_                                             /*COPY*/
+  DO eline = sigl-1 TO 1 BY -1                                          /*COPY*/
+     IF INDEX(STRIP(SOURCELINE(eline)),"SOCKET(") > 0 THEN LEAVE eline  /*COPY*/
+  END                                                                   /*COPY*/
+  IF eline > 1 THEN line = STRIP(SOURCELINE(eline))                     /*COPY*/
+     ELSE           line = STRIP(SOURCELINE(sigl-1))                    /*COPY*/
+  CALL SET_MSG " Socket RC:" ExitError, _type_ "Error:" _msg_, "YES"    /*COPY*/
+  CALL SET_MSG "Error Line:" eline, line, "YES"                         /*COPY*/
+  sm = SOCKET("CLOSE", _sid)           /* Disconnect Socket           *//*COPY*/
+  sm = SOCKET("TERMINATE", "SMTP01")   /* End RXSOCKET API            *//*COPY*/
+EXIT ExitError                         /* Set TSO/MVS RC to error RC  *//*COPY*/
+/**********************************************************************
+            Cleanup and Exit Gracefully
+***********************************************************************/
+CLEANUP:
+  ok='*'                               /* Ignore all non-0 RCs        */
+    sm = SOCKET("CLOSE", _sid)         /* Disconnect Socket           */
+    sm = SOCKET("TERMINATE", "SMTP01") /* End RXSOCKET API            */
+EXIT ExitError                         /* Set TSO/MVS RC to error RC  */
+/* COPY ERRMVS */
+/********************************************************************** /*COPY*/
+      Error Handling procedure -- SHOULD BE LAST PROCEDURES IN REXX     /*COPY*/
+***********************************************************************//*COPY*/
+ERROR_PROC:                                                             /*COPY*/
+  IF (CONDITION('C') = 'ERROR') & (SYMBOL('OK') = 'VAR') THEN ,         /*COPY*/
+     IF (WORDPOS(RC, ok) > 0) | ok='*' THEN RETURN    /* Not an ERROR *//*COPY*/
+                                                                        /*COPY*/
+  TRACE("O")                        /* Turn off ERROR traps et.al.    *//*COPY*/
+  elineno = sigl                    /* Source line error occured in   *//*COPY*/
+  SIGNAL OFF SYNTAX                 /* ... all Error trapping OFF     *//*COPY*/
+  SIGNAL OFF NOVALUE                                                    /*COPY*/
+  CALL   OFF ERROR                                                      /*COPY*/
+                                                                        /*COPY*/
+  CALL GET_ERROR_INFO               /* Get information about error    *//*COPY*/
+  CALL MVS_ERROR_DISPLAY            /* Display collected error info   *//*COPY*/
+                                                                        /*COPY*/
+  CALL ERROR_RESPONSE               /* EXEC dependent ERROR handling  *//*COPY*/
+  CALL CLEANUP                      /* Cleanup and EXIT gracefully    *//*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY ERRINFO  */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+      Get the information about the ERROR and format it                 /*COPY*/
+***********************************************************************//*COPY*/
+GET_ERROR_INFO:                                                         /*COPY*/
+  PARSE SOURCE . . erexx .          /* Get REXX EXEC name             *//*COPY*/
+  etype   = CONDITION('C')          /* Condition causing error        *//*COPY*/
+  sourcel = SOURCELINE(elineno)     /* Start getting error source line*//*COPY*/
+  IF INDEX(sourcel,'/*COPY*/') = 73 THEN sourcel = LEFT(sourcel,72)     /*COPY*/
+  sourcel = STRIP(sourcel)                                              /*COPY*/
+  DO e_i = 1 WHILE LASTPOS(',',sourcel) = LENGTH(sourcel)               /*COPY*/
+     nextl = SOURCELINE(elineno + e_i)                                  /*COPY*/
+     IF INDEX(nextl,'/*COPY*/') = 73 THEN nextl = LEFT(nextl,72)        /*COPY*/
+     sourcel = STRIP(sourcel,'T',',') STRIP(nextl)                      /*COPY*/
+  END                           /* END loop to handle continued lines *//*COPY*/
+  IF etype = 'SYNTAX' THEN DO                                           /*COPY*/
+     ecause  = ERRORTEXT(RC)       /* Brief description of error     */ /*COPY*/
+     expandl = "Can't INTERPRET source with SYNTAX errors!"             /*COPY*/
+    END                                                                 /*COPY*/
+  ELSE DO                                                               /*COPY*/
+     Lst = "ADDRESS CALL INTERPRET SAY"                                 /*COPY*/
+     ecause  = CONDITION('D')       /* Brief description of error     *//*COPY*/
+     FullLine = sourcel             /* Begin getting EXECuted source  *//*COPY*/
+     expandl = ""                                                       /*COPY*/
+     DO UNTIL FullLine = ''         /* loop to handle ';' in source   *//*COPY*/
+        PARSE VALUE FullLine WITH srcl ';' FullLine                     /*COPY*/
+        SELECT                                                          /*COPY*/
+          WHEN WORDPOS(WORD(srcl,1),Lst) > 0        THEN evals=srcl     /*COPY*/
+          WHEN WORDPOS(WORD(srcl,2),Lst) > 0        THEN evals=srcl     /*COPY*/
+          WHEN INDEX(srcl,"=")           > 1        THEN evals=srcl     /*COPY*/
+        OTHERWISE; evals = VALUE(srcl); END                             /*COPY*/
+        IF DATATYPE(evals, "NUM")                   THEN evals=srcl     /*COPY*/
+        expandl = expandl';' evals                                      /*COPY*/
+     END                                                                /*COPY*/
+     expandl = STRIP(STRIP(expandl,"L",";"))                            /*COPY*/
+  END                                                                   /*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN etype = 'ERROR' & SYMBOL('ZERRLM') = 'VAR' THEN                /*COPY*/
+          emsg = ZERRLM                                                 /*COPY*/
+    WHEN SYMBOL('SYSMSGLVL1') ¬= 'VAR'              THEN                /*COPY*/
+          emsg = 'No available ERROR description.'                      /*COPY*/
+    WHEN SYSMSGLVL1 = ""                            THEN                /*COPY*/
+          emsg = 'No available ERROR description.'                      /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+     IF SYMBOL('SYSMSGLVL2') = 'VAR'                THEN                /*COPY*/
+          emsg = SYSMSGLVL1 "--" SYSMSGLVL2                             /*COPY*/
+     ELSE emsg = SYSMSGLVL1                                             /*COPY*/
+  END                                                                   /*COPY*/
+  IF INDEX(emsg, "IN VARIABLE SYSREASON") > 0       THEN                /*COPY*/
+          emsg = "SYSREASON: '"SYSREASON"'"                             /*COPY*/
+  IF etype = 'NOVALUE' THEN ExitError = 4    /* Set EXIT error level  *//*COPY*/
+     ELSE ExitError = RC                                                /*COPY*/
+  erc = ExitError       /* Get all information about error            *//*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY MVSERROR */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+                 Output ERROR information to SYSPRINT                   /*COPY*/
+***********************************************************************//*COPY*/
+MVS_ERROR_DISPLAY:                                                      /*COPY*/
+  eresult. = "";eresult.0 = QUEUED() /* Get info currently on STACK   *//*COPY*/
+  DO eresult = 1 TO eresult.0; PARSE PULL eresult.eresult; END          /*COPY*/
+  ls = LINESIZE()                   /* How wide is the display?       *//*COPY*/
+  IF ls <= 80 THEN ls2 = ls; ELSE ls2 = ls - 30                         /*COPY*/
+  SAY ''                            /* Start SAYing error information *//*COPY*/
+  SAY  CENTER(CENTER(" An ERROR occurred in REXX '"erexx"' ",50,'*'),ls)/*COPY*/
+  SAY    CENTER(LEFT('          Error Type:' etype,80),ls)              /*COPY*/
+  SAY    CENTER(LEFT('         Error Cause:' ecause,80),ls)             /*COPY*/
+  SAY    CENTER(LEFT('                  RC:' erc,80),ls)                /*COPY*/
+  SAY    CENTER(LEFT('      Stack Contents:' eresult.1,80),ls)          /*COPY*/
+  DO eresults = 2 TO eresult.0                                          /*COPY*/
+     SAY CENTER(LEFT('                     ' eresult.eresults,80),ls)   /*COPY*/
+  END                                                                   /*COPY*/
+  SAY    CENTER(LEFT('         Source Line:' elineno,80),ls)            /*COPY*/
+  SAY           LEFT('   Error Description:' emsg,ls)                   /*COPY*/
+  SAY ''                                                                /*COPY*/
+  SAY           LEFT('Source line reads as:' sourcel,ls)                /*COPY*/
+  SAY ''                                                                /*COPY*/
+  SAY          LEFT('  Source EXECutes as:' expandl,ls)                 /*COPY*/
+  SAY CENTER(CENTER("      End of ERROR Reporting     ",50,'*'),ls)     /*COPY*/
+  SAY CENTER(CENTER("   Beginning of Error Handling   ",50,'*'),ls)     /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+        In case ERROR_RESPONSE and CLEANUP are not supplied             /*COPY*/
+   REXX allows Multiple PROCEDUREs with same name, but always uses      /*COPY*/
+   the first one found.  So, a REXX specific version of these can       /*COPY*/
+   be use writen if it is placed before ERROR_PROC.                     /*COPY*/
+***********************************************************************//*COPY*/
+ERROR_RESPONSE:                     /* Dummy ERROR_RESPONSE PROC      *//*COPY*/
+RETURN                                                                  /*COPY*/
+CLEANUP:                            /* Simple CLEANUP PROC            *//*COPY*/
+  ADDRESS "ISPEXEC" "FTCLOSE"       /* CLOSE File Tailoring FILE      *//*COPY*/
+EXIT ExitError                      /* EXIT with error return code    *//*COPY*/

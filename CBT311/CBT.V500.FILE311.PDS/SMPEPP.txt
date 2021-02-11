@@ -1,0 +1,1211 @@
+./ ADD NAME=$README  1200-98062-98062-2029-00027-00027-00000-DAVEA
+   The SMP/E Post-Processing ISPF application
+
+You would use the SMPEPP rexx exec to process the SMP/E output of an
+APPLY-Check.  This application makes it easier to view hold data for an
+APPLY before you run an APPLY with BYPASS.
+
+Contents:
+
+- REXX exec:
+  - SMPEPP.....This REXX exec
+  - SMPEPPB....Batch processing version
+
+- ISPF Panels:
+  - SMPEPPS....options settings
+  - SMPEPPST...tutorial for SMPEPPS
+  - SMPEPPW....Work in progress
+  - SMPEPPT....Table display of PTFs found
+  - SMPEPPTT...tutorial for SMPEPPT
+
+To use, invoke with SMPEPP as either a normal REXX exec or as an
+edit macro for the current edit dataset.  The SMPEPP exec can be used
+in SDSF when the job is selected with the "SE" line command.
+
+ Disclaimer: This package is FREEWARE.  Use at your own risk.  It
+             is provided for your enjoyment and neither David
+             Alcock or his employer provides any warranty for it's
+             use.  I'd like to hear how it works on your system.
+
+             This software is not in the public domain but is
+             available free of charge and with source code
+             provided.  It is copyright 1996-2002+ by David Alcock
+             All rights reserved.
+./ ADD NAME=SMPEPP   1200-98062-98062-2029-00717-00717-00000-DAVEA
+/* REXX
+ |
+ | Name: SMPEPP ... SMP/E Post-Processor
+ |
+ | Author: David Alcock :: dave@planetmvs.com
+ |
+ | Purpose: Process a SMP/E SMPOUT listing to aid in maintenance
+ |          investigation. The GIM42001W messages are processed and the
+ |          SMPPTS ++HOLD text is displayed. This allows the programmer
+ |          to easily see all of the hold information for faster
+ |          SMP/E PTF resolution.
+ |
+ | Note: This exec can work as a regular EXEC or an ISPF edit macro.
+ |       If invoked in ISPF EDIF mode as an edit macro (such as in
+ |       SDSF when the job is selected with a "SE"), this exec will
+ |       process the lines from the current edit session.
+ |
+ |
+ | This application consists of:
+ |
+ | - REXX exec:
+ |   - SMPEPP.....This REXX exec
+ |   - SMPEPPB....Batch processing version
+ | - Panels:
+ |   - SMPEPPS....options settings
+ |   - SMPEPPST...tutorial for SMPEPPS
+ |   - SMPEPPW....Work in progress
+ |   - SMPEPPT....Table display of PTFs found
+ |   - SMPEPPTT...tutorial for SMPEPPT
+ |
+ |
+ | Disclaimer: This REXX exec is FREEWARE.  Use at your own risk.  It
+ |             is provided for your enjoyment and neither David
+ |             Alcock or his employer provides any warranty for it's
+ |             use.  I'd like to hear how it works on your system.
+ |
+ |             This software is not in the public domain but is
+ |             available free of charge and with source code
+ |             provided.  It is copyright 1996-2002+ by David Alcock
+ |             All rights reserved.
+ */
+
+spp@ver = "v1.2"
+
+/* ================================================================= *
+ |
+ |           M o d i f i c a t i o n   H i s t o r y
+ |
+ | Person     Date        Description
+ | ---------- ----------- --------------------------------------------
+ | DGAlcock   03-MAR-1998 v1.2:
+ |                        - Added processing of message GIM35966I
+ |                          which is needed at OS/390 2.4 SMP/E and
+ |                          higher (thanks to Mike Theys for sending
+ |                          this to me!);
+ |                        - Added version number to panels;
+ |                        - Variable for SMFID on working panel was
+ |                          not being created by the exec;
+ |                        - Added capture of SMP level;
+ |                        - Corrected bug where last line was NOT
+ |                          being processed;
+ | DGAlcock   11-OCT-1996 Added batch submission; Added SMPCNTL
+ |                        statement creation;  Added edit macro
+ |                        invocation;
+ | DGAlcock   30-SEP-1995 Initial exec written;
+ * ================================================================= */
+
+
+   /* !!! The following statements are installation dependent !!! */
+
+parse source a b c d sppxlib .  /* Obtain execution lib name */
+if sppxlib == "?" then sppxlib = "ibmuser.EXEC"      /* Installation */
+
+temp_dsn_prefix = sysvar(sysuid)".SPFTEMP1.SMPEPP"   /* Installation */
+smpe_proclib    = "SYS2.SYS.MVS.PROCLIB"             /* Installation */
+
+/*********************************************************************
+* Figure out how we were invoked
+*********************************************************************/
+
+if address() <> "TSO" then do
+   say "%SMPEPP - must be executed under TSO"
+   exit 12
+   end
+
+if sysvar("SYSISPF") <> "ACTIVE" then do
+   arg options
+   address TSO "%SMPEPPB "options
+   exit 0
+   end
+
+
+dsntype = "n"   /* Normal */
+address ISREDIT "MACRO (PARMS) NOPROCESS"
+if rc <> 0 then do
+   ispfmode = "notem"
+   arg dsn
+   if dsn <> "" then ovdsn = dsn
+   else ovdsn = ""
+   end
+else do
+     ispfmode = "em"
+     address ISREDIT "(OVDSN) = DATASET"
+     address ISREDIT "(MEMBER) = MEMBER"
+     if member <> '' then ovdsn = "'"ovdsn||"("||member||")'"
+     else ovdsn = "'"ovdsn"'"
+     if ovdsn == "''" then do
+        ovdsn = "<Current Edit (EDIF)>"
+        dsntype = "e"   /* ABE-Normal: EDIF */
+        end
+     end
+
+/*********************************************************************
+ | Get SMFID (shown on "work in progress" screen
+ ********************************************************************/
+
+if sysvar(systsoe) > "2040" then ,             /* At v2.5 or higher? */
+   SPP@SMF = mvsvar(syssmfid)                  /* Yes, use IBM func  */
+else do
+     cvt    = storage(10,4)
+     dcvt   = c2d(cvt)
+     smca   = storage(c2x(d2c(dcvt+x2d(c5))),3)
+     dsmca  = c2d(smca)
+     SPP@SMF = storage(c2x(d2c(dsmca+x2d(10))),4)
+     end
+address ispexec "vput (SPP@SMF) shared"
+
+/*********************************************************************
+* Display options panel
+*********************************************************************/
+
+address ISPEXEC
+"VGET (SPPNUM SPPDSN SPPPTS SPPFILE SPPMODE" ,
+      "SPPJCL1 SPPJCL2 SPPJCL3 SPPJCL4) PROFILE"
+
+if sppdsn  == "" then sppdsn = "Your.SDSF.output(JOBNAME)"
+if spppts  == "" then spppts = "'SMPEPP.SMPPTS'"
+if sppnum  == "" then sppnum = "9999"
+
+select
+ when sppfile == "DELETE" then nop
+ when sppfile == "KEEP"   then nop
+ otherwise
+      sppfile = "DELETE"
+end /* of "select" */
+
+select
+ when sppmode == "F" then nop
+ when sppmode == "B" then nop
+ otherwise
+      sppmode = "F"     /* set to default type: F=Foreground */
+end /* of "select" */
+
+if dsntype = "n" then ,
+   if substr(sppdsn,1,1) == "<" then ,
+      sppdsn = "YOUR.SDSF.OUTPUT(JOBNAME)"
+
+if sppjcl1 == "" then sppjcl1 = "//"sysvar(sysuid)"S JOB (acct)"
+
+if ovdsn <> "" then sppdsn = ovdsn /* Get override datasetname */
+
+sppcur = "sppdsn"
+drc = 1
+do while drc <> 0
+
+   "DISPLAY PANEL(SMPEPPS) CURSOR("sppcur")"
+   drc = rc
+
+   if drc == 8 then do
+      zedsmsg = "Cancelled"
+      zedlmsg = "Processing of SMPOUT dataset cancelled, have a nice day"
+      "SETMSG MSG(ISRZ001)"
+      exit
+      end
+
+     y = LISTDSI(spppts)
+     if y <> 0 then do
+        zedsmsg = "SMPPTS Error"
+        zedlmsg = "Error with DSN: "spppts "-" y
+        "SETMSG MSG(ISRZ001)"
+        sppcur = "SPPPTS"
+        drc = 1
+        end
+     else do
+          if dsntype == "n" then do
+             x = LISTDSI(sppdsn)
+             if x <> 0 then do
+                zedsmsg = "SMPOUT Error"
+                zedlmsg = "Error with DSN: "sppdsn "-" y
+                "SETMSG MSG(ISRZ001)"
+                sppcur = "SPPDSN"
+                drc = 1
+                end
+             end
+          end
+     /* Note: we fall thru with this last LISTDSI used in next section */
+
+   end /* of "do while drc = 0" */
+
+sppmode = translate(sppmode)
+"VPUT (SPPNUM SPPDSN SPPPTS SPPFILE SPPMODE" ,
+      "SPPJCL1 SPPJCL2 SPPJCL3 SPPJCL4) PROFILE"
+
+/*********************************************************************
+* If we are an Edit Macro and have a EDIF dataset, then we need to
+* handle it
+*********************************************************************/
+if dsntype = "e" then do
+
+   address ISREDIT
+   'PROCESS RANGE S'
+   select
+     when rc = 0 then do
+          '(CMD) = RANGE_CMD'          /* Get the command    */
+          '(LINE1) = LINENUM .ZFRANGE' /* Get first in range */
+          '(LINE2) = LINENUM .ZLRANGE' /* Get last in range  */
+          end
+     when rc <= 4 then do /* No S or SS entered, use entire file     */
+          '(CMD) = RANGE_CMD'          /* Get the command    */
+          '(LINE1) = LINENUM .ZFIRST'  /* Get first in range */
+          '(LINE2) = LINENUM .ZLAST'   /* Get last in range  */
+          if (line2 - line1) > sppnum then line2 = line2 - sppnum
+          end
+     otherwise  /* Line command conflict - Edit will create message  */
+          exit 12
+   end /* of "select" */
+
+
+   if sppmode == "B" then do
+      function = "Copying SMPOUT from your Edit session"
+      address ISPEXEC "CONTROL DISPLAY LOCK"
+      address ISPEXEC "DISPLAY PANEL(SMPEPPW)"
+      smpout_bdd  = "SPP"random()
+      smpout_bdsn = "'"temp_dsn_prefix".SMPOUT.OFEDIF'"
+      address TSO
+      x = outtrap("XMSG.","*")
+      "DELETE "smpout_bdsn
+      x = outtrap("off")
+      "ALLOCATE FILE("smpout_bdd") DA("smpout_bdsn")",
+      "UNIT(SYSDA) NEW REUSE SPACE(15 15) TRACKS",
+      "LRECL(255) BLKSIZE(2550) RECFM(F B)"
+      newstack
+
+      address ISREDIT
+      do i = line2 to line1 by -1
+         '(LINEVAL) = LINE' i
+         push lineval
+         end
+      queue '' /* indicate end of file */
+      address TSO "EXECIO * DISKW "smpout_bdd" (FINIS"
+      address TSO "delstack"
+      address TSO "FREE FILE("smpout_bdd")"
+      sppdsn = smpout_bdsn
+      end
+
+   end
+/***********************************************************************
+* Create job to run the job in the background
+***********************************************************************/
+
+if sppmode == "B" then do
+   function = "Creating job"
+   address ISPEXEC "CONTROL DISPLAY LOCK"
+   address ISPEXEC "DISPLAY PANEL(SMPEPPW)"
+   /*
+   *** Create library for batch job JCL and insert job
+   */
+   address TSO
+   sppcdd  = "SPP"random()
+   sppclib = temp_dsn_prefix".JOB"
+   x = outtrap("XMSG.","*")
+   "DELETE '"sppclib"'"
+   x = outtrap("off")
+   "ALLOCATE FILE("sppcdd") DA('"sppclib"')",
+               "UNIT(SYSDA) NEW REUSE SPACE(5 5) TRACKS",
+               "LRECL(80) BLKSIZE(8800) RECFM(F B)"
+
+   "newstack"
+
+   push "//SMPCNTL  DD SYSOUT=*"
+   push "/*"
+   push "         " spppts
+   push " %SMPEPPB" sppdsn "+"
+   push "//SYSTSIN  DD *"
+   push "//SYSTSPRT DD SYSOUT=*"
+   push "//SYSEXEC  DD DISP=SHR,DSN="sppxlib
+   push "//JUSTDOIT EXEC PGM=IKJEFT01,TIME=1439,DYNAMNBR=100"
+   push "//*"
+   push "//** at" time()". It prints the hold data found for PTFs."
+   push "//** This job created by the SMPEPP application on" date()
+   push "//*"
+   if sppjcl4 <> "" then push sppjcl4
+   if sppjcl3 <> "" then push sppjcl3
+   if sppjcl2 <> "" then push sppjcl2
+   if sppjcl1 <> "" then push sppjcl1
+
+   queue ''      /* add null line to indicate End-Of-File */
+   "EXECIO * DISKW "sppcdd" (FINIS"
+   "DELSTACK"
+
+   address ISPEXEC
+   zedsmsg = ""
+   zedlmsg = "Verify this job and submit it or END to cancel"
+   "SETMSG MSG(ISRZ001)"
+
+   "EDIT DATASET('"sppclib"')"
+
+   x = outtrap("XMSG.","*")
+   address TSO "DELETE '"sppclib"'"
+   x = outtrap("off")
+
+   exit /* Terminate utility */
+   end
+
+/***********************************************************************
+* Read the input dataset into storage and create ISPF table
+***********************************************************************/
+
+function = "Reading SMPOUT"
+address ISPEXEC "CONTROL DISPLAY LOCK"        /* Lock the next screen */
+address ISPEXEC "DISPLAY PANEL(SMPEPPW)"      /* LOGO (in Progress)   */
+
+if dsntype = "e" then do
+   address ISREDIT
+   do i = line1 to line2
+      '(LINEVAL) = LINE' i
+      sppfile.i = lineval
+      end
+   sppfile.0 = (line2 - line1) + 1
+   end
+else do
+     smpout_dsn = sysdsname
+     parse value sppdsn with . "(" member ")" .
+     if member <> "" then do
+        smpout_dsn = smpout_dsn"("strip(member)")"
+        end
+
+     smpout_ddname = "SPP"random()
+
+     address TSO
+     "ALLOCATE FILE("smpout_ddname") DA('"smpout_dsn"') SHR REUSE"
+     "EXECIO "sppnum" DISKR "smpout_ddname" (FINIS STEM sppfile."
+     end
+
+table = "SPP"random()
+address ISPEXEC "TBCREATE "table ,
+        "NOWRITE NAMES(TYPES LAST) KEYS(MEMBER)"
+
+/*********************************************************************
+* Process the SMPOUT file and add entries into the table
+*********************************************************************/
+
+function = "Processing SMPOUT"
+address ISPEXEC "CONTROL DISPLAY LOCK"     /* Lock the next screen */
+address ISPEXEC "DISPLAY PANEL(SMPEPPW)"   /* LOGO (in Progress) */
+
+gim42001w_count = 0 /* Number of GIM42001W messages processed */
+spprc = "Not Found"
+gimlvl = "n/a"
+types = ""
+member = ""
+last = ""
+smpcntl.0 = 0
+csiname = "SMPE.GLOBAL.CSI"   /* Default to a name */
+
+do i = 1 to sppfile.0
+   select
+     when word(sppfile.i,1) == "GIM20502I" then do
+          parse value sppfile.i with . "RETURN CODE WAS" spprc "." .
+          parse value sppfile.i with . "LEVEL" vv "." rr "." .
+          gimlvl = vv"."rr
+          leave
+          end
+
+     when word(sppfile.i,1) == "GIM42001W" then do
+          gim42001w_count = gim42001w_count + 1
+
+          if member <> "" then do
+             types = strip(types)
+             address ISPEXEC "TBADD "table
+             types = ""
+
+             c = smpcntl.0
+             c = c + 1
+             smpcntl.0 = c
+             smpcntl.c = member
+             end
+
+          parse value sppfile.i with . "SYSMOD" member .
+          member = strip(member)
+          end
+
+     when word(sppfile.i,1) == "GIM35935I" then do
+          parse value sppfile.i with . "HOLD" type "WAS" .
+          types = types" "left(type,8)
+          end
+
+     when word(sppfile.i,1) == "GIM35966I" then do /* OS/390 v2r4 */
+         parse value sppfile.i with . "HOLD" type "ORIGINATED" .
+         types = types" "left(type,8)
+         end
+
+     when word(sppfile.i,1) == "SMPCSI" then do
+          if word(sppfile.i,2) == "PERM" then ,
+             csiname = word(sppfile.i,3)
+          end
+     otherwise
+          nop
+     end /* of "select" */
+
+   end /* of "do i = 1 to sppfile.0" */
+
+if member <> "" then do
+   types = strip(types)
+   address ISPEXEC "TBADD "table
+   c = smpcntl.0
+   c = c + 1
+   smpcntl.0 = c
+   smpcntl.c = member
+   end
+
+if gim42001w_count == 0 then do
+   zedsmsg = "No Action Items"
+   zedlmsg = "No GIM42001W messages in '"smpout_dsn"' - SMP RC:"spprc
+   if length(zedlmsg) > 78 then zedlmsg = substr(zedlmsg,1,78)
+   address ISPEXEC "SETMSG MSG(ISRZ001)"
+   address ISPEXEC "TBCLOSE "table" "
+   exit
+   end
+
+if spprc == "Not Found" then do
+   zedsmsg = ""
+   zedlmsg = "Warning: The SMPOUT processing number" ,
+             "may be too low: "sppnum
+   address ISPEXEC "SETMSG MSG(ISRZ001)"
+   end
+ else do
+      zedsmsg = "SMP RC="spprc
+      zedlmsg = "Processing of SMPOUT was successful"
+      address ISPEXEC "SETMSG MSG(ISRZ001)"
+      end
+
+/*********************************************************************
+*  Process the table for commands
+*********************************************************************/
+Process_Table:
+
+smppts_dsn = strip(spppts,"B","'")
+
+address ISPEXEC
+"vput (GIMLVL SPP@VER) shared"
+"TBTOP "table
+TSEL = ""
+NRC = 0
+do while NRC == 0
+   "TBDISPL "table" PANEL(SMPEPPT)"
+   NRC = rc
+   if NRC == 0 then do
+
+      verb = ""
+      if zcmd <> '' then do
+         parse value zcmd with verb " " action
+         zcmd = ''
+         select
+           when translate(verb) == 'SMPCNTL' then call generate_smpcntl
+           when translate(verb) == 'KEEP'    then do
+                if sppfile == "KEEP" then do
+                   zedsmsg = "Already Keep"
+                   zedlmsg = "The file disposition is already keep"
+                   "SETMSG MSG(ISRZ001)"
+                   end
+                else do
+                     sppfile = "KEEP"
+                     zedsmsg = "Set to KEEP"
+                     zedlmsg = "All new datasets created will be " ,
+                               "not deleted. (This session only)"
+                     "SETMSG MSG(ISRZ001)"
+                     end
+                end /* of "when translate(verb) == 'KEEP'" */
+           when translate(verb) == 'DELETE'  then do
+                if sppfile == "DELETE" then do
+                   zedsmsg = "Already DELETE"
+                   zedlmsg = "The file disposition is already DELETE"
+                   "SETMSG MSG(ISRZ001)"
+                   end
+                else do
+                     sppfile = "DELETE"
+                     zedsmsg = "Set to DELETE"
+                     zedlmsg = "All new datasets created will be",
+                               "deleted. (This session only)"
+                     "SETMSG MSG(ISRZ001)"
+                     end
+                end /* of "when translate(verb) == 'KEEP'" */
+           otherwise
+             ZEDSMSG = "Unknown verb"
+             ZEDLMSG = "Use: SMPCNTL"
+             "SETMSG MSG(ISRZ001)"
+         end /* of "select" */
+
+         end /* of "if zcmd <> ''" */
+
+      tsel = translate(tsel)
+      select
+        /**************************************************************
+        *  Handle situations where we did a zcmd thing
+        **************************************************************/
+        when verb <> "" then NOP
+        /**************************************************************
+        * The user just hit the enter key and nothing else...
+        **************************************************************/
+        when tsel == "" then NOP
+        /**************************************************************
+        *  Select the dataset and show only the HOLD stuff
+        **************************************************************/
+        when TSEL == 'S' then do
+             dsn = smppts_dsn"("member")"
+             last = "Show ++ HOLD"
+             call Process_Dataset
+             address ISPEXEC
+             "TBMOD "table
+             end
+        /**************************************************************
+        * Browse the dataset
+        **************************************************************/
+        when TSEL == 'B' then do
+             dsn = smppts_dsn"("member")"
+             call Browse_Dataset
+             last = "Browsed"
+             address ISPEXEC
+             "TBMOD "table
+             end
+        when TSEL == '/' then do
+             dsn = smppts_dsn"("member")"
+             call Browse_Dataset
+             last = "Browsed"
+             address ISPEXEC
+             "TBMOD "table
+             end
+        /**************************************************************
+        * specifed an incorrect option
+        **************************************************************/
+        when TSEL == '' then nop
+        /**************************************************************
+        * specifed an incorrect option
+        **************************************************************/
+        otherwise
+         zedsmsg = "Not Processed"
+         zedlmsg = "Table selection item "TSEL" not supported"
+         "SETMSG MSG(ISRZ001)"
+         end
+      /****************************************************************
+      * End of command processing
+      ****************************************************************/
+      tsel = ""
+      end
+   end
+"TBCLOSE "table" "
+return
+/*********************************************************************
+* Generate SMPCNTL statements to an output file
+**********************************************************************/
+generate_smpcntl:
+
+if smpcntl.0 == 0 then do
+   zedsmsg = "No members"
+   zedlmsg = "SMP control statments not created"
+   address ISPEXEC "SETMSG MSG(ISRZ001)"
+   return
+   end
+
+function = "Generating SMPCNTL statements"
+"CONTROL DISPLAY LOCK"
+"DISPLAY PANEL(SMPEPPW)"
+
+address TSO
+sppcdd  = "SPP"random()
+sppclib = temp_dsn_prefix".SMPCNTL"
+x = outtrap("XMSG.","*")
+"DELETE '"sppclib"'"
+x = outtrap("off")
+"ALLOCATE FILE("sppcdd") DA('"sppclib"')",
+            "UNIT(SYSDA) NEW REUSE SPACE(15 15) TRACKS",
+            "LRECL(80) BLKSIZE(8800) RECFM(F B)"
+
+"newstack"
+push "            ) HOLDDATA HOLDSYSTEM ."
+
+do c = smpcntl.0 to 1 by -1
+   push "              "smpcntl.c
+   end
+
+push " LIST SYSMOD("
+push " SET BDY(GLOBAL)."
+push "//SMPCNTL  DD *"
+push "//SMPLOG   DD DUMMY"
+push "//SMPLOGA  DD DUMMY"
+push "//LISTZONE EXEC SMPE,CSI='"csiname"'"
+push "//*"
+push "//** at" time()". It list SMP/E hold data."
+push "//** This job created by the SMPEPP application on" date()
+push "//*"
+push "//PROCLIB JCLLIB ORDER=("smpe_proclib")"
+if sppjcl4 <> "" then push sppjcl4
+if sppjcl3 <> "" then push sppjcl3
+if sppjcl2 <> "" then push sppjcl2
+if sppjcl1 <> "" then push sppjcl1
+
+queue ''      /* add null line to indicate End-Of-File */
+"EXECIO * DISKW "sppcdd" (FINIS"
+"DELSTACK"
+
+address ISPEXEC "EDIT DATASET('"sppclib"')"
+
+if sppfile == "DELETE" then do
+   x = outtrap("XMSG.","*")
+   address TSO "DELETE '"sppclib"'"
+   x = outtrap("off")
+   end
+
+address ISPEXEC
+return
+/*********************************************************************
+* Browse the dataset with error recovery
+**********************************************************************/
+Browse_Dataset:
+"CONTROL ERRORS RETURN"
+"CONTROL DISPLAY SAVE"
+"BROWSE DATASET('"dsn"')"
+BDRC = rc
+if BDRC <> 0 then do
+   zedsmsg = SYSDSN(dsn)
+   zedlmsg = "Browse to dataset failed, DSN="dsn
+   "SETMSG MSG(ISRZ001)"
+   end
+"CONTROL DISPLAY RESTORE"
+"CONTROL ERRORS CANCEL"
+return
+/**********************************************************************
+* Process the dataset for ++ HOLD stuff
+**********************************************************************/
+Process_Dataset:
+"CONTROL DISPLAY SAVE"
+
+tdsn = "'"dsn"'"
+x = LISTDSI(tdsn)
+if x <> 0 then do
+   zedsmsg = x
+   zedlmsg = "Error with DSN: "tdsn
+   "SETMSG MSG(ISRZ001)"
+   last = "Failed ++ HOLD"
+   "CONTROL DISPLAY RESTORE"
+   return
+   end
+
+idd = "SPPI"random()
+address TSO "ALLOCATE FILE("idd") DA('"dsn"') SHR REUSE"
+address TSO "EXECIO * DISKR "idd" (FINIS STEM idd."
+
+pline.0 = 0
+saving = 0
+do i = 1 to idd.0
+   if substr(idd.i,1,2) == "++" then do
+      saving = 0
+      if substr(idd.i,3,4) == "HOLD" then saving = 1
+      if substr(word(idd.i,2),1,4) == "HOLD" then saving = 1
+      end
+    if saving then do
+       pline.0 = pline.0 + 1
+       j = pline.0
+       pline.j = idd.i
+       end
+   end
+
+if pline.0 == 0 then do
+   zedsmsg = "No ++HOLD elements"
+   zedlmsg = "No ++HOLD elements in '"dsn"'"
+   address ISPEXEC "SETMSG MSG(ISRZ001)"
+   address ISPEXEC "CONTROL DISPLAY RESTORE"
+   call Browse_Dataset
+   last = "Browsed"
+   return
+   end
+
+/* If we need to worry about invoking this application on more */
+/* than one screen and keeping the dataset, then do the VGET below */
+/* and then append it on the pdsn */
+/* address ISPEXEC "VGET (ZSCREEN)" */
+pdsn = temp_dsn_prefix"."member
+
+x = outtrap("XMSG.","*")
+address TSO "DELETE "pdsn
+x = outtrap("off")
+pdd = "SPPP"random()
+address TSO "ALLOCATE FILE("pdd") DA("pdsn")",
+            "UNIT(SYSDA) NEW REUSE SPACE(5 5) TRACKS",
+            "LRECL(80) BLKSIZE(6320) RECFM(F B)"
+
+address TSO "NEWSTACK"
+do i = pline.0 to 1 by -1
+   push pline.i
+   end
+queue ''      /* add null line to indicate End-Of-File */
+address TSO "EXECIO * DISKW "pdd" (FINIS"
+address TSO "DELSTACK"
+
+address ISPEXEC "BROWSE DATASET("pdsn")"
+
+if sppfile == "DELETE" then do
+   x = outtrap("XMSG.","*")
+   address TSO "DELETE "pdsn
+   x = outtrap("off")
+   end
+
+address ISPEXEC "CONTROL DISPLAY RESTORE"
+return
+
+/* | ---------EEEEEEEE---------NN-----NN---------DDDDDDD--------- |
+   | ---------EE---------------NNNN---NN---------DD----DD-------- |
+   | ---------EEEEE------------NN-NN--NN---------DD----DD-------- |
+   | ---------EE---------------NN---NNNN---------DD----DD-------- |
+   | ---------EEEEEEEE---------NN----NNN---------DDDDDDD--------- | */
+./ ADD NAME=SMPEPPB  1200-98062-98062-2029-00253-00253-00000-DAVEA
+/* REXX
+ |
+ | Name: SMPEPPB
+ |
+ | Author: David Alcock :: dave@planetmvs.com
+ |
+ | Purpose: Process a SMP/E SMPOUT listing to aid in maintenance
+ |          investigation. The GIM42001W messages are processed and the
+ |          SMPPTS ++HOLD text is displayed. This allows the programmer
+ |          to easily see all of the hold information for faster
+ |          SMP/E PTF resolution.
+ |
+ |          This exec is meant to run in batch.  Use the SMPEPP
+ |          REXX exec for online processing of SMP/E output.
+ |
+ | Disclaimer: This REXX exec is FREEWARE.  Use at your own risk.  It
+ |             is provided for your enjoyment and neither David
+ |             Alcock or his employer provides any warranty for it's
+ |             use.  I'd like to hear how it works on your system.
+ |
+ |             This software is not in the public domain but is
+ |             available free of charge and with source code
+ |             provided.  It is copyright 1996-2002+ by David Alcock
+ |             All rights reserved.
+ */
+
+spp@ver = "v1.2"
+
+/* ================================================================= *
+ |
+ |           M o d i f i c a t i o n   H i s t o r y
+ |
+ | Person     Date        Description
+ | ---------- ----------- --------------------------------------------
+ | DGAlcock   03-MAR-1998 V1.2:
+ |                        - Added processing of message GIM35966I
+ |                          which is needed at OS/390 2.4 SMP/E and
+ |                          higher (thanks to Mike Theys for sending
+ |                          this to me!);
+ |                        - Added version number to start message
+ | DGAlcock   11-OCT-1996 Initial exec written;
+ * ================================================================= */
+
+arg sppdsn spppts
+sppnum = "*"  /* read the whole dataset in batch */
+
+say " "
+say "%SMPEPPB - "spp@ver" FREEWARE! written by David Alcock"
+say "%SMPEPPB - Execution started at "time()" on "date()
+say " "
+say "%SMPEPPB - Processing SMP/E output in DSN="sppdsn
+say "         - using SMPPTS DSN="spppts
+
+if sppdsn == "" then do
+   say "%SMPEPPB - Missing dataset name to process"
+   signal theend
+   end
+
+if spppts == "" then do
+   say "%SMPEPPB - Missing SMPPTS name to process"
+   signal theend
+   end
+
+/***********************************************************************
+* Read the input dataset into storage and create ISPF table
+***********************************************************************/
+
+smpout_ddname = "SYSUT1"
+smpout_dsn    = sppdsn
+address TSO
+"ALLOCATE FILE("smpout_ddname") DA("smpout_dsn") SHR REUSE"
+arc = rc
+if arc <> 0 then do
+   say "%SMPEPPB - Error allocating dsn="smpout_dsn "RC="arc
+   signal theend
+   exit
+   end
+
+"EXECIO "sppnum" DISKR "smpout_ddname" (FINIS STEM sppfile."
+erc = rc
+if erc <> 0 then do
+   say "%SMPEPPB - Error reading dsn="smpout_dsn "RC="arc
+   signal theend
+   exit
+   end
+
+/*********************************************************************
+* Process the SMPOUT file and print SMPPTS ++HOLD information
+*********************************************************************/
+
+gim42001w_count = 0 /* Number of GIM42001W messages processed */
+spprc = "Not Found"
+types = ""
+member = ""
+last = ""
+smpcntl.0 = 0
+smppts_dsn = strip(spppts,"B","'")
+
+do i = 1 to sppfile.0
+   select
+     when word(sppfile.i,1) == "GIM20502I" then do
+          parse value sppfile.i with . "RETURN CODE WAS" spprc "." .
+          leave
+          end
+
+     when word(sppfile.i,1) == "GIM42001W" then do
+          gim42001w_count = gim42001w_count + 1
+
+          if member <> "" then do
+             types = strip(types)
+             dsn = smppts_dsn"("member")"
+             call process_dataset dsn
+             end
+
+          parse value sppfile.i with . "SYSMOD" member .
+          member = strip(member)
+          end
+
+     when word(sppfile.i,1) == "GIM35935I" then do
+          parse value sppfile.i with . "HOLD" type "WAS" .
+          types = types" "left(type,8)
+          end
+
+     when word(sppfile.i,1) == "GIM35966I" then do /* OS/390 v24 */
+         parse value sppfile.i with . "HOLD" type "ORIGINATED" .
+         types = types" "left(type,8)
+         end
+     otherwise
+          nop
+          end /* of "otherwise" */
+
+   end /* of "do i = 1 to sppfile.0" */
+
+if member <> "" then do
+   types = strip(types)
+   dsn = smppts_dsn"("member")"
+   call process_dataset dsn
+   end
+
+if gim42001w_count == 0 then do
+   say "%SMPEPPB - No Action Items (GIM42001W messages) in "
+       smpout_dsn" - SMP RC:"spprc
+   end
+
+/*********************************************************************
+* Put out the SMP control statements for those who want to list the
+* hold data the approved way
+*********************************************************************/
+
+if smpcntl.0 <> 0 then do
+
+   "newstack"
+   push "            ) HOLDDATA HOLDSYSTEM ."
+
+   do c = smpcntl.0 to 1 by -1
+      push "              "smpcntl.c
+      end
+
+   push " LIST SYSMOD("
+   push " SET BDY(GLOBAL)."
+
+   queue ''      /* add null line to indicate End-Of-File */
+   "EXECIO * DISKW SMPCNTL (FINIS"
+   "DELSTACK"
+   end
+
+/*********************************************************************
+* All good things must come to an end
+*********************************************************************/
+
+theend:
+say " "
+say "%SMPEPPB - Execution terminating at "time() "on" date()
+exit
+
+/**********************************************************************
+* Process the dataset for ++ HOLD stuff
+**********************************************************************/
+Process_Dataset:
+
+c = smpcntl.0
+c = c + 1
+smpcntl.0 = c
+smpcntl.c = member
+
+tdsn = "'"dsn"'"
+x = LISTDSI(tdsn)
+if x <> 0 then do
+   say "%SMPEPPB - Error reading SMPPTS member "
+   say "         > DSN: "tdsn
+   return
+   end
+
+idd = "SPPI"random()
+address TSO "ALLOCATE FILE("idd") DA('"dsn"') SHR REUSE"
+address TSO "EXECIO * DISKR "idd" (FINIS STEM idd."
+
+say " "
+say " "
+say "%SMPEPPB - Elements in dsn='"dsn"':"
+say " "
+mod.0 = 0
+none_found = 1
+saving = 0
+
+do j = 1 to idd.0
+   if substr(idd.j,1,2) == "++" then do
+      saving = 0
+
+      if substr(idd.j,3,4) == "HOLD" then saving = 1
+      if substr(idd.j,3,4) == "HOLD" then saving = 1
+      if substr(word(idd.j,2),1,4) == "HOLD" then saving = 1
+
+      modfound = 0
+      if substr(idd.j,3,3) == "MOD" then modfound = 1
+      if substr(idd.j,3,3) == "MOD" then modfound = 1
+      if substr(word(idd.j,2),1,3) == "MOD" then modfound = 1
+      if modfound then do
+         m = mod.0
+         m = m + 1
+         parse value idd.j with . "(" module ")" .
+         mod.m = module
+         mod.0 = m
+         end
+
+      end
+    if saving then do
+       say ">" idd.j
+       none_found = 0
+       end
+   end
+
+if none_found then ,
+   say "%SMPEPPB - Error: No ++HOLD elements found in dsn='"dsn"'"
+
+if mod.0 <> 0 then do
+   say "%SMPEPPB - Modules found: in "dsn":"
+   line = ""
+   say " "
+   do m = 1 to mod.0
+      line = line" "mod.m
+      if length(line) > 68 then do
+         say ">" line
+         line = ""
+         end
+      end
+   if line <> "" then say ">" line
+   end
+
+return
+
+/* | ---------EEEEEEEE---------NN-----NN---------DDDDDDD--------- |
+   | ---------EE---------------NNNN---NN---------DD----DD-------- |
+   | ---------EEEEE------------NN-NN--NN---------DD----DD-------- |
+   | ---------EE---------------NN---NNNN---------DD----DD-------- |
+   | ---------EEEEEEEE---------NN----NNN---------DDDDDDD--------- | */
+./ ADD NAME=SMPEPPS  1200-98062-98062-2029-00043-00043-00000-DAVEA
+)Attr Default(%+_)
+ /********************************************************************/
+ /* Name: SMPEPPS                                                    */
+ /* Author: David Alcock                                             */
+ /* Application: SMPEPP                                              */
+ /* Purpose: Obtain dataset names to process and the SMP/E PTS name  */
+ /********************************************************************/
+ # type(text) intens(high) color(yellow)
+ ¢ type(text) intens(low)  color(green)
+ ¬ type(text) intens(low)  color(green) hilite(reverse)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+ { type(output) intens(high) color(yellow) caps(off)
+ } type(output) intens(high) color(turq)   caps(off)
+)body expand(!!)
+%!-! ¬SMP/E SMPOUT Processing Options % !-!
+%Command ===>_ZCMD
++
+~Before processing the SMP/E output, please verify the options below
+~and hit the#ENTER~key to continue or hit~the#END~key to cancel.
++
++SMPOUT %===>_sppdsn                                        +
+             ¢SMPOUT dataset to process
++SMPPTS %===>_spppts                                        +
+             ¢SMPPTS to be used to get information about your hold data
+
++Number %===>_sppnum  ¢Number of lines to process in the SMPOUT dataset
++Files  %===>_sppfile+¢KEEP or DELETE the files generated by this application
++Mode   %===>_z+      ¢Process in +F¢(foreground) or+B¢(background)
+
++JCL:
+%===>_sppjcl1
+%===>_sppjcl2
+%===>_sppjcl3
+%===>_sppjcl4
+)init
+  .HELP = SMPEPPST
+ .ZVARS = '(SPPMODE)'
+)proc
+  VER (&SPPNUM,RANGE,1,999999)
+  VER (&SPPFILE,LIST,DELETE,KEEP)
+  VER (&SPPMODE,LIST,F,B)
+)end
+./ ADD NAME=SMPEPPST 1200-98062-98062-2029-00040-00040-00000-DAVEA
+)attr default(%¦_)
+ /********************************************************************/
+ /* Name: SMPEPPST                                                   */
+ /* Author: David Alcock                                             */
+ /* Application: SMPEPP                                              */
+ /* Purpose: Tutorial for SMPEPPS (selection menu)                   */
+ /********************************************************************/
+ # type(text) intens(high) color(yellow)
+ ¢ type(text) intens(low)  color(green)
+ ¬ type(text) intens(low)  color(green) hilite(reverse)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+ { type(output) intens(high) color(yellow) caps(off)
+ } type(output) intens(high) color(turq)   caps(off)
+)body expand(!!)
+%Tutorial !-! SMP/E SMPOUT Post-Processing !-! Tutorial
+%Command ===>_ZCMD                                                             ¦
+¦
+¦This ISPF dialog automates the verification of a SMP/E¢APPLY CHECK¦output run
+¦by automating the perusal of¢++ HOLD¦elements from the SMPPTS dataset for PTFs
+¦and APARs which would go on because of a BYPASS option.
+¦
+¦The selection panel allows you to specify the:
+¦
+   #SMPOUT  ~The dataset that has the output from the SMP/E APPLY CHECK.
+            ~Usually you will use SDSF to place the output from the SMPOUT file
+            ~to a DISK dataset for use by this application.
+¦
+   #Number  ~Number of lines to process.  This is used to limit the number of
+            ~lines initially read from the dataset for performance reasons. It
+            ~must be high enough to read all of the SMPOUT file.
+¦
+   #SMPPTS  ~The dataset name of the SMPPTS to obtain the HOLD information from.
+¦
+¦This application does not automate all aspects of verification of SMP/E
+¦maintenance, it only automates a portion of it.  This application has only
+¦been tested with output from SMP/E "GIMSMP LVL 18.03".
+)init
+)proc
+)end
+./ ADD NAME=SMPEPPT  1200-98062-98062-2029-00032-00032-00000-DAVEA
+)Attr Default(%¦_)
+ /********************************************************************/
+ /* Name: SMPEPPT                                                    */
+ /* Author: David Alcock                                             */
+ /* Application: SMPEPP                                              */
+ /* Purpose: Table display of PTFs from the SMPOUT listing which     */
+ /*          need some verification                                  */
+ /********************************************************************/
+ ! type(output) intens(low) caps(off) color(turq)
+ ¬ type(output) intens(high) caps(off) color(yellow)
+ # type(output) intens(low) caps(off) color(green)
+ ¢ type(output) intens(high) color(green)
+ ` type(text) intens(high)  color(turq)
+ ~ type(text) intens(low) color(green)
+ { type(text) intens(low) color(red)
+)Body Expand(\\) Width(&ZSCREENW)
+%-\-\- SMPOUT action items %-\-\-
+%Command ===>_ZCMD                                 \ \%Scroll ===>_amt ¦
+%
+~S`Show only "++ HOLD" SMP/E elements                 {SMPEPP level: ¬SPP@VER
+~B`Browse the complete member                         {SMP/E level:  ¬GIMLVL
+¦
+  ¦Member   Types                                              Last processing
+%- -------- -------------------------------------------------- -\-\
+)Model
+_Z¬MEMBER  #TYPES                                             !LAST         \ \
+)Init
+  .HELP = SMPEPPTT
+  .ZVARS = '(TSEL)'
+  &AMT = PAGE
+)Proc
+)End
+./ ADD NAME=SMPEPPTT 1200-98062-98062-2029-00036-00036-00000-DAVEA
+)attr default(%¦_)
+ /********************************************************************/
+ /* Name: SMPEPPTT                                                   */
+ /* Author: David Alcock                                             */
+ /* Application: SMPEPP                                              */
+ /* Purpose: Tutorial for SMPEPPT (table)                            */
+ /********************************************************************/
+ # type(text) intens(high) color(yellow)
+ ¢ type(text) intens(low)  color(green)
+ ¬ type(text) intens(low)  color(green) hilite(reverse)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+ @ type(text) intens(low)  color(red)
+ { type(output) intens(high) color(yellow) caps(off)
+ } type(output) intens(high) color(turq)   caps(off)
+)body expand(!!)
+%Tutorial !-! SMP/E SMPOUT Post-Processing !-! Tutorial
+%Command ===>_ZCMD                                                             ¦
+¦
+¦This is a list of the PTFs that have hold conditions which you should
+¦investigate before applying.  The options for the table rows are:
+¦
+   #S       ~Select the PTF and browse ONLY the ++HOLD information from the
+            ~SMPPTS dataset.
+¦
+   #B       ~Browse the member in SMPPTS for this PTF.
+¦
+   @Sorry but multiple row selections are not supported yet
+¦
+¦The following commands are available from the command line:
+¦
+   #SMPCNTL ~Generate a job that will invoke SMP/E in batch to list all of the
+            ~hold data for all of the PTFs in the list.
+)init
+)proc
+)end
+./ ADD NAME=SMPEPPW  1200-98062-98062-2029-00042-00042-00000-DAVEA
+)attr
+ /********************************************************************/
+ /* Name: SMPEPPW                                                    */
+ /* Author: David Alcock                                             */
+ /* Applicatoni: SMPEPP                                              */
+ /* Purpose: Logo - in process - panel                               */
+ /********************************************************************/
+ # TYPE(TEXT)   INTENS(LOW)  COLOR(TURQ)
+ ¦ TYPE(TEXT)   INTENS(HIGH) COLOR(GREEN)  HILITE(BLINK)
+ ¢ TYPE(TEXT)   INTENS(LOW)  COLOR(BLUE)
+ ( TYPE(TEXT)   INTENS(HIGH) COLOR(RED)
+ ) TYPE(OUTPUT) INTENS(HIGH) COLOR(PINK) JUST(ASIS)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+)Body Expand(!!) Width(&ZSCREENW)
+¦WW        WW  OOOOOOOOOOOO  RRRRRRRRRRR   KK        KK    `Time     -~&ZTIME
+¦WW        WW  OOOOOOOOOOOO  RRRRRRRRRRRR  KK       KK     `Date     -~&ZDATE
+¦WW        WW  OO        OO  RR        RR  KK      KK      `Julian   -~&ZJDATE
+¦WW        WW  OO        OO  RR        RR  KK     KK       `System   -~&SPP@VER
+¦WW        WW  OO        OO  RR        RR  KK    KK
+¦WW        WW  OO        OO  RRRRRRRRRRRR  KKKKKKK       ------------
+¦WW   WW   WW  OO        OO  RRRRRRRRRRR   KKKKKKK       ------------
+¦WW  WWWW  WW  OO        OO  RR    RR      KK    KK
+¦WW WW  WW WW  OO        OO  RR     RR     KK     KK
+¦WWWW    WWWW  OO        OO  RR      RR    KK      KK
+¦WWW      WWW  OOOOOOOOOOOO  RR       RR   KK       KK
+¦WW        WW  OOOOOOOOOOOO  RR        RR  KK        KK
+                                       ¦IIIIIIIIII   NN        NN   GGGGGGGGGG
+                                      ¦IIIIIIIIII   NNN       NN  GGGGGGGGGGGG
+                                         ¦II       NNNN      NN  GG        GG
+(Please be patient, performing:         ¦II       NN NN     NN  GG
+)FUNCTION                              ¦II       NN  NN    NN  GG
+                                      ¦II       NN   NN   NN  GG
+                                     ¦II       NN    NN  NN  GG     GGGGG
+                                    ¦II       NN     NN NN  GG     GGGGG
+                                   ¦II       NN      NNNN  GG        GG
+                                  ¦II       NN       NNN  GG        GG
+                             ¦IIIIIIIIII   NN        NN  GGGGGGGGGGGG
+`SMP/E SMPOUT processing    ¦IIIIIIIIII   NN         N   GGGGGGGGGG
+)init
+)proc
+)end
+./ ENDUP       "REVIEW" PDS MEMBER OFFLOAD AT 19:50 ON 98/05/28

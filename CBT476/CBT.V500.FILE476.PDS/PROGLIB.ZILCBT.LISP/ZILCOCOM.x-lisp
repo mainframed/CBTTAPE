@@ -1,0 +1,719 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+;
+; "ZILCOCOM"
+; The driver function and pseudocode builder for the compiler.
+;
+
+; Compile and generate source code for input program.
+; The input, in file "SRC", contains inline code and
+; function definitions (identified by "DEFUN").
+; Output, file "CODE", contains assembler source code.
+; Each "DEFUN" encountered at the top level causes
+; an internal subroutine to be compiled.
+; The argument "EXEC" specifies whether an executable
+; program or a stand-alone function is to be created.
+;
+;
+; Note:      MACRO properties are now recognized by the compiler at
+;            compile time, as well as CMACRO properties.  This means
+;            that DEFMACRO's evaluated at compile time create macro
+;            definitions that are used in compilation; there is no
+;            way to avoid this.  CMACRO's are still supported for
+;            compatibility and as a means of defining compiler-only
+;            optimizations of functions.  See ZILCOMEX.
+;
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 05/13/88 - Top-level PROGRAM transform now output to CTRN file.     *
+;* 06/23/88 - Support for PROG and RETURN removed.  ZCCFPRT absorbed.  *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(declare (special debug program allsubrs alfatoms numatoms alllists
+                  special-freevars intfuncs zdef codebody
+                  processing-macros))
+
+(defun zilcocom (fname kind debug)
+ (prog (a c m e z
+        exec
+        processing-macros
+        codebody
+        defuns
+        program
+        allsubrs
+        alfatoms
+        numatoms
+        alllists
+        special-freevars
+        intfuncs
+        zdef
+        ctrnp
+       )
+
+   (setq c        (list nil)
+         ; Eventually, e will be set to the global contour,
+         ; whatever that is.
+         e        nil
+         exec     (eq kind 'program)
+         codebody (list 'progn)
+         defuns   (list nil)
+         program  (if exec fname nil)
+         allsubrs (list nil)
+         alfatoms (list nil)
+         numatoms (list nil)
+         alllists (list nil)
+         special-freevars (list nil)
+         intfuncs (list nil)
+         zdef (ncons nil)
+         ctrnp (ofilep 'ctrn)
+   )
+
+;
+; Establish some compilation settings.
+;
+; AUTOFUNCALL will never default to NIL, always T.
+;
+; In fact, AUTOFUNCALL will be phased out, as AUTOSPECIAL already has.
+;
+
+   (remprop '*zilco* 'error-code)
+   (defprop *zilco* t autofuncall)
+   (putprop '*zilco* fname 'fname)
+
+;
+; Read input from macro file CMAC, if present.  Note that any input
+; from this file other than DEFMACRO's and DEFLOAD's is assumed to
+; be eval-when (compile) stuff.
+;
+
+   (setq processing-macros t)
+
+   (unless (ifilep 'cmac)
+    (princ "Compilation is not using any locally defined macros.")
+    (terpri)
+    (go mnocmac))
+
+  mloop
+
+   (unless (ok (setq a (read 'cmac)))
+    (princ "Syntax error in macro file.")
+    (terpri)
+   )
+   (and (eof 'cmac) (go mfinish))
+   (catch nil (top-level-compile a c exec fname e))
+   (go mloop)
+
+  mfinish
+
+   (close 'cmac)
+
+  mnocmac
+
+   (setq processing-macros nil)
+
+;
+; If this compilation is of a module, build a function that loads all
+; the forms in the file, and also build definitions for compiled
+; functions within the file.
+;
+   (when (eq kind 'module)
+         (zilcocom-process-module c exec fname e)
+         (go finish)
+   )
+
+;
+; Otherwise, proceed with normal compilation processing.
+;
+; End of file on source input may be indicated by the top-level
+; function (END).  Top-level macros cannot generate this call.
+;
+
+  loop
+   (unless (ok (setq a (read 'src)))
+    (if (eof 'src)
+        (go finish)
+        (go loop)))
+   (and (eof 'src)       (go finish))
+   (and (equal a '(end)) (go finish))
+   (catch nil (top-level-compile a c exec fname e))
+   (go loop)
+
+  finish
+
+   (close 'src)
+
+   (if (get '*zilco* 'error-code) (go blowup))
+
+   (when ctrnp
+         (terpri 'ctrn)
+         (princ  ";;; *** Compiler transformations generated follow ***"
+                 'ctrn)
+         (terpri 'ctrn)
+         (terpri 'ctrn)
+   )
+
+;;;
+;;; For all the DEFUN's collected, process their contents so that we
+;;; know that they exist and the number of args they take.
+;;;
+
+   (dolist (x (cdr c))
+    (let ((cexpr (get x 'cexpr)))
+     (when cexpr
+
+;;; Fully expand and transform the definition.
+
+      (putprop x (setq cexpr (zilcotrn cexpr debug)) 'cexpr)
+
+;;; If a transformation output file is present,
+;;; dump the transformation to the file.
+
+      (when ctrnp
+            (terpri 'ctrn)
+            (princ ";;; Transformed function definition of " 'ctrn)
+            (prin1 x 'ctrn)
+            (terpri 'ctrn)
+            (terpri 'ctrn)
+            (pprint cexpr 'ctrn)
+            (terpri 'ctrn)
+       )
+
+;;; Analyze the parameter list and establish the number of arguments
+
+      (unless
+       (zilcoarg x (cadr cexpr)) ; Valid arg list for function
+       (princ "Error: Bad argument list for function ")
+       (prin1 x)
+       (terpri)
+       (zilcoerr 12)
+      )
+     )))
+
+   (terpri)
+   (princ "Initiating P-code phase of compilation.")
+   (terpri)
+   (terpri)
+   (if exec       ; If a "program" is to be compiled
+    then
+     (if (cdr codebody) ; If top-level code was found
+      then              ; (it should have been), compile a "program".
+        (setq z (zilcotrn `(lambda () ,codebody) debug))
+        (setq m (zccexpr program
+                         z    ; transformed top-level program
+                         t    ; MAIN = YES
+                         nil  ; ALONE = NO
+                         (cons (zccmkcec 'defun e) e)))
+        (when ctrnp
+              (terpri 'ctrn)
+              (princ ";;; Transformed definition of program " 'ctrn)
+              (prin1 program 'ctrn)
+              (terpri 'ctrn)
+              (terpri 'ctrn)
+              (pprint z 'ctrn)
+              (terpri 'ctrn)
+        )
+        (if debug (dump-compile m))
+      else
+        (princ
+ "Error: PROGRAM specified, but no top-level (non-DEFUN) source code.")
+        (terpri)
+        (zilcoerr 12)
+        (go blowup)
+      endif
+     )
+    else          ; A "function" is to be compiled
+      (unless (and program (get program 'cexpr))
+           (princ "Error: Missing or invalid function definition for ")
+           (prin1 fname)
+           (terpri)
+           (zilcoerr 12)
+           (go blowup))
+      (setq m (zccfunc program t t e)) ; Compile the main "function".
+      (if debug (dump-compile m))
+    endif
+   )
+   (princ (if exec "Main program " "Main function "))
+   (princ "P-code compilation complete for ")
+   (prin1 (car (get m 'name)))
+   (terpri)
+   (dolist (x (cdr c))               ; Compile all subfunctions.
+           (or (get x 'cmacro)       ; Don't compile macros.
+               (eq x program)        ; Don't redo main function.
+               (let ((y (zccfunc x nil (not exec) e)))
+                    (modq defuns y)
+                    (if debug (dump-compile y))
+                    (princ "P-code compilation complete for ")
+                    (prin1 x)
+                    (terpri))))
+   (terpri)
+   (if (get '*zilco* 'error-code) (go blowup))
+
+   (when ctrnp (close 'ctrn 'output))
+
+   (princ "Initiating code generation phase.")
+   (terpri)
+   (terpri)
+   (zilcogen m)                      ; Generate code for main fun/pgm.
+   (princ "Code generated for main ")
+   (princ (if exec "program " "function "))
+   (prin1 (car (get m 'name)))
+   (terpri)
+
+;;;
+;;; Generate code for all functions which are not macros.
+;;;
+   (dolist (x (cdr defuns))
+           (zilcogen x)
+           (princ "Code generated for function ")
+           (prin1 (car (get x 'name)))
+           (terpri))
+   (if (get '*zilco* 'error-code) (go blowup))
+   (princ "         END" 'code)  ; Generate assembler END statement.
+   (terpri 'code)
+   (close 'code 'output)
+   (terpri)
+   (return nil)
+
+  blowup
+
+   (princ "Compilation terminated due to errors.")
+   (terpri)
+   (throw 'zilcocom-error (get '*zilco* 'error-code))
+ )
+)
+
+;**********************************************************************
+
+(declare (special loadlist complist)) ; for ZILCOMOD.
+
+(defun zilcocom-process-module (c exec fname e)
+ (prog (loadlist complist form mainfunc)
+  loop (unless (ok (setq form (read 'src)))
+               (if (eof 'src)
+                   (go check-it-out)
+                   (go loop)))
+  check-it-out
+       (if   (or (eof 'src) (equal form '(end)))
+        then
+             (setq loadlist (nreverse loadlist)
+                   complist (nreverse complist)
+                   mainfunc
+                            `(defun ,fname ()
+
+#| This code has been removed.  If you want to herald your module,
+   do it yourself.
+
+                              (cterpri)
+                              (princ ,(string-append "Loading module "
+                                                     fname "."))
+                              (terpri)
+
+   End of suppressed heralding code.
+
+|#
+                              ,.loadlist  ; forms executed at load time
+                              ',fname ; return name of function as value
+                             )
+             )
+             (when debug
+                   (terpri)
+                   (princ "Begin module debugging output.")
+                   (terpri)
+                   (terpri)
+                   (princ "Main (loadable) function follows:")
+                   (terpri)
+                   (terpri)
+                   (pprint mainfunc)
+                   (terpri)
+                   (terpri)
+                   (princ "Other (compilable) forms follow:")
+                   (terpri)
+                   (terpri)
+                   (dolist (x complist) (pprint x) (cterpri))
+                   (terpri)
+                   (terpri)
+                   (princ "End module debugging output.")
+                   (terpri)
+             )
+             (top-level-compile mainfunc c exec fname e)
+             (dolist (x complist) (top-level-compile x c exec fname e))
+             (return)
+        else
+             (zilcomod form e)
+             (go loop)
+        endif
+       )
+ )
+)
+
+;**********************************************************************
+
+;
+; This function handles anything (other than (END)) that can occur
+; at top level.  It is invoked recursively when a (PROGN ...)
+; form is encountered, which specifies that all forms within it are
+; to be treated as top-level (which enables DEFUN, etc.)
+;
+; % signifies something to be executed at compile time
+; e.g. (% PRINT "Hi, I'm being compiled")
+;
+; DEFUN signifies a function definition.
+;
+; (PROGN ...) signifies a list of top-level things.
+;
+
+(defun top-level-compile (f c exec fname e) ;
+ (let ((a (zilcomex f t)))  ; top-level form after macro expansion
+  (cond
+   ((atom a)                (princ "Ignoring atom ")
+                            (prin1 a)
+                            (princ " found at top level.")
+                            (terpri))
+   ((eq (car a) 'comment)   nil)
+   ((eq (car a) 'declare)   (zilcodcl (cdr a) exec e))
+   ((eq (car a) 'defload)   (zilcocom-defload (cdr a) fname e))
+   ((eq (car a) 'defun)     (zilcocom-defun a c exec fname e))
+   ((eq (car a) 'eval-when) (zilcocom-eval-when (cdr a) c exec fname e))
+   ((eq (car a) 'progn)     (dolist (x (cdr a))
+                             (top-level-compile x c exec fname e)))
+   (t                       (zilcocom-other a exec e)))))
+
+(defun zilcocom-eval-when (a c exec fname e)
+
+;
+; EVAL-WHEN is interpreted as follows:
+;
+; COMPILE - let the compiler evaluate it itself.
+;
+; EVAL    - ignore.
+;
+; LOAD    - process like usual top-level form.
+;
+
+ (let* (
+        ((times . forms) a)
+        (compilep            (memq 'compile times))
+        (loadp               (memq 'load    times))
+       )
+       (loop for f in forms
+             when compilep do (catch nil (eval f))
+             when loadp    do (top-level-compile f c exec fname e)
+             finally       (return nil))))
+
+(defun zilcocom-defun (a c exec fname e)
+ (prog (func args nargs body ftype)
+  (or (and (cdr a)
+           (cddr a)
+           (cdddr a))  (go bad-defun))
+  (setq func (cadr a))
+
+  ; Note: NIL is no longer a permissible function name for DEFUN.
+
+  (unless (and func (symbolp func))
+          (princ "Error: Invalid DEFUN function name - ")
+          (prin1 func)
+          (terpri)
+          (zilcoerr 12) ; Set error switch on.
+          (return nil))
+
+  (when (and exec (eq func fname))
+        (princ "Error: Internal function name ")
+        (prin1 func)
+        (princ " conflicts with program name.")
+        (terpri)
+        (zilcoerr 12) ; Set error switch on.
+        (return nil))
+
+  (setq args (caddr a))
+  (setq body (cdddr a))
+
+;
+; If the DEFUN was read from the macro file, assume it is a compile-time
+; DEFUN unless it is a DEFUN of a macro.
+;
+
+  (when (and processing-macros (neq args 'macro))
+        (catch nil (eval a))
+        (return)
+  )
+
+  (cond
+   ((eq args 'expr)  (setq ftype 'cexpr)  (desetq (args . body) body))
+   ((eq args 'macro) (setq ftype 'cmacro) (desetq (args . body) body))
+   ((eq args 'fexpr)
+    (princ "Error: DEFUN of FEXPR cannot be compiled - ")
+    (prin1 func)
+    (terpri)
+    (zilcoerr 12)
+    (return nil))
+   ((or (consp args) (symbolp args))
+    (setq ftype 'cexpr))
+   (t
+    (princ "Error: Bad DEFUN function type specified - ")
+    (prin1 ftype)
+    (terpri)
+    (zilcoerr 12)
+    (return nil))
+  )
+
+
+;;; If a macro, the argument list must be a list of 1 argument,
+;;; or a list of more than 1 argument where the first is NIL
+;;; (the latter being generated by DEFMACRO).
+
+  (when (and (eq ftype 'cmacro)         ; If a macro definition
+             (or (atom args) (and (car args) (cdr args))))
+        (princ "Error: Bad argument list for macro ")
+        (prin1 func)
+        (terpri)
+        (zilcoerr 12)
+        (return nil))
+
+;;; Check to see if this function shadows an existing macro or defload.
+
+  (case (get func 'defined-by)
+        ((system)
+         (princ "Warning: DEFUN overriding system definition for ")
+         (prin1 func)
+         (terpri)
+         (remprop func 'cmacro   )
+         (remprop func 'cautoload)
+         (remprop func 'compiler-transform)
+         (when (eq ftype 'cexpr)       ; Don't lose these properties if
+          (remprop func 'minargs)      ; a macro overrides a known ZIL
+          (remprop func 'maxargs)      ; function.  Someone may DEFLOAD
+          (remprop func 'restarg)      ; to the known function name.
+         )
+         (putprop func 'user 'defined-by) ; Say defined by user.
+        )
+        ((user)
+         (princ "Error: Function ")
+         (prin1 func)
+         (princ " is multiply defined in file.")
+         (terpri)
+         (zilcoerr 12)
+         (return nil)
+        )
+  )
+
+;;; Simulate the DEFUN to define the function to the compiler.
+
+  (putprop func `(lambda ,args . ,body) ftype)
+
+;;; Some processing that used to be done here has been moved.
+
+  (modq intfuncs func)          ; Add to list of internal procedures
+
+  (when (eq func fname)         ; If DEFUN name matches source file
+        (if program             ; then if program name already set
+         then                   ; (may have been done by DEFLOAD)
+            (princ "Error: Duplicate main function ")
+            (prin1 func)
+            (princ " defined in input source.")
+            (terpri)
+            (zilcoerr 12)
+            (return nil)
+         else
+            (setq program func)
+         endif
+        )
+  )
+  (modq c func)                ; Add function to list of functions
+  (when debug
+      (princ (if (eq ftype 'cmacro) "Macro" "Function"))
+      (princ " definition found for ")
+      (prin1 func)
+      (terpri))
+  (return nil)
+
+ bad-defun
+
+  (princ "Invalid DEFUN syntax - definition ignored.")
+  (terpri)
+  (zilcoerr 12)
+
+ ) ; end PROG
+)
+
+;
+; This compiles the DEFLOAD special form.
+;
+
+(defun zilcocom-defload (x fname e)
+ (if (or (null x)
+         (null (cdr x)))
+  then
+     (princ "Too few arguments to DEFLOAD")
+     (terpri)
+     (zilcoerr 12)
+  else
+  if (cddr x)
+  then
+     (princ "Too many arguments to DEFLOAD")
+     (terpri)
+     (zilcoerr 12)
+  else
+  if
+     (not (and (symbolp (car x))
+               (symbolp (cadr x))))
+  then
+     (princ "Invalid argument(s) to DEFLOAD")
+     (terpri)
+     (zilcoerr 12)
+  else
+     (when (eq (get (car x) 'defined-by) 'system)
+           (princ "Warning: DEFLOAD overriding system definition for ")
+           (prin1 (car x))
+           (terpri)
+     )
+     ;
+     ; Don't change "defined-by" status.
+     ;
+     ; If it's "defined-by system", it won't hurt anything.
+     ;
+     ; If it's "defined-by user", don't reject it; it's legal to have
+     ;
+     ; (defload foobarbazfrob fbbf)
+     ; and
+     ; (defun foobarbazfrob (x) ...)
+     ;
+     ;
+     (putprop (car x) (cadr x) 'cautoload)
+     (putprop (car x) (get (cadr x) 'builtin) 'inline)
+     (putprop (car x) (get (cadr x) 'predicate) 'predicate)
+     (putprop (car x) (get (cadr x) 'compiler-transform)
+                      'compiler-transform)
+     (if   (eq (cadr x) fname)
+      then
+           (if (and program (neq program (car x)))
+            then
+             (princ "Error: Main function ")
+             (prin1 fname)
+             (princ " is multiply defined.")
+             (terpri)
+             (zilcoerr 12)
+            else
+             (setq program (car x))  ; Indicate main program found.
+           )
+      else
+      if   (eq (car x) fname)
+      then
+       (princ "Error: DEFLOAD not permitted for main function ")
+       (prin1 fname)
+       (terpri)
+       (zilcoerr 12)
+      )
+  endif
+ )
+)
+
+;
+; This compiles non-function code found at top level, which is valid
+; only when the entity being compiled is a PROGRAM (EXEC = T).
+;
+(defun zilcocom-other (a exec e)
+ (cond (exec (modq codebody a))
+       (t    (princ "Input other than function definition found.")
+             (terpri)
+             (princ "Check your source for errors,")
+             (terpri)
+             (princ "or specify MODULE or PROGRAM instead of FUNCTION.")
+             (terpri)
+             (throw 'zilcocom-error 12))))
+
+(defun dump-compile (m)
+ (terpri)
+ (princ "Compilation dump for ")
+ (prin1 (get m 'name))
+ (terpri)
+ (princ "Property list:")
+ (terpri)
+ (pprint (symbol-plist m))
+ (terpri)
+ (terpri)
+ (fprint "Dump of P-code follows:"
+         (get m 'body)
+         '(begincall begintag beginblock begininline begintail beginlam)
+         '(call      endtag   endblock   inline      tailrecur endlam))
+ (fprint "Dump of \"TAILRECUR\" follows:"
+         (get m 'tailrecur) nil nil)
+ (fprint "Dump of subroutine table follows:"
+         (cdr allsubrs) nil nil)
+ (fprint "Dump of symbol table follows:"
+         (cdr alfatoms) nil nil)
+ (fprint "Dump of number/string table follows:"
+         (cdr numatoms) nil nil)
+ (fprint "Dump of list table follows:"
+         (cdr alllists) nil nil)
+ (fprint "Dump of free SPECIAL variables follows:"
+         (cdr special-freevars) nil nil)
+ (fprint "Dump of non-local SPECIAL variables follows:"
+         (cdr (get m 'special-unbounds)) nil nil)
+ (fprint "Dump of non-local LEXICAL variables follows:"
+         (cdr (get m 'fluid-unbounds)) nil nil)
+ (fprint "Dump of internal functions follows:"
+         (cdr intfuncs) nil nil)
+)
+
+;
+; "FPRINT"
+;
+; This function prints out pseudocode in readable format.
+; In fact, it prints out any list in readable format.
+;
+
+(defun fprint (msg l in out)
+ (princ msg)
+ (terpri)
+ (terpri)
+ (fprint1 l in out 1)
+ (terpri)
+)
+
+(defun fprint1 (l i o n)
+ (cond
+  ((null l) nil)
+  ((atom l) (prin1 l) (terpri))
+  (t (prog (n2)
+      (setq n2 n)
+      (cond
+       ((null l)           nil)
+       ((atom (car l))     nil)
+       ((memq (caar l) i)  (setq n2 (add1 n)))
+       ((memq (caar l) o)  (setq n2 (setq n (sub1 n))))
+      )
+      (zputfpo n)
+      (prin1 (car l))
+      (terpri)
+      (return (fprint1 (cdr l) i o n2))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+; Obsolete code...
+;
+;
+;;; If null function name (DEFUN NIL ...), generate a new name and
+;;; add to list of null functions (for which code generation is
+;;; to be bypassed).  More than one null function can exist.
+;
+; (or func (push (setq func (gensym)) nilfuncs))
+;

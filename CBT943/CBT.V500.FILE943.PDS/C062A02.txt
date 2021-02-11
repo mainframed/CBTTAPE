@@ -1,0 +1,471 @@
+A CICS command processor
+
+The following process was initially developed to collect data
+for a capacity planning study, starting at specific intervals
+during the CICS region cycle.  The process was modified to
+handle the scheduling of certain operational procedures.  The
+main purpose of the program is to issue either a CEMT request
+or an MVS command at a specified time.  The 'command'
+records are stored in a sequential file and processed at PLTPI
+initialization time, or by requesting a transaction that executes
+the COMMANDS program.  At PLTPI time, a COMMINIT
+program is executed, which starts the process for INIT, TIME,
+and any of the current-day record types.  These record types
+are:
+
+o      INIT - process at initialization time.
+
+o      TIMEhhmmss - process daily at hhmmss.
+
+o      DAYxhhmmss - process on day of the week x, where x is
+      0 for Sunday, 1 for Monday etc.
+
+o      MMxxhhmmss - process on the xxth day of the month
+      where xx is any number from 0 to 31.
+
+o      Jxxxhhmmss - process on the Julian date xxx.
+
+o      mmddhhmmss - process on the Gregorian date mmdd.
+
+For example, if every Friday at 17:00 we want to close all
+datasets prefixed with 'MSA' to enable batch work to begin,
+the record would like this:
+
+      DAY5170000CEMT SET DA(MSA*) CLOSE
+
+Similarly to close all datasets prefixed with 'MSA' at 18:00
+daily, the record would be:
+
+      TIME180000CEMT SET DA(MSA*) CLOSE
+
+If you define a transaction that executes the COMMANDS
+program, any command records that match the transaction-id
+are processed.  For example, to close all MSA datasets for
+batch, the transaction would be defined as:
+
+      DEFINE TR(MSAC) PROG(COMMANDS)
+
+the record would be:
+
+      MSAC******CEMT SET DA(MSA*) CLOSE
+
+and the request would be:
+
+      F CICSTEST,MSAC
+
+Similarly, to perform an immediate shutdown of the region, the
+transaction would be defined as:
+
+      DEFINE TR(IMME) PROG(COMMANDS)
+
+the records would be:
+
+      IMME******/*$VS,'F CICSTEST,CEMT P SHUT IMMED'
+      IMME******/*$VS,'S TESTDUMP'
+
+and the request would be:
+
+      F CICSTEST,IMME
+
+Since our use of this process is minimal, the COMMANDS
+program dynamically allocates an internal reader and frees it at
+close for each execution of this program.  This would not be a
+good approach if you use this extensively, since the open/close
+process will use OSCOR, but could easily be changed by
+coding a DD card for the internal reader.
+
+
+COMMANDS PROGRAM
+
+         TITLE 'COMMANDS - CICS COMMAND PROCESSOR/SCHEDULER'
+*** THIS PROGRAM IS A CICS TRANSACTION PROCESSOR THAT WILL PROCESS A
+* (1) CEMT REQUEST, OR (2) ISSUE AN MVS COMMAND THROUGH AN INTRDR.
+*    WHEN THIS PROGRAM IS INVOKED, IT READS A COMMAND FILE (DCT),
+* SEARCHING FOR RECORDS THAT MATCH THE "TYPE" PASSED IN THE "START",
+* OR IF NO DATA IS PASSED, PROCESS RECORDS THAT MATCH TRAN ID.
+*   W/DATA:    "EXEC CICS START TRANSID('CMDS') FROM(TDMP) LENGTH(5)"
+*   COMMAND FILE: "TDMP******CEMT S DA(TEST*) CLOSE"
+*                 "TDMP******/*VS,'START TESTDUMP'"
+*   W/O DATA:  "EXEC CICS START TRANSACTION('OTST') END-EXEC."
+*   COMMAND FILE: "OTST******CEMT S DA(TEST*) OPEN"
+*   TRANSACTIONS CAN ALSO BE INVOKED THRU THE MVS CONSOLE,
+*              "F CICSTEST,OTST"
+* NOTE: IN THE ABOVE EXAMPLES, "CMDS" AND "OTST" ARE DEFINED AS
+*       TRANSACTIONS THAT BOTH EXECUTE THE "COMMANDS" PROGRAM.
+*    COMMANDS ARE STORED IN A 80 BYTE QSAM FILE, DEFINED AS AN
+* EXTRA-PARTITIONED DATASET, WITH RECORDS IN THE FOLLOWING FORMAT.
+*    TTTTOOOOOOCCC... UP TO A 70 BYTE COMMAND
+*     WHERE TTTT   = TRANSACTION/TYPE/RECORD I.D.
+*           OOOOOO = TIME (OPTIONAL ON TIME COMMANDS)
+*           CCC... = COMMAND, EITHER A CEMT OR MVS COMMAND
+* ...DOING A PROGRAM CONTROL "START" OF THIS PROGRAM/TRAN WITH DATA,
+*    AND ANY RECORD "TYPE" THAT MATCHES THE DATA, WILL BE PROCESSED.
+*      EXAMPLE: CLOSE ALL ADR* DATASETS TO CICS FOR BATCH PROCESSING.
+*               EXEC CICS START TRANID('CMDS') FROM(ADRC) LENGTH(5)
+*      ALL RECORDS THAT START WITH "ADRC" ARE PROCESSED,
+*    NOTE: PASSED DATA IS 5 BYTES IN LENGTH WITH 4 BYTES REPRESENTING
+*          THE RECORD "TYPE", AND 1 BYTE THAT IS USED FOR SOME OF
+*          THE EXPIRED TIME CALCULATIONS.
+* ... CEMT COMMANDS CAN BE SIMPLIFIED BY DEFINING A TRANSACTION TO
+*     EXECUTE THIS PROGRAM.
+*      EXAMPLE: SWITCH THE DUMP DATASETS AND START A DUMP BATCH JOB.
+*               "F CICSTEST,SWITCH"
+*      ALL RECORDS THAT START WITH "SWIT" ARE PROCESSED,
+*               SWIT******CEMT S DUMP SWITCH
+***             SWIT******/*$VS,'START TESTDUMP'
+COMMANDS CSECT
+         EXEC  CICS HANDLE ABEND LABEL(CLEANUP)
+         EXEC  CICS ENQ RESOURCE(CMDSDCT) LENGTH(7)
+*** VERIFY DCT IS OPEN AND ENABLED
+         MVC   CEMTCMD,=C'CEMT S QUEUE(CMND) CLO ENA'
+         MVC   CEMTLEN(2),=H'26'       SET LENGTH OF CEMT COMMAND
+         BAL   10,CALLCEMT             PROCESS CEMT COMMAND
+         MVC   CEMTCMD,=C'CEMT S QUEUE(CMND) OPE ENA'
+         MVC   CEMTLEN(2),=H'26'       SET LENGTH OF CEMT COMMAND
+         BAL   10,CALLCEMT             PROCESS CEMT COMMAND
+*** CHECK FOR NORMAL OPEN CONDITION
+         LA    4,CEMTOUT               RESPONSE AREA FROM CEMT
+         LH    5,=H'80'                SET MAX LENGTH FOR SEARCH
+NORMLOOP EQU *
+         CLC   0(6,4),=C'NORMAL'       NORMAL RESPONSE?
+         BE    NORMAL                  YES, GO CHECK STATUS
+         LA    4,1(,4)                 NO, BUMP TO NEXT POSITION
+         BCT   5,NORMLOOP              GO CHECK AGAIN
+         B     ABNDNORM                GO CHECK AGAIN
+*** ALLOCATE AN INTERNAL READER
+NORMAL   EQU *
+         LA    1,S99RBP                POINT TO S99 REQUEST POINTER
+         DYNALLOC                      ALLOCATE INTERNAL READER
+         C     15,=A(0)                CONDITION CODE CHECK
+         BNE   ABNDINTR                NOT GOOD, GO END IT
+         MODCB ACB=ACB,DDNAME=(*,DALDDNAM) DDNAME RETURNED FOR OPEN
+         OPEN  ACB                     OPEN THE INTERNAL READER
+         C     15,=A(0)                CONDITION CODE CHECK
+         BNE   ABNDOPEN                NOT GOOD, GO END IT
+         MVI   INTROP,YES              SAY INTRDR OPENED
+         EXEC  CICS HANDLE CONDITION QZERO(CLEANUP) ENDDATA(SETTYPE)
+         EXEC  CICS RETRIEVE INTO(TYPES) LENGTH(HALF5)
+         B     READNEXT                GOT PASSED "TYPE"
+*** NO DATA PASSED, SET TYPE TO TRANSACTION ID
+SETTYPE  EQU *
+         MVC   TYPE(4),EIBTRNID        THIS TRANSACTION ID?
+         MVI   TYPEX,SPACE             NOT A TIMED COMMAND?
+*** READ QUEUE SEQUENTIALLY, DO THE PROCESSING REQUESTED, UNLESS
+***   IT IS A TIMER CONTROLLED FUNCTION, DO A CICS START THIS PROGRAM
+***      AT THE SPECIFIED TIME.
+READNEXT EQU *
+         EXEC  CICS READQ TD QUEUE('CMND') INTO(CMDS) LENGTH(CMNDLEN)
+         CLC   CMDS,TYPE               THIS TYPE OF RECORD?
+         BNE   READNEXT                NO, GET NEXT RECORD
+         CLI   TYPEX,X                 EXPIRED PASS?
+         BE    PROCESS                 YES, PROCESS IT
+         CLI   CMDSTIME,X              TIMED START?
+         BNE   INTERVAL                YUP, GO PROCESS
+PROCESS  EQU *
+         CLC   CMD(2),=C'/*'           MVS COMMAND?
+         BNE   CEMTIT                  NO, ISSUE CEMT COMMAND
+         PUT   RPL=RPL                 PUT THE JES2 COMMAND
+         B     READNEXT
+CEMTIT   EQU *
+         MVC   CEMTCMD(70),CMD         MOVE CEMT COMMAND
+         MVC   CEMTLEN(2),=H'70'       SET LENGTH OF CEMT COMMAND
+         BAL   10,CALLCEMT             PROCESS CEMT COMMAND
+         B     READNEXT                GET NEXT RECORD
+*** TIMED START, CALCULATE THE INTERVAL
+INTERVAL EQU *
+         MVC   CMDREQID(8),CMDS        SAVE COMMAND AND TIME
+         PACK  REQTIME(4),CMDSHH       PACK THE HH
+         MP    REQTIME(4),=PL2'60'     BY 60 MINUTES
+         PACK  PACKWORK(4),CMDSMM      PACK THE MM
+         AP    REQTIME(4),PACKWORK     ADD IN THE MINUTES
+         EXEC  CICS ASKTIME ABSTIME(ABSTIME)
+         EXEC  CICS FORMATTIME ABSTIME(ABSTIME) TIME(TIMEODAY)
+         PACK  CURTIME(4),TIMEOHH      PACK THE HH
+         MP    CURTIME(4),=PL2'60'     BY 60 MINUTES
+         PACK  PACKWORK(4),TIMEOMM     PACK THE MM
+         AP    CURTIME(4),PACKWORK     ADD IN THE MINUTES
+         SP    REQTIME(4),CURTIME      SUBTRACT TIME FROM REQUEST
+         CP    REQTIME,=P'0'           CHECK IF PAST REQUESTED TIME
+         BNL   ADJUSTED                OK, A FUTURE TIME-OF-DAY
+         PACK  REQTIME(4),CMDSHH       PACK THE HH
+         MP    REQTIME(4),=PL2'60'     BY 60 MINUTES
+         PACK  PACKWORK(4),CMDSMM      PACK THE MM
+         AP    REQTIME(4),PACKWORK     ADD IN THE MINUTES
+         AP    REQTIME(4),=P'1440'     SET TO NEXT DAY INTERVAL 24 HRS
+         SP    REQTIME(4),CURTIME      SUBTRACT TIME FROM REQUEST
+ADJUSTED EQU *
+         ZAP   PACKWORK(4),REQTIME     PACK THE MM
+         DP    PACKWORK(4),=PL2'60'    FROM MINUTES TO HOURS
+         UNPK  CMDSHH(2),PACKWORK(2)   UNPACK HOURS
+         OI    CMDSHH+1,X'F0'          OR FOR DISPLAY
+         UNPK  CMDSMM(2),PACKWORK+2(2) UNPACK MINUTES
+         OI    CMDSMM+1,X'F0'          OR FOR DISPLAY
+* TIME-OF-DAY START OF COMMAND, (HHMMSS).
+TIMER    EQU *
+         PACK  PACKWRK4(4),CMDSTIME    PACK REQUESTED TIME
+         MVI   TYPEX,X                 EXPIRED PASS?
+         EXEC  CICS START TRANSID('CMDS') INTERVAL(PACKWRK4)           X
+               REQID(CMDREQID) FROM(TYPES) LENGTH(5)
+         B     READNEXT                GET NEXT RECORD
+CLEANUP  EQU *
+         CLI   INTROP,YES              WAS INTRDR OPENED?
+         BNE   RETURN                  NO, JUST RETURN TO CICS
+         ENDREQ RPL=RPL                TELL JES2 END-OF-REQUEST
+         CLOSE ACB                     CLOSE THE INTERNAL READER
+RETURN   EQU *
+         EXEC  CICS DEQ RESOURCE(CMDSDCT) LENGTH(7)
+         EXEC  CICS RETURN
+CALLCEMT EQU *
+         EXEC  CICS LINK PROGRAM('DFHEMTA') COMMAREA(CEMTPARM)
+         BR    10
+ABNDNORM EQU *        EXTRA-PARTITIONED DATASET, DCT, OPEN PROBLEM
+         EXEC  CICS ABEND ABCODE('DCTO')
+ABNDINTR EQU *        ALLOCATION OF INTERNAL READER PROBLEM
+         EXEC  CICS ABEND ABCODE('INTA')
+ABNDOPEN EQU *        INTERNAL READER OPEN PROBLEM
+         EXEC  CICS ABEND ABCODE('INTO')
+* CONTROL BLOCKS FOR INTERNAL READER
+ACB      ACB   MACRF=(ADR,SEQ,OUT)
+RPL      RPL   ACB=ACB,AREA=CMD,OPTCD=(ADR,SEQ,SYN,NUP),RECLEN=CMDL
+YES      EQU   C'Y'
+NO       EQU   C'N'
+X        EQU   C'X'
+SPACE    EQU   C' '
+INTROP   DS    C
+CMDSDCT  DC    CL7'CMDSDCT'
+TYPES    DS    0CL5
+TYPE     DS    CL4
+TYPEX    DS    CL1
+         DS    0H
+HALF5    DC    H'5'
+         DS    0D
+ABSTIME  DS    CL8
+PACKWRK4 DS    PL4
+PACKWORK DS    PL4
+REQTIME  DS    PL4
+CURTIME  DS    PL4
+TIMEODAY DS    0CL8
+TIMEOHH  DS    CL2
+TIMEOMM  DS    CL2
+TIMEOSS  DS    CL2
+TIMEFILL DS    CL2
+* COMMAND INPUT AREA
+CMDREQID DS    CL8
+CMDS     DS    CL4
+CMDSTIME DS    0CL6
+CMDSHH   DS    CL2
+CMDSMM   DS    CL2
+CMDSSS   DS    CL2
+CMD      DS    CL70
+CMDL     EQU   *-CMD
+         DS    0H
+CMNDLEN  DC    H'80'
+* DFHEMTA PARAMETER LIST
+         DS    0F
+CEMTPARM DC    A(CEMTCMD)
+         DC    A(CEMTLEN)
+         DC    A(CEMTDEST)
+         DC    A(CEMTOUT)
+         DC    X'80',AL3(CEMTOLEN)
+         DS    0F
+CEMTCMD  DS    CL70
+CEMTLEN  DS    H
+CEMTDEST DC    X'00'
+CEMTOUT  DS    80C
+CEMTOLEN DC    H'80'
+* DYNAMIC ALLOCATION PARAMETER LIST
+         DS    0F
+S99RBP   DC    X'80',AL3(S99RB)
+         DS    0F
+S99RB    EQU   *
+S99RBL   DC    X'14'
+S99VRB   DC    X'01'
+S99FLG1  DC    X'40'
+S99FLG2  DC    X'00'
+S99ERR   DC    X'0000'
+S99INFO  DC    X'0000'
+S99TXTP  DC    A(S99RBTX)
+         DS    F
+S99AUT1  DC    X'00'
+S99AUT2  DC    X'00'
+S99AUT3  DC    X'00'
+S99AUT4  DC    X'00'
+         DS    0F
+S99RBTX  DC    A(DALSYSOU)
+         DC    A(DALSPGNM)
+         DC    A(DALCLOSE)
+         DC    X'80',AL3(DALRTDDN)
+* DYNAMIC ALLOCATION TEXT UNITS
+         DS    0F
+DALSYSOU DC    X'0018'
+         DC    X'0001'
+         DC    X'0001'
+         DC    C'A'                    SYSOUT=(A,...
+         DS    0F
+DALSPGNM DC    X'0019'
+         DC    X'0001'
+         DC    X'0006'
+         DC    C'INTRDR'                      ...INTRDR)
+         DS    0F
+DALCLOSE DC    X'001C'
+         DC    X'0000'                 DE-ALLOCATE AT CLOSE
+         DS    0F
+DALRTDDN DC    X'0055'
+         DC    X'0001'
+         DC    X'0008'
+DALDDNAM DS    CL8                     RETURNED DDNAME
+         LTORG
+         END
+
+
+COMMINIT INITIAL START-UP PROGRAM
+
+         TITLE 'COMMINIT - START COMMAND PROCESSOR'
+***  THIS PROGRAM IS THE START-UP PROCESS FOR THE COMMAND PROCESSOR.
+* START THE PROCESS FOR "INIT", "TIME", AND TODAY'S TIME RECORDS. IT
+* STARTS THE "COMMANDS" PROGRAM, PASSING THE "TYPE" TO PROCESS.
+* NOTE: ALL "INIT", "TIME", AND CURRENT DATE TYPES ARE PROCESSED AT
+***     PLTPI TIME FROM PROGRAM "COMMINIT", (BELOW OPTIONAL).
+COMMINIT CSECT
+         EXEC  CICS HANDLE ABEND LABEL(RETURN)
+         MVI   TYPEX,SPACE             SAY FIRST PASS
+         MVC   TYPE(4),INIT            PROCESS "INIT" TYPE
+         BAL   10,STARTIT              GO START INIT PROCESS
+         MVC   TYPE(4),TIME            PROCESS "TIME" TYPE
+         BAL   10,STARTIT              GO START TIME PROCESS
+         EXEC  CICS ASKTIME ABSTIME(ABSTIME)
+         EXEC  CICS FORMATTIME ABSTIME(ABSTIME) DAYOFWEEK(FULLWORD)
+         L     4,FULLWORD              GET READY TO CONVERT TO DECIMAL
+         CVD   4,PACKWRK8              BINARY TO DECIMAL
+         UNPK  ZONEWORK(2),PACKWRK8(8) UNPACK THE DAY-OF-WEEK
+         OI    ZONEWORK+1,X'F0'        MAKE IT ZONED DECIMAL
+         MVC   DAYX(1),ZONEWORK+1      MOVE TODAY DAY-OF-WEEK TO START
+         MVC   TYPE(4),DAYS            PROCESS "DAY*" TYPE
+         BAL   10,STARTIT              GO START DAY* PROCESS
+         EXEC  CICS FORMATTIME ABSTIME(ABSTIME) DAYOFMONTH(FULLWORD)
+         L     4,FULLWORD              GET READY TO CONVERT TO DECIMAL
+         CVD   4,PACKWRK8              BINARY TO DECIMAL
+         UNPK  ZONEWORK(2),PACKWRK8(8) UNPACK THE DAY-OF-MONTH
+         OI    ZONEWORK+1,X'F0'        MAKE IT ZONED DECIMAL
+         MVC   MMX(2),ZONEWORK         MOVE TODAY DAY-OF-WEEK TO START
+         MVC   TYPE(4),MMS             PROCESS "MM**" TYPE
+         BAL   10,STARTIT              GO START MM** PROCESS
+         EXEC  CICS FORMATTIME ABSTIME(ABSTIME) YYDDD(JULIAN)
+         MVC   JJJX(3),JULIAN+2        JULIAN
+         MVC   TYPE(4),JJJS            PROCESS "J***" TYPE
+         BAL   10,STARTIT              GO START J*** PROCESS
+         EXEC  CICS FORMATTIME ABSTIME(ABSTIME) MMDDYY(MMDDYY)
+         MVC   MMDD(4),MMDDYY          REQUESTED MONTH
+         MVC   TYPE(4),MMDDS           PROCESS "MMDD" TYPE
+         BAL   10,STARTIT              GO START MMDD PROCESS
+RETURN   EQU *
+         EXEC  CICS RETURN
+*** START THE COMMANDS PROGRAM
+STARTIT  EQU *
+         EXEC  CICS START TRANSID('CMDS') FROM(TYPES) LENGTH(5)
+         BR    10
+SPACE    EQU   C' '
+         DS    0D
+ABSTIME  DS    CL8
+         DS    0F
+FULLWORD DS    F
+         DS    0D
+PACKWRK8 DS    PL8
+ZONEWORK DS    CL2
+JULIAN   DS    CL6
+MMDDYY   DS    CL8
+TYPES    DS    0CL5
+TYPE     DS    CL4
+TYPEX    DS    CL1
+INIT     DC    CL4'INIT'
+TIME     DC    CL4'TIME'
+DAYS     DS    0CL4
+DAY      DC    CL3'DAY'
+DAYX     DS    CL1
+MMS      DS    0CL4
+MM       DC    CL2'MM'
+MMX      DS    CL2
+JJJS     DS    0CL4
+JJJ      DC    CL1'J'
+JJJX     DS    CL3
+MMDDS    DS    0CL4
+MMDD     DS    CL4
+         LTORG
+         END
+
+
+DCT ENTRIES
+
+COMMND  DFHDCT TYPE=SDSCI,DSCNAME=COMMAND,BLKSIZE=6160,RECSIZE=80,     X
+               RECFORM=FIXBLK,TYPEFLE=INPUT,BUFNO=1
+CMND    DFHDCT TYPE=EXTRA,DESTID=CMND,DSCNAME=COMMAND
+
+
+SAMPLE CICS DDCARD FOR DCT
+
+//* EXTRA-PARTITION FILE FOR COMMANDS
+//*
+//COMMAND  DD DSN=CICS.COMMAND.FILE(CICSTEST),DISP=SHR
+//*
+
+
+SAMPLE CONTROL CARDS
+
+* COMMANDS program control cards
+*        Process CEMT commands or issue MVS commands
+* "INIT" card(s) only execute at CICS initialization time.
+*        Started by PLTPI (COMMINIT program)
+* Example:
+INIT******/*$VS,'S JOB,NAME=$NOTIFYS'
+INIT******CEMT SET DA(MSA*) OPEN ENABLED
+* "TIMEhhmmss" card(s) processed "DAILY", each day region is started.
+*        Processed at hhmmss time.
+* Example: daily at 07:30 a.m. and 17:30 p.m.
+TIME073000/*$VS,'F CICSTEST,CEMT S NET(CR121A*) CRE'
+TIME173000/*$VS,'F CICSTEST,CEMT S NET(CR121A*) CRE'
+* "DAYxhhmmss" card(s) processed on x day-of-week,where x 0=SUN..6=SAT.
+*        Processed at hhmmss time on x day-of-week.
+* Example: Every Monday at 08:00 a.m.
+DAY1080000/*$VS,'F CICSTEST,CEMT S DA(MSA*) OPEN ENA'
+* "MMddhhmmss" card(s) processed on dd of each month.
+*        Processed at hhmmss time on dd day of each month each year.
+* Example: First day of each month at 00:00:01
+MM01000001/*$VS,'S JOB,NAME=$TSMONTH'
+* "mmddhhmmss" card(s) processed on mm/dd GREGORIAN day only.
+*        Processed at hhmmss time on mmdd day of each year.
+* Example: NOV 17 at 16:20 p.m.
+1117162000/*$VS,'S JOB,NAME=$7TEENTH'
+* "Jjjjhhmmss" card(s) processed on JULIAN jjj day only.
+*        Processed at hhmmss time on jjj day of each year.
+* Example: JAN 01 at noon.
+J001120000/*$VS,'SE ''HAPPY NEW YEAR'''
+* "IMME" card(s) only execute at CICS IMMEDIATE shutdown.
+*        F CICSTEST,IMMEdiate
+* Example:
+IMME******/*$VS,'F CICSTEST,OCIS SHUT'
+IMME******/*$VS,'F OCCIT440,F OCBGR.CICSTEST,SWITCH'
+IMME******/*$VS,'F CICSTEST,CEMT P SHUT IMMED'
+IMME******/*$VS,'S JOB,NAME=$TESTDMP'
+* "SHUT" card(s) only execute at CICS shutdown.
+*        F CICSTEST,SHUTdown
+* Example:
+SHUT******/*$VS,'F OCCIT440,F OCBGR.CICSTEST,SWITCH'
+SHUT******/*$VS,'F CICSTEST,CEMT P SHUT'
+SHUT******/*$VS,'S JOB,NAME=$TESTDMP,LIB='$TEP.JOBLIB'''
+* "SWIT" card(s) only execute when a dump switch is needed.
+*        F CICSTEST,SWITch
+* Example:
+SWIT******CEMT S DUMP SWITCH
+SWIT******/*$VS,'F CICSTEST,DUMP'
+*  User transaction defined by you to execute "COMMANDS" program.
+*  RDO:  DEFINE TR(VTMC) PROG(COMMANDS)
+* "VTAM" card(s) to close the VTAM ACB to CICSTEST.
+* Example:
+*        F CICSTEST,VTMClose
+VTMC******CEMT SET VTAM CLOSE
+
+
+Ray Smith
+EDP Technical Support Specialist II
+State of Arizona (USA)
+

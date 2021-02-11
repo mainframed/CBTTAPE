@@ -1,0 +1,198 @@
+ Continuous CICS
+When CICS journalling is used for VSAM files it is necessary to co-ordinate the
+back-up of the files with the back-up and restart of the journal.  If this is
+not done, problems will arise in the event of DASD failure for the VSAM files.
+In such cases, the VSAM roll-forward utilities cannot successfully re-apply the
+journalled transactions to the restored files, since the journal start point
+will not correspond with the back-up.  Even if the roll-forward utility has a
+Tstart timeU option, errors may occur in specifying the relevant time.
+Until early this year, we followed the practice of shutting down CICS, backing
+up the files, backing up and re-formatting the journal and restarting CICS.  As
+we have a one-shift operation, this reduced our operational hours for all CICS
+applications, not all of which use journalled files.
+A new batch utility, Cross-Talk (now called Xenoserve), allowed batch jobs to
+issue the following CICS commands from outside the CICS partition (our
+environment is VSE/SP Release 2, CICS 1.6):
+%    Enable/disable transactions
+%    Close/open files or groups of files by application
+%    Switch journals
+%    Send messages to selected CICS users notifying them of application system
+status.
+We were therefore able to set up a job with the following logic:
+%    Send messages to application users notifying them of impending application
+shut-down
+%    Disable the relevant transactions
+%    Close the CICS VSAM files
+%    Back-up the files (we use disk-to-disk back-up using VSAM REPRO to VSAM-
+managed SAM files with large blocksizes)
+%    Switch to the TBU journal.  This avoids any CICS journal problems arising
+while the TAU journal is being reset
+%    Back-up the TAU user journal using FCOPY disk-to-disk and reformat it
+%    Switch back to the TAU user journal
+%    Open the CICS VSAM files
+%    Enable the transactions
+%    Send messages to application users notifying them of application
+availability.
+Since this job requires no tapes, it is scheduled for automatic execution at
+night by a job scheduler utility (when there are very few users).  The disk
+copies of the VSAM files and the journal can be backed up to tape at any
+convenient time during the following day.  CICS down-time for non-journalled
+applications is reduced to zero - apart from restarts required for CICS table
+changes.  Down-time for journalled applications is late at night when users have
+usually gone home.
+This scheme depends upon not allowing the user journal to switch from TAU to TBU
+before the back-up job is run.  It is therefore desirable to make the TAU
+journal much bigger than the likely daily usage between back-ups.  If the TAU
+journal does become full, the operator should immediately initiate the back-up
+job described above, having first ensured that last nightUs journal back-up has
+been copied to tape.  It is also necessary to set up a job to back-up the
+current journal if CICS needs to be cold restarted between back-ups.  The TBU
+journal can be negligibly small, since it is never actually used.
+SET UP CROSS-TALK (XENOSERVE) COMMANDS
+Journal switching
+//  JOB JSWITCH
+//  LIBDEF *,SEARCH=ADP.XTALK
+//  EXEC PROC=XDLBL   CROSS-TALK CATALOG ASSGNS & DLBLS
+//  EXEC XTALK,SIZE=AUTO
+DEFINE COMMAND JSWITCH AS
+(ISSUE CICS 'SET JOURNAL(02) SWITCH' IN PRODCICS)
+(WAIT 30 SECONDS)
+/*
+/&
+Closing CICS VSAM files
+//  JOB FFCLOS
+//  LIBDEF *,SEARCH=ADP.XTALK
+//  EXEC PROC=XDLBL
+//  EXEC XTALK,SIZE=AUTO
+ DEFINE COMMAND FFCLOS AS
+(SEND 'CLOSING SAMPLE APPLICATION, PLS LOGOFF' TO LHAO IN PRODCICS)
+(ISSUE CICS 'SET TRAN(FF01) DISABLED' IN PRODCICS)
+(WAIT 120 SECONDS)
+(CLOSE FILEGROUP)
+(WAIT 10 SECONDS)
+/*
+/&
+Opening VSAM files
+//  JOB FFOPEN
+//  LIBDEF *,SEARCH=ADP.XTALK
+//  EXEC PROC=XDLBL CROSS-TALK CATALOG ASSGNS & DLBLS
+//  EXEC XTALK,SIZE=AUTO
+DEFINE COMMAND FFOPEN AS
+(OPEN FILEGROUP)
+(WAIT 10 SECONDS)
+(ISSUE CICS 'SET TRAN(FF01) ENABLED' IN PRODCICS)
+(WAIT 10 SECONDS)
+(SEND 'SAMPLE APPLICATION BACK IN BUSINESS' TO LHAO IN PRODCICS)
+BACKUP JOB EXAMPLE
+//  JOB BACKUP
+//  ON #RC GT 0 GOTO ERROR
+/*
+/*  STEP 1. NOTIFY USERS, DISABLE THE TRANSACTION, CLOSE FILES
+//  LIBDEF *,SEARCH=ADP.XTALK
+//  EXEC PROC=XDLBL (CROSS-TALK CATALOG ASSGNS & DLBLS)
+//  EXEC XTALK,SIZE=AUTO
+EXECUTE FFCLOS
+/*
+/*  STEP 2.  BACKUP THE FILES
+//  DLBL PRODCAT,'PROD.CATALOG',,VSAM
+//  DLBL BACKCAT,'BACKUP.CATALOG',,VSAM
+//  DLBL PROD01,'PROD01',,VSAM,CAT=PRODCAT
+//  DLBL BACK01,'BACK01',0,VSAM,CAT=BACKCAT,
+                RECSIZE=100,RECORDS=(10000,10000),DISP=(NEW,KEEP)
+//  EXEC IDCAMS,SIZE=AUTO
+    REPRO INFILE (PROD01) -
+          OUTFILE(BACK01   -
+                  ENV(RECFM(VB) BLKSZ(8192))
+    IF LASTCC NE 0 THEN CANCEL JOB
+/*
+/*  STEP 3.  SWITCH TO 'B' JOURNAL
+//  EXEC PROC=XDLBL
+//  EXEC XTALK,SIZE=AUTO
+EXECUTE JSWITCH
+/*
+/*  STEP 4.  BACKUP JOURNAL
+//  ASSGN SYS004,DISK,VOL=DISK01,SHR
+//  DLBL JRN1,'CICS2.USER.JOURNAL.FILE.A'
+//  EXTENT SYS004,DISK01,1,0,10530,300
+//  ASSGN SYS005,DISK,VOL=DISK02,SHR
+//  DLBL JBAK,'CICS2.USER.JOURNAL.BACKUP',0,SD
+//  EXTENT SYS005,DISK02,1,0,15060,300
+//  EXEC FCOPY
+COPY INFILE=JRN1 OUTFILE=JBAK REORGANIZE NOVERIFY
+/*
+/*  STEP 5.  REFORMAT JOURNAL
+//  LOG
+//  ASSGN SYS014,DISK,VOL=DISK01,SHR
+//  DLBL JOURNAL,'CICS2.USER.JOURNAL.FILE.A',0,SD
+//  EXTENT SYS014,DISK01,1,0,10530,300
+//  EXEC DFHJCJFP,SIZE=AUTO
+/*
+//  NOLOG
+/*
+/*  STEP 6.  SWITCH BACK TO 'A' JOURNAL
+ //  EXEC PROC=XDLBL
+//  EXEC XTALK,SIZE=AUTO
+EXECUTE JSWITCH
+/*
+/*  STEP 7.  OPEN FILES, ENABLE TRANSACTION, NOTIFY USERS
+//  EXEC XTALK,SIZE=AUTO
+EXECUTE FFOPEN
+/*
+/.  NORMAL
+/*  LEAVE MSG ON LOG TO NOTE NORMAL BACK UP COMPLETION
+*   SAMPLE APPLICATION BACKUP COMPLETED NORMALLY
+//  GOTO #EOJ
+/*
+/.  ERROR
+*   BACKUP OF SAMPLE APPLICATION FAILED - PLS TAKE RECOVERY ACTION
+/*
+/&
+
+
+David Roth
+Computer Centre Director
+Australian High Commission (UK)    ) Xephon 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

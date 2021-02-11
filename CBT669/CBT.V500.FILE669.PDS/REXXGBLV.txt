@@ -1,0 +1,2571 @@
+//RXGV064  JOB (DVL),'REXXGBLV-064',
+//*    RESTART=IVP1,
+//             CLASS=A,REGION=64M,COND=(0,LT),TIME=(1)
+//*
+/*JOBPARM L=99999
+//*
+//     SET IVP=IVP1
+//*
+//A         EXEC ASMACL,PARM.C='TERM,RENT',
+//             PARM.L='RENT,REUS,LIST,MAP,RMODE(ANY)'
+//C.SYSLIB  DD DISP=SHR,DSN=CBT669.LIB
+//          DD DISP=SHR,DSN=SYS1.MACLIB
+//          DD DISP=SHR,DSN=SYS1.MODGEN
+//C.SYSTERM DD SYSOUT=*
+//C.SYSIN   DD *
+**asma syslib *
+**asma opt    term
+*-
+*  Save/load REXX variables to/from address-space common storage.
+*  This storage is available as long as the user/program is active.
+*
+*  Build: 064.1 2020-07-22
+*
+*  New in this build:
+*
+*  Changed in this build:
+*  - Set rc=4 if no records are returned.
+*    This is customizable, see new customization member RXGVCUST.
+*  - Set rc=4 for some founctions if pool is not found.
+*    This is customizable, see new customization member RXGVCUST.
+*  - Set rc=4 if SAVE could not retrieve variables to store.
+*    This is customizable, see new customization member RXGVCUST.
+*
+*  Fixed in this build:
+*  - STEMIX did not work.
+*  - Possible false negative for DATA(mask) filters.
+*
+*  See the RXGVHIST member for earlier changes
+*
+*  Warnings
+*  - build 063 changes the return code for no-records-loaded and
+*    pool-not-found. See the customization member RXGVCUST.
+*
+*  Global register usage
+*   12 mainline base
+*   11 subroutime base (in general, not guaranteed)
+*   10 mainline workarea
+*
+*  Syntax: see member RXGVDOC
+*-
+
+*-
+* Set local customization. Externalized in member RXGVCUST.
+*-
+         lclc  &JPAQopt
+         lcla  &NullLoadRc,&NoPoolRc,&SaveNoVarRc
+&JPAQopt     setc  'Y'
+&NullLoadRc  seta  4
+&SaveNoVarRc seta  4
+&NoPoolRc    seta  4
+         Copy  RXGVCUST
+
+*-
+* Set module variables
+*-
+           lclc rxgvver
+&rxgvver   setc  '064.2'
+           gblc  &@modname,&@vdatal,&@ntname,&@mainver
+           gblc  &@maintrc,&@pvtnum
+&@modname  setc 'REXXGBLV'
+&@mainver  setc '&rxgvver'
+&@maintrc  setc 'Y'
+*
+&@vdatal   setc '32700'                initial max length of data
+&@pvtnum   setc '10'                   numer of pvt entries per block
+*////////////////////////////////////////////////////////////////////*
+* Update the ntname if the storage block structure (VCB) has changed *
+*////////////////////////////////////////////////////////////////////*
+&@ntname setc 'REXXGBLV.060'
+
+         Print off
+         Copy  SYSMACS                 non-IBM macros
+         Copy  REXXMACS                REXX interfacing macros
+         Copy  VCBMACS                 Variable-store macros
+         Copy  WSAMMACS                Willow Structured Assembler Macs
+         Copy  RXGVMACS                REXXGBLV macros
+*        Copy  z10macs                 new immediates emulation
+         Print on
+
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                               Prolog                                *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+
+         VCBGlobal anchor=f.PACBcur,keepnum=20,keepmaxw=512
+         #subr set,entry=csect,base=r11,saend=saheapn
+         gblc  &#subrbase
+
+REXXGBLV #module base=(r12),text='&rxgvver',  print=GEN,               c
+               work=(lclstorl,lclstor,r10),sa=SAheap,xepilog=MainEpil
+*-
+* Keep module in JPAQ for duration of job / TSO session
+*-
+&JPAQopt setc  Upper('&JPAQopt')
+* Retain module in JPAQ
+         aif   ('&JPAQopt' ne 'Y').JPAQend
+         CDEUCTZ2 dsect=N
+.JPAQend anop
+
+*-
+* initialize global fields
+*-
+         lgfi  r1,DynDataL
+         ClrLong DynData,(r1)
+         ereg  0,1
+         stm   r0,r1,parmlist      save callers r0,r1
+         mvlit SAheap,'F1SA'       indicate that we used linkage stack
+         st    r12,mainaddr
+         mvi   rc,c'0'
+         xc    rxrc1(l'rxrc1+l'rxrc2),rxrc1
+         mvi   options,0
+         xc    zero,zero
+         xc    rtndef(8),rtndef
+         mvi   generic,c'N'
+         zap   p1,=p'1'
+         mvc   sanum,p1                  reset counter
+         la    r1,p0fields
+         la    r2,p0fieldn
+         do    until,(cr,r1,ge,r2)
+           zap   0(4,r1),=p'0'           reset counter
+           la    r1,4(,r1)
+         enddo
+         mvc   NtName,=cl16'&@ntname'
+         clear blank
+         clear parmstr
+         clear logr
+         clear emsg
+         clear rxtext
+         mvc   varpool,blank
+         mvc   ddname,blank
+         mvc   wtopfx(2),=al2(100)
+* REXX setup
+         lm    r0,r1,parmlist          reload
+         RxInit parmarea=parmstr
+         if    (ltr,0,0,z)               no REXX
+           wto   'RxInit err'
+           #modend 99
+         endif
+         if    (cli,parmstr,eq,c' ')
+           emsg  'Missing parm',rc=8
+           #module end,rc=0
+         endif
+*
+         la    r2,parmstr-5(r15)
+         mvc   dw,0(r2)
+         oc    dw,blank
+* some initial logging
+         if    (=c'TRACE',eq,dw)
+           mvi   trace,c'Y'
+           st    r12,dw
+           st    r10,dw+4
+           strmake logr,'epa ',(dw,4,c2x),' ws ',(dw+4,4,c2x)
+           trclog ,
+         endif
+* Pool anchor setup
+         Call PACBinit
+         if   (ltr,r15,r15,nz)
+           #module end,rc=0
+         endif
+*
+         trclog 'drop temp pool'
+         Pool  Drop,=cl16')TEMP'
+         mvc   varpool,blank
+         xc    PACBcur,PACBcur
+* parameter verify/split
+         Call  PRMinit
+         if    (ltr,r15,r15,nz)
+           #module end,rc=0
+         endif
+* some logging
+         TrcBlk
+         STRMAKE logr,'RXINIT Excoma ',(zrx_ExComA,4,cvxd)
+         STRMAKE        ,' Envblka ',(zrx_EnvBlka,4,cvxd)
+         STRMAKE        ,' Comblka ',(zrx_Comblk,4,cvxd)
+         trclog  ,
+         st    r10,dw
+         lgfi  r1,lclstorl
+         st    r1,dw+4
+         STRMAKE logr,'LclStor ',(dw+4,4,cvd,8),                       c
+               ' at ',(dw,4,cvxd)
+         trclog ,
+         TrcBlkEnd
+* get variable data block
+         l     r1,=a(&@vdatal)         var data max size
+         call  AcqDatab
+         if    (ltr,r15,r15,nz),then=(#modend,8)
+
+* call processor
+         mvi   RxFlags,0
+         sr    r1,r1
+         l     r15,funcaddr
+         balr  r14,r15
+         if    (c,r15,gt,rc),then=(st,r15,rc)
+* end
+         #module end,rc=0
+         ltorg
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                           Epilog                                    *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+MainEpil #subr
+         trclog 'Epilog'
+         strmake logr,'rc ',(rc,4,c2x),lenreg=r2
+         trclog ,(r2)
+*-
+* free data buffers
+*-
+         lm    r3,r4,databfra          address, length             v051
+         if    (ltr,r3,r3,nz)          if acquired                 v051
+           trclog 'Releasing databfr'
+           STORAGE RELEASE,LENGTH=(4),ADDR=(3)                     v051
+         endif ,                                                   v051
+*-
+* cleanup temp pool
+*-
+         trclog 'drop temp pool'
+         mvc   varpool,=cl16')TEMP'
+         sr    r1,r1
+         Call  PoolLoc
+         Call  PoolDrop
+*-
+* back now if REXX is not avaiable
+*-
+         if    (zrx_EnvBlka,eq,zero)    REXX initialized??
+           wto   'Back - no REXX'
+           #subr  exit,8
+         endif
+*-
+* build variables to externalize various internal values
+*-
+         Using VCBAnchr,r8
+         if    (icm,r8,15,PACBcur,z)
+           xc    wrk256,wrk256       make null
+           la    r8,wrk256             VCB anchor
+         endif
+         vputc2d maxnl,VCBAvmaxnl    max name length
+         vputc2d maxdl,VCBAvmaxdl    max data length
+         vputc2d maxndl,VCBAvmaxndl  max name+data length
+         drop  r8
+*
+         vputp2d vlistn,vlistcnt
+         vputp2d vloadn,vloadcnt
+         vputp2d vsaven,vsavecnt
+         vputp2d vdeln,vdelcnt
+         vputp2d importn,vimpcnt
+         vputp2d exportn,vexpcnt
+         vputp2d rlistn,rlistcnt
+         vputp2d rloadn,rloadcnt
+*-
+* make message variable
+*-
+         if    (cli,emsg,ne,c' '),and,(emsgl,eq,zero)
+           la    r1,l'emsg
+           st    r1,emsgl
+         endif
+         RxVput name=('REXXGBLV_MSG'),data=(emsg,f.emsgl)
+
+* if rtn not set, then use rc
+         if     (rtndef(4),eq,zero)
+           l     r1,rc
+           $cvd  r1,rcc,len=8
+           la    r1,rcc                set
+           la    r2,8                    rc
+           stm   r1,r2,rtndef          address, length
+         endif
+*
+         lm    r4,r5,rtndef            address, length
+         strmake logr,'rxretval l=',(r5,,cvdr,4),                      c
+               ' t="',((r4),(r5),,60),'"',lenreg=r2
+         trclog ,(r2)
+*
+         RxRetval f.rtndef,f.rtndef+4
+*-
+* back
+*-
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                     parameter evaluation/obtain                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+PRMinit  #subr
+         if    (blank,eq,parmstr)        blank is the shorter string
+           emsg  'Parm err 1',rc=8
+           #subr exit,rc=8
+         endif
+*
+         StrParse (parmstr,l'parmstr),                                 +
+               (#p,function,l=10,c=u),            1st pos = function   c
+               (var,varname,l=255,c=u),                                +
+               (stem,stemnm,l=255,c=u),                                +
+               (liststem,liststem,l=255,c=u,a=5),                      +
+               (value,value,l=200),                                    +
+               (data,data,l=200),                                      +
+               (valvar,valvar,l=255,c=u),                              +
+               (prefix,prefix,l=20,c=u),          v051/v052            +
+               (pool,varpool,l=16,c=u),                                +
+               (where,where,l=40,c=u),                                 +
+               (xtended,xtended,l=1,c=u),                              +
+               (length,length,l=1,c=u),                                +
+               (ddname,ddname,l=8,c=u,a=2),                            +
+               (nw,pnw,c=b,l=f,i=35),                                  +
+               (dw,pdw,c=b,l=f,i=80),                                  +
+               (trace,trace,l=1,c=u),                                  +
+               msg=logr,pp=#p,align=f,build=Y
+*              build=y,msg=logr,align=f,pp=#p    future
+*              (dump,funcdump,l=1,c=u),          future
+*-
+* some general checks
+*-
+         if    (ltr,r5,r15,nz)
+           emsg  'Parm error',rc=8
+           #subr exit,rc=8
+         endif
+         if       (cli,varpool,eq,c'-'),                               c
+               or,(cli,varpool,eq,c'('),                               c
+               or,(cli,varpool,eq,c')')
+           emsg  'Invalid pool',rc=8
+           #subr exit,rc=8
+         endif
+*-
+* validate function name
+*-
+         if    (cli,function,eq,c' ')
+           emsg  'Function missing',rc=8
+           #subr exit,rc=8
+         endif
+         oc    function,blank
+         strmake logr,'function ',function
+         trclog
+         la    r14,funclist
+         do    forever
+           if    (function,eq,0(r14)),then=leave
+           la    r14,14(,r14)
+           if    (cli,0(r14),eq,x'ff')
+             emsg  'Function invalid',rc=8
+             #subr exit,rc=8
+           endif
+         enddo
+         mvc   funcaddr,10(r14)
+*-
+* special process
+*-
+         if    (funcaddr,eq,=v(STEMIX))
+           mvc   varnamel,stemnml
+           mvc   varname,stemnm
+         endif
+*-
+* set defaults
+*-
+         if    (cli,ddname,eq,c' '),then=(mvlit,ddname,'RXGVEXP ')
+         if    (cli,varpool,eq,c' '),or,(cli,varpool,eq,c'*')
+           mvc   varpool,=cl16')DEFAULT'
+         endif
+         strmake logr,'prmi varpool ',varpool
+         trclog
+*
+         if    (cli,where_dl,ne,0)     test contents??
+           lb    r15,where_dl          size of needle
+           $cvd  logr+12,len=2,reg=r15
+           bctr  r15,0
+           mvc   logr+16(*-*),where
+           ex    r15,*-6
+           trclog 'where:'
+         endif
+
+*setup length fields
+         xc    varname_z(3),varname_z leave as 4-byte length
+         xc    stemnm_z(3),stemnm_z   leave as 4-byte length
+*-
+* check for generic variable name
+*-
+         oc    varname,blank
+         if    (cli,varname_dl,eq,0)  no varname given
+*          mvi   varname_dl,1         default
+*          mvi   varname,c'*'           to '*'
+           oi    options,opt_generic+opt_all
+           trclog 'all vars'
+         else ,                       try for generic
+           sr    r15,r15
+           ic    r15,varname_dl        length
+           la    r14,varname-1(r15)    -> last byte of string
+           if    (cli,0(r14),eq,c'.')  stem base (stem.) ?
+             lb    r15,varname_dl
+             la    r15,1(,r15)
+             stc   r15,varname_dl      update length
+             mvi   1(r14),c'*'         add '*' to name
+             oi    options,opt_generic+opt_stem
+             trclog 'stembase var'
+           else ,                      could contain generic char
+             la    r14,varname
+             ic    r15,varname_dl
+             do    over=(r15)
+               if    (cli,0(r14),eq,c'%'),or,(cli,0(r14),eq,c'*')
+                 oi    options,opt_generic
+               endif
+               la    r14,1(,r14)
+             enddo
+           endif
+         endif
+         if    (tm,options,opt_generic,o)
+           mvi   generic,c'Y'
+           trclog 'generic var'
+         else
+           trclog 'named var'
+         endif
+*
+         #subr exit,rc=0
+
+* Function list
+         Macro
+         SetFunc &name,&addr
+         lclc  &s
+&s       setc  Upper('&name')
+         aif   (k'&addr eq 0).addr2
+         dc    cl10'&s',vl4(&addr)
+         mexit
+.addr2   dc    cl10'&s',vl4(&s)
+         Mend
+
+Funclist ds    0a
+         SetFunc copy,rcopy
+         SetFunc return,vreturn
+         SetFunc load,vload
+         SetFunc loaddrop,vloaddrp
+         SetFunc pull,vpull
+         SetFunc list,vlist
+         SetFunc rlist
+         SetFunc rstat
+         SetFunc del,vdel
+         SetFunc drop,Drop
+         SetFunc save,vsave
+         SetFunc dropsave
+         SetFunc clrsave,dropsave      alias, deprecated
+         SetFunc delsave
+         SetFunc clrvsave,delsave      alias, deprecated
+         SetFunc add,vadd
+*export/import
+         SetFunc export,Export
+         SetFunc import,Import
+         SetFunc rexport
+         SetFunc rimport
+         SetFunc saveexp,saveexp       not recommended, use rexport
+         SetFunc impload,impload       not recommended, use rimport
+*indexing
+         SetFunc index,vindex
+         SetFunc varix,vindex
+         SetFunc varindex,vindex
+         SetFunc rindex
+         SetFunc stemix
+         SetFunc stmx,stemix           alias
+         SetFunc stemindex,stemix      alias
+*info
+         SetFunc map,map
+         SetFunc version
+*        SetFunc dump,vdump
+*        SetFunc brif,POOLBRIF,type=R                 045
+         dc    x'FF'
+*
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Init PACB chain / get anchor point                                  *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+
+PACBinit #subr xprolog=SubrProl,xepilog=SubrEpil
+*-
+* retrieve if done previously
+*-
+         NTServx rt,name==cl16'&@ntname',token=NtToken,                c
+               rc=wrk256,pl=wrk256+4
+         if    (z)
+           trclog 'NTrt &@ntname ok'
+           #subr exit,rc=0
+         endif
+*-
+* first time, go get
+*-
+         xc    nttoken,nttoken
+         PACBnew name==cl16')SELF',vcbainit=N  1st PACB
+         st    r1,PACBhead
+         st    r1,PACBcur
+*
+         NTServx cr,name==cl16'&@ntname',token=NtToken,                c
+               rc=wrk256,pl=wrk256+4
+         if    (nz)
+           lr    r5,r15
+           st    r5,fw
+           strmake logr,'NTCR &@ntname rc ',(fw,4,c2x),lenreg=r2
+           logwto ,(2)
+           abend 103
+         endif
+         trclog 'NTcr &@ntname ok'
+*
+         Pool  add,=cl16')DEFAULT'
+         if    (nz),then=(#subrend,8)
+         Pool  add,=cl16')TEMP'
+         if    (nz),then=(#subrend,8)
+*
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         SETVERS - return version                                    *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Version  #subr xprolog=SubrProl,xepilog=SubrEpil
+         la    r1,verstxt
+         la    r2,l'verstxt
+         stm   r1,r2,rtndef
+         #subr exit
+         #subr drop
+         Macro
+         MkVersion &t
+         lclc  &c
+&c       setc  '&sysclock'(1,19)
+verstxt  dc    c'&t &c'
+         Mend
+         MkVersion &@modname..&rxgvver
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* DroPSave : Drop pool, then save                                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+DropSave #subr xprolog=SubrProl,xepilog=SubrEpil
+         Pool  Drop,0
+         Call  Vsave
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* DelSave  : Delete vars, then save                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+DelSave  #subr xprolog=SubrProl,xepilog=SubrEpil
+         Call  Vdel
+         if    (ltr,r15,r15,z)
+           Call  Vsave
+         endif
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* REXPORT  save to temp and export                                    *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Rexport  #subr xprolog=SubrProl,xepilog=SubrEpil
+         mvc   varpool,=cl16')TEMP'
+         Call  SaveExp
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* SAVEEXP  save to pool and export                                    *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+SaveExp  #subr xprolog=SubrProl,xepilog=SubrEpil
+         Call  Vsave
+         if    (ltr,r15,r15,z)
+           oi    options,opt_all
+           Call  Export
+         endif
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Rimport  Import and then load                                       *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+RImport  #subr xprolog=SubrProl,xepilog=SubrEpil
+         mvc   varpool,=cl16')TEMP'
+         Call  ImpLoad
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* IMPLOAD  Import to pool and then load                               *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+ImpLoad  #subr xprolog=SubrProl,xepilog=SubrEpil
+         Call  Import
+         if    (ltr,r15,r15,z)
+           oi    options,opt_all
+           Call  Vload
+         endif
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         LoadDrop : Load, then drop pool                             *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VLoadDrp #subr
+         call  Vload
+         if    (ltr,r15,r15,z)
+           call  PoolDrop
+         endif
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         DROP : drop pool                                            *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Drop     #subr xprolog=SubrProl,xepilog=SubrEpil
+*
+         if    (cli,varpool,eq,c' ')
+           emsg  'missing pool name',rc=8
+           mvc   logr,emsg
+           trclog ,
+           #subr exit
+         endif
+*        if    (cli,varpool,eq,c')')
+*          emsg  'internal pool name'
+*          mvc   logr,emsg
+*          trclog ,
+*          #subr exit,rc=8
+*        endif
+*
+         Call  PoolDrop
+         #subrend rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         Pull : Load, then delete variables in pool                  *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VPull    #subr
+*
+*        if    (cli,varname_dl,eq,0)  no varname given
+*          mvi   varname_dl,1         default
+*          mvi   varname,c'*'           to '*'
+*          oi    options,opt_generic+opt_all
+*          trclog 'set all vars'
+*        endif
+*
+         call  Vload
+         if    (ltr,r15,r15,z)
+           call  Vdel
+         endif
+*
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* RLIST: show list of REXX variables                                  *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+RList    #subr xprolog=SubrProl,xepilog=SubrEpil
+*
+         mvc   varpool,=cl16')TEMP'
+         sr    r1,r1
+         call  VSave
+*
+         if    (ltr,r15,r15,z)
+           ni    options,255-opt_generic
+           oi    options,opt_all
+           call  VList
+           mvc   rlistcnt,vlistcnt
+           zap   vlistcnt,=p'0'
+         endif
+*
+         #subr exit,rc=(r15)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* RCOPY:   copy REXX variables with a prefix                          *
+* Syntax                                                              *
+*   COPY VAR(varmask) PREFIX(text)                                    *
+* Sadly it is not possible to use REXX VGET NEXT followed by REXX     *
+* VPUT because the VPUT will clear the internal REXX next-ptr.        *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+RCOPY    #subr xprolog=SubrProl,xepilog=SubrEpil
+         if    (tm,options,opt_generic,z) descrete name?
+           emsg  'VAR must be generic',rc=8
+           #subr exit
+         endif
+         if    (cli,prefix_dl,eq,0)
+           emsg  'Prefix missing',rc=8
+           #subr exit
+         endif
+*
+         mvc   varpool,=cl16')TEMP'
+         Call  VSave                   save selected
+         oi    options,opt_all
+         Call  Vload                   load all, with rename
+*
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         MAP  - map PACB structure                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Map      #subr xprolog=SubrProl,xepilog=SubrEpil
+         using PACBblk,r8
+         using VCBanchr,r6
+*-
+* get total active count
+*-
+         sr    r4,r4                   active
+         sr    r5,r5                   total
+         l     r8,PACBhead
+         strmake logr,'N/T name ',ntname,lenreg=r3
+         SayOrList logr,(3)
+         clear logr
+*
+         Do    until,(ltr,r8,r8,z)
+           la    r5,1(,r5)
+           st    r8,fw
+           if    (cli,pacbname,ne,c'-'),then=(la,r4,1(,r4))
+           la    r6,PACBvcba
+           strmake logr,(fw,4,c2x),+1,pacbname,reg=r3
+           if    (=c')SELF',ne,pacbname)
+* compute size
+             l     r14,VCBAaqh
+             l     r15,VCBAaqn
+             sr    r1,r1
+             do    over(r15)
+               a     r1,VCBsize-VCB(,r14)
+               l     r14,VCBnext-VCB(,r14)
+             enddo
+             st    r1,fw
+             strmake ((r3)),                                           c
+               ' aqn ',(VCBAaqn,4,cvd,6),                              c
+               ' aqh ',(VCBAaqh,4,cvxd),                               c
+               ' aqt ',(VCBAaqt,4,cvxd),                               c
+               ' siz ',(fw,4,cvd,8),                                   c
+               ' fqn ',(VCBAfqn,4,cvd,2),                              c
+               ' csr ',(VCBAcsrp,4,cvxd),reg=r3
+             la    r2,logr
+             sr    r3,r2
+             SayOrList logr,(r3)
+             clear logr
+             if    (cli,xtended,eq,c'Y')
+               l     r2,VCBAaqh
+               using VCB,r2
+               l     r2,VCBnext
+               l     r3,VCBAaqn
+               bctr  r3,0
+               sr    r1,r1
+               do    over(r3)
+                 stm   r2,r3,dw
+                 strmake logr,'ent ',(dw,4,c2x),                       c
+               ' sz ',(VCBsize,4,cvd,6),                               c
+               ' nl ',(VCBnamel,4,cvd,3),                              c
+               ' dl ',(VCBdatal,4,cvd,6),                              c
+               +1,(VCBname,f.vcbnamel,,30),                            c
+               =74,(f.VCBdataa,f.vcbdatal,,40),                        c
+               reg=r3
+                 la    r2,logr
+                 sr    r3,r2
+                 SayOrList logr,(r3)
+                 clear logr
+                 lm    r2,r3,dw
+                 l     r2,VCBnext
+               enddo
+               drop  r2
+             endif
+           endif
+           clear logr
+           l     r8,PACBnext
+         Enddo
+*
+         strmake logr,'Allocated ',(r5,,cvdr,4),                       c
+               ' active ',(r4,,cvdr,4),lenreg=r3
+         SayOrList logr,(r3)
+         clear logr
+*
+         if    (cli,liststem_dl,ne,0)
+           strp2d from=stemnum,to=dw
+           RxStemPut stema=wrkname,base=(liststem,b.liststem_dl),      c
+               num=f.zero,data=dw
+         endif
+*
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         VSAVE: copy variable from REXX and store into pool          *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VSave    #subr xprolog=SubrProl,xepilog=SubrEpil
+         sr    r5,r5                      preset counter
+         sr    r7,r7                      preset rc
+*
+         Pool  loc,0
+         if    (nz)
+           Pool  add,0
+           if    (ltr,r2,r15,nz)
+             SubEnd text='Pool add failed',maxrc=8
+           endif
+         endif
+*-
+* save descrete
+*-
+         if    (tm,options,opt_generic,z) descrete name?
+           trclog 'descrete'
+           la    r1,varname
+           l     r0,varnamel
+           Call  REXXVGET                 go get variable data
+           if    (ltr,r15,r15,nz)
+             SubEnd maxrc=&SaveNoVarRc,text='Descrete var not found'
+           endif
+           trclog 'call VCBput'
+           VCBcall VCBput,                                             c
+               name=(varname,b.varname_dl),data=(f.vardataa,f.vardatal)
+           if    (nz)
+             SubEnd ctext='Write to pool failed',maxrc=8
+           endif
+           mvc   vsavecnt,p1
+           trclog 'call VCBput done'
+           #subr exit,rc=0
+         endif
+*-
+* save generic
+*-
+         trclog 'generic'
+         l     r3,PACBcur
+         STRMAKE logr,'anchor ',(PACBcur,4,cvxd),' ',((r3),8)
+         trclog ,
+         do forever
+           Call  REXXVNXT                 get next
+           if    (ltr,r15,r15,nz),then=leave  end of list ??
+           trclog 'call VCBput'
+           VCBCall VCBPut,             add/update VCB                  c
+               name=(rnvvar,f.rnvvarl),data=(f.vardataa,f.vardatal)
+           lr    r2,r15
+           strmake logr,'call VCBput rc ',(r2,,cvdr,6)
+           trclog
+           if    (ltr,r2,r2,nz)
+             SubEnd ctext='Write to pool failed',maxrc=8
+           endif
+           la    r5,1(,r5)
+           ap    vsavecnt,p1
+         enddo
+
+         if    (cp,vsavecnt,eq,p0)
+           SubEnd maxrc=&SaveNoVarRc,text='Generic var not found'
+         endif
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         VLOAD: load variables from pool into REXX                   *
+*                                                                     *
+* reg use                                                             *
+*   r5 : cond code                                                    *
+*   r6 > VCB                                                          *
+*                                                                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VLoad    #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r6
+         Using VCBANCHR,r8
+
+*
+         Pool  loc,0
+         if    (nz)
+           emsg  'Pool not found',rc=&NoPoolRc
+           #subr end,rc=0
+         endif
+*
+         lr    r8,r1
+         if    (icm,r3,15,varnamel,nz)
+           STRMAKE logr,'VLOAD name ',(varname,(r3),,60)
+           TrcLog ,
+         else
+           TrcLog 'VLOAD all'
+         endif
+
+*- descrete
+         if    (tm,options,opt_generic,z)
+           VCBlocate name=(varname,f.varnamel)
+           lr    r5,r15
+           lr    r6,r1                   -> VCB
+           strmake logr,'locate rc ',(r5,,cvdr,6)
+           trclog
+           if    (ltr,r5,r5,z)
+             RexxPut (vcbvar,f.vcbnamel),(f.vcbdataa,f.vcbdatal)
+             ap    vloadcnt,p1
+             lr    r5,r15
+             #subr end,rc=0
+           endif
+           emsg  'Variable not found',rc=&NullLoadRc
+           #subr end,rc=0
+         endif
+
+*- generic
+         xc    pgetnxtp,pgetnxtp
+         Do    forever
+           PGetNext vcba=(r8),name=(varname,varnamel),                 c
+               cursor=pgetnxtp,pl=parmlist
+           if    (nz),then=leave
+           lr    r6,r1                   -> VCB
+           if    (cli,prefix_dl,eq,0)
+* write variable as received
+             RexxPut (vcbvar,f.vcbnamel),(f.vcbdataa,f.vcbdatal)
+           else
+* copy name after prefix, compute new length
+             lb    r3,prefix_dl          prefix length
+             la    r2,prefix
+             ar    r2,r3                 -> after prefix
+             l     r15,vcbnamel
+             bctr  r15,0
+             mvc   0(*-*,r2),vcbname
+             ex    r15,*-6
+             la    r3,1(r3,r15)          new length
+             STRMAKE logr,'load newname ',(prefix,(r3),,40),           c
+               '=',(f.vcbdataa,f.vcbdatal,,50)
+           trclog
+             RexxPut (prefix,(r3)),(f.vcbdataa,f.vcbdatal)
+           endif
+           ap    vloadcnt,p1
+         Enddo
+
+         if    (cp,vloadcnt,eq,p0)
+           emsg  'Variable not found',rc=&NullLoadRc
+         endif
+         #subr end,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         VRETURN: return contents of a variable                      *
+*                                                                     *
+* reg use                                                             *
+*   r5 : cond code                                                    *
+*   r6 > VCB                                                          *
+*                                                                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VReturn  #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r7
+*
+         Pool  loc,0
+         if    (nz)
+           emsg  'Pool not found'
+           la    r0,=c' '                set
+           sr    r1,r1                     'null data'
+           stm   r0,r1,rtndef
+           #subr end,rc=0
+         endif
+*
+         l     r8,PACBcur                -> VCB anchor
+         trclog 'locate'
+         VCBLocate name=(varname,f.varnamel),anchor=(r8)
+         if    (ltr,r15,r15,z)           got it
+           lr    r7,r1                   -> VCB
+           trclog 'data to return'
+           l     r0,VCBdataa             addr of data
+           l     r1,VCBdatal             size of data
+         else
+           trclog 'no data to return'
+           la    r0,=c' '                set
+           sr    r1,r1                     'null data'
+         endif
+         stm   r0,r1,rtndef
+         #subr exit
+vrtrnptr ds    a
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* VADD - add data directly to the pool                                *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+
+VAdd     #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCBAnchr,r8
+*
+         if    (tm,options,opt_generic,o)
+           emsg 'Generic variable not allowed',rc=8
+           #subr exit
+         endif
+         if    (cli,value_dl,ne,0),and,(cli,valvar_dl,ne,0)
+           emsg 'Mutually exclusive parameters',rc=8
+           #subr exit
+         endif
+         if    (cli,value_dl,eq,0),and,(cli,valvar_dl,eq,0)
+           emsg 'Required parameter missing',rc=8
+           #subr exit
+         endif
+*
+         Pool  loc,0
+         if    (nz)
+           Pool  add,0
+           if    (ltr,r2,r15,nz)
+             emsg  'Pool create failed',rc=(r2)
+             #subr end,rc=8
+           endif
+         endif
+         l     r8,PACBcur             VCB anchor
+
+* setup for either 'value' in parm, or by 'valver' variable
+         if    (cli,value_dl,ne,0)    in-parm value
+           trclog 'value'
+           sr    r1,r1
+           ic    r1,value_dl          value length
+           st    r1,vadddl
+           la    r1,value             value address
+           st    r1,vaddda
+         endif
+
+         if    (cli,valvar_dl,ne,0)   by variable
+           trclog 'valvar'
+*          Name is defined by r1 address) and r0 (length)
+*          Returns data via vardataa/vardatal.
+           la    r1,valvar
+           sr    r0,r0
+           ic    r0,valvar_dl
+           call  REXXVGET
+           if    (ltr,r15,r15,nz)
+             emsg 'VALVAR name not found',rc=8
+             #subr exit
+           endif
+           mvc   vaddda,vardataa
+           mvc   vadddl,vardatal
+         endif
+
+         STRMAKE logr,'VADD ',                                         c
+               (varname,f.varnamel,,40),'=',(f.vaddda,f.vadddl,,60)
+         TrcLog ,
+
+* if the last chars of varname='.+' then
+*   get &varname.0 from pool. make &varname.0 if not found
+*   &varname.0=1+&varname.0
+*   &varname=varname.
+
+         la    r6,varname
+         a     r6,varnamel             -> after name
+         lr    r1,r6
+         ahi   r1,-2                   -> '.+'
+*-
+* add varname
+*-
+         if    (=c'.+',ne,0(r1))       normal name add
+           trclog 'VADD normal'
+           VCBput name=(varname,f.varnamel,,40),                       c
+               data=(f.vaddda,f.vadddl,,40)
+           ap    vsavecnt,p1
+           #subr exit
+         endif
+*-
+* add var.+1
+*-
+         trclog 'VADD get .0'
+* generate and write varname.0
+         bctr  r6,0                    -> '+'
+         mvi   0(r6),c'0'              &varname.0
+         VCBget name=(varname,f.varnamel),data=wrk256
+         lr    r2,r0                   data length from VCBget
+         if    (nz),or,(ltr,r2,r2,z)   not found
+           zap   stemnum,=p'0'
+         else
+           bctr  r2,0
+           j     *+10
+           pack  stemnum,wrk256(*-*)
+           ex    r2,*-6
+         endif
+         ap    stemnum,=p'1'            add one
+         unpk  dw,stemnum
+         oi    dw+7,x'f0'
+         VCBput name=(varname,f.varnamel),data=dw    write stemname.0
+         ap    vsavecnt,p1
+*generate and write varname.n
+         trclog 'write varname.n'
+         l     r2,varnamel
+         bctr  r2,0                    minus '+'
+*
+         RxStemname base=(varname,(r2)),stema=wrkname,pnum=stemnum
+         lr    r2,r0                   length of name
+         VCBput name=(wrkname,(r2)),data=(f.vaddda,f.vadddl)
+         ap    vsavecnt,p1
+
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*         VDEL : delete variables from pool (logical delete) -        *
+*                move to 'deleted' queue.                             *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VDel     #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r6
+         Using VCBANCHR,r8
+*
+         if    (cli,varname_dl,eq,0)
+           emsg  'Missing var parm',rc=8
+           mvc   logr,emsg
+           trclog
+           #subr exit
+         endif
+*
+         Pool  loc,0
+         if    (nz)
+           emsg  'Pool not found',rc=8
+           mvc   logr,emsg
+           trclog
+           #subr exit,rc=8
+         endif
+*
+         lr    r8,r1
+         xc    pgetnxtp,pgetnxtp
+         Do    forever
+           PGetNext vcba=(r8),name=(varname,varnamel),                 c
+               cursor=pgetnxtp,pl=parmlist
+           if    (nz),then=leave
+           lr    r6,r1                   -> VCB
+           mvc   pgetnxtp,VCBprev        use ptr before
+           STRMAKE logr,'VDEL ',(varname,f.varnamel,,60)
+           trclog
+           lr    r1,r6                    -> VCB to delete
+           VCBCall VCBDel,anchor=(r8)
+           ap    vdelcnt,=p'1'
+         Enddo
+*
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* VList - show names in pool                                          *
+* Syntax:                                                             *
+*  LIST VAR(name) POOL(pool) LENGTH NW(name-width) DW(data-width)     *
+* Register usage:                                                     *
+*  r12: local base                                                    *
+*  r10: global storage                                                *
+*  r09: local branch                                                  *
+*  r08: VCBanchor                                                     *
+*  r07: VCB queue                                                     *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+VLIST    #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r7
+*
+         Pool  loc,0
+         if    (nz)
+           emsg  'Pool not found',rc=&NoPoolRc
+           #subr end,rc=1
+         endif
+         lr    r8,r1                     PAcb
+*
+         if    (cli,function,ne,c'R')    no heading for RLIST
+           strmake logr,'Pool name ',(pacbname-pacb(r8),16),lenreg=r3
+           SayOrList logr,(r3),counter=vlistcnt
+         endif
+         zap   vlistcnt,p0               don't count the header
+*
+         xc    pgetnxtp,pgetnxtp
+         Do    forever
+           PGetNext vcba=(r8),name=(varname,varnamel),                 c
+               cursor=pgetnxtp,pl=parmlist
+           if    (nz),then=leave
+           lr    r7,r1                   -> VCB
+*- trace
+           TrcBlk
+           la    r4,VCBvar
+           a     r4,VCBnamel
+           strmake logr,'vcbdata ',                                    c
+               (vcbnamel,4,cvd,4),+1,(vcbdatal,4,cvd,6),               c
+               +1,(vcbvar,f.vcbnamel,,30),                             c
+               +1,((r4),f.vcbdatal,,40)
+           trclog ,
+           TrcBlkEnd
+
+*- make list line
+           clear wrk64k,l=255
+           la    r5,wrk64k           -> name in output buffer
+           la    r6,wrk64k+2         -> data in
+           a     r6,pnw                output buffer
+           if    (cli,length,eq,c'Y')
+             strmake wrk64k,(vcbnamel,4,cvd,4),                        c
+               ':',(vcbdatal,4,cvd,8),' '
+             la    r5,15(,r5)        past length
+             la    r6,15(,r6)          fields
+           endif
+           StrMake ((r5)),(vcbvar,f.vcbnamel,,f.pnw),reg=r2
+           if    (pnw,eq,zero)       unformatted name width
+             la    r6,1(,r2)         data immediately following name
+           endif
+           StrMake ((r6)),(f.vcbdataa,f.vcbdatal,,f.pdw),reg=r2
+           la    r1,wrk64k
+           sr    r2,r1
+           SayOrList wrk64k,(r2),counter=vlistcnt
+         Enddo
+
+*- stats after processing
+         if    (cli,liststem_dl,eq,0)
+           clear logr
+           STRMAKE logr,'# of records listed: ',(vlistcnt,4,unpk,8),   c
+               lenreg=r5
+           RxSay logr,(r5)
+         else ,                      write stem.0
+           strp2d from=vlistcnt,to=dw
+           RxStemPut stema=wrkname,base=(liststem,b.liststem_dl),      c
+               num=f.zero,data=dw
+         endif
+         clear logr
+*
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Vindex - return list of pool variable names in a stem               *
+* Syntax:                                                             *
+*  INDEX VAR(name) STEM(stem) POOL(pool)                              *
+* Register usage                                                      *
+*  r6  : VCB                                                          *
+*  r7  : local dsect                                                  *
+*  r12 : global base                                                  *
+*  r11 : local base                                                   *
+*  r10 : global area                                                  *
+*  r9  : local call                                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Vindex   #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r6
+*
+         if    (cli,stemnm_dl,eq,0)
+           emsg  'Missing stemname',rc=8
+           #subr exit
+         endif
+*
+         Pool  loc,0
+         if    (ltr,r2,r15,nz)
+           emsg  'Pool not found',rc=&NoPoolRc
+           #subr end,rc=1
+         endif
+         lr    r8,r1
+*
+         Do    forever
+           PGetNext vcba=(r8),name=(varname,varnamel),                 c
+               cursor=pgetnxtp,pl=parmlist
+           if    (nz),then=leave
+           lr    r6,r1                   -> VCB
+           ap    vlistcnt,p1
+           RxStemPut stema=wrkname,base=(stemnm,b.stemnm_dl),          c
+               pnum=vlistcnt,data=(vcbname,f.vcbnamel)
+         Enddo
+* build stem.0
+         strp2d from=vlistcnt,to=dw
+         RxStemPut stema=wrkname,base=(stemnm,b.stemnm_dl),            c
+               num=f.zero,data=dw
+
+*        if    (cp,VindexStemN,eq,=pl4'0'),then=(la,r2,4)
+         if    (cp,vlistcnt,eq,p0),then=(#subrend,4)
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* EXPORT  Copy VCBs to file                                           *
+*                                                                     *
+* Register usage                                                      *
+* r6  -> VCB data                                                     *
+* r7  -> remaining data length                                        *
+* r8  -> VCB anchor block                                             *
+* r9  -> VCB located by PGETNEXT                                      *
+* r10 -> global dynamic area                                          *
+* r11 :  base                                                         *
+* r12 -> I/O buffer                                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+
+Export   #subr xprolog=SubrProl,xepilog=SubrEpil
+         Using VCB,r9
+         Using VCBAnchr,r8
+         Using VExpdsct,r12
+*-
+         Pool  loc,0
+         if    (ltr,r2,r15,nz)
+           emsg  'Pool not found',rc=&NoPoolRc
+           #subr end,rc=1
+         endif
+         lr    r8,r1
+         la    r12,wrk64k
+*-
+         STRMAKE logr,'ddname ',(ddname,8)
+         trclog ,
+         Qsam31 open,dcba=vexpdcba,gen=y,ddname=ddname,acc=p
+*-
+         Qsam31 expose,dcba=vexpdcba,field=recl
+         lh    r1,0(,r1)
+         st    r1,Vexplrecl
+         ahi   r1,-8                   minus rdw and length-field
+         st    r1,Vexpmaxdl
+
+         l     r3,Vexplrecl
+         STRMAKE logr,'lrecl ',(r3,,cvdr,5)
+         trclog ,
+
+         xc    vexpptr,vexpptr
+         Do    forever
+           PGetNext vcba=(r8),name=(varname,varnamel),                 c
+               cursor=vexpptr,pl=parmlist
+           if    (nz)
+             if    (clfi,r15,eq,1),then=(sr,r15,r15) 1 = end of vars
+             leave
+           endif
+           lr    r9,r1                   -> VCB
+           call  Export2                 go copy
+           if    (ltr,r15,r15,nz),then=leave
+         Enddo
+         lr    r5,r15                    save rc
+         trclog 'end write'
+
+         Qsam31 close,dcba=vexpdcba,drop=y
+         trclog 'file closed'
+
+         STRMAKE logr,'count ',(vexpcnt,4,p2d,6)
+         trclog ,
+
+         #subr exit,rc=(r5)
+
+* build and write record
+*  r5  -> start of source segment
+*  r6  -> end of source segment
+*  r7  -> end of source
+*  r8  -> VCB anchor
+*  r9  -> VCB
+*  r11 -> dynamic area incl i/o buffer
+Export2  #subr label
+* log it
+         trcblk
+         l     r2,VCBnamel
+         l     r3,VCBdatal
+         la    r4,VCBvar
+         a     r4,VCBnamel
+         STRMAKE logr,'write ',(VCBnamel+2,2,cvd),' ',                 c
+               (VCBdatal,4,cvd,6),' ',                                 c
+               (VCBvar,(r2),,30),'=',((r4),(r3),,40)
+         trclog ,
+         trcblkend
+
+* initialize before write
+         l     r1,VCBnamel
+         a     r1,VCBdatal
+         la    r1,8(,r1)               plus length fields
+         st    r1,vexpreclen           save combined length
+         la    r7,VCBnamel
+         ar    r7,r1                   -> last source byte
+         la    r5,VCBnamel             -> start of source
+
+         sr    r4,r4                  save number of segments
+         do    forever
+           lr    r6,r5
+           a     r6,vexpmaxdl
+           if    (cr,r6,gt,r7)        past source end?
+             lr    r6,r7              then use last
+           endif
+           lr    r2,r6                copy end address
+           sr    r2,r5                get length
+           StrCopy from=((r5),(r2)),to=(vexprecdata,(r2))
+           la    r2,8(,r2)            plus rdw and length
+           sll   r2,16
+           st    r2,vexprecrdw
+           Qsam31 put,dcba=vexpdcba,data=vexprecrdw
+           la    r4,1(,r4)
+           lr    r5,r6                bump source
+           if    (cr,r5,ge,r7),then=leave
+           xc    vexpreclen,vexpreclen
+         enddo
+*
+         strmake logr,'write done, ',(r4,,cvdr,4),' segments'
+         trclog
+*
+         ap    vexpcnt,p1
+         #subr end
+         #subr drop
+
+VexpDsct    dsect
+vexplrecl   ds   a
+vexpmaxdl   ds   a
+vexpptr     ds   a
+vexpdcba    qsam31 dcba
+Vexprec     ds    0a
+Vexprecrdw  ds    a
+Vexpreclen  ds    a
+Vexprecdata ds    0c
+            ds    xl32800
+            ds    0d
+Vexpdsctl   equ   *-vexpdsct
+*-
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* IMPORT   copy variables from file to pool                           *
+* register usage                                                      *
+*  r11  base                                                          *
+*  r8   VCB anchor (not really needed)                                *
+*  r7   I/O buffer 327800 bytes                                       *
+*  r6   structure buffer                                              *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+Import   #subr xprolog=SubrProl,epilog=ImportX  SubrEpil
+         Using vimpstrb,r6
+         Using vimpiob,r7
+         la    r7,wrk64k                 copy ptr
+         xc    vimpdcba,vimpdcba
+         xc    vimpstrbl,vimpstrbl
+*- open
+         trclog 'open'
+         Estaexx a,addr=importoe
+         Qsam31 open,dcba=vimpdcba,ddname=ddname,acc=g,eod=vimpeof,    c
+               gen=y
+         Estaexx c
+         mvi   vimpopen,c'Y'
+         trclog 'open done'
+*-
+         Qsam31 expose,dcba=vimpdcba,field=recl
+         lh    r3,0(,r1)
+         st    r3,vimpdcblr
+         STRMAKE logr,'lrecl ',(r3,,cvdr,5)
+         trclog ,
+*- VCB pool
+         Pool  loc,0
+         if    (nz)
+           Pool  add,0
+           if    (nz)
+             emsg  'Pool create failed',rc=8
+             #subr end,rc=8
+           endif
+         endif
+*-
+         GETMAIN R,LV=40000,LOC=31       resultant structure area
+         lr    r6,r1                     copy ptr
+         mvc   vimpstrbl,=a(40000)
+
+*construct name/data structure from one or more records
+       Do forever                    till eof
+         trclog 'Get vimpdcb'
+         Qsam31 Get,dcba=vimpdcba,data=vimpiorec
+         l     r3,vimpiorec+4        name+data length
+         clear logr
+         STRMAKE logr,'imprec ',(vimpiorec,16,cvxd),                   c
+               +1,(vimpiorec+16,(r3),,80)
+         trclog ,
+* ensure structure work area is big enough
+         if    (vimpioblkl,gt,vimpstrbl) will entire record fit?
+           trclog 'realloc structure bfr'
+           l     r2,vimpstrbl
+           FREEMAIN R,LV=(2),A=(6)
+           l     r2,vimpioblkl        new blklen
+           srl   r2,12                d by 4096
+           sll   r2,12                m by 4096
+           ahi   r2,8192              plus some
+           GETMAIN R,LV=(2),LOC=31    new structure buffer
+           lr    r6,r1
+           st    r2,vimpstrbl
+         else
+           trclog 'data fits in buffer'
+         endif
+
+* copy initial data to structure
+         lh    r2,Vimpiorl
+         ahi   r2,-4                  minus rdw
+         StrCopy from=(vimpiodata,(2)),to=(vimpstr,(r2))
+
+* add additional records to structure
+         l     r5,vimpstrl            size of structure in file
+         sr    r4,r4                  prep for divide
+         lh    r1,vimpiorl            input data
+         ahi   r1,-4                    length (minus rdw)
+         dr    r4,r1                  r5 = number of addntl records
+
+         la    r4,vimpstr             -> structure
+         ah    r4,vimpiorl            add current
+         ahi   r4,-4                  minus rdw
+         do    over(r5)
+           trclog 'read 2nd'
+           Qsam31 Get,dcba=vimpdcba,data=vimpiorec
+           STRMAKE logr,'imprec2 ',(vimpiorec,40,cvxd)
+           trclog ,
+           lh    r2,Vimpiorl
+           ahi   r2,-8                minus rdw and length field
+           StrCopy from=(vimpioblkl+4,(r2)),to=((r4),(r2))
+           ar    r4,r2                -> end of added
+         enddo
+
+*if varname then check
+         if    (tm,options,opt_all,z)
+           StrPatrn data=(Vimpstrnm,f.vimpstrnl),                      c
+               mask=(varname,b.varname_dl)
+           if    (nz)
+             trclog 'pattern check failed'
+             iterate
+           endif
+         endif
+
+*make VCB
+         la    r3,Vimpstrnm           -> name
+         a     r3,vimpstrnl           + name length -> data
+         VCBCall VCBPut,                 add VCB                       c
+               name=(Vimpstrnm,f.vimpstrnl),                           c
+               data=((r3),f.vimpstrdl)
+         if    (ltr,r15,r15,nz)
+           trclog 'vcbput fail'
+           #subr exit,rc=8
+         endif
+         ap    vimpcnt,p1
+       Enddo
+*-
+VImpEof  cnop  0,4
+         trclog 'eof'
+         #subr exit,rc=0
+*- import open error
+importoe cnop  0,4
+         Estaexx c
+         trclog 'open failed'
+         strmake emsg,'open ',ddname,' ',estxtext,lr=r14
+         st    r14,emsgl
+         SetMaxRc 8
+         #subr exit,rc=8
+*
+Importx  #subr label
+         trclog 'closing'
+         Qsam31 close,dcba=vimpdcba,drop=y
+         if    (lt,r2,vimpstrbl,nz)
+           trclog 'freeing'
+           FREEMAIN R,LV=(2),A=(6)
+           trclog 'free done'
+         else
+           trclog 'free bypassed'
+         endif
+         Call  subrEpil
+         #subr end
+         #subr drop
+*-
+* Vimpiob, i/o area, pointed by r7
+Vimpiob    Dsect
+vimpdcba   Qsam31 dcba
+vimpopen   ds    c
+vimpdcblr  ds    a
+vimpstrbl  ds    a
+Vimpiorec  ds    0a
+Vimpiordw  ds    0a
+Vimpiorl   ds    h
+           ds    h
+Vimpiodata ds    0a
+Vimpioblkl ds    a
+
+* Vimpstrb pointed to by r6
+Vimpstrb   Dsect
+Vimpstr    ds    0a
+Vimpstrl   ds    a
+Vimpstrnl  ds    a
+Vimpstrdl  ds    a
+Vimpstrnm  ds    0c
+*-
+
+ ago .pbrifend
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*        PoolBRIF: browse variables in pool                           *
+*        r12: local base                                              *
+*        r10: global storage                                          *
+*        r09: local branch                                            *
+*        r08: VCBanchor                                               *
+*        r07: VCB queue                                               *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+         MACRO
+&NAME    ISPLINK &OPRNDS,&ERRET=
+         GBLB  &IHBSWA
+&IHBSWA  SETB  1                       VL=1
+&NAME    LA    R1,PARMLIST             parm list
+         IHBOPLST ,&OPRNDS,MF=(E,(1))
+         L     R15,ISPLINK@            ISPLINK bootstrap
+         BALR  R14,R15                 invoke ISPLINK
+         AIF   (T'&ERRET EQ 'O').MEND
+         LTR   R15,R15                 Any error?
+         BNZ   &ERRET                  yes, jump
+.MEND    MEND
+
+PoolBRIF #subr , base=r11
+         Using VCB,r7
+         Using VCBAnchr,r8
+         l     r8,PACBcur                VCB anchor
+         zap   pbrifCnt,=p'0'            reset counter
+
+* setup parmlist for ISPLINK
+         la    r1,=cl8'BRIF'           function
+         la    r2,=cl1' '              title
+         la    r3,=c'V '
+         l     r4,vcbavmaxndl
+         la    r4,4(,r1)
+         st    r4,pbriflrecl
+         la    r4,pbriflrecl
+         la    r5,PBRIFR
+         stm   r1,r5,pbrifpl
+         oi    pbrifplv,x'80'          set VL
+         la    r1,pbrifpl
+         Link  EP=ISPLINK
+
+         if    (cp,pbrifCnt,eq,=pl4'0'),then=(la,r2,4)
+         #subr exit rc=(r2)
+
+pbrifpl  ds    5a
+pbrifplv equ   *-4
+pbrifWk  ds    4a
+pbrifCnt ds    pl4
+pbrifCx1 clc   VCBvar(*-*),varname
+
+* VCB found, now format
+pbrif2   ds    0a
+*        trclog 'pbrif2'
+         if    (cli,xtended,ne,c'Y')
+*          trclog 'not extended'
+           if    (c,r7,eq,VCBAaqh),or,(c,r7,eq,VCBAaqt),then=(br,r9)
+         endif
+
+         clear logr
+         la    r5,logr
+* format extended
+         if    (cli,xtended,eq,c'Y')
+*          trclog 'Extended'
+           st    r7,fw
+           StrC2X from=(fw,4),to=logr
+           if    (c,r7,eq,VCBAaqh)
+              mvi   8(r5),c'<'
+           endif
+           if    (c,r7,eq,VCBAaqt)
+              mvi   8(r5),c'>'
+           endif
+           la    r5,9(,r5)
+
+           st    r7,fw
+           STRMAKE logr,'VLIST match at ',(fw,4,cvxd)
+           trclog
+
+           l     r2,VCBnamel
+           cvd   r2,dw
+           unpk  0(4,r5),dw+6(2)
+           oi    3(r5),x'f0'
+           la    r5,5(,r5)
+
+           l     r3,VCBsize
+           cvd   r3,dw
+           unpk  0(4,r5),dw+6(2)
+           oi    3(r5),x'f0'
+           la    r5,5(,r5)
+
+           l     r3,VCBdatal
+           cvd   r3,dw
+           unpk  0(4,r5),dw+6(2)
+           oi    3(r5),x'f0'
+           la    r5,5(,r5)
+         endif
+*
+         l     r2,VCBnamel
+         l     r3,VCBdatal
+         la    r4,VCBvar
+         ar    r4,r2
+         STRMAKE logr,'Vlist2 ',                                       c
+               (VCBvar,(r2),,40),'=',((r4),(r3),,40)
+         trclog  ,
+
+         l     r2,VCBnamel
+         l     r3,VCBdatal
+         la    r4,VCBvar
+         if    (c,r2,gt,=a(35))            vname length
+           mvc   0(34,r5),0(r4)
+           mvi   34(r5),c'+'
+         else
+           bctr  r2,0
+           mvc   0(*-*,r5),0(r4)           vname lt 35
+           ex    r2,*-6
+         endif
+         la    r5,36(,r5)
+
+         a     r4,VCBnamel                -> data
+         if    (ltr,r3,r3,nz)
+           if    (c,r3,gt,=a(75))            vname length
+             mvc   0(74,r5),0(r4)
+             mvi   74(r5),c'+'
+           else
+             bctr  r3,0
+             mvc   0(*-*,r5),0(r4)           vname lt 35
+             ex    r3,*-6
+           endif
+         endif
+
+         trclog 'pbrif2 return'
+         br    r9
+
+PBRIFRECFM  DS    C'V '
+         ltorg
+         #subr drop
+
+* ------------------------------------------------------------------- *
+*         Pool BRIF read routine                                      *
+* ------------------------------------------------------------------- *
+pbrifr   #subr
+         #subr exit
+.pbrifend anop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* STEMIX: Enum a stem.                                                *
+* Syntax: STEMIX stem(name.)                                          *
+* i.e. city.sydney -> 'SYDNEY' in stem.1                              *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+StemIx   #subr xprolog=SubrProl,xepilog=SubrEpil
+         if    (cli,stemnm_dl,eq,0)
+           emsg 'STEM parameter missing'
+           #subr exit,rc=8
+         endif
+*-
+* 1 - make pool with selected stem variables
+*-
+         mvc   varpool,=cl16')TEMP'
+         pool  loc,0
+* add '*' at the end if not already there
+         mvc   varname,stemnm
+         mvc   varname_dl,stemnm_dl
+         la    r1,varname
+         sr    r15,r15
+         ic    r15,varname_dl
+         ar    r1,r15                    -> after name
+         bctr  r1,0                      -> last byte
+         if    (cli,0(r1),ne,c'*')
+           if    (cli,0(r1),eq,c'.')
+             mvi   1(r1),c'*'            add generic
+             la    r15,1(,r15)
+             stc   r15,varname_dl        update length
+             trclog 'genchar added'
+           endif
+         endif
+         call  vsave
+*-
+* 2 - build stem with suffix as data
+*-
+         trclog 'build stems'
+         using  VCB,r6
+         xc    pgetnxtp,pgetnxtp
+         oi    options,opt_all
+         l     r8,PACBcur
+         Do    forever
+           PGetNext vcba=(r8),name=(stemnm,stemnml),                   c
+               cursor=pgetnxtp,pl=parmlist
+           if    (nz),then=leave
+           lr    r6,r1                   -> VCB
+* point to suffix
+           lb    r2,stemnm_dl            length of base
+           la    r4,VCBname
+           ar    r4,r2                   past base
+           if    (cli,0(r4),ge,c'0')     may not be numeric
+             iterate
+           endif
+           la    r4,VCBname
+           ar    r4,r2
+           l     r3,VCBnamel
+           sr    r3,r2
+           ap    vloadcnt,p1
+           RxStemPut stema=wrkname,base=(stemnm,b.stemnm_dl),          c
+               pnum=vloadcnt,data=((r4),(r3))
+           lr    r2,r0
+           strmake logr,(wrkname,(r2),,40),'=',((r4),(r3),,60)
+           trclog
+         Enddo
+         drop  r6
+* stem.0
+         unpk  dw,vloadcnt
+         oi    dw+7,x'f0'
+         RxStemPut stema=wrkname,base=(stemnm,b.stemnm_dl),            c
+               pnum=p0,data=dw
+*-
+* back
+*-
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* RINDEX   make a list (stem) of REXX variable names                  *
+*  Syntax: RINDEX var(varname) STEM(stemname)                         *
+*                                                                     *
+*  We need to VSAVE up front as REXX do not allow mix of READNEXT     *
+*  and PUT.                                                           *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+RINDEX   #subr xprolog=SubrProl,xepilog=SubrEpil
+*
+         if    (tm,options,opt_generic,z)
+           emsg  'Var is not generic',rc=8
+           #subr exit,rc=8
+         endif
+         if    (cli,stemnm_dl,eq,0)
+           emsg  'STEM missing',rc=8
+           #subr exit,rc=8
+         endif
+*
+         mvc   varpool,=cl16')TEMP'
+         pool  loc,0
+*
+         do forever
+           Call  REXXVNXT                 get next
+           if    (ltr,r15,r15,nz),then=leave  end of list ??
+           ap    vsavecnt,p1
+           RxStemname base=(stemnm,b.stemnm_dl),                       c
+               stema=wrk256,pnum=vsavecnt
+           lr    r2,r0                 length of name
+           strmake logr,'VCBput ',(wrk256,(r2),,40),                   c
+               '=',(rnvvar,f.rnvvarl,,60)
+           trclog
+           VCBcall VCBput,name=(wrk256,(r2)),data=(rnvvar,f.rnvvarl)
+           lr    r2,r15
+           strmake logr,'VCBput rc ',(r2,,cvdr,6)
+           trclog
+           if    (ltr,r2,r2,nz),then=(leave)
+         enddo
+* stem.0
+         RxStemname base=(stemnm,b.stemnm_dl),stema=wrk256,pnum=p0
+         lr    r2,r0                     length of name
+         unpk  dw,vsavecnt
+         oi    dw+l'dw-1,x'f0'
+         VCBcall VCBput,name=(wrk256,(r2)),data=(dw,l'dw)
+*
+         oi    options,opt_all           get all from pool
+         call  VLoad
+*
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* RSTAT:   return number and total size of varfiables                 *
+*  Syntax:  RSTAT var(varmask)                                        *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+RSTAT    #subr xprolog=SubrProl,xepilog=SubrEpil
+*
+         if    (icm,r15,15,varnamel,z)
+           emsg  'Mising VAR',rc=8
+           #subr exit,rc=8
+         endif
+         if    (tm,options,opt_generic,z)
+           emsg  'Var is not generic',rc=8
+           #subr exit,rc=8
+         endif
+*
+         strmake logr,'varname "',(varname,f.varnamel),'"'
+         trclog ,
+*
+         RxVGet reset
+         sr    r7,r7                   total data length
+         sr    r8,r8                   count
+         do    forever
+           RxVnext name=wrk256,data=(0,0)
+           if    (tm,zrx_SHVRET,SHVLVAR,o),then=leave
+           lr    r5,r1                 copy name length
+           lr    r6,r0                 copy data length
+           strmake logr,(wrk256,(r5),,30),+1,(r6,,cvdr,8)
+           trclog ,
+           StrPatrn data=(wrk256,(r5)),mask=(varname,f.varnamel)
+           if    (ltr,r15,r15,nz),then=iterate
+           trclog 'passed'
+           ar    r7,r6                 total data size
+           la    r8,1(,r8)             count
+         enddo
+*
+         strmake rxtext,'count ',(r8,,cvdr,8),' dtotz ',(r7,,cvdr,12), c
+               lr=r3
+         la    r2,rxtext
+         stm   r2,r3,rtndef
+*
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                       Get variable from REXX                        *
+*  Name to look for is defined by r1 (pointer) and r0 (length)        *
+*  Returns data via vardataa/vardatal.                                *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+REXXVGET #subr xprolog=SubrProl,xepilog=SubrEpil
+         xc    vardatal,vardatal
+         lr    r4,r1                   name address
+         lr    r5,r0                   name length
+         xc    rxrc1(l'rxrc1+l'rxrc2),rxrc1
+         clear rxtext
+
+         STRMAKE logr,'name ',((r4),(r5),,60)
+         trclog
+
+         do forever
+           RxVget name=((r4),(r5)),data=(f.vardataa,f.databfrl)
+           st    r15,fw
+           st    r0,vardatal           save data length
+           lr    r2,r15
+*
+           trcblk
+           strmake logr,'RxVget rc ',(r2,,cvdr,6),reg=r3
+           if    (ltr,r2,r2,z)
+             strmake ,' namel ',(zrx_ShVbVnl,4,cvd,4),                 c
+               ' datal ',(zrx_ShVbVbl,4,cvd,6),                        c
+               ' data ',(f.vardataa,f.zrx_ShVbVbl,,40),reg=r3
+           endif
+           trclog
+           trcblkend
+
+* handle truncation
+           if    (tm,zrx_shvret,zrx_trunc,o)
+             l     r1,zrx_ShVbVbl        get required size
+             call  AcqDatab              reacquire data block
+             if    (ltr,r15,r15,nz),then=(#subrend,8)
+             iterate
+           endif
+           leave
+         enddo
+
+* check rc
+         if    (ltr,r2,r2,nz)
+           strmake emsg,'RxVget rc ',(r2,,cvdr,6),reg=r3
+           st    r3,emsgl
+           #subr end,rc=8
+         endif
+
+* if data=name then => 'not found'
+         if    (c,r5,eq,vardatal)        same length
+           l     r2,vardataa             -> data
+           l     r3,vardatal             length
+           bctr  r3,0
+           if    (ex,r3,REXXVGET_cd,eq)  name=data?
+             trclog 'data=name=>no var'
+             mvlit emsg,'Variable not found',lenreg=r2
+             st    r2,emsgl
+             #subr exit,rc=1             yes
+           endif
+         endif
+*
+         #subr exit,rc=0
+REXXVGET_cd clc 0(*-*,r2),0(r4)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                   Get next variable from REXX                       *
+*  Name to look for is defined by the varname/varnamel fields         *
+*  Returns                                                            *
+*   r15 = 0 then                                                      *
+*    returns name via rnvvar/rnvvarl                                  *
+*    returns data via vardataa/vardatal                               *
+*   r15 <>0 then most likely eof                                      *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+REXXVNXT #subr xprolog=SubrProl,xepilog=SubrEpil
+
+* last record already processed?
+         if    (tm,zrx_ShVRet,shvlvar,o)  all done
+           #subr exit,rc=2
+         endif
+
+* if first time around?
+         if    (RexxVNxtblk(4),eq,zero)
+           RxVNext stats,nl=r3,dl=r5,count=r6
+           StrMake logr,'count ',(r6,,cvdr,6),                         c
+               ' maxnl ',(r3,,cvdr,4),+1,'maxdl ',(r5,,cvdr,4)
+           trclog ,
+           if    (ltr,r6,r6,z)         no variables
+             #subr exit,rc=2
+           endif
+           Getmain R,lv=(r5),loc=31    data max size
+           lr    r4,r1
+           st    r4,vardataa
+           stm   r4,r6,RexxVNxtblk
+         endif
+
+* locate and return value
+         lm    r4,r5,RexxVNxtblk
+         do    forever
+           RxVNext name=rnvvar,data=((r4),(r5))
+           if    (ltr,r15,r15,nz),then=leave
+           mvc   rnvvarl,zrx_ShVbVnl   copy name length
+           mvc   vardatal,zrx_ShVbVbl  copy data length
+           st    r15,fw
+           trcblk
+           strmake logr,'shvret ',(zrx_shvret,1,c2x),                  c
+               ' r15 ',(fw,4,c2x),                                     c
+               +1,(rnvvarl,4,cvd,3),                                   c
+               +1,(vardatal,4,cvd,5),                                  c
+               +1,(rnvvar,f.rnvvarl,,20),                              c
+               '=',((r4),f.vardatal,,40)
+           trclog ,
+           trcblkend
+
+           if    (tm,options,opt_all,o),then=(#subrend,0)
+
+* do pattern check - name
+           StrPatrn data=(rnvvar,f.rnvvarl),mask=(varname,b.varname_dl)
+           lr    r3,r15
+           strmake logr,'pattern name check rc ',(r3,,cvdr,6)
+           trclog
+           if    (ltr,r3,r3,nz),then=iterate
+* do pattern check - data
+           if    (cli,data_dl,ne,0)
+             StrPatrn data=((r4),f.vardatal),mask=(data,b.data_dl)
+             lr    r3,r15
+             strmake logr,'pattern data check rc ',(r3,,cvdr,6)
+             trclog
+             if    (ltr,r3,r3,nz),then=iterate
+           endif
+           #subr end,rc=0              all tests passed
+         enddo
+
+* end of file
+         lm    r4,r5,RexxVNxtblk
+         Freemain R,a=(4),lv=(5)
+         xc    RexxVNxtblk,RexxVNxtblk
+         xc    databfra,databfra
+         #subr exit,rc=2
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                        Write REXX variable                          *
+* at entry                                                            *
+*  r1 -> a(varname)                                                   *
+*        a(l'varname)                                                 *
+*        a(data)                                                      *
+*        a(l'data)                                                    *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+REXXVPUT #subr xprolog=SubrProl,xepilog=SubrEpil
+         lr    r6,r1
+
+         lm    r2,r5,0(r6)             load values
+         STRMAKE logr,'RexxVput: ',                                    c
+               ((r2),(r3),,40),'=',((r4),(r5),,60)
+         trclog  ,
+
+         lm    r2,r5,0(r6)             load values
+         RxVput name=((r2),(r3)),data=((r4),(r5))
+         if    (ltr,r5,r15,nz)
+           strmake logr,'RxVput rc ',(r5,,cvdr,4),lenreg=r2
+           mvc   emsg,logr
+           st    r2,emsgl
+           SetMaxRc 8
+         endif
+
+         #subr exit,rc=(r5)
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*               (re)acquire data block storage                        *
+* at entry                                                            *
+*  r1 =  size to acquire                                              *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+AcqDatab #subr xprolog=SubrProl,xepilog=SubrEpil
+         lr    r6,r1
+* drop old
+         if    (clc,databfra,ne,zero)
+           STRMAKE logr,'Release ',(databfrl,4,cvd,8)
+           trclog ,
+           l     r2,databfra         current block address
+           l     r3,databfrl         current block size
+           STORAGE RELEASE,LENGTH=(3),ADDR=(2)
+         endif
+
+* compute 4k boundary and get
+         a     r6,=a(4093)         required data size
+         srl   r6,12               adjust
+         sll   r6,12                to 4k
+         st    r6,databfrl
+         STRMAKE logr,'Obtain ',(databfrl,4,cvd,8)
+         trclog ,
+         STORAGE OBTAIN,LENGTH=(6),loc=31,cond=YES
+         if    (ltr,r15,r15,nz)
+           lr    r5,r15
+           strmake emsg,'Obtain for ',(r6,,cvdr,6),' rc ',             c
+               (r5,,cvdr,6)
+           mvc   rc+3,20
+           SetMaxRc 8
+           #subr end,rc=8
+         endif
+         st    r1,databfra
+         st    r1,vardataa
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Write logrecord to terminal                                         *
+* At entry:                                                           *
+*  r1 -> cl120'log data'                                              *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+         ds    0d
+logrdsct dsect
+logrsa   ds    18a
+logrwrk  ds    xl256
+logrdsctl equ  *-logrdsct
+
+         push  using
+         using logger,r7
+         using logrdsct,r8
+Logger   #module base=r7,work=(logrdsctl,logrdsct,r8),sa=logrsa
+         ereg  0,r1
+*-
+         NTServx rt,name='REXXGBLV$LOGGER$',                           c
+               token=logrwrk,rc=logrwrk+16,pl=logrwrk+20
+         l     r10,logrwrk
+         RxSay (r9),l'logr
+*-
+         #module exit
+         ltorg
+         pop   using
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Pool anchor - new cb                                                *
+*  r1 -> cl16'name'                                                   *
+*  returns r15=0
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+PoolAdd  #Subr xprolog=SubrProl,xepilog=SubrEpil
+         if    (ltr,r4,r1,z)          if null ptr
+           la   r4,varpool            then use default name
+         endif
+         strmake logr,'name ',((r4),16)
+         trclog
+         l     r8,PACBhead             -> 1st PACB
+         Using PACBblk,r8
+*-
+* locate free
+*-
+         Do    until,(ltr,r8,r8,z)
+           strmake logr,'check ',pacbname
+           trclog ,
+           if    (cli,PACBname,eq,c'-')  use if free
+             strmake logr,'reuse ',pacbname
+             trclog ,
+             mvc   PACBname,0(r4)      obtain
+             st    r8,PACBcur          save as current
+             lr    r1,r8
+             #subr exit,rc=0
+           endif
+           lr    r7,r8                 save address for current
+           l     r8,PACBnext           -> next if any
+         enddo
+         drop  r8
+*-
+* setup new chained PACB
+*-
+         Using PACBblk,r7
+         trclog 'add'
+         PACBnew name=(r4)
+         st    r1,PACBnext            set fwd ptr
+         drop  r7
+         Using PACBblk,r3
+         lr    r3,r1
+         st    r3,PACBcur             save as current
+         strmake logr,lenreg=r2,'at ',(pacbcur,4,c2x)
+         trclog ,(r2)
+         lr    r1,r3
+         drop  r3
+*-
+* back
+*-
+         #subr end
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* POOL locate entry                                                   *
+*  r1 -> cl16'name'                                                   *
+*  returns r15=rc, r1 -> PACB entry                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+PoolLoc  #Subr xprolog=SubrProl,xepilog=SubrEpil
+         Using PACBblk,r8
+*-
+         if    (ltr,r9,r1,z)          if null ptr
+           la   r9,varpool            then use default
+         endif
+         strmake logr,'name ',((r9),16)
+         trclog
+*-
+* test if already current
+*-
+         l     r8,PACBcur
+         if    (PACBname,eq,0(r9))
+           trclog 'alrady current'
+           lr    r1,r8
+           #subr exit,0
+         endif
+*-
+* locate named
+*-
+         xc    PACBcur,PACBcur         prevent accidental reuse
+         l     r8,PACBhead             -> 1st PACB
+         Do    until,(ltr,r8,r8,z)
+           if    (PACBname,eq,0(r9))
+             st    r8,fw
+             strmake logr,'at ',(fw,4,c2x),lenreg=r2
+             trclog ,(r2)
+             st    r8,PACBcur          save as current
+             lr    r1,r8
+             #subr exit,rc=0           back
+           endif
+           l     r8,PACBnext           -> next if any
+         enddo
+*-
+* back
+*-
+         sr    r1,r1
+         #subr end,rc=4                not found
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* PoolDrop : relase all pool storage, except anchor                   *
+* entry                                                               *
+*  r1 -> cl16'name' or 0                                              *
+*   'varpool' contains name of pool                                   *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+PoolDrop #subr xprolog=SubrProl,xepilog=SubrEpil
+*
+         if    (ltr,r9,r1,z)          if null ptr
+           la   r9,varpool            then use default
+         endif
+         strmake logr,'name ',((r9),16)
+         trclog
+*
+         Pool  Loc,(r9)
+         if    (nz)
+           trclog 'not found'
+           #subr exit,rc=0
+         endif
+*
+         trcblk
+         l     r8,PACBcur
+         using PACBblk,r8
+         strmake logr,'drop ',pacbname,                                c
+               ' pacb ',(pacbcur,4,c2x)
+         trclog ,
+         trcblkend
+         VCBCall VCBDelAc              delete active VCBs, keep free
+         l     r8,PACBcur
+         if    (cli,pacbname,ne,c')')
+           mvi   pacbname,c'-'
+*          trclog 'marked'
+         endif
+*
+         #subr exit
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*        PGETNEXT - get next VCB record                               *
+*  r1-> parm block as follows                                         *
+*   +00 a(VCB anchor)                         load to r2              *
+*   +04 a(varname)        point to field      load to r3              *
+*   +08 a(varname-length) point to field      load to r4              *
+*   +12 a(cursor)         point to field      load to r5              *
+*   varname and varnamel only relevant if not all                     *
+*  returns                                                            *
+*       r15 = 0 if found                                              *
+*       r1 -> VCB if found                                            *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+PGetNext #subr xprolog=SubrProl,xepilog=SubrEpil
+         lr    r9,r1
+         lm    r2,r5,0(r1)
+         lr    r8,r2
+         using VcbAnchr,r8
+*
+         if    (VCBAeye,ne,=c'VCBANCHR')  better check
+           mvlit emsg,'PGetNext bad anchor',lenreg=r3
+           st    r3,emsgl
+           SetMaxRc 99
+           #subr end,rc=99
+         endif
+         if    (VCBAaqn,eq,zero)          any entries?
+           #subr end,rc=1
+         endif
+*
+         using Vcb,r7
+         l     r7,0(,r5)               cursor
+         if    (ltr,r7,r7,z)           first ??
+           l     r7,VCBAaqh            -> first (pseudo VCB)
+         endif
+         Do    forever
+           l     r7,VCBnext
+           if    (c,r7,eq,VCBAaqt)     last done?
+             #subr exit,rc=1
+           endif
+           l     r2,12(,r9)            update
+           st    r7,0(r2)                cursor
+           strmake logr,'vcbname "',(vcbname,f.vcbnamel,,60),'"'
+           trclog ,
+           if    (tm,options,opt_all,o),then=leave leave if all
+* do pattern check - name
+           StrPatrn data=(vcbname,f.vcbnamel),                         c
+               mask=(varname,b.varname_dl)
+           lr   r2,r15
+           strmake logr,'pattern check name rc ',(r2,,cvdr,6)
+           trclog
+           if    (ltr,r2,r2,nz),then=iterate not matched
+* do pattern check - data
+           if    (cli,data_dl,ne,0)
+             StrPatrn data=(f.vcbdataa,f.vcbdatal),                    c
+               mask=(data,b.data_dl)
+             lr   r2,r15
+             strmake logr,'pattern check data rc ',(r2,,cvdr,6)
+             trclog
+             if    (ltr,r2,r2,nz),then=iterate
+           endif
+           leave
+         enddo
+*
+         lr    r1,r7
+         #subr exit,rc=0
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+* Subroutine prolog / epilog  - do tracing                            *
+* r10 -> global storage                                               *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+SubrProl #subr base=r6
+         ap    sanum,=p'1'
+         if    (zrx_ExComA,eq,zero),then=(#subrend,0)   no REXX
+*
+         TrcBlk
+         l     r3,4(,r13)              reload callers
+         l     r3,64(,r3)                basereg (r11)
+         strmake logr,(10(,r3),8),' ',(sanum,4,p2d,2),' entry',        c
+               lenreg=r2
+         trclog   ,(r2)
+         l     r1,4(,r13)              reload callers
+         lm    r0,r1,20(r1)              r0+r1
+         TrcBlkEnd
+*
+         #subr exit,rc=0
+         #subr drop
+*--
+* r2 = #subr end rc
+SubrEpil #subr base=r6
+         if    (zrx_ExComA,eq,zero),then=(#subrend,(r2))  no REXX
+         lr    r5,r2                   copy rc
+*
+         TrcBlk
+         l     r3,4(,r13)              reload callers
+         l     r3,64(,r3)                basereg
+         strmake logr,(10(,r3),8),' ',(sanum,4,p2d,2),                 c
+               ' exit rc ',(r5,,cvdr,8),lenreg=r2
+         trclog   ,(r2)
+         l     r1,4(,r13)              reload callers
+         lm    r0,r1,20(r1)              r0+r1
+         TrcBlkEnd
+*
+         sp    sanum,=p'1'
+         #subr exit,rc=(r5)            r5 = original r15
+         #subr drop
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                            dynamic area                             *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+LclStor  Dsect
+*save areas
+         ds    0a
+SAheap   ds    xl(8*72)                6 saveareas
+SAheapN  ds    0a                      end
+DynData  ds    0a
+mainaddr ds    a                       -> main routine
+PACBcur  ds    a                       -> current PACB
+sanum    ds    pl4
+Zero     ds    a
+rc       ds    a                       return code
+rcc      ds    cl8                     return code
+p0fields equ   *
+p0       ds    pl4
+stemnum  ds    pl4
+vsavecnt ds    pl4
+vloadcnt ds    pl4
+vdelcnt  ds    pl4
+VlistCnt ds    pl4
+vexpcnt  ds    pl4
+vimpcnt  ds    pl4
+rlistcnt ds    pl4
+rloadcnt ds    pl4
+p0fieldn equ   *
+p1       ds    pl4
+NtName   ds    cl16
+NtToken  ds    0xl16
+PACBhead ds    a                       -> 1st pool anchor
+         ds    xl12                    not used
+NtRc     ds    a
+rtndef   ds    2a
+subrc    ds    a                       #subr return code
+parmlist ds    8a                      address/length of parm
+Envb_Ptr equ   parmlist,4              address of environment block
+initr0   equ   parmlist,4              original r0
+initr1   equ   parmlist+4,4            original r1
+procadr  ds    a
+
+blank    ds    cl120
+wtopfx   ds    a
+logr     ds    cl120
+emsgl    ds    a
+emsg     ds    cl120
+trclogrp ds    c
+RxText   ds    cl48
+subxwrk  ds    d
+dw       ds    d
+dw2      ds    d
+fw       ds    f
+fw2      ds    f
+* REXX return and reason code
+         ds    d
+Result   ds    c                       result area
+RxFlags  ds    x
+RxRc1    ds    x
+RxRc2    ds    x
+*
+rnvvarl  ds    a
+RnvVar   ds    cl(255)
+trcwrk   ds    8a
+         estaexx ds
+
+*fields passed as parms from caller
+funcaddr    ds    a                    address of main function to run
+funcname    ds    cl4
+functype    ds    c
+
+XComRc      ds    a
+options      ds  x
+.*opt_status   equ x'40'
+opt_generic  equ x'80'               varname is generic
+opt_stem     equ x'40'               varname is a stem base
+opt_all      equ x'20'               no varname, select all
+generic      ds  c                   Y/N
+*-
+         ds    0a
+         StrParse area
+varnamel equ   varname_z,4
+stemnml  equ   stemnm_z,4
+*-
+         RexxMacs ds
+*-
+patrninf    ds    cl16
+someptrs    ds    0a
+clrsavevl   ds    a
+clrsaveopt  ds    x
+pgetnxtp    ds    a
+            org   someptrs
+vaddda      ds    a
+vadddl      ds    a
+            org
+VCBptr      ds    a
+VCBAptr     ds    a
+RexxVNxtBlk ds    3a                     databfra,databfrl,count
+*-
+vardataa    ds    0a
+*next 2 fields must be kept on order bfra,bfrl
+databfra    ds    a                      address of var-data block
+databfrl    ds    a                      size of var-data area
+vardatal    ds    a
+* following will be moved to separate getmained area
+*ardatab ds    a                      var data block / rdw
+wrknamel    ds    a
+wrkname     ds    cl255
+            ds    0d
+wrk256      ds    xl256
+wrk64k      ds    xl65512
+            org   wrk64k
+parmstr     ds    cl255
+            org   wrk64k
+iordw       ds    a
+ioreclen    equ   iordw,2
+iodata      ds    0x
+            org
+LclStorL    equ   *-LclStor
+DynDataL    equ   *-DynData
+
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+*                            other dsects                             *
+* ------------------------------------------------------------------- *
+* ------------------------------------------------------------------- *
+
+*-
+* Pool Anchor CB
+*-
+PACBblk  Dsect
+PACB     ds    0x
+PACBvcba ds    xl(VCBAnchrl)
+PACBnext ds    a          -> next vector table
+PACBname ds    cl16
+PACBblkl equ   *-PACBblk
+
+*-
+* other
+*-
+         RexxMacs dsect
+         VCBANCHR dsect=yes
+         VCBmodul
+         VCB   ,   dsect
+
+         IeaNtAsm
+         print nogen
+         IkjTcb
+         IHACDE                       used by CDEUCTZ2
+         IHAPSA DSECT=YES             used by CDEUCTZ2
+         Qsam31 Dsects                DCB, DCBE
+*-
+         END
+//*
+//L.SYSLIB   DD DISP=SHR,DSN=SYS1.CSSLIB
+//L.SYSLMOD  DD DISP=SHR,DSN=CBT669.LPALIB(REXXGBLV)
+//*
+//* Production version is in LPALIB
+//*
+//* activate dynamic:
+//*   SETPROG LPA,ADD,MODNAME=REXXGBLV,DSNAME=CBT669.LPALIB
+//*
+//IVP1     EXEC PGM=IKJEFT1B,PARM='%RXGV&IVP'
+//STEPLIB  DD DISP=SHR,DSN=CBT669.LPALIB
+//SYSEXEC  DD DISP=SHR,DSN=CBT669.LIB
+//SYSTSPRT DD SYSOUT=*,OUTLIM=(5000)
+//RXGVDUMP DD SYSOUT=*
+//SYSTSIN  DD DUMMY
+//RXGVEXP  DD RECFM=VB,LRECL=23000,SPACE=(TRK,(5,5)),UNIT=SYSDA
+//*XGVEXP  DD DISP=OLD,DSN=CBT669.REXXGBLV.EXPORT
+//*YSMDUMP DD DISP=OLD,DSN=CBT669.SYSMDUMP

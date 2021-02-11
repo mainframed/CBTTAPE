@@ -1,0 +1,330 @@
+ File transfer mechanism
+Our installation runs MVS/SP on a 4381 and VM/SP on a 4341 with an NJE link
+connecting the two systems.  Since we also have full DASD sharing between the
+two systems, moving files from MVS to VM is as simple as issuing the proper
+filedefs and using the MOVEFILE command.  However, moving files from VM to MVS
+is much more complex as VM cannot write directly onto an MVS pack and MVS does
+not comprehend VM mini-disks.  We solved this dilemma by creating a REXX EXEC
+that breaks down a VM file into 80-byte records, dynamically modifies a COBOL
+program and ships it off as an MVS batch job via the NJE link.  The COBOL
+program reconstructs the 80-byte records as an MVS sequential file.  Since the
+NJE link supports transparency, binary files can be moved and there is no
+restriction on record length.  The net result is that a CMS user can move his
+data to the MVS system with a single command.
+
+TRANSMVS EXEC
+/* EXEC to transfer data from CMS to MVS regardless of record length */
+action='new'
+/* assume that we are creating a new OS dataset */
+parse upper arg fn ft fm '(' options
+call parse_options 1 'QUAL'   : qual=keyword
+call parse_options 1 'LRECL'  : lrecl=keyword
+call parse_options 0 'NOTIFY' : notify=keyword
+call parse_options 0 'ROUTE'  : route=keyword
+call parse_options 0 'QUIET'
+if keyword='QUIET' then quiet=1
+                   else quiet=0
+if qual='NO' then qual=fn
+if length(qual)>8 then call error_exit 2 'QUAL must be 1 to 8 characters'
+if datatype(qual.A)=0 then call error_exit 3 'QUAL cannot',
+              ' contain special characters'
+if (lrecl¬='NO')&(datatype(lrecl,N)=0) then call error_exit 4 'LRECL',
+               ' must be numeric'
+node3=userid()
+if datatype(node3,N)
+   then do
+        node3='$'||node3
+        if length(node3)>8 then node3=substr(node3,1,8)
+        end
+qual='CMS3.PROD.'||node3||'.'||qual
+'GETFMADR'
+pull . freemode freecuu .
+'SET CMSTYPE HT'
+listfile fn ft fm '(lifo noheader alloc'
+if rc¬=0 then call error_exit rc 'File' fn ft fm 'does not exist'
+pull . . . recfm flrecl recs .
+if lrecl='NO' then lrecl=flrecl
+blocksize=(23476/lrecl)%1*lrecl
+blockquan=recs/(blocksize/lrecl)%1+1
+if blockquan<2 then blockquan=2
+'LINK ADIMVS 16D' freecuu  'RR MVSIPO'
+'ACCESS' freecuu freemode
+'FILEDEF SYSUT1 CLEAR'
+'FILEDEF SYSUT1 DISK OSDATA FILE' freemode 'DSN' qual
+'ESTATE DSDATA FILE' freemode
+sc=rc
+'SET CMSTYPE RT'
+if sc=0
+   then do
+        if quiet
+           then action='D'
+           else do
+                say qual '  already exists, your choices are:'
+                say
+                say '(A)ppend this transfer onto the existing OS dataset'
+                say '(D)elete the existing OS dataset'
+                say   ' and continue with transfer'
+                 say '(Q)uit this transfer operation'
+                say
+                say 'Please enter A,D, or Q'
+                pull action
+                if verify(action,'AD')¬=0
+                   then call error_exit 5 'Terminating this transfer'
+                end
+        end
+push macro transmvs qual lrecl recs blocksize blockquan notify route action
+address command 'XEDIT TRANSMVS MODEL * '
+'SPOOL PUN CONT'
+'PUNCH TRANSMVS JCL A (NOH'
+remaining_bytes=''
+startpos=1
+do recs
+   data=''
+   'EXECIO 1 DISKR' fn ft fm '(VAR DATA'
+   sc=rc
+   if sc=0
+      then do
+           x=length(data)
+           if length(data) < lrecl then data=left(data,lrecl)
+           data=remaining_bytes||data
+           bytes_left=length(data)
+           do while bytes_left > 80
+              punrec=substr(data,startpos,80)
+              'EXECIO 1 PUNCH (VAR PUNREC'
+              bytes_left=bytes_left-80
+              startpos=startpos+80
+           end
+           remaining_bytes=substr(data,startpos,bytes_left)
+           startpos=1
+      end
+      else do
+           call error_exit sc 'EXECIO error return',
+                                ' code - ' sc ',unable to continue'
+           end
+end
+if bytes_left>0 then 'EXECIO 1 PUNCH (VAR REMAINING_BYTES'
+'EXECIO 1 PUNCH (STRING ZZ'
+'EXECIO 1 PUNCH (STRING //'
+'SPOOL PUN RSCS'
+'TAG DEV OOD NWD1 JOB'
+'EXECIO * CP (SKIP STRING SPOOL PUN NOCONT CLOSE'
+'SPOOL PUN OFF'
+'TAG DEV OOD'
+'RELEASE' freemode
+'EXECIO * CP (SKIP STRING DETACH' freecuu
+if ¬quiet then say fn ft fm 'will be transferred to MVS as' qual
+exit
+parse_options:
+arg offset keyword
+x=find(options,keyword)
+if x=O
+   then keyword='NO'
+   else keyword=word(options,x+offset)
+return
+error_exit:
+'SET CMSTYPE RT'
+parse arg return_code error_msg
+say error_msg
+exit return_code
+return
+
+TRANSMVS MODEL
+//TRANSMVS JOB ACCT#.'USER',
+ //         CLASS=A,
+//         MSGCLASS=A,
+/*ROUTE PRINT ANALOG.USER
+//STEP001 EXEC COBCLG.OUTC='Z',
+//         CPARM='NOLIST,NOSXREF,NOPMAP',
+//         LPARM='NOXREF.NOMAP'
+//COB.SYSIN  DD *
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID.   TRNSFR.
+       AUTHOR.
+       INSTALLATION.
+       DATE-WRITTEN.
+       DATE-COMPILED.
+       REMARKS.
+      *
+      *  INPUT  TO THIS PROGRAM ARE 80 BYTE RECORDS CREATED
+      *   BY A REXX EXEC
+      *
+      * OUTPUT RECORDS ARE EXPANDED BACK
+      * TO THE ORIGINAL RECORD LENGTH
+      *
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER.  IBM-370.
+       OBJECT-COMPUTER.  IBM-370.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT CARD-FILE           ASSIGN UR-2540R-S-SYSIN.
+           SELECT DISK-FILE           ASSIGN NEWFILE.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  CARD-FILE
+           RECORDING MODE IS F
+           RECORD CONTAINS 80 CHARACTERS
+           LABEL RECORDS ARE OMITTED
+           DATA RECORD IS CARD-IN.
+       01  CARD-IN                    PIC X(80)
+       FD  DISK-FILE
+           RECORD CONTAINS 11111 CHARACTERS
+           BLOCK  CONTAINS bbbbb CHARACTERS
+           LABEL RECORDS ARE STANDARD
+           DATA RECORD IS DISK-RECD.
+       01  DISK-RECD                  PIC X(11111).
+       EJECT
+       WORKING-STORAGE SECTION.
+       01  COUNTERS                            COMP-3
+           03  RCD-LTH                PIC S9(5)  VALUE +11111.
+           03  VM-RCD                 PIC S9(7)  VALUE +vvvvv.
+           03  MVS-RCD                PIC S9(7)  VALUE +0.
+           03  S1                     PIC S9(5)  VALUE +1.
+           03  S2                     PIC S9(5)  VALUE +1.
+       01  HOLD-RECD-IN.
+           03  HOLD-IP                PIC X(80)
+           03  HOLD-IP-R    REDEFINES HOLD-IP.
+               05  HOLD-IP-COL OCCURS 80 TIMES PIC X.
+       01  HOLD-RECD-OUT.
+           03  HOLD-OP                PIC X(11111) VALUE SPACES.
+           03  HOLD-OP-R    REDEFINES HOLD-OP.
+               05  HOLD-OP-COL OCCURS  11111  TIMES PIC X.
+       EJECT
+       PROCEDURE DIVISION.
+       START-IT.
+           OPEN  INPUT                 CARD-FILE
+                OUTPUT                 DISK-FILE.
+           MOVE    SPACES              TO      DISK-RECD.
+       READ-CARD.
+            READ CARD-FILE              INTO    HOLD-RECD-IN
+                AT END GO TO END-JOB.
+           PERFORM MOVE-COL            THRU    MOVE-COL-EXIT
+                VARYING S1             FROM    1
+                                       BY      1
+                UNTIL   S1             >       80.
+           GO TO READ-CARD.
+       MOVE-COL.
+           MOVE    HOLD-IP-COL(S1)     TO      HOLD-OP-COL(S2).
+           ADD     +1                  TO      S2.
+           IF      S2                  >       RCD-LTH
+               PERFORM WRITE-OP-RECD   THRU    WRITE-OP-EXIT.
+       MOVE-COL-EXIT.
+       WRITE-OP-RECD.
+           ADD     +1                  TO      MVS-RCD.
+           IF      MVS-RCD             >       VM-RCD
+               GO TO WRITE-OP-EXIT.
+           WRITE   DISK-RECD           FROM    HOLD-RECD-OUT.
+           MOVE    SPACES              TO      HOLD-RECD-OUT.
+           MOVE    +1                  TO      S2.
+       WRITE-OP-EXIT.
+       END-JOB.
+           CLOSE CARD-FILE, DISK-FILE.
+           STOP RUN.
+/*
+//GO.NEWFILE  DD DSN=DSNAME,
+//         UNIT=SYSDA,VOL=SER=HSMSHR,SPACE=(bbbbb,(qqqqq,sssss)),
+//         DISP=(NEW,CATLG,DELETE),DCB=(RECFM=FB)
+//GO.SYSPRINT   DD   SYSOUT=*
+//GO.SYSOUT     DD   SYSOUT=*
+//GO.SYSIN  DD  DATA,DLM=ZZ
+
+TRANSMVS XEDIT
+/* Support macro for TRANSMVS EXEC */
+arg dsn lrecl recs blocksize blockquan notify route action
+second_alloc=(blockquan*.20)%1
+if second_alloc<2 then second_alloc = 2
+'set stay on'
+'set msgmode off'
+'CH /DSNAME/'||dsn||'/* *'
+'CH /USER/'||userid()||'/* *'
+'CH /11111/'||lrecl||'/* *'
+'CH /vvvvv/'||recs||'/* *'
+'CH /bbbbb/'||blocksize||'/* *'
+'CH /qqqqq/'||blockquan||'/* *'
+'CH /sssss/'||second_alloc||'/* *'
+if   route='NO' then do
+                  '/*ROUTE'
+                  'DELETE'
+                  '-/MSGCLASS=A'
+                  'CH /MSGCLASS=A/MSGCLASS=Z'
+                  end
+if  notify='NO' then do
+                 '/*NOTIFY'
+                 'DELETE'
+                 end
+if  action='D' then do
+                '/STEP001'
+                'up'
+                'input //STEP000 EXEC PGM=IEFBR14'
+                'input //OSFILE  DD   DSN='||dsn||',DISP=(OLD,DELETE,DELETE)'
+                 end
+if action='A' then 'ch /DISP=(NEW,CATLG,DELETE)/DISP=(MOD,KEEP,KEEP)/* *'
+'FFILE TRANSMVS JCL A3'
+
+TRANSMVS HELPADI
+ .cm .11 80
+.cs 1 on
+TRANSMVS
+Use the TRANSMVS command to transfer data form CMS to MVS without
+concern for the record length.  A batch MVS job
+is submitted and the dataset is placed on the HSMSHR pack.
+.cs 1 off
+.cs 2 on
+ The format of the command is:
++----------+---------------------------------------------------------+
+|          |                                                         |
+| TRANSMVS |fn ft fm ( QUAL xxxxxxxx  LRECL nnnnn ROUTE NOTIFY QUIET |
+|          |                                                         |
+|          |                                                         |
++----------+---------------------------------------------------------+
+ where:
+fn ft fm     the filename and filetype of the disk file (filemode is
+             optional and will default to A)
+QUAL         is the dataset name qualifier
+             The dataset name will be CMS3.PROD.userid.xxxxxxx
+                   where userid will be your CMS userid
+                   and xxxxxxx is the qualifier that you supply.
+             Note: If no QUAL is supplied, then the CMS filename is
+                   used as the default.
+LRECL        the logical record length of the file to be transferred.
+             The record length of the CMS file you are moving is used
+             as the default.
+ROUTE        If you specify ROUTE then the sysout of the batch job will
+             be routed back to your CMS reader.
+NOTIFY       If you specify NOTIFY then you will be notified by the MVS
+             system when your transfer job has been completed.
+QUIET        The EXEC will not display messages on your terminal.  If
+             the dataset already exists on HSMSHR then the EXEC assumes
+             you wish to delete and recreate the dataset without
+             prompting that you.  This option is useful if you are
+             invoking the TRANSMVS EXEC from within another
+             environment such as RAMIS.
+.cs 2 off
+Usage Notes
+     1.  All datasets are created on the HSMSHR disk pack.
+     2.  The blocking factor is automatically computed.  All datasets
+         are full track blocked for optimum performance.
+     3.  If you attempt to create a dataset that previously exists,
+         then you are prompted as to whether you wish to Append to that
+         dataset. Delete and recreate the dataset, or to Terminate
+         the transfer.
+
+Luke Marvin and Don Junkins
+Analog Devices Inc (USA)
+     ) Analog Devices 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

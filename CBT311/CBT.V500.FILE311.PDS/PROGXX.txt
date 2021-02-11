@@ -1,0 +1,1060 @@
+./ ADD NAME=$CHANGES 1200-97137-97137-1812-00009-00009-00000-DALCOCK
+- Tutorial panels (not very extensive)
+- Use NoRecall on LISTDSI
+- Parse SysReason for better LISTDSI error messages
+- Detect comments that don't have blanks by the asterisks
+- Use dynamic areas on the status popup panel so the msgs text areas stand
+  out
+- Handle multiple parms
+- The REPORT command (in the table list) puts an APFLST report on your
+  ISPF list file.
+./ ADD NAME=PROGXX   1200-97137-97137-1812-00903-00903-00000-DALCOCK
+/* REXX
+ |
+ | Name: PROGxx
+ |
+ | Author: David Alcock :: dave@planetmvs.com
+ |
+ | Purpose: This edit macro processes a SYS1.PARMLIB(PROGxx) member that
+ |          consists of APF entries (and only APF entries) and performs
+ |          these functions:
+ |
+ |          - puts note and msg lines into the edit datasets for errors
+ |          - parm of SORT puts a sorted version of the PROGxx
+ |            member into "USERID.SPFTEMP1.SORTED.PROGXX"
+ |          - parm of TLIST shows a table list of all of the entries
+ |            in the APFLST and allows browsing or invoking the PDS
+ |            command for that dataset.
+ |
+ |          You can process the whole member or use the SS range line
+ |          line commands to select a few entries to process.
+ |
+ |          This exec expects valid PROGxx APF entries. We stop when
+ |          we find bad entries.
+ |
+ |          Although easy enough, we don't filter out the non-APF
+ |          entries and you will get a syntax error on them.
+ |
+ |          You can keep your SYS1.PARMLIB(PROGxx)' entries separate
+ |          via 'IEASYSxx' statement PROG=(AA,EE,LL) where PROGAA
+ |          has your APFLST entries, EE has your EXITs and LL has
+ |          your LNKLST entries.
+ |
+ | Modifications: You *MUST* use the correct attributes for the
+ | binary fields that are defined in the PROGXXS panel
+ | for the output to look correct.
+ |
+ | Sample invocations:
+ |
+ |   PROGXX
+ |   PROGXX SORT
+ |   PROGXX TLIST
+ |   PROGXX LIST
+ |   PROGXX LIST NOVERIFY
+ |
+ | Hints: If you have only added/modified a few or even just one entry
+ |        to a PROGxx member, use the "SS" line commands to do the
+ |        processing for only the lines changed for quicker response.
+ */
+
+/**********************************************************************
+***                                                                 ***
+**           M o d i f i c a t i o n   H i s t o r y                 **
+**                                                                   **
+** Person     Date        Ver  Description                           **
+** ---------- ----------- ---- ------------------------------------- **
+** DGAlcock   12-MAR-1997 v1.2 Tutorial panels; Use NoRecall; Parse  **
+**                             SysReason for better LISTDSI error;   **
+**                             Detect comments that don't have blanks**
+**                             by the asterisks; Use dynamic areas   **
+**                             on the status popup panel so the msgs **
+**                             text areas stand out; Handle multiple **
+**                             parms; Added Report option;           **
+** DGAlcock   10-MAR-1997 v1.1 Parse comments correctly;             **
+**                             Added Master Catalog volume support;  **
+**                             Added SMS-managed keyword support;    **
+**                             Better header on sorted file;         **
+**                             Save type of APFLST format if found;  **
+**                             Added parm alias of LIST for TLIST;   **
+**                             Corrected incorrect panel name;       **
+** DGAlcock   10-MAR-1997 v1.0 Initial REXX exec created             **
+***                                                                 ***
+**********************************************************************/
+
+debug = 0
+
+address ISREDIT
+'MACRO (PARMS) NOPROCESS'
+parms = translate(parms)
+if parms == '?' | parms = "HELP" then do
+   address ISPEXEC "DISPLAY PANEL(PROGXXH0)"
+   exit
+   end
+
+/*---------------------------------------------------------------------
+ | Process line commands for S/SS/S99999
+ ------------------------------------------------------------------- */
+
+'PROCESS RANGE S'
+select
+  when rc = 0 then do
+       '(CMD) = RANGE_CMD'          /* Get the command    */
+       '(LINE1) = LINENUM .ZFRANGE' /* Get first in range */
+       '(LINE2) = LINENUM .ZLRANGE' /* Get last in range  */
+       end
+  when rc <= 4 then do /* No S or SS entered, use entire file     */
+       '(CMD) = RANGE_CMD'          /* Get the command    */
+       '(LINE1) = LINENUM .ZFIRST'  /* Get first in range */
+       '(LINE2) = LINENUM .ZLAST'   /* Get last in range  */
+       end
+  otherwise  /* Line command conflict - Edit will create message  */
+       exit 12
+end /* of "select" */
+
+msg1 = '02'x time() '01'x "Starting processing of APFLST"
+msg2 = " "
+address ISPEXEC
+"CONTROL DISPLAY LOCK"
+"ADDPOP"
+"DISPLAY PANEL(PROGXXS)"
+"REMPOP"
+
+/*---------------------------------------------------------------------
+ | Process the parms
+ ------------------------------------------------------------------- */
+
+o_list = 0
+o_noverify = 0
+o_sort = 0
+
+do i = 1 to words(parms)
+   select
+     when word(parms,i) == "LIST"     then o_list = 1
+     when word(parms,i) == "TLIST"    then o_list = 1
+     when word(parms,i) == "NOVERIFY" then o_noverify = 1
+     when word(parms,i) == "SORT"     then o_sort = 1
+     otherwise
+          say "Unknown option '"word(parms,i)" was ignored"
+          end
+   end
+
+/*---------------------------------------------------------------------
+ | Initialize variables
+ ------------------------------------------------------------------- */
+
+entry_started = 0
+apflist.1 = ""
+format_type = ""
+apfsrc.1 = 0
+a = 1
+comment = 0
+firsterr = 0
+mcatvol = ""
+warn_num = 0
+dsn_errcount = 0
+Syntax_errcount = 0
+
+/*---------------------------------------------------------------------
+ | Process the selected lines for apf entries
+ ------------------------------------------------------------------- */
+
+address ISREDIT
+"(ICAPS) = CAPS"  /* save caps type upon entry */
+"CAPS = OFF"      /* Ensure mixed case for note/msg lines */
+
+"(SRCDSN) = DATASET"
+"(SRCMEM) = MEMBER"
+"(DID) = DATAID"
+address ISPEXEC "LMQUERY DATAID("DID") VOLUME(SRCVOL)"
+lmq_rc = rc
+if lmq_rc == 0 then srcvol = "n/a"
+address ISREDIT
+
+if  member <> '' then srcdsn = srcdsn||"("||srcmem||")"
+
+tline = line2 - line1
+
+do i = line1 to line2
+   '(LINEVAL) = LINE' i   /* Get edit line */
+
+   if debug then say "#"i ">" lineval
+
+   if (i // 10) == 0 then do
+      msg1 = '04'x "Reading APFLST edit line"||'03'x i '04'x "of" ,
+             '03'x tline
+      msg2 = '02'x time() '06'x dsname '01'x volume
+      address ISPEXEC
+      "CONTROL DISPLAY LOCK"
+      "ADDPOP"
+      "DISPLAY PANEL(PROGXXS)"
+      "REMPOP"
+      address ISREDIT
+      end
+
+   do j = 1 to words(lineval)
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | Comment start and end detection
+       |
+       | Note: Since not all comments end on a " @/", we need to
+       | extract the last two bytes of every word and test them@/
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      wl = length(word(lineval,j))
+      if wl > 2 then ws = substr(word(lineval,j),wl-1,2)
+
+      if comment then do
+         if word(lineval,j) == "*/" | ws == "*/" then ,
+            comment = 0
+         iterate
+         end
+      else if word(lineval,j) == "/*" | ,
+              substr(word(lineval,j),1,1) == "/*" then do
+              comment = 1
+              iterate
+              end
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | Start of an APF entry
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      if word(lineval,j) == "APF" then do
+
+         /* Ignore the "APF FORMAT(type)" line */
+         k = j + 1
+         if k == words(lineval) | k < words(lineval)  then do
+            if word(lineval,k) == "FORMAT(STATIC)" then do
+               format_type = "STATIC"
+               iterate
+               end
+            if word(lineval,k) == "FORMAT(DYNAMIC)" then do
+               format_type = "DYNAMIC"
+               iterate
+               end
+            end
+
+         if entry_started then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Found new APF entry before the end of the previous one'"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         entry_started = 1
+         apfsrc.a = i
+         end
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | We don't do anything with the ADD word, skip to next word
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      if word(lineval,j) == "ADD" then iterate
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | DSNAME() parameter
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      if substr(word(lineval,j),1,7) == "DSNAME(" then do
+         if length(apflist.a) == 44 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Duplicate DSNAME() parameter found for APF entry'"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         parse value word(lineval,j) with "("dsname")"
+         if dsname == "" then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Parse of DSNAME() parameter failed, check syntax'"
+            Syntax_errcount = Syntax_errcount + 1
+            dsname = left('?',44,'?')
+            end
+         dsname = left(dsname,44)
+
+         if apflist.a == "" then do
+            apflist.a = dsname
+            iterate
+            end
+
+         if length(apflist.a) <> 6 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Expecting VOLUME() or SMS parameter but did not find it'"
+            apflist.a = "??????"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         apflist.a = dsname""apflist.a
+         error.a = ""
+         a = a + 1
+         apflist.a = ""
+         apfsrc.a = 0
+         entry_started = 0
+         iterate
+         end
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | VOLUME() parameter
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      if substr(word(lineval,j),1,7) == "VOLUME(" then do
+         if length(apflist.a) == 6 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Duplicate VOLUME() parameter found for APF entry'"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         parse value word(lineval,j) with "("volume")"
+         if volume == "" then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Parse of VOLUME() parameter failed, check syntax'"
+            volume = "?????"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+         volume = left(volume,6)
+
+         if apflist.a == "" then do
+            apflist.a = volume
+            iterate
+            end
+
+         if length(apflist.a) <> 44 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Expecting DSNAME() parameter but did not find it'"
+            Syntax_errcount = Syntax_errcount + 1
+            apflist.a = left('?',44,'?')
+            end
+
+         apflist.a = apflist.a""volume
+         error.a = ""
+         a = a + 1
+         apflist.a = ""
+         apfsrc.a = 0
+         entry_started = 0
+         iterate
+         end
+
+      /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+       | SMS parameter
+       - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+      if substr(word(lineval,j),1,3) == "SMS" then do
+         if length(apflist.a) == 6 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Duplicate VOLUME()/SMS found for APF entry'"
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         volume = "---SMS"  /* Our special name for SMS volume */
+
+         if apflist.a == "" then do
+            apflist.a = volume
+            iterate
+            end
+
+         if length(apflist.a) <> 44 then do
+            if firsterr = 0 then firsterr = i
+            "LOCATE" i   /* locate to this bad line */
+            "LINE_AFTER "i" = INFOLINE " ,
+            "'Expecting DSNAME() parameter but did not find it'"
+            apflist.a = left('?',44,'?')
+            Syntax_errcount = Syntax_errcount + 1
+            end
+
+         apflist.a = apflist.a""volume
+         error.a = ""
+         a = a + 1
+         apflist.a = ""
+         apfsrc.a = 0
+         entry_started = 0
+         iterate
+         end
+
+      end /* of "do j = 1 to words(lineval)" - - - - - - - - - - - */
+
+   end /* of "do i = line1 to line 2" - - - - - - - - - - - - - - - */
+
+a = a - 1
+if a == 0 then do
+   zedsmsg = ""
+   zedlmsg = "Error: Did not find any valid APF entries in input"
+   address ISPEXEC 'SETMSG MSG(ISRZ001)'
+   exit 12
+   end
+
+if Syntax_errcount <> 0 then do
+   if Syntax_errcount > 0 then terr = "errors"
+   else terr = "error"
+   msg1 = '02'x time() '01'x||"Warning: Found" ,
+          '03'x||Syntax_errcount||'01'x||"syntax "terr
+   msg2 = '0f'x "(Please hit ENTER)"
+   address ISPEXEC
+   "ADDPOP"
+   "DISPLAY PANEL(PROGXXS)"
+   "REMPOP"
+   address ISREDIT
+   end
+
+/*---------------------------------------------------------------------
+ | Get the SYSRES
+ |
+ | Note: This code *may* not work if the SYSRES is on a 4 digit
+ |       UCB - untested in that environment.
+ ------------------------------------------------------------------- */
+
+cvt    = storage(10,4)                         /* -> CVT             */
+dcvt   = c2d(cvt)                              /* Convert to decimal */
+sysad  = storage(c2x(d2c(DCVT+x2d(30))),4)     /* -> CVTSYSAD        */
+dsysad = c2d(sysad)                            /* convert to decimal */
+sysres = storage(c2x(d2c(dsysad+x2d(1C))),6)   /* Get SYSRES volser  */
+
+/* address TSO "SHOWTSO SYSRES"  <- Installation may have this */
+
+/*--------------------------------------------------------------------
+ | Verify the APFLST, put the results in the file
+ ------------------------------------------------------------------- */
+
+
+if o_noverify == 0 then do
+
+   stime = time()
+
+   do i = 1 to a
+      cdsn = "'"strip(word(apflist.i,1))"'"
+      cvol = strip(word(apflist.i,2))
+      cvols = cvol
+      error.i = ""
+      j = apfsrc.i
+
+      if ((i // 10) == 0) | i = 1 then do
+         msg1 = '04'x "Processing APFLST entry"||'03'x i '04'x "of" ,
+                '03'x a '04'x "Started:" '02'x stime
+         msg2 = '02'x time() '06'x left(cdsn,44) '01'x cvol
+         address ISPEXEC
+         "CONTROL DISPLAY LOCK"
+         "ADDPOP"
+         "DISPLAY PANEL(PROGXXS)"
+         "REMPOP"
+         address ISREDIT
+         end
+
+      if cvol == "---SMS" then do
+         x = LISTDSI(cdsn norecall)
+         cvol = sysvolume
+         end
+      else do
+           select
+              when cvol == "******" then cvol = sysres
+              when cvol == "*MCAT*" then do
+                   if mcatvol == "" then call return_mcatvol
+                   cvol = mcatvol
+                   end
+              otherwise
+                   nop
+                   end
+           x = LISTDSI(cdsn "VOLUME("cvol")" norecall)
+           end
+
+      if x <> 0 then do
+         warn_num = warn_num + 1
+
+         if j <> 0 then do
+
+            if firsterr = 0 then firsterr = j
+            dsn_errcount = dsn_errcount + 1
+            call return_listdsi_reason   /* Set error.i to sysreason */
+
+            address ISREDIT
+            "LINE_AFTER "j" = MSGLINE" ,
+            "'         "error.i"'"
+            "LINE_AFTER "j" = NOTELINE" ,
+            "'Warning: DSN="cdsn"'"
+            end
+
+         else say "Error: "cdsn
+
+         end /* of "if x <> 0" - - - - - - - - - - - - - - - */
+
+      end /* of "do i = 1 to a" - - - - - - - - - - - - - - - - */
+
+   end /* of "if o_noverify..." - - - - - - - - - - - - - - - - - - */
+
+address ISREDIT "CAPS = "icaps /* Restore CAPS state upon entry */
+
+/*--------------------------------------------------------------------
+ | Do the common task of creating an ISPF table of the APF list entries
+ | for the SORT and TLIST functions
+ ------------------------------------------------------------------- */
+
+ table_created = 0
+
+ if o_sort == 1 | o_list == 1  then do
+
+    address ISPEXEC
+
+    msg1 = '02'x time() '01'x "Creating ISPF Table"
+    msg2 = ""
+    "CONTROL DISPLAY LOCK"
+    "ADDPOP"
+    "DISPLAY PANEL(PROGXXS)"
+    "REMPOP"
+
+    tablenm = "PXX"random()
+    "TBCREATE "tablenm" NOWRITE NAMES(DSN VOL ERR NUM)"
+    tbc_rc = rc
+    if tbc_rc == 0 then table_created = 1
+    else do
+         say "Create of ISPF table for APFLST failed, rc="tbc_rc
+         signal theend
+         end
+
+    do i = 1 to a
+       num = i
+       dsn = strip(word(apflist.i,1))
+       vol = strip(word(apflist.i,2))
+       err = error.i
+       "TBADD "tablenm
+       end
+
+    end /* of "if o_sort == 1 | o_list == 1" ------  */
+
+/*--------------------------------------------------------------------
+ | Display the APFlist entries in an ISPF table display
+ ------------------------------------------------------------------- */
+
+sortffn = "Original order"
+
+if o_list == 1 then do
+
+   address ISPEXEC "TBTOP "tablenm
+   tsel = ""
+   nrc = 0
+
+   do while nrc == 0
+
+      address ISPEXEC "TBDISPL "tablenm" PANEL(PROGXXAT)"
+      nrc = rc
+
+      if nrc == 0 then do
+
+         if zcmd <> "" then do
+            tsel = ""
+            zcmd = translate(zcmd)
+            if word(zcmd,1) == "SORT" then do
+               sortf = "NUM"  /* assume original order */
+               if words(zcmd) == 2 then ,
+                  select
+                    when word(zcmd,2) == "D"      then sortf = "DSN"
+                    when word(zcmd,2) == "DSN"    then sortf = "DSN"
+                    when word(zcmd,2) == "DSNAME" then sortf = "DSN"
+                    when word(zcmd,2) == "V"      then sortf = "VOL"
+                    when word(zcmd,2) == "VOL"    then sortf = "VOL"
+                    when word(zcmd,2) == "VOLUME" then sortf = "VOL"
+                    when word(zcmd,2) == "VOLSER" then sortf = "VOL"
+                    when word(zcmd,2) == "E"      then sortf = "ERR"
+                    when word(zcmd,2) == "ERR"    then sortf = "ERR"
+                    when word(zcmd,2) == "ERRORS" then sortf = "ERR"
+                    when word(zcmd,2) == "NUM"    then sortf = "NUM"
+                    otherwise
+                         nop
+                         end
+               select
+                  when sortf == "NUM" then sortffn = "Original Order"
+                  when sortf == "DSN" then sortffn = "Dataset"
+                  when sortf == "VOL" then sortffn = "Volser"
+                  when sortf == "ERR" then sortffn = "Errors"
+                  otherwise
+                       nop
+                       end
+
+               if sortf == "NUM" then sortt = "N"
+               else sortt = "C"
+
+               "TBSORT" tablenm "FIELDS("sortf","sortt",A)"
+               "TBTOP" tablenm
+               iterate
+               end
+
+            if word(zcmd,1) == "REPORT" then do
+               call Generate_Report
+               iterate
+               end
+
+            zedsmsg = ""
+            zedlmsg = "Invalid command: "left(zcmd,60)
+            address ISPEXEC "SETMSG MSG(ISRZ001)"
+            end /* of "if zcmd <> """   */
+
+         tsel = translate(tsel)
+         select
+
+           /*------------------------------------------------------
+            | Browse the dataset
+            ------------------------------------------------------*/
+
+           when tsel == 'S' | tsel = 'B' then do
+                if vol == "******" then vol = sysres
+                if vol == "*MCAT*" then vol = mcatvol
+                call Browse_Library
+                end
+
+           /*------------------------------------------------------
+            | Invoke the PDS, PDSE, StarTools command for this lib
+            |
+            | Note: The PDS command name may differ from shop to shop
+            ------------------------------------------------------*/
+
+           when tsel == 'P' then do
+                address ISPEXEC "CONTROL ERRORS RETURN"
+                address ISPEXEC "CONTROL DISPLAY SAVE"
+
+                address TSO "PDSE '"dsn"' VOLUME("vol")"
+
+                address ISPEXEC "CONTROL DISPLAY RESTORE"
+                address ISPEXEC "CONTROL ERRORS CANCEL"
+                end
+
+           /*------------------------------------------------------
+            | Incorrect option
+            ------------------------------------------------------*/
+           otherwise
+                zedlmsg = "Unknown selection option:" tsel
+                zedsmsg = ""
+                address ISPEXEC 'SETMSG MSG(ISRZ001)'
+            end
+         /*------------------------------------------------------
+          | End of table row selection
+          ------------------------------------------------------*/
+         tsel = ""
+         end
+      end
+
+   end /* of "if o_list == 1"  */
+
+/*--------------------------------------------------------------------
+ | Sort the table and create a new PROGxx member with the sorted
+ | version
+ ------------------------------------------------------------------- */
+
+ if o_sort == 1 then do
+
+    address ISPEXEC
+
+    msg1 = '02'x time() '01'x "Sorting APFLST"
+    msg2 = ""
+    "CONTROL DISPLAY LOCK"
+    "ADDPOP"
+    "DISPLAY PANEL(PROGXXS)"
+    "REMPOP"
+
+    "TBSORT" tablenm "FIELDS(DSN,C,D)"
+    "TBTOP" tablenm
+
+    progxxs_dsn = "SPFTEMP1.SORTED.PROGXX"
+    progxxs_ddn = "PXX"random()
+    address TSO
+    x = outtrap("XMSG.","*")
+    "DELETE "progxxs_dsn
+    x = outtrap("off")
+    "ALLOCATE FILE("progxxs_ddn") DA("progxxs_dsn")",
+    "UNIT(SYSDA) NEW REUSE SPACE(15 15) TRACKS",
+    "LRECL(80) BLKSIZE(8800) RECFM(F B)"
+    newstack
+
+    address ISPEXEC
+    src = 0
+    do while src == 0
+       "TBSKIP" tablenm
+       src = rc
+       if src == 0 then do
+          if err <> "" then err = "/* Warning: "err" */"
+
+          push "    VOLUME("vol")   "err
+          push "    DSNAME("dsn")"
+          push "APF ADD"
+          end
+       end
+
+    if format_type <> "" then push "APF FORMAT("format_type")"
+
+    h.1 = "This sorted APFLST was created by the PROGXX edit macro"
+    h.2 = "on "date()" at "time()" from:"
+    h.3 = "DSN="SRCDSN
+    h.0 = 3
+
+    push "/* "left("-",65,"-")" */"
+    do t = h.0 to 1 by -1
+       push "/* "center(h.t,65)" */"
+       end
+    push "/* "left("-",65,"-")" */"
+
+    queue '' /* indicate end of file */
+    address TSO "EXECIO * DISKW "progxxs_ddn" (FINIS"
+    address TSO "FREE FILE("progxxs_ddn")"
+    address TSO "delstack"
+
+    msg1 = '02'x time() '01'x "A sorted version of the APFLST " ,
+           "was placed into:"
+    msg2 = '04'x "DSN='"sysvar(sysuid)"."progxxs_dsn"'" ,
+           '0f'x "(Please hit ENTER)"
+    address ISPEXEC
+    "ADDPOP"
+    "DISPLAY PANEL(PROGXXS)"
+    "REMPOP"
+    end /* of "if o_sort == 1" -------------------------------  */
+
+/*--------------------------------------------------------------------
+ | Now position us to the first error (if any) and exit with a msg
+ ------------------------------------------------------------------- */
+
+theend:
+if o_noverify == 0 then do
+   if warn_num == 0 then ,
+      zedlmsg = "Didn't find any problems with the APFLST" ,
+                "entries selected"
+   else do
+        zedlmsg = "Found "warn_num" APFLST entries in error for" ,
+                  "those lines which were selected"
+        "ISREDIT LOCATE" firsterr
+        end
+   zedsmsg = ""
+   address ISPEXEC 'SETMSG MSG(ISRZ001)'
+   end
+
+if table_created then address ISPEXEC "TBCLOSE "tablenm
+exit
+
+/*--------------------------------------------------------------------
+ | Browse the library with control on errors
+ ------------------------------------------------------------------- */
+
+Browse_Library:
+address ISPEXEC "CONTROL ERRORS RETURN"
+address ISPEXEC "CONTROL DISPLAY SAVE"
+if vol == "---SMS" then ,
+   address ISPEXEC "BROWSE DATASET('"dsn"')"
+else address ISPEXEC "BROWSE DATASET('"dsn"') VOLUME("vol")"
+brc = rc
+if brc <> 0 then do
+   zedsmsg = ""
+   zedlmsg = "Browse to dataset failed: "dsn "on" vol
+   address ISPEXEC "SETMSG MSG(ISRZ001)"
+   end
+address ISPEXEC "CONTROL DISPLAY RESTORE"
+address ISPEXEC "CONTROL ERRORS CANCEL"
+return
+
+/*--------------------------------------------------------------------
+ | Return the sysreson type in error.i
+ |
+ | I'd rather have an array but sysreason is a string and not numeric
+ ------------------------------------------------------------------- */
+
+return_listdsi_reason:
+
+s = sysreason
+select
+ when s="0001" then e="Internal error"
+ when s="0002" then e="Dynamic allocation processing error"
+ when s="0003" then e="Invalid dataset type"
+ when s="0004" then e="Error determining UNIT name"
+ when s="0005" then e="Data set not cataloged"
+ when s="0006" then e="Error obtaining the data set name"
+ when s="0007" then e="Error finding device type"
+ when s="0008" then e="The data set does not reside on a DASD"
+ when s="0009" then e="DFHSM migrated the data setand NORECALL set"
+ when s="0010" then e="Unknown error"
+ when s="0011" then e="Directory information was request but" ,
+                      "you didn't have authority to dataset"
+ when s="0012" then e="VSAM data sets are not supported"
+ when s="0013" then e="The data set could not be opened"
+ when s="0014" then e="Device type not found in UCB tables"
+ when s="0017" then e="System or user abend occurred"
+ when s="0018" then e="Partial data set information was obtained"
+ when s="0019" then e="Data set resides on multiple volumes"
+ when s="0020" then e="Device type not found in eligible" ,
+                      "device table (EDT)"
+ when s="0021" then e="Catalog error trying to locate the data set"
+ when s="0022" then e="Volume %VVVVV not mounted"
+ when s="0023" then e="Permanent I/O error on volume %VVVVVV"
+ when s="0024" then e="Dataset not found on volume %VVVVV"
+ when s="0025" then e="Dataset migrated to non-DASD device"
+ when s="0027" then e="No volume serial is allocated to the " ,
+                      "data set"
+ when s="0029" then e="Dataset name or ddname must be specified"
+ otherwise
+      e = "LISTDSI SysReason="s
+      end
+
+y = lastpos('%VVVVV',e)
+if y <> 0 then e = overlay(cvol,e,y,6)
+
+error.i = e
+
+return
+
+/*--------------------------------------------------------------------
+ | Generate a report on the SPF list file
+ ------------------------------------------------------------------- */
+Generate_Report:
+
+address ISPEXEC
+"CONTROL DISPLAY SAVE"
+pagenum = 0
+linenum = 99
+
+
+"TBTOP" tablenm
+rrc = 0
+do while rrc == 0
+
+   "TBSKIP" tablenm
+   rrc = rc
+   if rrc <> 0 then leave
+
+   linenum = linenum + 1
+
+   if linenum > 50 then do
+      pagenum = pagenum + 1
+      O = "1APFLST Report generated by the PROGxx edit macro -" ,
+          date() "-" time() "- Page:" pagenum
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      O = " "
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      if srcvol == "n/a" then slv = ""
+      else slv = "Volume: "srcvol
+      O = " Source library: "srcdsn slv
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      O = " "
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      O = " Data Set Name                                Volume Error"
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      O = " -------------------------------------------- ------ -----"
+      address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+      linenum = 1
+      end
+
+   O = " "left(dsn,44) left(vol,6) err
+   address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+   end
+
+pagenum = pagenum + 1
+O = "1APFLST Report summary - Page: "pagenum
+address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+O = " "
+address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+O = " Source: "SRCDSN
+address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+O = " "
+address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+
+if mcatvol <> "" then O = " We used volume "mcatvol" for the master ",
+   "catalog volume. "
+O = O||sysres "was used for the SYSRES"
+address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+if Syntax_errcount <> 0 then do
+   O = " Number of Syntax Errors:" Syntax_errcount
+   address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+   end
+if dsn_errcount <> 0 then do
+   O = " Number of Dataset Errors:" dsn_errcount
+   address ISPEXEC "LIST BUFNAME(O) LINELEN("length(O)") CC"
+   end
+
+zedsmsg = "Report Created"
+zedlmsg = "The APFLST report was written to your SPF list file"
+address ISPEXEC "SETMSG MSG(ISRZ001)"
+
+"CONTROL DISPLAY RESTORE"
+return
+
+/*--------------------------------------------------------------------
+ | Return the master catalog volume serial
+ |
+ | There is probably an easier way to do this other than assuming the
+ | SYS1.LINKLIB is in the master catalog and doing the overhead to
+ | invoke LISTCAT, parsing the output and then obtaining the volume
+ | via LISTDSI
+ ------------------------------------------------------------------- */
+
+return_mcatvol:
+call "OUTTRAP" "LISTCAT.","*"
+address TSO "LISTCAT ENTRY('SYS1.LINKLIB') ALL"
+idcams_rc = rc
+call "OUTTRAP" "OFF"
+
+if idcams_rc <> 0 then do
+   mcatvol = "-Error"
+   end
+else do
+     do l = 1 to listcat.0 by 1
+        if word(listcat.l,1) == "IN-CAT" then do
+           mcatdsn = "'"word(listcat.l,3)"'"
+           iterate
+           end
+        end
+     x = listdsi(mcatdsn)
+     if x <> 0 then mcatvol = sysvolume
+     else mcatvol = "-Error"
+     end /* of "else do" */
+return
+./ ADD NAME=PROGXXAT 1200-97137-97137-1812-00030-00030-00000-DALCOCK
+)attr default(%+_)
+ /********************************************************************/
+ /* Name: PROGXXAT                                                   */
+ /* Author: David Alcock                                             */
+ /* Application: PROGxx                                              */
+ /* Purpose: Table display of APFLST entries                         */
+ /********************************************************************/
+ ! type(output) intens(low)  color(turq)    caps(off)
+ ¬ type(output) intens(high) color(yellow)  caps(off)
+ # type(output) intens(low)  color(green)   caps(off)
+ @ type(output) intens(high) color(turq)    caps(off)
+ | type(output) intens(high) color(blue)    caps(off)
+ ¢ type(output) intens(high) color(red)
+ ¦ type(text)   intens(high) color(red)
+ ` type(text)   intens(low)  color(green)
+)body expand(\\)
+%-\-\- APFLST entries %-\-\-
+%Command ===>_ZCMD                                 \ \%Scroll ===>_amt +
+%
+%               `Sorted by|sortffn
++S+DSName                                       Volume Errors
+%- -------------------------------------------- ------ -\-\-
+)Model
+_Z¬DSN                                         #vol   ¢err                  \ \
+)init
+  .Help = PROGXXA0
+  .ZVARS = '(TSEL)'
+  &AMT = PAGE
+)proc
+)end
+./ ADD NAME=PROGXXA0 1200-97137-97137-1812-00040-00040-00000-DALCOCK
+)attr default(%+_)
+ /********************************************************************/
+ /* Name: PROGXXA0                                                   */
+ /* Author: David Alcock                                             */
+ /* Application: PROGxx                                              */
+ /* Purpose: Tutorial panel for the PROGxxAT panel                   */
+ /********************************************************************/
+ # type(text) intens(high) color(yellow)
+ ¢ type(text) intens(low)  color(green)
+ ¬ type(text) intens(low)  color(green) hilite(reverse)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+ { type(output) intens(high) color(yellow) caps(off)
+ } type(output) intens(high) color(turq)   caps(off)
+)body expand(!!)
+%Tutorial !-! PROGxx Edit macro !-! Tutorial
+%Command ===>_ZCMD                                                             +
++
+This panels shows a list of the APF entries we found.  It accepts these primary
+commands on the command line:
+
+  `SORT¢Sort the table by one of these operands:~DSN VOL ERR NUM
+
+  `REPORT¢Generate a report showing the Dataset name, volume and error and write
+         ¢it to the ISPF list file.  It will be written in the current sort
+         ¢order.
++
+On each table entry for each APF library, you can enter one of these line
+commands:
+
+  `S¢Select the dataset for browse
+
+  `B¢Select the dataset for browse
+
+  `P¢Invoke the~PDS¢command on the dataset on that volume
++
+Note: Multiple row selection is not supported.
+)init
+)proc
+)end
+./ ADD NAME=PROGXXH0 1200-97137-97137-1812-00039-00039-00000-DALCOCK
+)attr default(%+_)
+ /********************************************************************/
+ /* Name: PROGXXH0                                                   */
+ /* Author: David Alcock                                             */
+ /* Application: PROGxx                                              */
+ /* Purpose: Top Tutorial panel for the PROGxx application           */
+ /********************************************************************/
+ # type(text) intens(high) color(yellow)
+ ¢ type(text) intens(low)  color(green)
+ ¬ type(text) intens(low)  color(green) hilite(reverse)
+ ` type(text) intens(high) color(yellow)
+ ~ type(text) intens(low)  color(turq)
+ { type(output) intens(high) color(yellow) caps(off)
+ } type(output) intens(high) color(turq)   caps(off)
+)body expand(!!)
+%Tutorial !-! PROGxx Edit macro !-! Tutorial
+%Command ===>_ZCMD                                                             +
++
+The`PROGxx+edit macro allows you to maintain your SYS1.PARMLIB(PROGxx) APF
+entries easily.  Some features:
+
+-¢Check the APFLST for syntax errors and see which entries are not
+  on the volumes specified as note and msg lines in the edit dataset.+
+-¢Get a Table list for easy browsing and invoking the PDS command.+
+-¢Sort the APFLST into an output dataset in PROGxx format.  Comments
+  are not preserved (future objective).
++
+You can select a smaller part of the APFLST using the SS range command.
++
+Syntax:
+
+ `PROGXX             +Syntax and volume checking only
+ `PROGXX~LIST        +Syntax and volume checking.  The APFLST entries are placed
+                     +into an ISPF table for easy selection.
+ `PROGXX~SORT        +Syntax and volume checking. The APFLST entries are sorted
+                     +and placed into a dataset in PROGxx format.
+)init
+)proc
+)end
+./ ADD NAME=PROGXXS  1200-97137-97137-1812-00033-00033-00000-DALCOCK
+)attr default(%+_)
+ /********************************************************************/
+ /* Name: PROGXXS                                                    */
+ /* Author: David Alcock                                             */
+ /* Application: PROGxx                                              */
+ /* Purpose: Status of processing the APFLST                         */
+ /********************************************************************/
+ #  type(text)   intens(high) color(yellow)
+ ¢  type(text)   intens(low)  color(green)
+ ¬  type(text)   intens(low)  color(green) hilite(reverse)
+ `  type(text)   intens(high) color(yellow)
+ {  type(output) intens(high) color(yellow) caps(off)
+ }  type(output) intens(high) color(turq)   caps(off)
+ ? area(dynamic)
+ 01 type(dataout) color(blue)
+ 02 type(dataout) color(white)  intens(high)
+ 03 type(dataout) color(yellow) intens(high)
+ 04 type(dataout) color(turq)   intens(high)
+ 05 type(dataout) color(red)    intens(high)
+ 06 type(dataout) color(green)  intens(high)
+ 0B type(dataout) color(blue)                 hilite(blink)
+ 0C type(dataout) color(white)  intens(high)  hilite(blink)
+ 0D type(dataout) color(yellow) intens(high)  hilite(blink)
+ 0E type(dataout) color(turq)   intens(high)  hilite(blink)
+ 0F type(dataout) color(red)    intens(high)  hilite(blink)
+ 10 type(dataout) color(green)  intens(high)  hilite(blink)
+)body window(70,3) expand(!!)
+?MSG1                                                               ?
++
+?MSG2                                                               ?
+)init
+)proc
+)end
+./ ENDUP       "REVIEW" PDS MEMBER OFFLOAD AT 14:24 ON 98/01/16

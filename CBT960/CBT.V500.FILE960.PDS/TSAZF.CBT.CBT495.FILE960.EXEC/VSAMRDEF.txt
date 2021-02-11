@@ -1,0 +1,801 @@
+/***************************** REXX ***********************************
+ This REXX is used to test out IGGCSI00 (the Catalog Search Interface)
+      programming. This REXX does not require TSO, i.e. it can run
+      under the IRXJCL Batch interface.
+ This REXX reteives information on VSAM File via CSI and creates two
+      sets of IDCAMS Control cards:
+      DELETEME DD -- IDCAMS Delete Cards to cleanup existing DSNs
+      DEFINEME DD -- IDCAMS Define Cards to redefine new DSNs
+
+                           --- EXAMPLE ---
+<TSO> <%>VSAMRDEF DsnLevel <TEST(TraceOption)>
+<TSO> <%>VSAMRDEF -H -- To display help for this REXX
+
+  Arguments: DsnLevel    - The DSN Level to search for VSAM Datasets Under
+             InParms     - Non-Positional parameters
+ ----------------------------- NP-PARMS -------------------------------
+                 CATALOG - Catalog to do search against. default: blank
+                    TEST - Used to control traces
+
+      Files: Input data is pulled from the System Catalog STC
+         DD  DELETEME - pre-allocated DD for IDCAMS DELETE statements
+         DD  DEFINEME - pre-allocated DD for IDCAMS DEFINE statements
+Other EXECS: NONE
+
+EXEC History
+
+ REXX EXEC Name: VSAMRDEF
+         Author: AL FERGUSON - TS ADM (TSAZFA) from version 1.21
+                 FERGUSON AL (HUL2353)
+        Written: 22JAN09
+        History: 08AUG17 - v1.37 - Refactor to use Common IGGCSI Functions
+                 06FEB17 - v1.23 - Pick up updated version or ERRINFO
+                           Common Code routines.
+                 01FEB17 - v1.22 - Mass update to pickup Error
+                           Handling Fixes.
+                 31JAN17 - v1.21 - Update all REXXes with latest
+                           common routines via %CCMASS
+                 06MAR09 - v1.16 - All Information with TEST
+                           OUTPUT function, still not doing IDCAMS DEFs.
+                 04MAR09 - v1.13 - Mostly working with Test Output.
+                 03MAR09 - v1.09 - Most VSAM Plus AIX, PATH, and
+                           Associated Names.
+                 03MAR09 - v1.06 - Most VSAM Attributes retrieved.
+                 22JAN09 - v1.00 - based off IGGCTEST REXX
+***************************** Rexx ***********************************/
+ADDRESS "MVS" "SUBCOM TSO"                /* Is TSO available?       */
+IF RC = 0 THEN MsgStat=MSG("OFF")
+ARG DsnLevel InParms                      /* Place arguments here    */
+
+SELECT
+  WHEN WORDPOS(DsnLevel,'-h -H') > 0 THEN CALL DISPLAY_HELP
+  WHEN DsnLevel = ""                  THEN DO
+      CALL SET_MSG "DSN Filter needed!",,
+           "This needs a Dataset Name filter to find information on!", "YES"
+      EXIT 4
+    END
+OTHERWISE
+    CALL INITIALIZE_THIS_REXX
+END
+/* COPY ERRINIT */
+/********************************************************************** /*COPY*/
+              Initialize ERROR handling                                 /*COPY*/
+***********************************************************************//*COPY*/
+CALL ON ERROR     NAME ERROR_PROC   /* On RCs > 0 CALL ERROR_PROC     *//*COPY*/
+SIGNAL ON HALT    NAME CLEANUP      /* Cleanup before exiting on HALT *//*COPY*/
+SIGNAL ON SYNTAX  NAME ERROR_PROC   /* On REXX Syntax Error GOTO ...  *//*COPY*/
+SIGNAL ON NOVALUE NAME ERROR_PROC   /* On uninitialized variable GOTO *//*COPY*/
+ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"  /* Is ISPEXEC available?       *//*COPY*/
+IF RC = 0 THEN DO                   /* Yes, then allow REXX to handle *//*COPY*/
+   ok='0';ADDRESS "ISPEXEC" "CONTROL ERRORS RETURN"   /* ISPF errors  *//*COPY*/
+END                                                                     /*COPY*/
+                                                                        /*COPY*/
+TRACE (TEST)
+/********************************************************************/
+/*  SET UP LOOP FOR RESUME (IF A RESUME IS NCESSARY)                */
+/********************************************************************/
+CALL INITIALIZE_IGGCSI_API
+
+CATNAMET = ''; DNAMET   = ''
+DO UNTIL RESUME ¬= 'Y'
+   ok='*';ADDRESS "LINKPGM" "IGGCSI00 MODRSNRC CSIFIELD DWORK"
+   IF RC ¬= 0 THEN CALL DISPLAY_IGGCSI_ERROR
+
+   RESUME = SUBSTR(CSIFIELD,150,1)    /* GET RESUME FLAG FOR NEXT LOOP */
+   PARSE VALUE DWORK WITH CSIUSRLN +4 CSIREQLN +4 CSIUSDLN +4 CSINUMFD +2 rest
+   CSIUSRLN = C2D(CSIUSRLN)           /* Total Length of WORK AREA     */
+   CSIREQLN = C2D(CSIREQLN)           /* Minimum Required Work         */
+   CSIUSDLN = C2D(CSIUSDLN)           /* GET AMOUNT OF WORK AREA USED  */
+   CSINUMFD = C2D(CSINUMFD)           /* Number of field names +1      */
+   rest = LEFT(rest, CSIUSDLN-14)
+   /********************************************************************/
+   /*  PROCESS DATA RETURNED IN WORK AREA                              */
+   /********************************************************************/
+   DO WHILE LENGTH(rest) > 49         /* DO UNTIL ALL DATA IS PROCESSED*/
+      CALL PARSE_DSN
+      IF CSICTYPE = '0' THEN CATNAMET = CSICNAME
+      ELSE DO
+         _type = SET_DSN_TYPE()
+                /*  We have NAME AND TYPE ... Get additional Info  */
+         _strt = 2*fld.0; fld_strt = 1; lengths = SUBSTR(rest,1,_strt)
+         fld_list = SUBSTR(rest,_strt+1,CSICRETM-(_strt+4))
+         rest = SUBSTR(rest,CSICRETM-3)
+         IF DNAMET = CSICNAME THEN ITERATE; ELSE DNAMET = CSICNAME
+         DO i = 1 TO fld.0
+            fld.i.totln = C2D(SUBSTR(lengths,((i*2)-1),2))
+            fld.i.list = SUBSTR(fld_list,fld_strt,fld.i.totln)
+            fld_strt = fld_strt + fld.i.totln
+         END
+         SELECT /*  Process appropriate VSAM component type        */
+           WHEN ABBREV(_type, "CLUS") THEN CALL PROCESS_CLUSTER
+           WHEN ABBREV(_type, "DATA") THEN CALL PROCESS_DATA
+           WHEN ABBREV(_type, "INDE") THEN CALL PROCESS_INDEX
+           WHEN ABBREV(_type, "AIX")  THEN CALL PROCESS_AIX
+           WHEN ABBREV(_type, "PATH") THEN CALL PROCESS_PATH
+         OTHERWISE; NOP; END
+      END
+   END
+END
+
+CALL DO_OUTPUT
+
+ok='*';ADDRESS "MVS" "SUBCOM TSO"          /* Is TSO available?       */
+IF RC = 0 THEN MsgStat=MSG(MsgStat)
+EXIT ExitError
+/***************************** REXX ***********************************
+                            END of REXX
+****************************** REXX ***********************************
+                       Beginning of PROCEDURES
+****************************** REXX ***********************************/
+/**********************************************************************
+     This Initializes any variables needed for this REXX
+***********************************************************************/
+INITIALIZE_THIS_REXX:
+  TRUE=1; FALSE=0      /* REXX functional values for TRUE and FALSE   */
+                       /* Initialize and process non-Positional parms */
+  ValidParms = "CATALOG() TEST(O)"
+  MatchLength = 3      /* NP-Parms match on first # chars             */
+  AcceptAll = FALSE    /* Allow un-recognized NP-PARMS to be passed   */
+  IF ValidParms ¬= '' THEN CALL DO_NP_PARMS
+
+  NbrSubmited = 0
+  SYSUID = USERID()
+  UserPrefix = LEFT(SYSUID,4)
+  ExitError = 0; SqlError = 0
+  SYSMSGLVL1 = ""; SYSMSGLVL2 = ""
+  Lower = "abcdefghijklmnopqrstuvwxyz"
+  Upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+  CSIDTYPS = 'CGR'
+  FIELDS   = 'VOLSER STORCLAS MGMTCLAS DATACLAS',
+             'SPACOPTN PRIMSPAC SCONSPAC ATTR1 ATTR2',
+             'VSAMTYPE AMDKEY AMDCIREC LRECL RGATTR NAME'
+  KSDS = FALSE; RRDS = FALSE; LDS = FALSE; VRRDS = FALSE; _sms_ = FALSE
+  CLUSTERS. = ""; CLUSTERS.0 = 0; AIX. = ""; AIX.0 = 0; DS_CHAR. = ""
+
+RETURN
+/* COPY DISHELP */
+/********************************************************************** /*COPY*/
+            This PROCEDURE displays the Help information in             /*COPY*/
+                 this REXX's HEADER when invoked.                       /*COPY*/
+***********************************************************************//*COPY*/
+DISPLAY_HELP: PROCEDURE                                                 /*COPY*/
+ARG ExitOrReturn .                                                      /*COPY*/
+  DO i = 1 TO SOURCELINE() UNTIL SOURCELINE(i + 2) = 'EXEC History'     /*COPY*/
+     source.i = SOURCELINE(i + 1)   /* Read in HELP from EXEC         *//*COPY*/
+  END                                                                   /*COPY*/
+  ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"                                 /*COPY*/
+  IF RC ¬= 0 THEN DO i = 1 TO i; SAY source.i; END /* No ISPF, so SAY *//*COPY*/
+  ELSE DO              /* ISPF available, use TBDISPL to display help *//*COPY*/
+     PARSE SOURCE . . rname .       /* Get REXX EXEC name             *//*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBCREATE RHELP02 NAMES(source) NOWRITE"  /*COPY*/
+     DO i = 1 TO i     /* Build HELP table to display                 *//*COPY*/
+        source = source.i; ADDRESS "ISPEXEC" "TBADD RHELP02"            /*COPY*/
+     END                                                                /*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBTOP RHELP02"                           /*COPY*/
+     ZTDMARK = CENTER("----> END of Help <----",80)                     /*COPY*/
+     ok='0 4 8';ADDRESS "ISPEXEC" "TBDISPL RHELP02 PANEL(RHELP02)"      /*COPY*/
+     ok='0';ADDRESS "ISPEXEC" "TBCLOSE RHELP02"                         /*COPY*/
+  END                                                                   /*COPY*/
+                      /* Stay inside current EXEC or EXIT             *//*COPY*/
+IF ABBREV('RETURN',ExitOrReturn,3) THEN RETURN                          /*COPY*/
+   ELSE EXIT 0                                                          /*COPY*/
+/* COPY NPPARMS */
+/********************************************************************** /*COPY*/
+            Initialize and process Non-Positional Parms in a            /*COPY*/
+                method similar to that of CLISTs                        /*COPY*/
+    NOTE: If you use parentheses in the initizing of a NP-Parms, do     /*COPY*/
+          not follow any internal ')' with spaces!!                     /*COPY*/
+**********************************************************************/ /*COPY*/
+DO_NP_PARMS:                                                            /*COPY*/
+  VpList = ValidParms ' '; InList = InParms ' '                         /*COPY*/
+  ParmList = ''; ParmErrorList = ''                                     /*COPY*/
+                                                                        /*COPY*/
+  DO linx = 1 TO WORDS(ValidParms) UNTIL VpList = ''                    /*COPY*/
+     PARSE VALUE VpList WITH parm.linx '(' ParmVal.linx ') ' VpList     /*COPY*/
+     ParmList = ParmList STRIP(LEFT(parm.linx,MatchLength))             /*COPY*/
+  END                                                                   /*COPY*/
+  DO WHILE INDEX(InList, '(') > 0                                       /*COPY*/
+     PARSE VALUE InList WITH parm '(' value ') ' InList                 /*COPY*/
+     UPPER parm            /* Don't want to translate value to UPPER */ /*COPY*/
+     parm = STRIP(parm)                                                 /*COPY*/
+     ParmNumber = WORDPOS(STRIP(LEFT(parm,MatchLength)), ParmList)      /*COPY*/
+     IF ParmNumber > 0 THEN ParmVal.ParmNumber = value                  /*COPY*/
+     ELSE IF INDEX(value,")") > 0 THEN                                  /*COPY*/
+          ParmErrorList = ParmErrorList parm"("value                    /*COPY*/
+     ELSE ParmErrorList = ParmErrorList parm"("value")"                 /*COPY*/
+  END                                                                   /*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN ParmErrorList ¬= '' & AcceptAll = TRUE          THEN           /*COPY*/
+       AnythingElse = STRIP(InList) ParmErrorList                       /*COPY*/
+    WHEN ParmErrorList ¬= ''                             THEN DO        /*COPY*/
+       PARSE SOURCE . . rname .        /* Get REXX EXEC name          *//*COPY*/
+       CALL SET_MSG 'Invalid Parameter(s)',,                            /*COPY*/
+            "'"ParmErrorList"' not valid Parm(s) for" rname"!", "YES"   /*COPY*/
+       EXIT 8                                                           /*COPY*/
+      END                                                               /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+      AnythingElse = STRIP(InList)                                      /*COPY*/
+  END                                                                   /*COPY*/
+  DO ParmInx = 1 TO linx                                                /*COPY*/
+     SELECT                                                             /*COPY*/
+       WHEN ABBREV(ParmVal.ParmInx, "&")                 |,             /*COPY*/
+            ABBREV(ParmVal.ParmInx, "*")                 THEN           /*COPY*/
+           INTERPRET parm.ParmInx "= '"ParmVal.ParmInx"'"               /*COPY*/
+       WHEN DATATYPE(ParmVal.ParmInx, "NUM")             THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+       WHEN WORDPOS(ParmVal.ParmInx, "FALSE TRUE") > 0   THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+       WHEN (LEFT(ParmVal.ParmInx,1) = "'"               & ,            /*COPY*/
+             RIGHT(ParmVal.ParmInx,1) = "'")             | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,':') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'*') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'%') > 0               | ,            /*COPY*/
+            INDEX(ParmVal.ParmInx,'=') > 0               THEN           /*COPY*/
+           INTERPRET parm.ParmInx "= ParmVal."ParmInx                   /*COPY*/
+       WHEN INDEX(STRIP(ParmVal.ParmInx), " ") > 0       THEN           /*COPY*/
+           INTERPRET parm.ParmInx "=" ParmVal.ParmInx                   /*COPY*/
+     OTHERWISE                                                          /*COPY*/
+        ADDRESS "MVS" "SUBCOM TSO"                                      /*COPY*/
+        IF RC = 0 THEN TSO_avail = TRUE; ELSE TSO_avail = FALSE         /*COPY*/
+        PARSE VALUE ParmVal.ParmInx WITH PDS_name '(' rest              /*COPY*/
+        SELECT                                                          /*COPY*/
+          WHEN ¬(TSO_avail) | PDS_name = ""              THEN           /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+          WHEN SYSVAR("SYSNEST") = 'YES'                 THEN           /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+          WHEN (INDEX(rest, ")") > 0                     &,             /*COPY*/
+               (ABBREV(rest, "+") | ABBREV(rest,"-")     |,             /*COPY*/
+                ABBREV(rest, "0)")))                     THEN           /*COPY*/
+              INTERPRET parm.ParmInx "= '"ParmVal.ParmInx"'"            /*COPY*/
+          WHEN (LISTDSI(ParmVal.ParmInx)           <= 4  | ,            /*COPY*/
+                LISTDSI("'"ParmVal.ParmInx"'")     <= 4  | ,            /*COPY*/
+                LISTDSI("'"PDS_name"'")            <= 4  | ,            /*COPY*/
+                LISTDSI(PDS_name)                  <= 4) THEN           /*COPY*/
+              INTERPRET parm.ParmInx "= ParmVal."ParmInx                /*COPY*/
+        OTHERWISE                                                       /*COPY*/
+              INTERPRET parm.ParmInx "=" ParmVal.ParmInx                /*COPY*/
+        END                                                             /*COPY*/
+     END                                                                /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY SETMSG */                                                       /*COPY*/
+/********************************************************************** /*COPY*/
+              Error with DSN, Use ISPF to display Error Message         /*COPY*/
+***********************************************************************//*COPY*/
+SET_MSG: PROCEDURE                                                      /*COPY*/
+PARSE ARG ZERRSM, ZERRLM, ZERRALRM, ZERRHM, ZERRTP, ZERRWN .            /*COPY*/
+  ok='*';ADDRESS "MVS" "SUBCOM ISPEXEC"                                 /*COPY*/
+  SELECT                                                                /*COPY*/
+   WHEN RC ¬= 0                   THEN DO                               /*COPY*/
+      SAY ''; SAY ZERRSM ; SAY ZERRLM; SAY ''                           /*COPY*/
+    END                                                                 /*COPY*/
+   WHEN SYSVAR("SYSNEST") = 'YES' &,                                    /*COPY*/
+        SYSVAR('SYSENV') = 'BACK' THEN DO                               /*COPY*/
+      SAY ''; SAY ZERRSM ; SAY ZERRLM; SAY ''                           /*COPY*/
+    END                                                                 /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+      IF ABBREV('YES', ZERRALRM, 1) THEN ZERRALRM = 'YES'               /*COPY*/
+         ELSE ZERRALRM = 'NO'                                           /*COPY*/
+      IF ZERRHM    = ''    THEN ZERRHM   = 'ISR2MACR'                   /*COPY*/
+      ok='0';ADDRESS "ISPEXEC" "SETMSG MSG(ISRZ003)"                    /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY IGGINIT */
+/********************************************************************** /*COPY*/
+      Initialze the API before calling IGGCSI                           /*COPY*/
+***********************************************************************//*COPY*/
+INITIALIZE_IGGCSI_API:                                                  /*COPY*/
+  MODRSNRC = LEFT(' ',4)              /* CLEAR MODULE/RETURN/REASON   *//*COPY*/
+  CSIFILTK = LEFT(STRIP(DsnLevel,"B","'"),44) /*MOVE FILTER INTO LIST*/ /*COPY*/
+  CSICATNM = LEFT(STRIP(CATALOG,"B","'"),44)   /*   SET CATALOG NAME  *//*COPY*/
+  CSIRESNM = LEFT(' ',44)             /* CLEAR RESUME NAME            *//*COPY*/
+  CSIDTYPS = LEFT(CSIDTYPS,16)        /* ABCGHRUX are valid entries   *//*COPY*/
+  CSICLDI  = LEFT('Y',1)              /* INDICATE DATA AND INDEX      *//*COPY*/
+  CSIRESUM = LEFT(' ',1)              /* CLEAR RESUME FLAG            *//*COPY*/
+  IF CATALOG = "" THEN                /* Did we specify a catalog?    *//*COPY*/
+       CSIS1CAT = LEFT(' ',1)         /* ... No, search > 1 Catalog   *//*COPY*/
+  ELSE CSIS1CAT = LEFT('Y',1)         /* ... Yes, search that Catalog *//*COPY*/
+  CSIOPTNS = LEFT(' ',1)              /* CLEAR RESERVE CHARACTER      *//*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN WORDS(FIELDS)            = 0     THEN DO; fld.=""; fld.0=0; END/*COPY*/
+    WHEN WORDS(FIELDS)            = 1     THEN CALL FLDS_WO_LENGTH      /*COPY*/
+    WHEN DATATYPE(WORD(FIELDS,2)) = "NUM" THEN CALL FLDS_WITH_LENGTH    /*COPY*/
+    WHEN WORD(FIELDS,2) = "VL"            THEN CALL FLDS_WITH_LENGTH    /*COPY*/
+  OTHERWISE;                                   CALL FLDS_WO_LENGTH ; END/*COPY*/
+  CSINUMEN = X2C(RIGHT(D2X(fld.0),4,'0'))                               /*COPY*/
+  /********************************************************************//*COPY*/
+  /*  BUILD THE SELECTION CRITERIA FIELDS PART OF PARAMETER LIST      *//*COPY*/
+  /********************************************************************//*COPY*/
+  CSIOPTS  = CSICLDI ||CSIRESUM||CSIS1CAT||CSIOPTNS                     /*COPY*/
+  CSIFIELD = CSIFILTK||CSICATNM||CSIRESNM||CSIDTYPS||CSIOPTS||CSINUMEN  /*COPY*/
+  DO i = 1 TO fld.0; CSIFIELD = CSIFIELD||fld.i.nm; END                 /*COPY*/
+  /********************************************************************//*COPY*/
+  /*  INITIALIZE AND BUILD WORK ARE OUTPUT PART OF PARAMETER LIST     *//*COPY*/
+  /********************************************************************//*COPY*/
+  WORKLEN = 32768; CSIUSRLN = X2C(RIGHT(D2X(WORKLEN),8,'0'))            /*COPY*/
+  DWORK = CSIUSRLN||COPIES('00'X,WORKLEN-4)                             /*COPY*/
+                                                                        /*COPY*/
+  CATNAMET = ''; DNAMET = ''; dsns. = ""; dsns.0 = 0                    /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+      Process FIELDS Variable when Length is provided                   /*COPY*/
+***********************************************************************//*COPY*/
+FLDS_WITH_LENGTH:                                                       /*COPY*/
+  fld. = ""; fld.0 = WORDS(FIELDS)/2                                    /*COPY*/
+  DO i=1 TO WORDS(FIELDS)/2                                             /*COPY*/
+     fld.i.nm=LEFT(WORD(FIELDS,(((i-1)*2)+1)),8)                        /*COPY*/
+     fld.i.ln=WORD(FIELDS,(((i-1)*2)+2))                                /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+      Process FIELDS Variable when Length is NOT provided               /*COPY*/
+***********************************************************************//*COPY*/
+FLDS_WO_LENGTH:                                                         /*COPY*/
+  fld. = ""; fld.0 = WORDS(FIELDS)                                      /*COPY*/
+  DO i=1 TO fld.0                                                       /*COPY*/
+     fld.i.nm = LEFT(WORD(FIELDS,i),8)                                  /*COPY*/
+     PARSE VALUE VER_FNM(fld.i.nm) WITH fld.i.ln fld.i.ty fld.i.rp      /*COPY*/
+  END                                                                   /*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY IGGFNM */                                                       /*COPY*/
+/********************************************************************** /*COPY*/
+      Verify Field Name and Set Attributes (from SYS1.MACLIB(IGGCSI))   /*COPY*/
+***********************************************************************//*COPY*/
+VER_FNM:                                                                /*COPY*/
+ARG fnm .                                                               /*COPY*/
+  SELECT               /* Validate Field name and assign attributes   *//*COPY*/
+    WHEN fnm = "ACTOKEN"  THEN RETURN 36   "CH" "N"                     /*COPY*/
+    WHEN fnm = "AKEYPOS"  THEN RETURN 2    "F"  "N"                     /*COPY*/
+    WHEN fnm = "AMDCIREC" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "AMDKEY"   THEN RETURN 4    "R"  "N"                     /*COPY*/
+    WHEN fnm = "ASSOCSYM" THEN RETURN 45   "CH" "Y"                     /*COPY*/
+    WHEN fnm = "ATTR1"    THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "ATTR2"    THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "BUFSIZE"  THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "CATTR"    THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "COMPIND"  THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "COMUDSIZ" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "DATACLAS" THEN RETURN "VL" "CH" "N"                     /*COPY*/
+    WHEN fnm = "DEVTYP"   THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "DSCBTTR"  THEN RETURN 3    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "DSCRDT2"  THEN RETURN 4    "MX" "N"                     /*COPY*/
+    WHEN fnm = "DSEXDT2"  THEN RETURN 4    "MX" "N"                     /*COPY*/
+    WHEN fnm = "ENTYPE"   THEN RETURN 1    "CH" "N"                     /*COPY*/
+    WHEN fnm = "ENTNAME"  THEN RETURN 44   "CH" "N"                     /*COPY*/
+    WHEN fnm = "EXCPEXIT" THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "FILESEQ"  THEN RETURN 2    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "GDGALTDT" THEN RETURN 4    "MX" "N"                     /*COPY*/
+    WHEN fnm = "GDGATTR"  THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "GDGLIMIT" THEN RETURN 1    "F"  "N"                     /*COPY*/
+    WHEN fnm = "GENLEVEL" THEN RETURN 4    "CH" "Y"                     /*COPY*/
+    WHEN fnm = "HARBA"    THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "HARBADS"  THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "HIKEYV"   THEN RETURN "VL" "CH" "Y"                     /*COPY*/
+    WHEN fnm = "HKRBA"    THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "HURBA"    THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "HURBADS"  THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "ITYPEXT"  THEN RETURN 1    "BS" "Y"                     /*COPY*/
+    WHEN fnm = "LOGPARMS" THEN RETURN 1    "B"  "N"                     /*COPY*/
+    WHEN fnm = "LOGSTRID" THEN RETURN 26   "CH" "N"                     /*COPY*/
+    WHEN fnm = "LOKEYV"   THEN RETURN "VL" "CH" "Y"                     /*COPY*/
+    WHEN fnm = "LRECL"    THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "LTBACKDT" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "MGMTCLAS" THEN RETURN "VL" "CH" "N"                     /*COPY*/
+    WHEN fnm = "NAME"     THEN RETURN 44   "CH" "Y"                     /*COPY*/
+    WHEN fnm = "NOBLKTRK" THEN RETURN 2    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "NOBYTAU"  THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "NOBYTTRK" THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "NOEXTNT"  THEN RETURN 1    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "NOTRKAU"  THEN RETURN 2    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "NVSMATTR" THEN RETURN 1    "CH" "Y"                     /*COPY*/
+    WHEN fnm = "OPENIND"  THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "OWNERID"  THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "PASSATMP" THEN RETURN 2    "F"  "N"                     /*COPY*/
+    WHEN fnm = "PASSPRMT" THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "PASSWORD" THEN RETURN 32   "CH" "N"                     /*COPY*/
+    WHEN fnm = "PHYBLKSZ" THEN RETURN 4    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "PRIMSPAC" THEN RETURN 3    "F"  "N"                     /*COPY*/
+    WHEN fnm = "RECVTIME" THEN RETURN 8    "B"  "N"                     /*COPY*/
+    WHEN fnm = "RECVTIMG" THEN RETURN 8    "B"  "N"                     /*COPY*/
+    WHEN fnm = "RGATTR"   THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "RLSBWO"   THEN RETURN 1    "B"  "N"                     /*COPY*/
+    WHEN fnm = "RLSFLAGS" THEN RETURN 1    "B"  "N"                     /*COPY*/
+    WHEN fnm = "SCONSPAC" THEN RETURN 3    "F"  "N"                     /*COPY*/
+    WHEN fnm = "SECFLAGS" THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "SPACOPTN" THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "STORCLAS" THEN RETURN "VL" "CH" "N"                     /*COPY*/
+    WHEN fnm = "STRIPCNT" THEN RETURN  2   "F"  "N"                     /*COPY*/
+    WHEN fnm = "TYPE"     THEN RETURN 1    "CH" "Y"                     /*COPY*/
+    WHEN fnm = "UDATASIZ" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "USVRMDUL" THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "USERAREC" THEN RETURN "VL" "CH" "N"                     /*COPY*/
+    WHEN fnm = "VOLSER"   THEN RETURN 6    "CH" "Y"                     /*COPY*/
+    WHEN fnm = "VOLFLG"   THEN RETURN 1    "BS" "Y"                     /*COPY*/
+    WHEN fnm = "VSAMREUS" THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "VSAMSTAT" THEN RETURN 46   "F"  "N"                     /*COPY*/
+    WHEN fnm = "VSAMTYPE" THEN RETURN 2    "BS" "N"                     /*COPY*/
+    WHEN fnm = "VVRNFLGS" THEN RETURN 2    "BS" "N"                     /*COPY*/
+    WHEN fnm = "XACIFLAG" THEN RETURN 1    "BS" "N"                     /*COPY*/
+    WHEN fnm = "XHARBA"   THEN RETURN 8    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "XHARBADS" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "XHKRBA"   THEN RETURN 8    "F"  "Y"                     /*COPY*/
+    WHEN fnm = "XHURBADS" THEN RETURN 8    "F"  "N"                     /*COPY*/
+    WHEN fnm = "XHURBA"   THEN RETURN 8    "F"  "Y"                     /*COPY*/
+ /* Tape Library Entry Field Names                                    *//*COPY*/
+    WHEN fnm = "LCBCONID" THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "LCBDEVTP" THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "LCBDESCR" THEN RETURN 120  "CH" "N"                     /*COPY*/
+    WHEN fnm = "LCBEMPTY" THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "LCBLIBID" THEN RETURN 5    "CH" "N"                     /*COPY*/
+    WHEN fnm = "LCBLOGIC" THEN RETURN 1    "B"  "N"                     /*COPY*/
+    WHEN fnm = "LCBSCRTH" THEN RETURN 1020 "F"  "N"                     /*COPY*/
+    WHEN fnm = "LCBSLOTS" THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "LCBTHRES" THEN RETURN 1020 "F"  "N"                     /*COPY*/
+ /* Tape Volume Entry Field Names                                     *//*COPY*/
+    WHEN fnm = "VCBCHKPT" THEN RETURN 1    "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBCRDT"  THEN RETURN 10   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBDEVTP" THEN RETURN 4    "F"  "N"                     /*COPY*/
+    WHEN fnm = "VCBEDATE" THEN RETURN 10   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBERRST" THEN RETURN 2    "BS" "N"                     /*COPY*/
+    WHEN fnm = "VCBEXPDT" THEN RETURN 10   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBLIBNM" THEN RETURN 44   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBLOC"   THEN RETURN 1    "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBMOUNT" THEN RETURN 10   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBOWNER" THEN RETURN 64   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBSGRP"  THEN RETURN 8    "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBSHELF" THEN RETURN 32   "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBUATTR" THEN RETURN 1    "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBWPROT" THEN RETURN 1    "CH" "N"                     /*COPY*/
+    WHEN fnm = "VCBWRITE" THEN RETURN 10   "CH" "N"                     /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+     CALL SET_MSG ,"Unsupported Field Name: '"fnm"'","YES"              /*COPY*/
+  END                                                                   /*COPY*/
+EXIT 8                                                                  /*COPY*/
+/**********************************************************************
+      Pull out Dataset Name information
+***********************************************************************/
+PARSE_DSN:
+  PARSE VALUE rest WITH CSICFLG  +1 CSICTYPE +1 CSICNAME +44 CSICRETM,
+                     +2 CSICRETR +1 CSICRETN +1 rest
+  CSICFLG  = C2X(CSICFLG )
+  CSICRETM = C2D(CSICRETM)
+  CSICRETR = C2D(CSICRETR)           /* Catalog return reason code    */
+  CSICRETN = C2D(CSICRETN)           /* Catalog return code           */
+RETURN
+/**********************************************************************
+      Determine any additional attributes
+***********************************************************************/
+SET_ATTR1:
+ARG ATTR1 .
+  IF ATTR1 = "" THEN RETURN ""; ELSE ATTR1 = X2B(C2X(ATTR1))
+  IF SUBSTR(ATTR1,1,1) THEN _attr1_ = "SPEED"; ELSE _attr1_ = ""
+  IF SUBSTR(ATTR1,3,1) THEN _attr1_ = _attr1_ "RUS"
+  IF SUBSTR(ATTR1,4,1) THEN _attr1_ = _attr1_ "ERASE"
+RETURN STRIP(_attr1_)
+/**********************************************************************
+      Determine VSAM Share options
+***********************************************************************/
+SET_ATTR2:
+ARG ATTR2 .
+  IF ATTR2 = "" THEN RETURN ""
+     ELSE ATTR2 = X2B(C2X(ATTR2))
+  shr_rgn = SUBSTR(ATTR2,1,1)*2 + SUBSTR(ATTR2,2,1) + 1
+  shr_sys = SUBSTR(ATTR2,3,1)*2 + SUBSTR(ATTR2,4,1) + 1
+RETURN "SHR("shr_rgn shr_sys")"
+/**********************************************************************
+      Determine how SPACE was allocated
+***********************************************************************/
+SET_SPACOPTN:
+ARG SPACOPTN .
+  SELECT
+     WHEN SPACOPTN = '01000000'B THEN option = 'RECORDS'
+     WHEN SPACOPTN = '10000000'B THEN option = 'TRK'
+     WHEN SPACOPTN = '11000000'B THEN option = 'CYL'
+     WHEN SPACOPTN = '11111111'B THEN RETURN ""
+  OTHERWISE;                          option = '?????????'; END
+RETURN option"("C2D(fld.6.list) C2D(fld.7.list)")"
+/**********************************************************************
+      Determine any additional VSAM attributes
+***********************************************************************/
+SET_VSAMTYPE:
+ARG VSAMTYPE .
+  IF VSAMTYPE = ""        THEN RETURN ""
+  VSAMTYPE = X2B(C2X(VSAMTYPE)); options = ""
+  IF SUBSTR(VSAMTYPE, 1,1) THEN KSDS  = TRUE; ELSE KSDS  = FALSE
+  IF SUBSTR(VSAMTYPE, 7,1) THEN RRDS  = TRUE; ELSE RRDS  = FALSE
+  IF SUBSTR(VSAMTYPE, 8,1) THEN options = options "SPND"
+  IF SUBSTR(VSAMTYPE,15,1) THEN LDS   = TRUE; ELSE LDS   = FALSE
+  IF SUBSTR(VSAMTYPE,16,1) THEN VRRDS = TRUE; ELSE VRRDS = FALSE
+RETURN options
+/**********************************************************************
+      Expand CSICTYPE Value for Dataset Type
+***********************************************************************/
+SET_DSN_TYPE:
+  SELECT                   /* ASSIGN ENTRY TYPE NAME  */
+     WHEN CSICTYPE = 'A' THEN DTYPE = 'NONVSAM '
+     WHEN CSICTYPE = 'B' THEN DTYPE = 'GDG     '
+     WHEN CSICTYPE = 'C' THEN DTYPE = 'CLUSTER '
+     WHEN CSICTYPE = 'D' THEN DTYPE = 'DATA    '
+     WHEN CSICTYPE = 'G' THEN DTYPE = 'AIX     '
+     WHEN CSICTYPE = 'H' THEN DTYPE = 'GDS     '
+     WHEN CSICTYPE = 'I' THEN DTYPE = 'INDEX   '
+     WHEN CSICTYPE = 'L' THEN DTYPE = 'TAPELIB '
+     WHEN CSICTYPE = 'R' THEN DTYPE = 'PATH    '
+     WHEN CSICTYPE = 'U' THEN DTYPE = 'UCAT    '
+     WHEN CSICTYPE = 'W' THEN DTYPE = 'TAPEVOL '
+     WHEN CSICTYPE = 'X' THEN DTYPE = 'ALIAS   '
+  OTHERWISE;                  DTYPE = '        '; END
+RETURN DTYPE
+/**********************************************************************
+      Process CSI Information about VSAM Cluster
+***********************************************************************/
+PROCESS_CLUSTER:
+  cinx = STRIP(TRANSLATE(CSICNAME,'_','.'),"T")
+  DS_CHAR.cinx.NAME = STRIP(CSICNAME,"T")
+  DS_CHAR.cinx.TYPE = STRIP(_type,"T")
+  cnt = CLUSTERS.0 + 1; CLUSTERS.0 = cnt
+  CLUSTERS.cnt.NAME = CSICNAME
+  CLUSTERS.cnt.RELATE.0 = fld.15.totln/fld.15.ln
+  DO i = 1 TO CLUSTERS.cnt.RELATE.0
+     CLUSTERS.cnt.RELATE.i.NAME =,
+         SUBSTR(fld.15.list,((i-1)*fld.15.ln)+1,fld.15.ln)
+  END
+ IF LENGTH(fld.2.list) > 2 THEN DO
+    _sms_ = TRUE
+    IF LENGTH(fld.4.list) > 2 THEN DS_CHAR.cinx.CHAR =,
+                             "STORCLAS("SUBSTR(fld.2.list,3)")",
+                             "MGMTCLAS("SUBSTR(fld.3.list,3)")",
+                             "DATACLAS("SUBSTR(fld.4.list,3)")"
+    ELSE DS_CHAR.cinx.CHAR = "STORCLAS("SUBSTR(fld.2.list,3)")",
+                             "MGMTCLAS("SUBSTR(fld.3.list,3)")"
+   END
+ ELSE _sms_ = FALSE
+ x = SET_VSAMTYPE(fld.10.list)
+ IF LDS THEN DS_CHAR.cinx.INXD = "LIN"
+RETURN
+/**********************************************************************
+      Process CSI Information about VSAM Data portion
+***********************************************************************/
+PROCESS_DATA:
+  dsinx = STRIP(TRANSLATE(CSICNAME,'_','.'),"T")
+  DS_CHAR.dsinx.TYPE = STRIP(_type,"T")
+  IF ¬(_sms_) THEN DO
+     y = SUBSTR(fld.1.list,1,fld.1.ln)
+     DO i = 2 TO (fld.1.totln/fld.1.ln)
+        y = y SUBSTR(fld.1.list,((i-1)*fld.1.ln)+1,fld.1.ln)
+     END
+    DS_CHAR.dsinx.CHAR = "VOLUMES("y") "
+  END
+  DS_CHAR.dsinx.CHAR = DS_CHAR.dsinx.CHAR || SET_SPACOPTN(fld.5.list),
+           "CISZ("C2D(LEFT(fld.12.list,4))")",
+           "RECSZ("C2D(fld.13.list) C2D(RIGHT(fld.12.list,4))")"
+  DS_CHAR.dsinx.ATTR = STRIP(SET_ATTR1(fld.8.list) SET_ATTR2(fld.9.list),
+                    || SET_VSAMTYPE(fld.10.list))
+RETURN
+/**********************************************************************
+      Process CSI Information about VSAM Index
+***********************************************************************/
+PROCESS_INDEX:
+  dsinx = STRIP(TRANSLATE(CSICNAME,'_','.'),"T")
+  DS_CHAR.dsinx.TYPE = STRIP(_type,"T")
+  IF ¬(_sms_) THEN DO
+     y = SUBSTR(fld.1.list,1,fld.1.ln)
+     DO i = 2 TO (fld.1.totln/fld.1.ln)
+        y = y SUBSTR(fld.1.list,((i-1)*fld.1.ln)+1,fld.1.ln)
+     END
+    DS_CHAR.dsinx.CHAR = "VOLUMES("y") "
+  END
+  DS_CHAR.dsinx.CHAR = DS_CHAR.dsinx.CHAR || SET_SPACOPTN(fld.5.list),
+           "CISZ("C2D(LEFT(fld.12.list,4))")",
+           "RECSZ("C2D(fld.13.list) C2D(RIGHT(fld.12.list,4))")"
+  DS_CHAR.dsinx.ATTR = SET_ATTR1(fld.9.list)
+  DS_CHAR.cinx.INXD = "IXD"
+  DS_CHAR.cinx.KEYS = "KEYS("C2D(RIGHT(fld.11.list,2)),
+                             C2D(LEFT(fld.11.list,2))")"
+RETURN
+/**********************************************************************
+      Process CSI Information about VSAM AIX
+***********************************************************************/
+PROCESS_AIX:
+  cnt = AIX.0 + 1; AIX.0 = cnt
+  cinx = STRIP(TRANSLATE(CSICNAME,'_','.'),"T")
+  DS_CHAR.cinx.NAME = STRIP(CSICNAME,"T")
+  DS_CHAR.cinx.TYPE = STRIP(_type,"T"); DS_CHAR.cinx.AIX = cnt
+  AIX.cnt.RELATE.0 = fld.15.totln/fld.15.ln
+  DO i = 1 TO AIX.cnt.RELATE.0
+     AIX.cnt.RELATE.i.NAME = SUBSTR(fld.15.list,((i-1)*fld.15.ln)+1,fld.15.ln)
+  END
+  IF SUBSTR(X2B(C2X(fld.8.list)),2,1) THEN
+       DS_CHAR.cinx.CHAR = "UNQK"
+  ELSE DS_CHAR.cinx.CHAR = "NUNQK"
+  IF SUBSTR(X2B(C2X(fld.14.list)),1,1) THEN
+       DS_CHAR.cinx.CHAR = DS_CHAR.cinx.CHAR "UPG"
+  ELSE DS_CHAR.cinx.CHAR = DS_CHAR.cinx.CHAR "NUPG"
+RETURN
+/**********************************************************************
+      Process CSI Information about VSAM Path
+***********************************************************************/
+PROCESS_PATH:
+  dsinx = STRIP(TRANSLATE(CSICNAME,'_','.'),"T")
+  DS_CHAR.dsinx.TYPE = STRIP(_type,"T")
+  DS_CHAR.dsinx.CHAR = "PATHENTRY("DS_CHAR.cinx.NAME")"
+RETURN
+/**********************************************************************
+      Output results for testing.
+***********************************************************************/
+DO_OUTPUT:
+  DO i = 1 TO CLUSTERS.0
+     IF i > 1 THEN SAY ""
+     cl_dsn = CLUSTERS.i.NAME; cl_inx = STRIP(TRANSLATE(cl_dsn,'_','.'),"T")
+     SAY RIGHT(DS_CHAR.cl_inx.TYPE,7) cl_dsn,
+         STRIP(DS_CHAR.cl_inx.CHAR DS_CHAR.cl_inx.INXD DS_CHAR.cl_inx.KEYS)
+     DO j = 1 TO CLUSTERS.i.RELATE.0
+       cr_dsn = CLUSTERS.i.RELATE.j.NAME
+       cr_inx = STRIP(TRANSLATE(cr_dsn,'_','.'),"T")
+       IF DS_CHAR.cr_inx.TYPE = "AIX" THEN DO
+          aix_inx = DS_CHAR.cr_inx.AIX
+          DO k = 1 TO AIX.aix_inx.RELATE.0
+             ar_dsn = AIX.aix_inx.RELATE.k.NAME
+             ar_inx = STRIP(TRANSLATE(ar_dsn,'_','.'),"T")
+             IF ABBREV(DS_CHAR.ar_inx.TYPE,"CLUSTER") THEN LEAVE k
+          END
+          aix_cl = STRIP(AIX.aix_inx.RELATE.k.NAME)
+          SAY RIGHT(DS_CHAR.cr_inx.TYPE,7) cr_dsn "RELATE("aix_cl")",
+              DS_CHAR.cr_inx.CHAR DS_CHAR.cr_inx.KEYS
+          IF DS_CHAR.cl_inx.CHAR ¬= "" THEN SAY LEFT("",53)DS_CHAR.cl_inx.CHAR
+          DO k = 1 TO AIX.aix_inx.RELATE.0
+             ar_dsn = AIX.aix_inx.RELATE.k.NAME
+             ar_inx = STRIP(TRANSLATE(ar_dsn,'_','.'),"T")
+             SELECT
+               WHEN ABBREV(DS_CHAR.ar_inx.TYPE,"CLUSTER") THEN NOP
+               WHEN ABBREV(DS_CHAR.ar_inx.TYPE,"PATH")    THEN SAY,
+                  RIGHT(DS_CHAR.ar_inx.TYPE,7) ar_dsn DS_CHAR.ar_inx.CHAR
+             OTHERWISE
+                 SAY RIGHT(DS_CHAR.ar_inx.TYPE,7) ar_dsn,
+                     DS_CHAR.ar_inx.CHAR DS_CHAR.ar_inx.ATTR
+             END
+          END
+         END
+       ELSE SAY RIGHT(DS_CHAR.cr_inx.TYPE,7) cr_dsn,
+                DS_CHAR.cr_inx.CHAR DS_CHAR.cr_inx.ATTR
+     END
+  END
+RETURN
+/**********************************************************************
+      An error occured when calling IGGCSI00, dislay MODRSNRC, the
+         parms used to call it, and the WORK area returned.
+***********************************************************************/
+DISPLAY_IGGCSI_ERROR:
+  SAY  "IGGCSI Error!  LINK RC="RC "MOD="LEFT(MODRSNRC,2),
+       "RSN="C2D(SUBSTR(MODRSNRC,3,1)) "RC="C2D(SUBSTR(MODRSNRC,4,1))
+  SAY  "_______________________ CSIFIELD ______________________"
+  SAY  CSIFIELD
+  SAY  "________________________ DWORK ________________________"
+  SAY  DWORK
+  SAY  "_______________________________________________________"
+EXIT RC
+/* COPY ERRPROC */
+/********************************************************************** /*COPY*/
+      Error Handling procedure -- SHOULD BE LAST PROCEDURES IN REXX     /*COPY*/
+***********************************************************************//*COPY*/
+ERROR_PROC:                                                             /*COPY*/
+  IF (CONDITION('C') = 'ERROR') & (SYMBOL('OK') = 'VAR') THEN ,         /*COPY*/
+     IF (WORDPOS(RC, ok) > 0) | ok='*' THEN RETURN    /* Not an ERROR *//*COPY*/
+                                                                        /*COPY*/
+  TRACE("O")                        /* Turn off ERROR traps et.al.    *//*COPY*/
+  elineno = sigl                    /* Source line error occured in   *//*COPY*/
+  SIGNAL OFF SYNTAX                 /* ... all Error trapping OFF     *//*COPY*/
+  SIGNAL OFF NOVALUE                                                    /*COPY*/
+  CALL   OFF ERROR                                                      /*COPY*/
+  CALL GET_ERROR_INFO               /* Get information about error    *//*COPY*/
+                                                                        /*COPY*/
+  "SUBCOM ISPEXEC"                  /* Is ISPF available?             *//*COPY*/
+  IF RC = 0 THEN IF SYSVAR('SYSENV') ¬= 'BACK' THEN DO UNTIL RC ¬= 0    /*COPY*/
+        eresults = ""                                                   /*COPY*/
+        DO QUEUED()                                                     /*COPY*/
+           PARSE PULL eresult                                           /*COPY*/
+           eresults = STRIP(eresults "NL ===>" eresult)                 /*COPY*/
+        END                                                             /*COPY*/
+        ADDRESS "ISPEXEC" "DISPLAY PANEL(REXXEPNL)"                     /*COPY*/
+      END                                                               /*COPY*/
+    ELSE CALL MVS_ERROR_DISPLAY                                         /*COPY*/
+  ELSE   CALL MVS_ERROR_DISPLAY                                         /*COPY*/
+                                                                        /*COPY*/
+  CALL ERROR_RESPONSE               /* EXEC dependent ERROR handling  *//*COPY*/
+  CALL CLEANUP                      /* Cleanup and EXIT gracefully    *//*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY ERRINFO  */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+      Get the information about the ERROR and format it                 /*COPY*/
+***********************************************************************//*COPY*/
+GET_ERROR_INFO:                                                         /*COPY*/
+  PARSE SOURCE . . erexx .          /* Get REXX EXEC name             *//*COPY*/
+  etype   = CONDITION('C')          /* Condition causing error        *//*COPY*/
+  sourcel = SOURCELINE(elineno)     /* Start getting error source line*//*COPY*/
+  IF INDEX(sourcel,'/*COPY*/') = 73 THEN sourcel = LEFT(sourcel,72)     /*COPY*/
+  sourcel = STRIP(sourcel)                                              /*COPY*/
+  DO e_i = 1 WHILE LASTPOS(',',sourcel) = LENGTH(sourcel)               /*COPY*/
+     nextl = SOURCELINE(elineno + e_i)                                  /*COPY*/
+     IF INDEX(nextl,'/*COPY*/') = 73 THEN nextl = LEFT(nextl,72)        /*COPY*/
+     sourcel = STRIP(sourcel,'T',',') STRIP(nextl)                      /*COPY*/
+  END                           /* END loop to handle continued lines *//*COPY*/
+  IF etype = 'SYNTAX' THEN DO                                           /*COPY*/
+     ecause  = ERRORTEXT(RC)       /* Brief description of error     */ /*COPY*/
+     expandl = "Can't INTERPRET source with SYNTAX errors!"             /*COPY*/
+    END                                                                 /*COPY*/
+  ELSE DO                                                               /*COPY*/
+     Lst = "ADDRESS CALL INTERPRET SAY"                                 /*COPY*/
+     ecause  = CONDITION('D')       /* Brief description of error     *//*COPY*/
+     FullLine = sourcel             /* Begin getting EXECuted source  *//*COPY*/
+     expandl = ""                                                       /*COPY*/
+     DO UNTIL FullLine = ''         /* loop to handle ';' in source   *//*COPY*/
+        PARSE VALUE FullLine WITH srcl ';' FullLine                     /*COPY*/
+        SELECT                                                          /*COPY*/
+          WHEN WORDPOS(WORD(srcl,1),Lst) > 0        THEN evals=srcl     /*COPY*/
+          WHEN WORDPOS(WORD(srcl,2),Lst) > 0        THEN evals=srcl     /*COPY*/
+          WHEN INDEX(srcl,"=")           > 1        THEN evals=srcl     /*COPY*/
+        OTHERWISE; evals = VALUE(srcl); END                             /*COPY*/
+        IF DATATYPE(evals, "NUM")                   THEN evals=srcl     /*COPY*/
+        expandl = expandl';' evals                                      /*COPY*/
+     END                                                                /*COPY*/
+     expandl = STRIP(STRIP(expandl,"L",";"))                            /*COPY*/
+  END                                                                   /*COPY*/
+  SELECT                                                                /*COPY*/
+    WHEN etype = 'ERROR' & SYMBOL('ZERRLM') = 'VAR' THEN                /*COPY*/
+          emsg = ZERRLM                                                 /*COPY*/
+    WHEN SYMBOL('SYSMSGLVL1') ¬= 'VAR'              THEN                /*COPY*/
+          emsg = 'No available ERROR description.'                      /*COPY*/
+    WHEN SYSMSGLVL1 = ""                            THEN                /*COPY*/
+          emsg = 'No available ERROR description.'                      /*COPY*/
+  OTHERWISE                                                             /*COPY*/
+     IF SYMBOL('SYSMSGLVL2') = 'VAR'                THEN                /*COPY*/
+          emsg = SYSMSGLVL1 "--" SYSMSGLVL2                             /*COPY*/
+     ELSE emsg = SYSMSGLVL1                                             /*COPY*/
+  END                                                                   /*COPY*/
+  IF INDEX(emsg, "IN VARIABLE SYSREASON") > 0       THEN                /*COPY*/
+          emsg = "SYSREASON: '"SYSREASON"'"                             /*COPY*/
+  IF etype = 'NOVALUE' THEN ExitError = 4    /* Set EXIT error level  *//*COPY*/
+     ELSE ExitError = RC                                                /*COPY*/
+  erc = ExitError       /* Get all information about error            *//*COPY*/
+RETURN                                                                  /*COPY*/
+/* COPY MVSERROR */                                                     /*COPY*/
+/********************************************************************** /*COPY*/
+                 Output ERROR information to SYSPRINT                   /*COPY*/
+***********************************************************************//*COPY*/
+MVS_ERROR_DISPLAY:                                                      /*COPY*/
+  eresult. = "";eresult.0 = QUEUED() /* Get info currently on STACK   *//*COPY*/
+  DO eresult = 1 TO eresult.0; PARSE PULL eresult.eresult; END          /*COPY*/
+  ls = LINESIZE()                   /* How wide is the display?       *//*COPY*/
+  IF ls <= 80 THEN ls2 = ls; ELSE ls2 = ls - 30                         /*COPY*/
+  SAY ''                            /* Start SAYing error information *//*COPY*/
+  SAY  CENTER(CENTER(" An ERROR occurred in REXX '"erexx"' ",50,'*'),ls)/*COPY*/
+  SAY    CENTER(LEFT('          Error Type:' etype,80),ls)              /*COPY*/
+  SAY    CENTER(LEFT('         Error Cause:' ecause,80),ls)             /*COPY*/
+  SAY    CENTER(LEFT('                  RC:' erc,80),ls)                /*COPY*/
+  SAY    CENTER(LEFT('      Stack Contents:' eresult.1,80),ls)          /*COPY*/
+  DO eresults = 2 TO eresult.0                                          /*COPY*/
+     SAY CENTER(LEFT('                     ' eresult.eresults,80),ls)   /*COPY*/
+  END                                                                   /*COPY*/
+  SAY    CENTER(LEFT('         Source Line:' elineno,80),ls)            /*COPY*/
+  SAY           LEFT('   Error Description:' emsg,ls)                   /*COPY*/
+  SAY ''                                                                /*COPY*/
+  SAY           LEFT('Source line reads as:' sourcel,ls)                /*COPY*/
+  SAY ''                                                                /*COPY*/
+  SAY          LEFT('  Source EXECutes as:' expandl,ls)                 /*COPY*/
+  SAY CENTER(CENTER("      End of ERROR Reporting     ",50,'*'),ls)     /*COPY*/
+  SAY CENTER(CENTER("   Beginning of Error Handling   ",50,'*'),ls)     /*COPY*/
+RETURN                                                                  /*COPY*/
+/********************************************************************** /*COPY*/
+        In case ERROR_RESPONSE and CLEANUP are not supplied             /*COPY*/
+   REXX allows Multiple PROCEDUREs with same name, but always uses      /*COPY*/
+   the first one found.  So, a REXX specific version of these can       /*COPY*/
+   be use writen if it is placed before ERROR_PROC.                     /*COPY*/
+***********************************************************************//*COPY*/
+ERROR_RESPONSE:                     /* Dummy ERROR_RESPONSE PROC      *//*COPY*/
+RETURN                                                                  /*COPY*/
+CLEANUP:                            /* Simple CLEANUP PROC            *//*COPY*/
+  ADDRESS "ISPEXEC" "FTCLOSE"       /* CLOSE File Tailoring FILE      *//*COPY*/
+  ZISPFRC = ExitError               /* SET ISPF RC to ExitError       *//*COPY*/
+  ADDRESS "ISPEXEC" "VPUT (ZISPFRC)"                                    /*COPY*/
+EXIT ExitError                      /* EXIT with error return code    *//*COPY*/

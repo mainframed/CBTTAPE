@@ -1,0 +1,1857 @@
+*                                      IDENTIFICATION DIVISION
+* PROGRAM NAME: MTCHMRG
+* AUTHOR: CRAIG SCHNEIDERWENT
+* DATE: 16-DEC-1999
+* PURPOSE: MATCH MERGE TWO FILES
+*
+* KEY COMPARISON IS A CLC INSTRUCTION IF THE KEY LENGTH IS 256 OR LESS,
+* ELSE IT IS A CLCL INSTRUCTION.  GENERALLY THIS MEANS YOU MUST BE
+* CAREFUL WHEN YOUR KEY CONTAINS PACKED DATA, AS THE SIGN NIBBLES MUST
+* MATCH EXACTLY.  EVEN THOUGH X'123C' AND X'123A' ARE BOTH +123, THEY
+* WILL _NOT_ COMPARE EQUAL IN THE CONTEXT OF THIS PROGRAM.
+*
+* EXEC PGM=MTCHMRG,PARM='000120002300042'
+*                        LLLLL1111122222
+*
+* LLLLL = LENGTH OF KEY
+* 11111 = OFFSET OF KEY IN SYSUT1
+* 22222 = OFFSET OF KEY IN SYSUT2
+*
+* ABOVE PARAMETER CAN ALSO BE SPECIFIED ON SYSIN
+*
+* SYSUT3 WILL CONTAIN CONCATENATED MATCHING SYSUT1 AND SYSUT2 RECORDS
+* SYSUT4 WILL CONTAIN UNMATCHED SYSUT1 RECORDS
+* SYSUT5 WILL CONTAIN UNMATCHED SYSUT2 RECORDS
+* SYSUT6 WILL CONTAIN MATCHED SYSUT1 RECORDS
+* SYSUT7 WILL CONTAIN MATCHED SYSUT2 RECORDS
+*
+* AT LEAST ONE OF SYSUT3, 4, 5, 6, 7 MUST BE PRESENT IN THE JCL
+*
+* RETURN CODES
+* 0 - SUCCESS
+* 1 - SUCCESS, MULTIPLE RECORDS WITH EQUAL KEYS IN BOTH INPUTS
+* 8 - ERROR, SEE SYSPRINT
+*
+*
+*
+* //MRG00001 EXEC PGM=MTCHMRG,PARM='000060000000000'
+* //SYSUT1   DD  DSN=MANDATORY.INPUT.FILE
+* //SYSUT2   DD  DSN=MANDATORY.INPUT.FILE
+* //SYSUT3   DD  DSN=OPTIONAL.OUTPUT.FILE    AT LEAST ONE
+* //SYSUT4   DD  DSN=OPTIONAL.OUTPUT.FILE      OF THESE FIVE
+* //SYSUT5   DD  DSN=OPTIONAL.OUTPUT.FILE        DD STATEMENTS
+* //SYSUT6   DD  DSN=OPTIONAL.OUTPUT.FILE          MUST BE
+* //SYSUT7   DD  DSN=OPTIONAL.OUTPUT.FILE            PRESENT
+* //SYSPRINT DD  SYSOUT=*
+* //SYSUDUMP DD  SYSOUT=*
+*
+* BASIC ALGORITHM
+*
+* PRIMING READS:
+* READ SYSUT1 AND ADD TO WRK1 LIST UNTIL KEY BREAK
+* READ SYSUT2 AND ADD TO WRK2 LIST UNTIL KEY BREAK
+* MATCH MERGE START:
+* KEYS EQUAL:
+*                    WRITE SYSUT6
+*                    WRITE SYSUT7
+*                    CONCATENATE AND WRITE SYSUT3
+*                    READ SYSUT1 AND ADD TO WRK1 LIST UNTIL KEY BREAK
+*                    READ SYSUT2 AND ADD TO WRK2 LIST UNTIL KEY BREAK
+*                    GO TO MATCH MERGE START:
+* WRK1 KEY LOW:
+*                    WRITE WRK1 LIST TO SYSUT4
+*                    READ SYSUT1 AND ADD TO WRK1 LIST UNTIL KEY BREAK
+*                    GO TO MATCH MERGE START:
+* WRK1 KEY HIGH:
+*                    WRITE WRK2 LIST TO SYSUT5
+*                    READ SYSUT2 AND ADD TO WRK2 LIST UNTIL KEY BREAK
+*                    GO TO MATCH MERGE START:
+*
+*
+* 03-APR-2002
+* PERFORMANCE HACKS:
+*   CHANGED ALGORITHM SO TO BE LESS MEMORY ALLOCATION INTENSE
+*   CHANGED CONCATENATION TO AVOID 4 LOADS AND AN MVCL UNDER
+* SOME CIRCUMSTANCES
+*   COSMETIC FIX TO INDICATE SYSUT4 AND/OR SYSUT5 WERE WRITTEN
+* WHEN SYSUT3 IS NOT PRESENT
+*   AESTHETIC FIX - REMOVED COMMENTED-OUT DEBUGGING CODE
+*
+* 20-NOV-2002
+* PERFORMANCE HACKS:
+*   REMOVED SUPERFLUOUS MVCL FOR SYSUT4 AND SYSUT5 RECORDS
+*   COUNTERS IN RD1WR000 AND RD2WR000 ARE NOW KEPT IN A WORK
+* REGISTER AND STORED AT EXIT FROM THE ROUTINE INSTEAD OF LOAD+
+* INCREMENT+STORE EACH TIME (FOUND A SPARE WORK REGISTER)
+*   REMOVED SOME SUPERFLUOUS ST AND L INSTRUCTIONS FOR SUBROUTINES
+* THAT DIDN'T ALTER REGISTER 14
+*   ASSEMBLER SERVICES REFERENCE NOW SAYS STORAGE MACRO SHOULD USE
+* LOC=31 INSTEAD OF LOC=ANY
+*
+* 29-FEB-2003
+* ADDED PROCESSING FOR SYSUT6 AND SYSUT7
+*
+* 23-JUL-2003
+* PERFORMANCE HACK: LOCALITY OF REFERENCE.
+* IT TURNS OUT THAT UPDATING DATA THAT IS CLOSE TO THE CODE THAT
+* UPDATES IT CAUSES A PERFORMANCE DEGRADATION.  MOVED SOME MINI SAVE
+* AREAS (PLACES FOR A SUBROUTINE TO STUFF R14) TO THE DYNAMICALLY
+* ALLOCATED $WRKSTRG DSECT FOR A 20% - 30% CPU REDUCTION.
+*
+* 26-NOV-2003
+* ADDED CHECK FOR F FORMAT IN JFCB AFTER OPEN OF SYSUT1 AND SYSUT2
+* TO PREVENT ATTEMPTS TO PROCESS NON-FIXED RECORD LENGTH FILES.
+* FACTORED OUT THE RDJFCB MACRO INTO ITS OWN SUBROUTINE.
+* MOVED MORE MINI SAVE AREAS TO WORKING-STORAGE.
+* CORRECTED A TYPO IN A COMMENT.
+* CORRECTED CLOSE OF SYSUT6 AND SYSUT7 - THEY WERE BOTH MISTAKENLY
+* CLOSING SYSUT5.  GO FIGURE.
+* MOVED QSAM BUFFERS ABOVE THE 16M LINE BY ADDING DCBE RMODE31=BUFF
+* FOR SYSUT1 THRU SYSUT7.
+* FIXED A BUG FOUND BY DAVE FREY: IF YOUR KEY LENGTH WAS ONE MORE THAN
+* A MULTIPLE OF 8 YOU WOULD GET UNPREDICTABLE RESULTS.  SOMETIMES
+* MANIFESTED ITSELF AS AN S202 ABEND IN THE I/O SUBSYSTEM.
+*
+* 15-NOV-2004
+* CHANGED THE EXIT LISTS FOR SYSUT1 AND SYSUT2 FROM TYPE 07 TO TYPE 13
+* AND ADDED LOGIC TO DISPLAY ALL THE CONCATENATED DSNS FOR THESE TWO
+* DDS.  CHANGED THE VERIFICATION OF THE PRESENCE OF SYSUT1 AND SYSUT2
+* FROM RDJFCB TO DEVTYPE.  CHANGED THE ALLOCATION OF LINKED LIST
+* ELEMENTS FROM THE STORAGE MACRO TO CPOOL.  IN SITUATIONS WHERE THERE
+* ARE MANY DUPLICATE KEYS THIS SEEMS TO SAVE SIGNIFICANT CPU.
+*
+* 05-OCT-2005
+* IT TURNS OUT YOU CAN'T DO A CPOOL BUILD WITH A CELL SIZE < 4 WITHOUT
+* GETTING A SC78 ABEND.  ADDED CODE TO ENSURE THIS DOESN'T HAPPEN: IF
+* SYSUT1 OR SYSUT2 LRECLS ARE < 4 BYTES THE CELL SIZE IS SET TO 4.
+* THIS WORKS BECAUSE THE REST OF THE CODE WORKS OFF THE ACTUAL LRECL.
+*
+* 06-JAN-2009
+* ADDED LOGIC TO DETECT A KEY LENGTH > 256 AND PERFORM A CLCL
+* FOR KEY COMPARISON IN SUCH CASES.  THE ACTUAL CHI TO DETERMINE
+* WHETHER A CLC OR CLCL IS PERFORMED USES 255 FOR COMPARISON
+* BECAUSE THE VALUE STORED IN THE KYLN FULLWORD ALREAD HAS BEEN
+* DECREMENTED BY 1 FOR MVC AND CLC PURPOSES.  SUGGESTED BY TINUS TAUTE.
+*
+* 17-DEC-2009
+* FIXED BUG FOUND BY ARBEL WEIZMAN.  RECORD ADDRESS WAS BEING SET
+* INCORRECTLY IN SUBROUTINE MVREC200.  L  R6,R4 WAS INCORRECTLY
+* CODED.  NOW USING THE ACTUAL STORAGE AREA INSTEAD OF FANCY TRICKS.
+* MOVEKY1 AND MOVEKY2 WERE ALSO PROBLEMATIC AND HAVE BEEN CORRECTED.
+* ALSO ADDED AN ARBITRARY VERSION NUMBER OF 3.01 TO DISTINGUISH
+* BETWEEN DIFFERENT VERSIONS.  THIS IS NOW DISPLAYED ON SYSPRINT.
+*
+*
+MTCHMRG  AMODE 31
+MTCHMRG  RMODE 24
+ALCTWORK AMODE 31
+ALCTWORK RMODE 24
+SETUP    AMODE 31
+SETUP    RMODE 24
+*                                  WRK1 AND WRK2 LISTS DSECT
+$MRGWORK DSECT
+NEXT     DS    F
+PREV     DS    F
+WORKREC  DS    F
+WORKFLAG DS    F
+#LAST1   EQU   B'00000001'         LAST LIST ITEM IN USE
+#CPYDONE EQU   B'00000010'         THIS LIST ITEM ALREADY COPIED
+#WRTDONE EQU   B'00000100'         THIS LIST ITEM ALREADY WRITTEN
+#CPYRSET EQU   B'11111101'         TURN OFF ITEM ALREADY COPIED
+#MRGWORK EQU   *-$MRGWORK
+*                                  WORKING-STORAGE DSECT
+$WRKSTRG DSECT
+RC       DS    F
+REC1A    DS    F                   ADDRESS OF SYSUT1 RECORD
+REC2A    DS    F                   ADDRESS OF SYSUT2 RECORD
+REC3A    DS    F                   ADDRESS OF SYSUT3 RECORD
+REC3C    DS    F                   ADDR OF SYSUT3 REC FOR CONCATENATION
+REC1KYA  DS    F                   ADDRESS OF SYSUT1 RECORD KEY
+REC2KYA  DS    F                   ADDRESS OF SYSUT2 RECORD KEY
+WRK1X    DS    F                   CURRENT WRK1 LIST ITEM ADDRESS
+WRK2X    DS    F                   CURRENT WRK2 LIST ITEM ADDRESS
+WRK1H    DS    F                   ADDRESS OF WRK1 LIST HEAD
+WRK2H    DS    F                   ADDRESS OF WRK2 LIST HEAD
+WRK1T    DS    F                   ADDRESS OF WRK1 LIST TAIL
+WRK2T    DS    F                   ADDRESS OF WRK2 LIST TAIL
+LRECL1   DS    F                   LRECL FOR SYSUT1
+LRECL2   DS    F                   LRECL FOR SYSUT2
+LRECL3   DS    F                   LRECL FOR SYSUT3
+COUNT1   DS    F                   COUNT OF RECORDS READ FROM SYSUT1
+COUNT2   DS    F                   COUNT OF RECORDS READ FROM SYSUT2
+COUNT3   DS    F                   COUNT OF RECORDS WRITTEN TO SYSUT3
+COUNT4   DS    F                   COUNT OF RECORDS WRITTEN TO SYSUT4
+COUNT5   DS    F                   COUNT OF RECORDS WRITTEN TO SYSUT5
+COUNT6   DS    F                   COUNT OF RECORDS ADDED TO WRK1
+COUNT7   DS    F                   COUNT OF RECORDS ADDED TO WRK2
+COUNT8   DS    F                   COUNT OF RECORDS WRITTEN TO SYSUT6
+COUNT9   DS    F                   COUNT OF RECORDS WRITTEN TO SYSUT7
+         DS    0D                  DOUBLE WORD ALIGNMENT
+KYLNP    DS    PL8                 KEY LENGTH PACKED
+KYOSET1P DS    PL8                 KEY OFFSET IN SYSUT1 RECORD PACKED
+KYOSET2P DS    PL8                 KEY OFFSET IN SYSUT2 RECORD PACKED
+COUNTP   DS    PL8                 USED TO OUTPUT COUNT FIELDS
+LRECLP   DS    PL8
+KYLN     DS    F                   KEY LENGTH BINARY
+KYOSET1  DS    F                   KEY OFFSET IN SYSUT1 RECORD BINARY
+KYOSET2  DS    F                   KEY OFFSET IN SYSUT2 RECORD BINARY
+PARMLEN  DS    H                   LENGTH OF PARMS
+         DS    0F                  FULLWORD ALIGNMENT
+NULLFILE DS    CL8                 LITERAL FOR DD DUMMY TESTING
+CLCL$GRR DS    4F                  MINI SA FOR BEFORE/AFTER CLCL
+MVCL$GRR DS    4F                  MINI SA FOR BEFORE/AFTER MVCL
+FLAG     DS    XL1
+#EOFW1   EQU   B'00000001'         EOF ON WRK1 LIST
+#EOFW2   EQU   B'00000010'         EOF ON WRK2 LIST
+#KYEQ    EQU   B'00000100'         KEYS ARE EQUAL
+#KY1HI   EQU   B'00001000'         WRK1 KEY > WRK2 KEY
+#KY1LO   EQU   B'00010000'         WRK1 KEY < WRK2 KEY
+#EOFW12  EQU   B'00000011'         USED TO TEST EOF ON WRK1 AND 2
+#NOEOFW1 EQU   B'11111110'         USED TO TURN OFF WRK1 EOF FLAG
+#NOEOFW2 EQU   B'11111101'         USED TO TURN OFF WRK2 EOF FLAG
+FLAG2    DS    XL1
+#EOFS1   EQU   B'00000001'         EOF ON SYSUT1
+#EOFS2   EQU   B'00000010'         EOF ON SYSUT2
+#DONES1  EQU   B'00010000'         DONE WITH LAST RECORD FROM SYSUT1
+#DONES2  EQU   B'00100000'         DONE WITH LAST RECORD FROM SYSUT2
+#DONES12 EQU   B'00110000'         DONE WITH LAST RECORDS FROM BOTH
+#EMTYS1  EQU   B'01000000'         SYSUT1 EMPTY
+#EMTYS2  EQU   B'10000000'         SYSUT2 EMPTY
+#EMTYS12 EQU   B'11000000'         BOTH EMPTY
+FLAG3    DS    XL1
+#MULTK1  EQU   B'01000000'         MULTIPLE WRK1 RECS WITH SAME KEY
+#MULTK2  EQU   B'10000000'         MULTIPLE WRK2 RECS WITH SAME KEY
+#MULTK12 EQU   B'11000000'         MULT WRK1 AND 2 RECS W/SAME KEY
+#MULTFST EQU   B'00100000'         FIRST TIME THRU MULT RECS
+FLAG4    DS    XL1
+#PRST3   EQU   B'10000000'         SYSUT3 PRESENT
+#PRST4   EQU   B'01000000'         SYSUT4 PRESENT
+#PRST5   EQU   B'00100000'         SYSUT5 PRESENT
+#PRST6   EQU   B'00010000'         SYSUT6 PRESENT
+#PRST7   EQU   B'00001000'         SYSUT7 PRESENT
+*                                  ERROR MESSAGES
+MSGERR01 DS    0CL80
+MSGE0101 DS    CL12
+MSGEDD01 DS    CL01
+MSGE0201 DS    CL16
+         DS    CL51
+MSGERR02 DS    0CL80
+MSGE0102 DS    CL23
+MSGEDD02 DS    CL01
+MSGE0202 DS    CL01
+         DS    CL55
+MSGERR03 DS    0CL80
+MSGE0103 DS    CL34
+MSGEDD03 DS    CL01
+MSGE0203 DS    CL08
+MSGELR03 DS    CL05
+MSGE0303 DS    CL01
+         DS    CL31
+MSGERR04 DS    0CL80
+MSGE0104 DS    CL43
+         DS    CL01
+MSGE0204 DS    CL29
+         DS    CL07
+MSGERR05 DS    0CL80
+MSGE0105 DS    CL21
+MSGEL105 DS    CL05
+MSGE0205 DS    CL22
+MSGEL205 DS    CL05
+MSGE0305 DS    CL18
+MSGEL305 DS    CL05
+MSGE0405 DS    CL04
+*
+MSGERR06 DS    0CL80
+MSGE0106 DS    CL12
+MSGE0206 DS    CL01
+         DS    CL01
+MSGE0306 DS    CL44
+         DS    CL01
+MSGE0406 DS    CL21
+*                                  INFORMATIONAL MESSAGES
+MSGINF01 DS    0CL80
+MSGI0101 DS    CL06
+MSGI0201 DS    CL04
+MSGIDS01 DS    CL54
+         DS    CL16
+MSGINF02 DS    0CL80
+MSGI0102 DS    CL05
+MSGIDD02 DS    CL01
+MSGI0202 DS    CL09
+MSGIOP02 DS    CL07
+MSGI0302 DS    CL03
+MSGICT02 DS    CL10
+         DS    CL45
+MSGINF04 DS    0CL80
+MSGI0104 DS    CL05
+MSGIDD04 DS    CL01
+MSGI0204 DS    CL14
+MSGIKO04 DS    CL05
+         DS    CL55
+MSGINF05 DS    0CL80
+MSGI0105 DS    CL13
+MSGIKL05 DS    CL05
+         DS    CL62
+         DS    0D
+MSGINF06 DS    CL80
+MSGINF03 DS    CL80                DEBUGGING
+#PRINT   EQU   80
+INREC    DS    0D
+INKYLN   DS    CL5
+INKYOS1  DS    CL5
+INKYOS2  DS    CL5
+         DS    CL65
+#INREC   EQU   *-INREC
+MVREC1SA DS    F                   MINI SAVE AREA
+MVREC2SA DS    F                   MINI SAVE AREA
+RD1WRR14 DS    F                   MINI SAVE AREA
+RD2WRR14 DS    F                   MINI SAVE AREA
+KYSEQSA  DS    F                   MINI SAVE AREA
+CONCATSA DS    F                   MINI SAVE AREA
+KY1LTSA  DS    F                   MINI SAVE AREA
+KY2LTSA  DS    F                   MINI SAVE AREA
+PUTSYS4A DS    F                   MINI SAVE AREA
+PUTSYS5A DS    F                   MINI SAVE AREA
+PUTSYS6A DS    F                   MINI SAVE AREA
+PUTSYS7A DS    F                   MINI SAVE AREA
+MYJFCBSA DS    F                   MINI SAVE AREA
+GETSYS1A DS    F                   MINI SAVE AREA
+GETSYS2A DS    F                   MINI SAVE AREA
+DISPLAYA DS    F                   MINI SAVE AREA
+FREELSTA DS    F                   MINI SAVE AREA
+DSPLSA   DS    F                   MINI SAVE AREA
+INFDSNSA DS    F                   MINI SAVE AREA
+DEVTYWK  DS    0F                  DEVTYPE WORK AREA
+         DS    XL24
+#WRKSTRG EQU   *-$WRKSTRG
+         DSECT
+         IEFJFCBN LIST=YES
+MTCHMRG  CSECT
+         REGISTER
+*
+         JSAVED
+         BALR  R11,0
+         USING *,R11,R12
+         LA    R12,4095(R11)
+         LA    R12,1(R12)
+*
+         ST    R1,LINKADDR             KEEP PARAMETER LIST ADDRESS
+         L     R2,LINKADDR             WORKING OFF R2
+         MVC   PARMADDR,0(R2)          GOTO ADDR IN R2 & GET ADDR
+         L     R3,PARMADDR             STORE THAT ADDR IN R3
+         STORAGE OBTAIN,LENGTH=#WRKSTRG,ADDR=WRKGSTRG,LOC=(31,64)
+         L     R10,WRKGSTRG            WORKING-STORAGE DSECT
+         USING $WRKSTRG,R10
+         USING $MRGWORK,R9
+         OPEN  (SYSPRINT,OUTPUT),MODE=31
+CKPRMLN  EQU   *
+         MVC   PARMLEN,0(R3)           SAVE LENGTH OF PARM
+         CLC   =H'0',PARMLEN           WAS THERE A PARM ?
+         BNE   FROMPARM                YES - PROCESS IT
+FRMSYSIN EQU   *
+         OPEN  (SYSIN,INPUT),MODE=31   NO PARM SO OPEN SYSIN
+         GET   SYSIN,INREC             READ PARAMETERS FROM SYSIN
+         CLOSE (SYSIN),MODE=31         CLOSE SYSIN
+         B     SETUP0                  BRANCH AROUND PARM PROCESSING
+FROMPARM EQU   *
+         MVC   INKYLN,2(R3)            GET KEY LENGTH
+         MVC   INKYOS1,7(R3)           GET KEY OFFSET IN SYSUT1
+         MVC   INKYOS2,12(R3)          GET KEY OFFSET IN SYSUT2
+SETUP0   EQU   *
+         L     R15,$SETUP
+         BASR  R14,R15             DO INITIAL HOUSEKEEPING
+         LA    R2,MSGINF06
+         BAS   R14,DISPLAY         DISPLAY VERSION IDENTIFIER
+         DEVTYPE =C'SYSUT1  ',DEVTYWK IS SYSUT1 PRESENT ?
+         C     R15,=F'4'
+         BNH   SWITCH01
+         BAS   R14,XDEVTY          DEVTYPE WENT SOUTH
+SWITCH01 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK01                  CASE 0:
+         B     ERR01                 CASE 4:
+OK01     EQU   *
+         OPEN  (SYSUT1,INPUT),MODE=31
+         LA    R8,SYSUT1
+         BAS   R14,RDMYJFCB        GET SYSUT1 INFO NOW THAT IT'S OPEN
+         L     R7,ARLAREA          POINT TO SYSUT1 INFO
+         LR    R2,R7               COPY OF R7
+         LA    R7,4(R7)            POINT PAST LEADING FULLWORD
+         USING INFMJFCB,R7
+         MVC   MSGE0206,=C'1'
+         MVC   MSGE0306,JFCBDSNM
+         TM    JFCRECFM,JFCFIX     FIXED RECORD LENGTH?     B'10000000'
+         BNO   PUTERR06            NO - ERROR
+         TM    JFCRECFM,JFCUND     UNDEFINED RECORD LENGTH? B'11000000'
+         BO    PUTERR06            YES - ERROR
+         LH    R8,JFCLRECL         SAVE LRECL
+         ST    R8,LRECL1
+         L     R8,KYOSET1
+         A     R8,KYLN
+         LA    R8,1(R8)           PREVIOUSLY SUBTRACTED 1 FOR MVC & CLC
+         CL    R8,LRECL1           KEY OSET+LENGTH > LRECL ?
+         BH    ERR03               YES - ERROR
+         LR    R7,R2               RESTORE R7 FOR DSPLJFCB
+         MVC   MSGI0101,=C'SYSUT1'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,DSPLJFCB
+         DEVTYPE =C'SYSUT2  ',DEVTYWK IS SYSUT2 PRESENT ?
+         C     R15,=F'4'
+         BNH   SWITCH02
+         BAS   R14,XDEVTY          DEVTYPE WENT SOUTH
+SWITCH02 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK02                  CASE 0:
+         B     ERR04                 CASE 4:
+OK02     EQU   *
+         OPEN  (SYSUT2,INPUT),MODE=31
+         LA    R8,SYSUT2
+         BAS   R14,RDMYJFCB        GET SYSUT2 INFO NOW THAT IT'S OPEN
+         L     R7,ARLAREA          POINT TO SYSUT1 INFO
+         LR    R2,R7               COPY OF R7
+         LA    R7,4(R7)            POINT PAST LEADING FULLWORD
+         MVC   MSGE0206,=C'2'
+         MVC   MSGE0306,JFCBDSNM
+         TM    JFCRECFM,JFCFIX     FIXED RECORD LENGTH?     B'10000000'
+         BNO   PUTERR06            NO - ERROR
+         TM    JFCRECFM,JFCUND     UNDEFINED RECORD LENGTH? B'11000000'
+         BO    PUTERR06            YES - ERROR
+         LH    R8,JFCLRECL         SAVE LRECL
+         ST    R8,LRECL2
+         L     R8,KYOSET2
+         A     R8,KYLN
+         LA    R8,1(R8)           PREVIOUSLY SUBTRACTED 1 FOR MVC & CLC
+         CL    R8,LRECL2           KEY OSET+LENGTH > LRECL ?
+         BH    ERR06               YES - ERROR
+         LR    R7,R2               RESTORE R7 FOR DSPLJFCB
+         MVC   MSGI0101,=C'SYSUT2'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,DSPLJFCB
+         LA    R8,SYSUT3
+         LA    R7,MYJFCB           MAKE USING STATEMENT TRUE
+         BAS   R14,RDMYJFCB        IS SYSUT3 PRESENT ?
+         C     R15,=F'8'
+         BNH   SWITCH03
+         BAS   R14,XRDJFCB         RDJFCB WENT SOUTH
+SWITCH03 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK03                  CASE 0:
+         B     OK03A                 CASE 4:
+         B     ERR07                 CASE 8:
+OK03     EQU   *
+         CLC   NULLFILE,JFCBDSNM
+         BE    OK03A
+         L     R8,LRECL1           COMPUTE CORRECT LRECL
+         A     R8,LRECL2
+         ST    R8,LRECL3
+         OI    FLAG4,#PRST3        INDICATE SYSUT3 IS PRESENT
+         MVC   MSGI0101,=C'SYSUT3'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,INFDSN
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY         DISPLAY SYSUT3 DSN
+OK03A    EQU   *
+         LA    R8,SYSUT4
+         BAS   R14,RDMYJFCB        IS SYSUT4 PRESENT ?
+         C     R15,=F'8'
+         BNH   SWITCH04
+         BAS   R14,XRDJFCB         RDJFCB WENT SOUTH
+SWITCH04 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK04                  CASE 0:
+         B     OK04A                 CASE 4:
+         B     ERR08                 CASE 8:
+OK04     EQU   *
+         CLC   NULLFILE,JFCBDSNM
+         BE    OK04A
+         OI    FLAG4,#PRST4        INDICATE SYSUT4 IS PRESENT
+         MVC   MSGI0101,=C'SYSUT4'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,INFDSN
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY         DISPLAY SYSUT4 DSN
+OK04A    EQU   *
+         LA    R8,SYSUT5
+         BAS   R14,RDMYJFCB        IS SYSUT5 PRESENT ?
+         C     R15,=F'8'
+         BNH   SWITCH05
+         BAS   R14,XRDJFCB         RDJFCB WENT SOUTH
+SWITCH05 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK05                  CASE 0:
+         B     OK05A                 CASE 4:
+         B     ERR09                 CASE 8:
+OK05     EQU   *
+         CLC   NULLFILE,JFCBDSNM
+         BE    OK05A
+         OI    FLAG4,#PRST5        INDICATE SYSUT5 IS PRESENT
+         MVC   MSGI0101,=C'SYSUT5'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,INFDSN
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY         DISPLAY SYSUT5 DSN
+OK05A    EQU   *
+         LA    R8,SYSUT6
+         BAS   R14,RDMYJFCB        IS SYSUT6 PRESENT ?
+         C     R15,=F'8'
+         BNH   SWITCH06
+         BAS   R14,XRDJFCB         RDJFCB WENT SOUTH
+SWITCH06 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK06                  CASE 0:
+         B     OK06A                 CASE 4:
+         B     ERR12                 CASE 8:
+OK06     EQU   *
+         CLC   NULLFILE,JFCBDSNM
+         BE    OK06A
+         OI    FLAG4,#PRST6        INDICATE SYSUT6 IS PRESENT
+         MVC   MSGI0101,=C'SYSUT6'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,INFDSN
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY         DISPLAY SYSUT6 DSN
+OK06A    EQU   *
+         LA    R8,SYSUT7
+         BAS   R14,RDMYJFCB        IS SYSUT7 PRESENT ?
+         C     R15,=F'8'
+         BNH   SWITCH07
+         BAS   R14,XRDJFCB         RDJFCB WENT SOUTH
+SWITCH07 EQU   *
+         B     *+4(R15)            SWITCH( R15 )
+         B     OK07                  CASE 0:
+         B     OK07A                 CASE 4:
+         B     ERR13                 CASE 8:
+OK07     EQU   *
+         CLC   NULLFILE,JFCBDSNM
+         BE    OK07A
+         OI    FLAG4,#PRST7        INDICATE SYSUT7 IS PRESENT
+         MVC   MSGI0101,=C'SYSUT7'
+         MVC   MSGI0201,=C' IS '
+         BAS   R14,INFDSN
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY         DISPLAY SYSUT7 DSN
+OK07A    EQU   *
+         TM    FLAG4,B'11111000'   AT LEAST ONE OUTPUT DEFINED ?
+         BZ    ERR10               NO - ERROR
+*                                  GET SPACE FOR INPUT RECORDS
+         L     R2,LRECL1
+         STORAGE OBTAIN,LENGTH=(R2),ADDR=REC1A,LOC=(31,64)
+         L     R2,LRECL2
+         STORAGE OBTAIN,LENGTH=(R2),ADDR=REC2A,LOC=(31,64)
+         TM    FLAG4,#PRST3
+         BZ    MALLOCKY
+         L     R2,LRECL3
+         STORAGE OBTAIN,LENGTH=(R2),ADDR=REC3A,LOC=(31,64)
+         L     R2,REC3A            ADDRESS OF SYSUT3 RECORD
+         A     R2,LRECL1           COMPUTE OFFSET FOR CONCATENATION
+         ST    R2,REC3C            SAVE FOR LATER
+MALLOCKY EQU   *
+*                                  GET SPACE FOR KEYS
+         L     R2,KYLN
+         LA    R2,1(R2)           PREVIOUSLY SUBTRACTED 1 FOR MVC & CLC
+         STORAGE OBTAIN,LENGTH=(R2),ADDR=REC1KYA,LOC=(31,64)
+         STORAGE OBTAIN,LENGTH=(R2),ADDR=REC2KYA,LOC=(31,64)
+*                                  OPEN FILES
+OPEN0    EQU   *
+         TM    FLAG4,#PRST3        SYSUT3 PRESENT ?
+         BZ    OPEN1               NO - BRANCH AROUND
+         OPEN  (SYSUT3,OUTPUT),MODE=31
+         LA    R8,SYSUT3
+         BAS   R14,RDMYJFCB        GET SYSUT3 INFO NOW THAT IT'S OPEN
+         LH    R8,JFCLRECL         GET ACTUAL LRECL
+         C     R8,LRECL3           ACTUAL LRECL = CORRECT LRECL ?
+         BNE   ERR11               NO - ERROR
+         DROP  R7
+OPEN1    EQU   *
+         TM    FLAG4,#PRST4        SYSUT4 PRESENT ?
+         BZ    OPEN2               NO - BRANCH AROUND
+         OPEN  (SYSUT4,OUTPUT),MODE=31
+OPEN2    EQU   *
+         TM    FLAG4,#PRST5        SYSUT5 PRESENT ?
+         BZ    OPEN3               NO - BRANCH AROUND
+         OPEN  (SYSUT5,OUTPUT),MODE=31
+OPEN3    EQU   *
+         TM    FLAG4,#PRST6        SYSUT6 PRESENT ?
+         BZ    OPEN4               NO - BRANCH AROUND
+         OPEN  (SYSUT6,OUTPUT),MODE=31
+OPEN4    EQU   *
+         TM    FLAG4,#PRST7        SYSUT7 PRESENT ?
+         BZ    ANNOUNCE            NO - BRANCH AROUND
+         OPEN  (SYSUT7,OUTPUT),MODE=31
+*
+ANNOUNCE EQU   *
+         LA    R2,KYOSET1P         MAKE
+         UNPK  MSGIKO04,5(3,R2)        SYSUT1
+         LA    R2,MSGIKO04                    KEY OFFSET
+         OI    L'MSGIKO04-1(R2),X'F0'                   READABLE
+         MVI   MSGIDD04,C'1'
+         LA    R2,MSGINF04         POINT TO MESSAGE TO DISPLAY
+         BAS   R14,DISPLAY         DISPLAY SYSUT1 KEY OFFSET
+         LA    R2,KYOSET2P         MAKE
+         UNPK  MSGIKO04,5(3,R2)        SYSUT2
+         LA    R2,MSGIKO04                   KEY OFFSET
+         OI    L'MSGIKO04-1(R2),X'F0'                  READABLE
+         MVI   MSGIDD04,C'2'
+         LA    R2,MSGINF04         POINT TO MESSAGE TO DISPLAY
+         BAS   R14,DISPLAY         DISPLAY SYSUT2 KEY OFFSET
+         LA    R2,KYLNP            MAKE
+         UNPK  MSGIKL05,5(3,R2)        KEY
+         LA    R2,MSGIKL05                LENGTH
+         OI    L'MSGIKL05-1(R2),X'F0'           READABLE
+         LA    R2,MSGINF05         POINT TO MESSAGE TO DISPLAY
+         BAS   R14,DISPLAY         DISPLAY KEY LENGTH
+         CPOOL BUILD,                                                  -
+               HDR='MTCHMRGWORKSPACELINKLIST',                         -
+               CPID=CMRGWORK,                                          -
+               LOC=31,                                                 -
+               PCELLCT=10,                                             -
+               SCELLCT=1000,                                           -
+               CSIZE=#MRGWORK        MAX SIZE
+         L     R7,LRECL1             SYSUT1 LRECL
+         C     R7,=F'4'              MIN SIZE OF CELL
+         BNL   SIZEOK01              BRANCH AROUND IF BIGGER THAN MIN
+         L     R7,=F'4'              LOAD MINIMUM SIZE
+SIZEOK01 EQU   *
+         CPOOL BUILD,                                                  -
+               HDR='MTCHMRGWORKSPACESYSUT1  ',                         -
+               CPID=CWRKREC1,                                          -
+               LOC=31,                                                 -
+               PCELLCT=10,                                             -
+               SCELLCT=1000,                                           -
+               CSIZE=(R7)            MAX SIZE
+         L     R7,LRECL2             SYSUT2 LRECL
+         C     R7,=F'4'              MIN SIZE OF CELL
+         BNL   SIZEOK02              BRANCH AROUND IF BIGGER THAN MIN
+         L     R7,=F'4'              LOAD MINIMUM SIZE
+SIZEOK02 EQU   *
+         CPOOL BUILD,                                                  -
+               HDR='MTCHMRGWORKSPACESYSUT2  ',                         -
+               CPID=CWRKREC2,                                          -
+               LOC=31,                                                 -
+               PCELLCT=10,                                             -
+               SCELLCT=1000,                                           -
+               CSIZE=(R7)            MAX SIZE
+*
+*                                  ALLOCATE HEAD-OF-LIST ITEMS
+         LA    R8,WRK1H
+         L     R7,CWRKREC1         SYSUT1 CPOOL
+         L     R15,$ALCTWRK        ADDRESS OF ALLOCATION ROUTINE
+         BASR  R14,R15             PERFORM ALCTWORK
+         MVC   WRK1T,WRK1H         COPY HEAD TO TAIL
+         MVC   WRK1X,WRK1H         COPY HEAD TO CURRENT
+         LA    R8,WRK2H
+         L     R7,CWRKREC2         SYSUT2 CPOOL
+         L     R15,$ALCTWRK        ADDRESS OF ALLOCATION ROUTINE
+         BASR  R14,R15             PERFORM ALCTWORK
+         MVC   WRK2T,WRK2H         COPY HEAD TO TAIL
+         MVC   WRK2X,WRK2H         COPY HEAD TO CURRENT
+*
+*                                  PRIMING READS
+PRMREAD0 EQU   *
+         BAS   R14,GETSYS1
+         TM    FLAG2,#EOFS1        EOF ON SYSUT1 ?
+         BZ    PRMREAD1            NO - BRANCH AROUND
+         OI    FLAG2,#DONES1       SYSUT1 DONE
+         OI    FLAG2,#EMTYS1       SYSUT1 EMPTY
+         L     R2,REC1A            POINT AT RECEIVING AREA
+         L     R3,LRECL1           SET ITS LENGTH
+         LA    R4,0                SET DUMMY FROM ADDRESS
+         IC    R5,=X'00'           SET PADDING CHARACTER
+         SLL   R5,24               SHIFT TO PADDING POSITION
+         MVCL  R2,R4               BLANK OUT THE AREA
+PRMREAD1 EQU   *
+         BAS   R14,MOVEKY1         COPY KEY FROM SYSUT1 REC TO HOLD
+         BAS   R14,GETSYS2
+         TM    FLAG2,#EOFS2        EOF ON SYSUT2 ?
+         BZ    PRMREAD2            NO - BRANCH AROUND
+         OI    FLAG2,#DONES2       SYSUT2 DONE
+         OI    FLAG2,#EMTYS2       SYSUT2 EMPTY
+         L     R2,REC2A            POINT AT RECEIVING AREA
+         L     R3,LRECL2           SET ITS LENGTH
+         LA    R4,0                SET DUMMY FROM ADDRESS
+         IC    R5,=X'00'           SET PADDING CHARACTER
+         SLL   R5,24               SHIFT TO PADDING POSITION
+         MVCL  R2,R4               BLANK OUT THE AREA
+PRMREAD2 EQU   *
+         BAS   R14,MOVEKY2         COPY KEY FROM SYSUT2 REC TO HOLD
+         TM    FLAG2,#EOFS1        EOF ON SYSUT1 ?
+         BO    PRMREAD3            YES - BRANCH AROUND
+         BAS   R14,RD1WR000
+PRMREAD3 EQU   *
+         TM    FLAG2,#EOFS2        EOF ON SYSUT2 ?
+         BO    MRGLOOP0            YES - BRANCH AROUND
+         BAS   R14,RD2WR000
+MRGLOOP0 EQU   *
+         TM    FLAG2,#EMTYS12      BOTH EMPTY ?
+         BO    CLOSEUP0            YES - LEAVE
+         TM    FLAG2,#EMTYS1       SYSUT1 EMPTY ?
+         BO    DONES100            YES - ACT LIKE SYSUT1 IS DONE
+         TM    FLAG2,#EMTYS2       SYSUT2 EMPTY ?
+         BO    DONES200            YES - ACT LIKE SYSUT2 IS DONE
+         NI    FLAG,B'11100011'    CLEAR BITS FOR <, > AND =
+         L     R9,WRK1H            ADDRESS OF WRK1 LIST HEAD
+         L     R2,WORKREC          ADDRESS OF WRK1 RECORD
+         A     R2,KYOSET1          ADDRESS OF KEY
+         L     R9,WRK2H            ADDRESS OF WRK2 LIST HEAD
+         L     R4,WORKREC          ADDRESS OF WRK2 RECORD
+         A     R4,KYOSET2          ADDRESS OF KEY
+         L     R6,KYLN             LOAD KEY LENGTH
+         CHI   R6,255              MUST WE DO A CLCL ?
+         BH    CLCL1               YES - BRANCH
+         EX    R6,CMPRKY           DO COMPARISON
+         BH    MRGKY1HI
+         BL    MRGKY1LO
+         BE    MRGKYEQ
+CLCL1    EQU   *                   MUST DO A CLCL DUE TO LONG KEY
+         LA    R6,1(,R6)           KEY WAS STORED -1 FOR CLC
+         LR    R3,R6               LENGTH OF KEY
+         LR    R5,R6               LENGTH OF KEY
+         STM   R2,R5,CLCL$GRR      CLCL MUNGES THE REGISTERS
+         CLCL  R2,R4               R2 AND R4 WERE SET BEFORE BRANCH
+         LM    R2,R5,CLCL$GRR      RELOAD MY REGISTERS
+         BH    MRGKY1HI
+         BL    MRGKY1LO
+MRGKYEQ  EQU   *                   KY1 = KY2
+         OI    FLAG,#KYEQ
+         B     MRGTST0
+MRGKY1HI EQU   *                   KY1 > KY2
+         OI    FLAG,#KY1HI
+         B     MRGTST0
+MRGKY1LO EQU   *                   KY1 < KY2
+         OI    FLAG,#KY1LO
+MRGTST0  EQU   *
+*
+*                                  TESTING FOR DONE CONDITIONS - IF
+*                                  SYSUT1 IS DONE ALL REMAINING SYSUT2
+*                                  RECORDS SHOULD BE WRITTEN TO SYSUT5.
+*                                  IF SYSUT2 IS DONE ALL REMAINING
+*                                  SYSUT1 RECORDS SHOULD BE WRITTEN TO
+*                                  SYSUT4.
+*
+         TM    FLAG2,#DONES1       ALL DONE WITH SYSUT1 ?
+         BO    DONES100            YES - FINISH UP
+         TM    FLAG2,#DONES2       ALL DONE WITH SYSUT2 ?
+         BO    DONES200            YES - FINISH UP
+NOTDONE  EQU   *                   NORMAL, NOT EOF, CONDITIONS
+         TM    FLAG,#KYEQ          KY1=KY2 ?
+         BO    MRGTST1
+         TM    FLAG,#KY1LO         KY1<KY2 ?
+         BO    MRGTST2
+         TM    FLAG,#KY1HI         KY1>KY2 ?
+         BO    MRGTST3
+         ABEND 111,DUMP,STEP,USER  THEORETICALLY WE CAN'T GET TO HERE
+MRGTST1  EQU   *
+         TM    FLAG4,B'10011000'   SYSUT3, 6, 7 PRESENT ?
+         BZ    MRGTST1A            NO - NO NEED TO PROCESS
+         BAS   R14,KYSEQ000
+         B     SETDONE0
+MRGTST1A EQU   *
+         OI    FLAG,#EOFW1
+         OI    FLAG,#EOFW2
+         B     SETDONE0
+MRGTST2  EQU   *
+         TM    FLAG4,#PRST4        SYSUT4 PRESENT ?
+         BZ    MRGTST2A            NO - NO NEED TO PROCESS
+         BAS   R14,KY1LT000
+         B     SETDONE0
+MRGTST2A EQU   *
+         OI    FLAG,#EOFW1
+         B     SETDONE0
+MRGTST3  EQU   *
+         TM    FLAG4,#PRST5        SYSUT5 PRESENT ?
+         BZ    MRGTST3A            NO - NO NEED TO PROCESS
+         BAS   R14,KY2LT000
+         B     SETDONE0
+MRGTST3A EQU   *
+         OI    FLAG,#EOFW2
+SETDONE0 EQU   *
+         TM    FLAG2,#DONES12      DONE WITH SYSUT1 AND SYSUT2 ?
+         BO    CLOSEUP0            YES - WE'RE DONE
+         TM    FLAG,#KYEQ          KEYS WERE EQUAL ?
+         BO    BOTH0               YES - PROCESS BOTH SYSUT1 AND SYSUT2
+         TM    FLAG,#KY1HI         SYSUT1 KEY WAS HIGH ?
+         BO    JUSTS2              YES - PROCESS JUST SYSUT2
+         B     JUSTS1              PROCESS JUST SYSUT1
+BOTH0    EQU   *
+         TM    FLAG2,#DONES1       ALL DONE WITH SYSUT1 ?
+         BO    BOTH2               YES - BRANCH AROUND
+         TM    FLAG2,#EOFS1        EOF ON SYSUT1 ?
+         BO    BOTH1               YES - BRANCH AROUND
+         BAS   R14,MOVEKY1         MOVE KEY FROM SYSUT1 REC TO HOLD
+         BAS   R14,RD1WR000        PROCESS UNTIL SYSUT1 KEY NOT = HOLD
+         B     BOTH2
+BOTH1    EQU   *
+         BAS   R14,MVREC100
+BOTH2    EQU   *
+         TM    FLAG2,#DONES2       ALL DONE WITH SYSUT2 ?
+         BO    SETDONE1            YES - BRANCH AROUND
+         TM    FLAG2,#EOFS2        EOF ON SYSUT2 ?
+         BO    BOTH3               YES - BRANCH AROUND
+         BAS   R14,MOVEKY2         MOVE KEY FROM SYSUT2 REC TO HOLD
+         BAS   R14,RD2WR000        PROCESS UNTIL SYSUT2 KEY NOT = HOLD
+         B     SETDONE2
+BOTH3    EQU   *
+         BAS   R14,MVREC200
+         B     SETDONE1
+JUSTS1   EQU   *
+         TM    FLAG2,#DONES1       ALL DONE WITH SYSUT1 ?
+         BO    SETDONE1            YES - BRANCH AROUND
+         TM    FLAG2,#EOFS1        EOF ON SYSUT1 ?
+         BO    JUSTS1A             YES - BRANCH AROUND
+         BAS   R14,MOVEKY1         MOVE KEY FROM SYSUT1 REC TO HOLD
+         BAS   R14,RD1WR000        PROCESS UNTIL SYSUT1 KEY NOT = HOLD
+         B     SETDONE2
+JUSTS1A  EQU   *
+         BAS   R14,MVREC100
+*                                  VERY SPECIFIC SITUATION:
+*                                  BOTH SYSUT1 AND SYSUT2 ARE AT EOF.
+*                                  THIS HAPPENS IF THE LAST RECORD IN
+*                                  BOTH FILES CONTAINS A UNIQUE KEY.
+         TM    FLAG2,#DONES2
+         BO    SETDONE1
+         TM    FLAG2,#EOFS2
+         BZ    SETDONE1
+         BAS   R14,MVREC200
+         B     SETDONE1
+*
+JUSTS2   EQU   *
+         TM    FLAG2,#DONES2       ALL DONE WITH SYSUT2 ?
+         BO    SETDONE1            YES - BRANCH AROUND
+         TM    FLAG2,#EOFS2        EOF ON SYSUT2 ?
+         BO    JUSTS2A             YES - BRANCH AROUND
+         BAS   R14,MOVEKY2         MOVE KEY FROM SYSUT2 REC TO HOLD
+         BAS   R14,RD2WR000        PROCESS UNTIL SYSUT2 KEY NOT = HOLD
+         B     SETDONE2
+JUSTS2A  EQU   *
+         BAS   R14,MVREC200
+*                                  VERY SPECIFIC SITUATION:
+*                                  BOTH SYSUT1 AND SYSUT2 ARE AT EOF.
+*                                  THIS HAPPENS IF THE LAST RECORD IN
+*                                  BOTH FILES CONTAINS A UNIQUE KEY.
+         TM    FLAG2,#DONES1
+         BO    SETDONE1
+         TM    FLAG2,#EOFS1
+         BZ    SETDONE1
+         BAS   R14,MVREC100
+SETDONE1 EQU   *
+         B     MRGLOOP0
+SETDONE2 EQU   *
+         B     MRGLOOP0
+*
+MVREC100 EQU   *
+         ST    R14,MVREC1SA
+         L     R9,WRK1X
+         BAS   R14,CMPRKY1         SYSUT1 ALREADY IN WRK1 ?
+         BE    MVREC101            YES - NO MOVE NEEDED
+         L     R6,REC1A            POINT TO SYSUT1 REC
+         L     R7,LRECL1           LENGTH FOR MVCL
+         L     R2,WORKREC          POINT TO WRK1 REC
+         L     R3,LRECL1           LENGTH FOR MVCL
+         MVCL  R2,R6               MOVE SYSUT1 REC TO WRK1 REC
+MVREC101 EQU   *
+         TM    FLAG,B'00010100'    KY1 <= KY2 ?
+         BZ    MVREC102            NO - BRANCH AROUND
+         OI    FLAG2,#DONES1       DONE WITH SYSUT1
+MVREC102 EQU   *
+         L     R14,MVREC1SA
+         BR    R14
+*
+MVREC200 EQU   *
+         ST    R14,MVREC2SA
+         L     R9,WRK2X
+         BAS   R14,CMPRKY2         SYSUT2 ALREADY IN WRK2 ?
+         BE    MVREC201            YES - NO MOVE NEEDED
+         L     R6,REC2A            POINT TO SYSUT2 REC
+         L     R7,LRECL2           LENGTH FOR MVCL
+         L     R2,WORKREC          POINT TO WRK2 REC
+         L     R3,LRECL2           LENGTH FOR MVCL
+         MVCL  R2,R6               MOVE SYSUT2 REC TO WRK2 REC
+MVREC201 EQU   *
+         TM    FLAG,B'00001100'    KY1 >= KY2 ?
+         BZ    MVREC202            NO - BRANCH AROUND
+         OI    FLAG2,#DONES2       DONE WITH SYSUT2
+MVREC202 EQU   *
+         L     R14,MVREC2SA
+         BR    R14
+*
+RD1WR000 EQU   *                   READ SYSUT1 AND ADD TO WRK1 LIST
+         ST    R14,RD1WRR14
+         SR    R6,R6               INITIALIZE WRK1 RECORD COUNT
+         L     R9,WRK1H            POINT TO HEAD OF LINKED LIST
+         ST    R9,WRK1X            MAKE HEAD OF LIST CURRENT LIST ITEM
+RD1WR001 EQU   *
+         MVC   WORKFLAG,=F'0'
+         L     R2,REC1A            ADDRESS OF SYSUT1 RECORD
+         L     R3,LRECL1           SYSUT1 LRECL
+         L     R4,WORKREC          ADDRESS OF CURRENT LIST ITEM RECORD
+         L     R5,LRECL1           SYSUT1 LRECL
+         MVCL  R4,R2               COPY SYSUT1 RECORD TO LIST ITEM
+         LA    R6,1(R6)            INCREMENT WRK1 RECORD COUNT
+         BAS   R14,GETSYS1
+         TM    FLAG2,#EOFS1        SYSUT1 EOF ?
+         BO    RD1WR005            YES - DONE
+         BAS   R14,CMPRKY1         COMPARE RECORD KEY TO HOLD AREA
+         BNE   RD1WR005            NOT EQUAL MEANS DONE WITH THIS SET
+RD1WR002 EQU   *
+         CLC   NEXT,=F'0'          END OF LIST ?
+         BE    RD1WR003            YES - BRANCH TO ALLOCATE
+         MVC   WRK1X,NEXT          MAKE NEXT LIST ITEM CURRENT
+         B     RD1WR004
+RD1WR003 EQU   *
+         LA    R8,WRK1X            POINT TO CURRENT LIST ITEM
+         L     R7,CWRKREC1         SYSUT1 CPOOL
+         L     R15,$ALCTWRK        ADDRESS OF ALLOCATION ROUTINE
+         BASR  R14,R15             PERFORM ALCTWORK
+         L     R9,WRK1X            POINT TO CURRENT LIST ITEM
+         MVC   PREV,WRK1T          CHAIN THE RECORD BACKWARD
+         L     R9,WRK1T            POINT TO TAIL OF LIST
+         MVC   NEXT,WRK1X          CHAIN THE RECORD FORWARD
+         L     R9,NEXT             POINT TO CURRENT LIST ITEM
+         MVC   WRK1T,WRK1X         MAKE TAIL ADDR = CURRENT ADDR
+RD1WR004 EQU   *
+         L     R9,WRK1X            ADDRESS OF CURRENT LIST ITEM
+         B     RD1WR001            DO IT AGAIN
+RD1WR005 EQU   *
+         OI    WORKFLAG,#LAST1     FLAG CURRENT ITEM AS LAST USED
+         MVC   WRK1X,WRK1H         MAKE CURRENT ITEM = HEAD
+         NI    FLAG,#NOEOFW1       TURN OFF WRK1 EOF FLAG
+         ST    R6,COUNT6           SAVE WRK1 RECORD COUNT
+         L     R14,RD1WRR14
+         BR    R14
+*
+RD2WR000 EQU   *                   READ SYSUT2 AND ADD TO WRK2 LIST
+         ST    R14,RD2WRR14
+         SR    R6,R6               INITIALIZE WRK2 COUNTER
+         L     R9,WRK2H            POINT TO HEAD OF LINKED LIST
+         ST    R9,WRK2X            MAKE HEAD OF LIST CURRENT LIST ITEM
+RD2WR001 EQU   *
+         MVC   WORKFLAG,=F'0'
+         L     R2,REC2A            ADDRESS OF SYSUT1 RECORD
+         L     R3,LRECL2           SYSUT2 LRECL
+         L     R4,WORKREC          ADDRESS OF CURRENT LIST ITEM RECORD
+         L     R5,LRECL2           SYSUT2 LRECL
+         MVCL  R4,R2               COPY SYSUT2 RECORD TO LIST ITEM
+         LA    R6,1(R6)            INCREMENT WRK2 COUNTER
+         BAS   R14,GETSYS2
+         TM    FLAG2,#EOFS2        SYSUT1 EOF ?
+         BO    RD2WR005            YES - DONE
+         BAS   R14,CMPRKY2         COMPARE RECORD KEY TO HOLD AREA
+         BNE   RD2WR005            NOT EQUAL MEANS DONE WITH THIS SET
+RD2WR002 EQU   *
+         CLC   NEXT,=F'0'          END OF LIST ?
+         BE    RD2WR003            YES - BRANCH TO ALLOCATE
+         MVC   WRK2X,NEXT          MAKE NEXT LIST ITEM CURRENT
+         B     RD2WR004
+RD2WR003 EQU   *
+         LA    R8,WRK2X            POINT TO CURRENT LIST ITEM
+         L     R7,CWRKREC2         SYSUT2 CPOOL
+         L     R15,$ALCTWRK        ADDRESS OF ALLOCATION ROUTINE
+         BASR  R14,R15             PERFORM ALCTWORK
+         L     R9,WRK2X            POINT TO CURRENT LIST ITEM
+         MVC   PREV,WRK2T          CHAIN THE RECORD BACKWARD
+         L     R9,WRK2T            POINT TO TAIL OF LIST
+         MVC   NEXT,WRK2X          CHAIN THE RECORD FORWARD
+         L     R9,NEXT             POINT TO CURRENT LIST ITEM
+         MVC   WRK2T,WRK2X         MAKE TAIL ADDR = CURRENT ADDR
+RD2WR004 EQU   *
+         L     R9,WRK2X            ADDRESS OF CURRENT LIST ITEM
+         B     RD2WR001            DO IT AGAIN
+RD2WR005 EQU   *
+         OI    WORKFLAG,#LAST1     FLAG CURRENT ITEM AS LAST USED
+         MVC   WRK2X,WRK2H         MAKE CURRENT ITEM = HEAD
+         NI    FLAG,#NOEOFW2       TURN OFF WRK2 EOF FLAG
+         ST    R6,COUNT7           SAVE WRK2 RECORD COUNT
+         L     R14,RD2WRR14
+         BR    R14
+*
+KYSEQ000 EQU   *
+*                                  CONCATENATE WRK1 AND WRK2
+*                                  RECORDS IN SYSUT3 RECORD AND
+*                                  WRITE SYSUT3.
+*
+*                                  THE TRICKY PART IS DEALING WITH THE
+*                                  TWO FILES BOTH HAVING MULTIPLE
+*                                  RECORDS WITH EQUAL KEYS.  IN THAT
+*                                  CASE WRK1 IS READ ONCE AFTER
+*                                  EACH EOF OF WRK2 AND WRK2
+*                                  IS RESTARTED.
+*
+         ST    R14,KYSEQSA
+         CLC   COUNT6,=F'1'
+         BNH   KYSEQ001
+         OI    FLAG3,#MULTK1       MULT RECS W/EQ KEYS
+KYSEQ001 EQU   *
+         CLC   COUNT7,=F'1'
+         BNH   KYSEQ002
+         OI    FLAG3,#MULTK2       MULT RECS W/EQ KEYS
+         TM    FLAG3,#MULTK12      MULT RECS W/EQ KEYS IN BOTH FILES ?
+         BO    KYSEQM00            YES - SPECIAL HANDLING
+KYSEQ002 EQU   *
+         TM    FLAG4,#PRST3        SYSUT3 PRESENT ?
+         BZ    KYSEQ003            NO - BYPASS CONCATENATION
+         BAS   R14,CONCAT12
+KYSEQ003 EQU   *
+         TM    FLAG4,#PRST6        SYSUT6 PRESENT ?
+         BZ    KYSEQ004            NO - BYPASS WRITING SYSUT6
+         L     R9,WRK1X            POINT TO LIST ITEM FROM SYSUT1
+         TM    WORKFLAG,#WRTDONE   RECORD ALREADY WRITTEN TO SYSUT6 ?
+         BO    KYSEQ004            YES - BYPASS WRITING SYSUT6
+         L     R4,WORKREC          POINT TO RECORD IN LIST FROM SYSUT1
+         BAS   R14,PUTSYS6         WRITE SYSUT6
+KYSEQ004 EQU   *
+         TM    FLAG4,#PRST7        SYSUT7 PRESENT ?
+         BZ    KYSEQ005            NO - BYPASS WRITING SYSUT7
+         L     R9,WRK2X            POINT TO LIST ITEM FROM SYSUT2
+         TM    WORKFLAG,#WRTDONE   RECORD ALREADY WRITTEN TO SYSUT7 ?
+         BO    KYSEQ005            YES - BYPASS WRITING SYSUT7
+         L     R4,WORKREC          POINT TO RECORD IN LIST FROM SYSUT2
+         BAS   R14,PUTSYS7         WRITE SYSUT7
+KYSEQ005 EQU   *
+         TM    FLAG,#EOFW1         WRK1 EOF ?
+         BO    KYSEQ006            YES - DON'T TRY TO READ
+         BAS   R14,GETWRK1         READ WRK1
+KYSEQ006 EQU   *
+         TM    FLAG,#EOFW2         WRK2 EOF ?
+         BO    KYSEQ007            YES - DON'T TRY TO READ
+         BAS   R14,GETWRK2         READ WRK2
+KYSEQ007 EQU   *
+         TM    FLAG,#EOFW12        WRK1 AND WRK2 EOF ?
+         BNO   KYSEQ002            NO - LOOP
+KYSEQ008 EQU   *
+         MVI   FLAG3,X'00'         TURN OFF ALL BITS IN FLAG3
+         NI    FLAG,#NOEOFW1
+         NI    FLAG,#NOEOFW2
+         L     R14,KYSEQSA
+         BR    R14
+*
+KYSEQM00 EQU   *
+         MVC   RC,=F'1'            INDICATE MULT EQ KEYS IN BOTH INPUTS
+KYSEQM01 EQU   *
+         TM    FLAG4,#PRST3        SYSUT3 PRESENT ?
+         BZ    KYSEQM02            NO - BYPASS CONCATENATION
+         BAS   R14,CONCAT12        CONCATENATE AND WRITE TO SYSUT3
+KYSEQM02 EQU   *
+         TM    FLAG4,#PRST6        SYSUT6 PRESENT ?
+         BZ    KYSEQM03            NO - BYPASS WRITING SYSUT6
+         L     R9,WRK1X            POINT TO LIST ITEM FROM SYSUT1
+         TM    WORKFLAG,#WRTDONE   RECORD ALREADY WRITTEN TO SYSUT6 ?
+         BO    KYSEQM03            YES - BYPASS WRITING SYSUT6
+         L     R4,WORKREC          POINT TO RECORD IN LIST FROM SYSUT1
+         BAS   R14,PUTSYS6         WRITE SYSUT6
+KYSEQM03 EQU   *
+         TM    FLAG4,#PRST7        SYSUT7 PRESENT ?
+         BZ    KYSEQM04            NO - BYPASS WRITING SYSUT7
+         L     R9,WRK2X            POINT TO LIST ITEM FROM SYSUT2
+         TM    WORKFLAG,#WRTDONE   RECORD ALREADY WRITTEN TO SYSUT7 ?
+         BO    KYSEQM04            YES - BYPASS WRITING SYSUT7
+         L     R4,WORKREC          POINT TO RECORD IN LIST FROM SYSUT2
+         BAS   R14,PUTSYS7         WRITE SYSUT7
+KYSEQM04 EQU   *
+         BAS   R14,GETWRK2         GET ANOTHER RECORD FROM WORK1 LIST
+         TM    FLAG,#EOFW2         END OF WORK1 LIST ?
+         BZ    KYSEQM01            NO - BRANCH
+KYSEQM05 EQU   *
+         MVC   WRK2X,WRK2H         MAKE CURRENT ADDR = HEAD
+         NI    FLAG,#NOEOFW2       TURN OFF WRK2 EOF FLAG
+         BAS   R14,GETWRK1
+         TM    FLAG,#EOFW1
+         BZ    KYSEQM01
+KYSEQM06 EQU   *
+         MVI   FLAG3,X'00'         TURN OFF ALL BITS IN FLAG3
+         OI    FLAG,#EOFW2
+         L     R14,KYSEQSA
+         BR    R14
+*
+CONCAT12 EQU   *                   CONCATENATE RECORDS AND WRITE SYSUT3
+         ST    R14,CONCATSA
+         L     R9,WRK1X
+         TM    WORKFLAG,#CPYDONE   ALREADY COPIED ? (PERFORMANCE HACK)
+         BO    CPYW2S3             YES - BRANCH AROUND
+         L     R6,REC3A            POINT TO SYSUT3 REC
+         L     R7,LRECL1           LENGTH FOR MVCL
+         L     R2,WORKREC          POINT TO WRK1 REC
+         LR    R3,R7               LENGTH FOR MVCL
+         MVCL  R6,R2               MOVE WRK1 REC TO SYSUT3 REC
+         OI    WORKFLAG,#CPYDONE   MARK LIST ITEM AS ALREADY COPIED
+CPYW2S3  EQU   *                   COPY WRK2 REC TO SYSUT3 REC
+         L     R9,WRK2X
+         L     R6,REC3C            POINT PAST WHAT WE JUST MOVED
+         L     R7,LRECL2           LENGTH FOR MVCL
+         L     R4,WORKREC          POINT TO WRK2 REC
+         LR    R5,R7               LENGTH FOR MVCL
+         MVCL  R6,R4               CONCATENATE WRK2 REC
+         L     R6,REC3A            POINT TO SYSUT3 REC
+         PUT   SYSUT3,(R6)         WRITE OUT SYSUT3 REC
+         L     R8,COUNT3           COUNT OF SYSUT3 RECORDS
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT3           SAVE COUNT OF SYSUT3 RECORDS
+         L     R14,CONCATSA
+         BR    R14
+*
+KY1LT000 EQU   *
+*                                  WRITE WRK1 RECORD WITH NO
+*                                  MATCHING WRK2 RECORD TO SYSUT4.
+*                                  PRESENCE OF SYSUT4 IN THE JCL IS
+*                                  TESTED FOR NEAR THE MRGTST0 LABEL.
+         ST    R14,KY1LTSA
+KY1LT001 EQU   *
+         TM    FLAG,#EOFW1         WRK1 EOF ?
+         BO    KY1LT002            YES - RETURN
+         L     R9,WRK1X
+         L     R2,WORKREC          POINT TO WRK1 REC
+         BAS   R14,PUTSYS4
+         TM    FLAG2,#DONES1       DONE WITH SYSUT1 ?
+         BO    KY1LT002            YES - RETURN
+         BAS   R14,GETWRK1
+         B     KY1LT001
+KY1LT002 EQU   *
+         L     R14,KY1LTSA
+         BR    R14
+*
+KY2LT000 EQU   *
+*                                  WRITE WRK2 RECORD WITH NO
+*                                  MATCHING WRK1 RECORD TO SYSUT5.
+*                                  PRESENCE OF SYSUT5 IN THE JCL IS
+*                                  TESTED FOR NEAR THE MRGTST0 LABEL.
+         ST    R14,KY2LTSA
+KY2LT001 EQU   *
+         TM    FLAG,#EOFW2         WRK2 EOF ?
+         BO    KY2LT002            YES - RETURN
+         L     R9,WRK2X
+         L     R4,WORKREC          POINT TO WRK2 REC
+         BAS   R14,PUTSYS5
+         TM    FLAG2,#DONES2       DONE WITH SYSUT2 ?
+         BO    KY2LT002            YES - RETURN
+         BAS   R14,GETWRK2
+         B     KY2LT001
+KY2LT002 EQU   *
+         L     R14,KY2LTSA
+         BR    R14
+*
+DONES100 EQU   *
+         L     R9,WRK2X
+         TM    FLAG4,#PRST5        SYSUT5 PRESENT ?
+         BZ    DONES105            NO PLACE TO WRITE - RETURN
+         TM    FLAG2,#DONES2       SYSUT2 DONE ?
+         BO    DONES105            YES - RETURN
+         TM    FLAG,#EOFW2         WRK2 EOF ?
+         BO    DONES102            YES - TRY BUFFER
+DONES101 EQU   *
+         L     R4,WORKREC          POINT TO WRK2 REC
+         BAS   R14,PUTSYS5
+         BAS   R14,GETWRK2
+         TM    FLAG,#EOFW2         WRK2 EOF ?
+         BZ    DONES101            NO - LOOP
+DONES102 EQU   *
+         BAS   R14,CMPRKY2         BUFFER ALREADY WRITTEN ?
+         BE    DONES103            YES - BRANCH
+         L     R4,REC2A            POINT TO SYSUT2 REC  !
+         BAS   R14,PUTSYS5
+DONES103 EQU   *
+         TM    FLAG2,#EOFS2        SYSUT2 EOF ?
+         BO    DONES105            YES - RETURN
+DONES104 EQU   *
+         BAS   R14,GETSYS2
+         TM    FLAG2,#EOFS2        SYSUT2 EOF ?
+         BO    DONES105            YES - RETURN
+         BAS   R14,PUTSYS5
+         B     DONES104            LOOP
+DONES105 EQU   *
+         B     CLOSEUP0
+*
+DONES200 EQU   *
+         L     R9,WRK1X
+         TM    FLAG4,#PRST4        SYSUT4 PRESENT ?
+         BZ    DONES205            NO PLACE TO WRITE - RETURN
+         TM    FLAG2,#DONES1       SYSUT1 DONE ?
+         BO    DONES205            YES - RETURN
+         TM    FLAG,#EOFW1         WRK1 EOF ?
+         BO    DONES202            YES - TRY BUFFER
+DONES201 EQU   *
+         L     R2,WORKREC
+         BAS   R14,PUTSYS4
+         BAS   R14,GETWRK1
+         TM    FLAG,#EOFW1         WRK1 EOF ?
+         BZ    DONES201            NO - LOOP
+DONES202 EQU   *
+         BAS   R14,CMPRKY1         BUFFER ALREADY WRITTEN ?
+         BE    DONES203            YES - BRANCH
+         L     R2,REC1A
+         BAS   R14,PUTSYS4
+DONES203 EQU   *
+         TM    FLAG2,#EOFS1        SYSUT1 EOF ?
+         BO    DONES205            YES - RETURN
+DONES204 EQU   *
+         BAS   R14,GETSYS1
+         TM    FLAG2,#EOFS1        SYSUT1 EOF ?
+         BO    DONES205            YES - RETURN
+         BAS   R14,PUTSYS4
+         B     DONES204
+DONES205 EQU   *
+         B     CLOSEUP0
+*
+RDMYJFCB EQU   *
+         ST    R14,MYJFCBSA
+         RDJFCB ((R8))
+         L     R14,MYJFCBSA
+         BR    R14
+*
+GETSYS1  EQU   *
+         ST    R14,GETSYS1A
+         L     R2,REC1A            POINT TO SYSUT1 RECORD
+         LA    R8,GETSYS1B         SET UP FOR EODAD
+         GET   SYSUT1,(R2)
+         L     R8,COUNT1           GET SYSUT1 RECORD COUNT
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT1           SAVE SYSUT1 RECORD COUNT
+GETSYS1B EQU   *
+         L     R14,GETSYS1A
+         BR    R14
+*
+GETSYS2  EQU   *
+         ST    R14,GETSYS2A
+         L     R4,REC2A            POINT TO SYSUT2 RECORD
+         LA    R8,GETSYS2B         SET UP FOR EODAD
+         GET   SYSUT2,(R4)
+         L     R8,COUNT2           GET SYSUT2 RECORD COUNT
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT2           SAVE SYSUT2 RECORD COUNT
+GETSYS2B EQU   *
+         L     R14,GETSYS2A
+         BR    R14
+*
+PUTSYS4  EQU   *
+         ST    R14,PUTSYS4A
+         LR    R6,R2
+         PUT   SYSUT4,(R6)
+         L     R8,COUNT4           COUNT OF SYSUT4 RECORDS
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT4           SAVE COUNT OF SYSUT4 RECORDS
+         L     R14,PUTSYS4A
+         BR    R14
+*
+PUTSYS5  EQU   *
+         ST    R14,PUTSYS5A
+         LR    R6,R4
+         PUT   SYSUT5,(R6)
+         L     R8,COUNT5           COUNT OF SYSUT5 RECORDS
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT5           SAVE COUNT OF SYSUT5 RECORDS
+         L     R14,PUTSYS5A
+         BR    R14
+*
+PUTSYS6  EQU   *
+         ST    R14,PUTSYS6A
+         LR    R6,R4
+         PUT   SYSUT6,(R6)
+         L     R8,COUNT8           COUNT OF SYSUT6 RECORDS
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT8           SAVE COUNT OF SYSUT6 RECORDS
+         OI    WORKFLAG,#WRTDONE
+         L     R14,PUTSYS6A
+         BR    R14
+*
+PUTSYS7  EQU   *
+         ST    R14,PUTSYS7A
+         LR    R6,R4
+         PUT   SYSUT7,(R6)
+         L     R8,COUNT9           COUNT OF SYSUT7 RECORDS
+         LA    R8,1(R8)            ADD 1 TO R8 GIVING R8
+         ST    R8,COUNT9           SAVE COUNT OF SYSUT7 RECORDS
+         OI    WORKFLAG,#WRTDONE
+         L     R14,PUTSYS7A
+         BR    R14
+*
+GETWRK1  EQU   *
+         TM    FLAG2,#DONES1
+         BO    GETWRK1B
+         L     R9,WRK1X
+         CLC   NEXT,=F'0'
+         BE    GETWRK1B
+         TM    WORKFLAG,#LAST1
+         BO    GETWRK1B
+         L     R9,NEXT
+         ST    R9,WRK1X
+         NI    WORKFLAG,#CPYRSET
+         B     GETWRK1C
+GETWRK1B EQU   *
+         OI    FLAG,#EOFW1
+GETWRK1C EQU   *
+         BR    R14
+*
+GETWRK2  EQU   *
+         TM    FLAG2,#DONES2
+         BO    GETWRK2B
+         L     R9,WRK2X
+         CLC   NEXT,=F'0'
+         BE    GETWRK2B
+         TM    WORKFLAG,#LAST1
+         BO    GETWRK2B
+         L     R9,NEXT
+         ST    R9,WRK2X
+         B     GETWRK2C
+GETWRK2B EQU   *
+         OI    FLAG,#EOFW2
+GETWRK2C EQU   *
+         BR    R14
+*
+MOVEKY   MVC   0(0,R2),0(R4)       EX'D MOVE OF KEY
+*
+MOVEKY1  EQU   *
+         L     R4,REC1A
+         A     R4,KYOSET1          POINT TO KEY IN SYSUT1 RECORD
+         L     R2,REC1KYA          POINT TO KEY HOLD AREA
+         L     R6,KYLN             LOAD KEY LENGTH
+         CHI   R6,255              DO WE NEED TO DO AN MVCL ?
+         BH    MOVEKY1A            YES - BRANCH
+         EX    R6,MOVEKY           MOVE KEY TO HOLD AREA
+         B     MOVEKY1E
+MOVEKY1A EQU   *                   LONG KEY NEEDS MVCL
+         STM   R2,R5,MVCL$GRR
+         L     R3,KYLN             LENGTH OF KEY
+         LA    R3,1(R3)            PREVIOUSLY SUBTRACTED 1, ADD IT BACK
+         LR    R5,R3               LENGTH AGAIN
+         MVCL  R2,R4
+         LM    R2,R5,MVCL$GRR
+MOVEKY1E EQU   *
+         BR    R14
+*
+MOVEKY2  EQU   *
+         L     R4,REC2A
+         A     R4,KYOSET2          POINT TO KEY IN SYSUT2 RECORD
+         L     R2,REC2KYA          POINT TO KEY HOLD AREA
+         L     R6,KYLN             LOAD KEY LENGTH
+         CHI   R6,255              DO WE NEED TO DO AN MVCL ?
+         BH    MOVEKY2A            YES - BRANCH
+         EX    R6,MOVEKY           MOVE KEY TO HOLD AREA
+         B     MOVEKY2E
+MOVEKY2A EQU   *                   LONG KEY NEEDS MVCL
+         STM   R2,R5,MVCL$GRR
+         L     R3,KYLN             LENGTH OF KEY
+         LA    R3,1(R3)            PREVIOUSLY SUBTRACTED 1, ADD IT BACK
+         LR    R5,R3               LENGTH AGAIN
+         MVCL  R2,R4
+         LM    R2,R5,MVCL$GRR
+MOVEKY2E EQU   *
+         BR    R14
+*
+CMPRKY   CLC   0(0,R2),0(R4)       EX'D COMPARISON OF KEYS
+*
+CMPRKY1  EQU   *
+         L     R4,REC1A
+         A     R4,KYOSET1          POINT TO KEY IN SYSUT1 RECORD
+         L     R2,REC1KYA          POINT TO KEY HOLD AREA
+         L     R15,KYLN            LOAD KEY LENGTH
+         CHI   R15,255             DO WE NEED TO DO A CLCL ?
+         BH    CMPRKY1C            YES - BRANCH
+         EX    R15,CMPRKY          COMPARE RECORD KEY TO HOLD AREA
+         B     CMPRKY1E
+CMPRKY1C EQU   *
+         LA    R15,1(,R15)         LENGTH WAS STORED -1 FOR CLC
+         LR    R3,R15              LENGTH
+         LR    R5,R15              LENGTH
+         STM   R2,R5,CLCL$GRR      CLCL MUNGES THE REGISTERS
+         CLCL  R2,R4               COMPARE RECORD KEY TO HOLD AREA
+         LM    R2,R5,CLCL$GRR      RELOAD MY REGISTERS
+CMPRKY1E EQU   *
+         BR    R14
+*
+CMPRKY2  EQU   *
+         L     R4,REC2A
+         A     R4,KYOSET2          POINT TO KEY IN SYSUT2 RECORD
+         L     R2,REC2KYA          POINT TO KEY HOLD AREA
+         L     R15,KYLN            LOAD KEY LENGTH
+         CHI   R15,255             DO WE NEED TO DO A CLCL ?
+         BH    CMPRKY2C            YES - BRANCH
+         EX    R15,CMPRKY          COMPARE RECORD KEY TO HOLD AREA
+         B     CMPRKY2E
+CMPRKY2C EQU   *
+         LA    R15,1(,R15)         LENGTH WAS STORED -1 FOR CLC
+         LR    R3,R15              LENGTH
+         LR    R5,R15              LENGTH
+         STM   R2,R5,CLCL$GRR      CLCL MUNGES THE REGISTERS
+         CLCL  R2,R4               COMPARE RECORD KEY TO HOLD AREA
+         LM    R2,R5,CLCL$GRR      RELOAD MY REGISTERS
+CMPRKY2E EQU   *
+         BR    R14
+*
+ERR01    EQU   *
+         MVI   MSGEDD01,C'1'
+         B     PUTERR01
+ERR02    EQU   *
+         MVI   MSGEDD02,C'1'
+         B     PUTERR02
+ERR03    EQU   *
+         MVI   MSGEDD03,C'1'
+         L     R2,LRECL1
+         CVD   R2,LRECLP
+         LA    R2,LRECLP
+         UNPK  MSGELR03,5(3,R2)
+         LA    R2,MSGELR03
+         OI    L'MSGELR03-1(R2),X'F0'
+         B     PUTERR03
+ERR04    EQU   *
+         MVI   MSGEDD01,C'2'
+         B     PUTERR01
+ERR05    EQU   *
+         MVI   MSGEDD02,C'2'
+         B     PUTERR02
+ERR06    EQU   *
+         MVI   MSGEDD03,C'2'
+         L     R2,LRECL2
+         CVD   R2,LRECLP
+         LA    R2,LRECLP
+         UNPK  MSGELR03,5(3,R2)
+         LA    R2,MSGELR03
+         OI    L'MSGELR03-1(R2),X'F0'
+         B     PUTERR03
+ERR07    EQU   *
+         MVI   MSGEDD02,C'3'
+         B     PUTERR02
+ERR08    EQU   *
+         MVI   MSGEDD02,C'4'
+         B     PUTERR02
+ERR09    EQU   *
+         MVI   MSGEDD02,C'5'
+         B     PUTERR02
+ERR10    EQU   *
+         LA    R2,MSGERR04
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+ERR11    EQU   *
+         CVD   R8,LRECLP
+         LA    R2,LRECLP
+         UNPK  MSGEL105,5(3,R2)
+         LA    R2,MSGEL105
+         OI    L'MSGEL105-1(R2),X'F0'
+         L     R2,LRECL1
+         CVD   R2,LRECLP
+         LA    R2,LRECLP
+         UNPK  MSGEL205,5(3,R2)
+         LA    R2,MSGEL205
+         OI    L'MSGEL205-1(R2),X'F0'
+         L     R2,LRECL2
+         CVD   R2,LRECLP
+         LA    R2,LRECLP
+         UNPK  MSGEL305,5(3,R2)
+         LA    R2,MSGEL305
+         OI    L'MSGEL305-1(R2),X'F0'
+         B     PUTERR05
+ERR12    EQU   *
+         MVI   MSGEDD02,C'6'
+         B     PUTERR02
+ERR13    EQU   *
+         MVI   MSGEDD02,C'7'
+         B     PUTERR02
+PUTERR01 EQU   *
+         LA    R2,MSGERR01
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+PUTERR02 EQU   *
+         LA    R2,MSGERR02
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+PUTERR03 EQU   *
+         LA    R2,MSGERR03
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+PUTERR05 EQU   *
+         LA    R2,MSGERR05
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+PUTERR06 EQU   *
+         LA    R2,MSGERR06
+         BAS   R14,DISPLAY
+         MVC   RC,=F'8'
+         B     GOBACK
+XRDJFCB  EQU   *
+*        IF THIS CODE IS EXECUTED RDJFCB RETURNED SOMETHING
+*        OTHER THAN 0, 4 OR 8.  R15 CONTAINS THE RETURNED VALUE.
+*        R14 CONTAINS THE RETURN ADDRESS SO YOU CAN SEE WHICH
+*        DD STATEMENT HAD ITS RDJFCB GO BAD.
+         ABEND 222,DUMP,STEP,USER,REASON=(R15)
+*
+XDEVTY   EQU   *
+*        IF THIS CODE IS EXECUTED DEVTYPE RETURNED SOMETHING
+*        OTHER THAN 0 OR 4.  R15 CONTAINS THE RETURNED VALUE.
+*        R14 CONTAINS THE RETURN ADDRESS SO YOU CAN SEE WHICH
+*        DD STATEMENT HAD ITS DEVTYPE GO BAD.
+         ABEND 333,DUMP,STEP,USER,REASON=(R15)
+*
+CLOSEUP0 EQU   *
+         CLOSE (SYSUT1),MODE=31
+         CLOSE (SYSUT2),MODE=31
+         MVC   MSGIOP02(4),=C'READ'
+         MVI   MSGIDD02,C'1'
+         L     R8,COUNT1
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         LA    R2,MSGINF02
+         BAS   R14,DISPLAY
+         MVI   MSGIDD02,C'2'
+         L     R8,COUNT2
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+         TM    FLAG4,#PRST3
+         BZ    CLOSEUP1
+         CLOSE (SYSUT3),MODE=31
+         MVC   MSGIOP02(7),=C'WRITTEN'
+         MVI   MSGIDD02,C'3'
+         L     R8,COUNT3
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+CLOSEUP1 EQU   *
+         TM    FLAG4,#PRST4
+         BZ    CLOSEUP2
+         CLOSE (SYSUT4),MODE=31
+         MVC   MSGIOP02(7),=C'WRITTEN'
+         MVI   MSGIDD02,C'4'
+         L     R8,COUNT4
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+CLOSEUP2 EQU   *
+         TM    FLAG4,#PRST5
+         BZ    CLOSEUP3
+         CLOSE (SYSUT5),MODE=31
+         MVC   MSGIOP02(7),=C'WRITTEN'
+         MVI   MSGIDD02,C'5'
+         L     R8,COUNT5
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+CLOSEUP3 EQU   *
+         TM    FLAG4,#PRST6
+         BZ    CLOSEUP4
+         CLOSE (SYSUT6),MODE=31
+         MVC   MSGIOP02(7),=C'WRITTEN'
+         MVI   MSGIDD02,C'6'
+         L     R8,COUNT8
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+CLOSEUP4 EQU   *
+         TM    FLAG4,#PRST7
+         BZ    RLSESTRG
+         CLOSE (SYSUT7),MODE=31
+         MVC   MSGIOP02(7),=C'WRITTEN'
+         MVI   MSGIDD02,C'7'
+         L     R8,COUNT9
+         CVD   R8,COUNTP
+         UNPK  MSGICT02,COUNTP
+         OI    MSGICT02+L'MSGICT02-1,X'F0'
+         BAS   R14,DISPLAY
+RLSESTRG EQU   *
+         L     R2,LRECL1
+         STORAGE RELEASE,LENGTH=(R2),ADDR=REC1A
+         L     R2,KYLN
+         STORAGE RELEASE,LENGTH=(R2),ADDR=REC1KYA
+         STORAGE RELEASE,LENGTH=(R2),ADDR=REC2KYA
+         L     R2,LRECL2
+         STORAGE RELEASE,LENGTH=(R2),ADDR=REC2A
+         TM    FLAG4,#PRST3
+         BZ    GOBACK
+         L     R2,LRECL3
+         STORAGE RELEASE,LENGTH=(R2),ADDR=REC3A
+         L     R9,CMRGWORK
+         BAS   R14,FREELIST
+         L     R9,CWRKREC1
+         BAS   R14,FREELIST
+         L     R9,CWRKREC2
+         BAS   R14,FREELIST
+GOBACK   EQU   *
+         CLOSE (SYSPRINT),MODE=31
+         L     R15,RC              LOAD RETURN CODE
+         JRETURND
+*
+CLSSYSU1 EQU   *
+         CLOSE (SYSUT1),MODE=31
+         OI    FLAG2,#EOFS1
+         BR    R8
+CLSSYSU2 EQU   *
+         CLOSE (SYSUT2),MODE=31
+         OI    FLAG2,#EOFS2
+         BR    R8
+*
+FREELIST EQU   *
+         ST    R14,FREELSTA
+         CPOOL DELETE,CPID=(R9)
+FREERTN  EQU   *
+         L     R14,FREELSTA
+         BR    R14
+*
+DSPLJFCB EQU   *
+         ST    R14,DSPLSA
+         LH    R6,ARLRTRVD
+LOOP01   EQU   *
+         MVC   INFO_LEN,0(R7)
+         LA    R7,4(R7)                  POINT TO JFCB
+         USING INFMJFCB,R7               MAP JFCB
+         BAS   R14,INFDSN                CONSTRUCT DSN IN MESSAGE
+         LA    R2,MSGINF01
+         BAS   R14,DISPLAY               DISPLAY DSN
+         MVI   MSGINF01,C' '
+         MVC   MSGINF01+1(L'MSGINF01-1),MSGINF01
+         AHI   R7,-4                     ADJUST FOR LEADING FULLWORD
+         AH    R7,INFO_LEN               POINT AT NEXT ENTRY
+         BCT   R6,LOOP01                 DO IT AGAIN
+         XR    R4,R4                     CLEAR R4
+         ICM   R4,B'0111',ARLRLEN        STUFF LENGTH OF GETMAIN IN R4
+         XR    R5,R5                     CLEAR R5
+         ICM   R5,B'0001',ARLPOOL        STUFF SUBPOOL IN R5
+         L     R6,ARLAREA                ADDRESS OF GETMAINED AREA
+         FREEMAIN RU,LV=(R4),SP=(R5),A=(R6) FREE WHAT RDJFCB GETMAINED
+         L     R14,DSPLSA
+         BR    R14
+         DROP  R7
+*
+INFDSN   EQU   *
+         ST    R14,INFDSNSA
+         USING INFMJFCB,R7               MAP JFCB
+         MVI   MSGIDS01,C' '
+         MVC   MSGIDS01+1(L'MSGIDS01-1),MSGIDS01
+         MVC   MSGIDS01(L'JFCBDSNM),JFCBDSNM  MOVE DSN TO OUTPUT
+         TM    JFCBIND1,JFCPDS           IS THIS A PDS MEMBER?
+         BNO   NOTMBR                    NO  - BRANCH
+         LA    R5,MSGIDS01
+CK4BLNK1 EQU   *                         LOOKING FOR FIRST BLANK
+         CLI   0(R5),C' '                IS THIS CHAR A BLANK?
+         BE    BLNKFND1                  YES - BRANCH
+         LA    R5,1(R5)                  POINT AT NEXT CHAR
+         B     CK4BLNK1                  DO IT AGAIN
+BLNKFND1 EQU   *
+         MVI   0(R5),C'('                MOVE IN LEFT PAREN
+         LA    R5,1(R5)                  POINT AT NEXT CHAR
+         MVC   0(L'JFCBELNM,R5),JFCBELNM MOVE MEMBER NAME
+CK4BLNK2 EQU   *                         LOOKING FOR A BLANK
+         CLI   0(R5),C' '                IS THIS CHAR A BLANK?
+         BE    BLNKFND2                  YES - BRANCH
+         LA    R5,1(R5)                  POINT AT NEXT CHAR
+         B     CK4BLNK2                  DO IT AGAIN
+BLNKFND2 EQU   *
+         MVI   0(R5),C')'                MOVE IN RIGHT PAREN
+NOTMBR   EQU   *
+         L     R14,INFDSNSA
+         BR    R14
+         DROP  R7
+*
+DISPLAY  EQU   *
+         ST    R14,DISPLAYA
+         PUT   SYSPRINT,(R2)
+         L     R14,DISPLAYA
+         BR    R14
+*                                  WORKING-STORAGE SECTION
+LINKADDR DC    F'0'
+PARMADDR DC    F'0'
+WRKGSTRG DC    F'0'
+CMRGWORK DC    F'0'   CPOOL ID
+CWRKREC1 DC    F'0'   CPOOL ID
+CWRKREC2 DC    F'0'   CPOOL ID
+INFO_LEN DC    H'0'
+$SETUP   DC    A(SETUP)
+$ALCTWRK DC    A(ALCTWORK)
+TYPE13X  DS    0F
+         DC    X'93',AL3(ARL)
+ARL      IHAARL DSECT=NO,DESCR=YES
+TYPE07X  DC    X'87',AL3(MYJFCB)
+MYJFCB   DC    XL(JFCBLGTH)'00'
+*        LTORG
+*                                      FILE SECTION
+*                                      MESSAGES
+SYSPRINT DCB   DDNAME=SYSPRINT,                                        X
+               DSORG=PS,                                               X
+               RECFM=F,                                                X
+               LRECL=#PRINT,                                           X
+               MACRF=PM,                                               X
+               DCBE=SYSPRINE
+SYSPRINE DCBE  RMODE31=BUFF
+*                                      OPTIONAL INPUT CARD
+SYSIN    DCB   DSORG=PS,                                               X
+               DDNAME=SYSIN,                                           X
+               MACRF=GM,                                               X
+               DCBE=SYSINE
+SYSINE   DCBE  RMODE31=BUFF
+*                                      INPUT FILE 1
+SYSUT1   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT1,                                          X
+               MACRF=GM,                                               X
+               EXLST=TYPE13X,                                          X
+               DCBE=SYSUT1E
+SYSUT1E  DCBE  RMODE31=BUFF,EODAD=CLSSYSU1
+*                                      INPUT FILE 2
+SYSUT2   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT2,                                          X
+               MACRF=GM,                                               X
+               EXLST=TYPE13X,                                          X
+               DCBE=SYSUT2E
+SYSUT2E  DCBE  RMODE31=BUFF,EODAD=CLSSYSU2
+*                                      OUTPUT FILE 1
+SYSUT3   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT3,                                          X
+               MACRF=PM,                                               X
+               EXLST=TYPE07X,                                          X
+               DCBE=SYSUT3E
+SYSUT3E  DCBE  RMODE31=BUFF
+*                                      OUTPUT FILE 2
+SYSUT4   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT4,                                          X
+               MACRF=PM,                                               X
+               EXLST=TYPE07X,                                          X
+               DCBE=SYSUT4E
+SYSUT4E  DCBE  RMODE31=BUFF
+*                                      OUTPUT FILE 3
+SYSUT5   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT5,                                          X
+               MACRF=PM,                                               X
+               EXLST=TYPE07X,                                          X
+               DCBE=SYSUT5E
+SYSUT5E  DCBE  RMODE31=BUFF
+*                                      OUTPUT FILE 4
+SYSUT6   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT6,                                          X
+               MACRF=PM,                                               X
+               EXLST=TYPE07X,                                          X
+               DCBE=SYSUT6E
+SYSUT6E  DCBE  RMODE31=BUFF
+*                                      OUTPUT FILE 5
+SYSUT7   DCB   DSORG=PS,                                               X
+               DDNAME=SYSUT7,                                          X
+               MACRF=PM,                                               X
+               EXLST=TYPE07X,                                          X
+               DCBE=SYSUT7E
+SYSUT7E  DCBE  RMODE31=BUFF
+*
+SETUP    CSECT
+*                                  INITIALIZE WORKING-STORAGE
+         JSAVED
+         BALR  R11,0
+         USING *,R11
+         USING $WRKSTRG,R10            WORKING-STORAGE DSECT
+         MVC   WRK1X,=F'0'
+         MVC   WRK2X,=F'0'
+         MVC   WRK1H,=F'0'
+         MVC   WRK2H,=F'0'
+         MVC   WRK1T,=F'0'
+         MVC   WRK2T,=F'0'
+         MVC   LRECL1,=F'0'
+         MVC   LRECL2,=F'0'
+         MVC   LRECL3,=F'0'
+         MVC   KYLN,=F'0'
+         MVC   KYOSET1,=F'0'
+         MVC   KYOSET2,=F'0'
+         MVC   KYLNP,=PL8'0'
+         MVC   KYOSET1P,=PL8'0'
+         MVC   KYOSET2P,=PL8'0'
+         MVI   FLAG,X'00'          TURN OFF FLAGS
+         MVI   FLAG2,X'00'         TURN OFF FLAGS
+         MVI   FLAG3,X'00'         TURN OFF FLAGS
+         MVC   RC,=F'0'            SET RETURN CODE TO ZERO
+         MVC   NULLFILE,=C'NULLFILE' LITERAL FOR DD DUMMY TESTING
+
+*                                  PACK THE PARMS
+         PACK  KYLNP,INKYLN
+         PACK  KYOSET1P,INKYOS1
+         PACK  KYOSET2P,INKYOS2
+*                                  CONVERT PARMS TO BINARY AND KEEP
+         CVB   R9,KYLNP
+         BCTR  R9,0                SUBTRACT 1 FOR MVC AND CLC
+         ST    R9,KYLN
+         CVB   R9,KYOSET1P
+         ST    R9,KYOSET1
+         CVB   R9,KYOSET2P
+         ST    R9,KYOSET2
+         LA    R9,MSGERR01
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR01-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGERR02
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR02-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGERR03
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR03-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGERR04
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR04-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGERR05
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR05-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGERR06
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGERR06-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF01
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF01-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF02
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF02-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF03
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF03-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF04
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF04-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF05
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF05-1,R9),0(R9)  INITIALIZE THE REST
+         LA    R9,MSGINF06
+         MVI   0(R9),C' '          INITIALIZE MESSAGE FIRST BYTE
+         MVC   1(L'MSGINF06-1,R9),0(R9)  INITIALIZE THE REST
+         MVC   MSGE0101,=C'ERROR: SYSUT'
+         MVC   MSGE0201,=C' MUST BE DEFINED'
+         MVC   MSGE0102,=C'ERROR: RDJFCB FOR SYSUT'
+         MVC   MSGE0202,=C' RC=8'
+         MVC   MSGE0103,=C'ERROR: KEY LENGTH + OFFSET > SYSUT'
+         MVC   MSGE0203,=C' LRECL ('
+         MVC   MSGE0303,=C')'
+         MVC   MSGE0104,=C'ERROR: AT LEAST ONE OF SYSUT3 SYSUT4 SYSUT5'
+         MVC   MSGE0204,=C'SYSUT6 SYSUT7 MUST BE DEFINED'
+         MVC   MSGE0105,=C'ERROR: SYSUT3 LRECL ('
+         MVC   MSGE0205,=C') NOT = SYSUT1 LRECL ('
+         MVC   MSGE0305,=C') + SYSUT2 LRECL ('
+         MVC   MSGE0405,=C')   '
+         MVC   MSGE0106,=C'ERROR: SYSUT'
+         MVC   MSGE0406,=C'IS NOT FIXED FORMAT  '
+         MVC   MSGI0101,=C'SYSUT'
+         MVC   MSGI0201,=C' IS '
+         MVC   MSGI0102,=C'SYSUT'
+         MVC   MSGI0202,=C' RECORDS '
+         MVC   MSGI0302,=C' = '
+         MVC   MSGI0104,=C'SYSUT'
+         MVC   MSGI0204,=C' KEY OFFSET = '
+         MVC   MSGI0105,=C'KEY LENGTH = '
+         MVC   MSGINF06(20),=C'MTCHMRG VERSION 3.01'
+         JRETURND
+ALCTWORK CSECT
+* ON ENTRY
+*   R8 ADDRESS OF WHERE TO STORE THE ALLOCATED $MRGWORK ADDRESS
+*   R7 LENGTH TO ALLOCATE FOR WORKREC INSIDE OF $MRGWORK
+*
+         JSAVED
+         BALR  R11,0
+         USING *,R11
+         USING $WRKSTRG,R10            WORKING-STORAGE DSECT
+         USING $MRGWORK,R9
+         CPOOL GET,U,CPID=CMRGWORK,REGS=SAVE
+         ST    R1,0(,R8)
+         LR    R9,R1
+         CPOOL GET,U,CPID=(R7),REGS=SAVE
+         ST    R1,WORKREC
+         MVC   PREV,=F'0'
+         MVC   NEXT,=F'0'
+         MVC   WORKFLAG,=F'0'
+ALCTRTN  EQU   *
+         JRETURND
+         END

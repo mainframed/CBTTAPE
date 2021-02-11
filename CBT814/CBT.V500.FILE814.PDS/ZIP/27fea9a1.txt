@@ -1,0 +1,330 @@
+An alternative SYSRES utility
+Access Methods Services provides a convenient feature for those installations
+which maintain two system-resident volumes (ie an active SYSRES volume and a
+SYSRES volume to which changes are applied).  Non-VSAM datasets that reside on a
+SYSRES volume can be ‘generically’ catalogued so access is directed to the
+SYSRES volume that is currently active.  Therefore, IPLing from an updated
+SYSRES does not have to involve catalog manipulation.
+To catalog SYSRES datasets generically, IDCAMS is used to eliminate the old
+catalog entry (but not the actual dataset) and establish the new catalog entry.
+Sample control statements to create such an entry would look like:
+     DELETE SYS1.LINKLIB NONVSAM NO SCRATCH
+     DEFINE NONVSAM(NAME(SYS1.LINKLIB) DEVT(0000) VOLUME('******'))
+The problem with this situation is that SYSRES volumes can hold quite a  large
+number of datasets, and manually coding these IDCAMS control statements would be
+error-prone and tedious.  The READCAT utility provided below scans a catalog,
+looking for non-VSAM datasets residing on the SYSRES volume (in our case,
+IPO001).  When an appropriate non-VSAM catalog entry is found, IDCAMS control
+statements are created to delete the old catalog entry and create a generic one.
+These control statements are subsequently used as input to an IDCAMS step.  As
+an additional feature, catalog entries that are selected are printed in
+hexadecimal and character format.  Examining these records can provide insights
+into how ICF catalogs work.  It should be noted that only authorised programs
+are allowed to access a catalog as a VSAM dataset, so this program must be
+linked with ‘AC=1’ and must reside in an authorised library.
+This utility can be especially useful after the installation of a new MVS via
+CBIPO, since CBIPO creates a new master catalog, with non-generic pointers  to a
+new SYSRES.  After the CBIPO system is moved to production, an alternative
+SYSRES can easily be established by copying the CBIPO SYSRES and running this
+program to update the catalog entries.  As additional products are installed,
+and new datasets are created, the utility can be executed again to ensure that
+new SYSRES datasets have the generic catalog entries.
+It is worth noting that this same utility, with some changes to the main
+processing routine and some different DSECTS, was used to transfer all of the
+catalog aliases into the new CBIPO master catalog.  Also, after the CBIPO was
+installed, the utility was modified to create catalog entries in the new catalog
+for all datasets that previously had entries in the old master catalog.  This
+was done by having the utility create an IEFBR14 job that catalogued, in the new
+master catalog, all the non-VSAM datasets in the old one.  When dataset names
+were duplicated (such as SYS1.LPALIB, SYS1.LINKLIB, etc) a ‘NOT CAT 2’ condition
+occurred, and the CBIPO catalog entry prevailed.
+Through referencing the catalog record descriptions in the manual, many
+functions can be performed with very little modification.  My recommendation is
+to use the catalog as a ‘read-only’ resource.  It is far better to create IDCAMS
+control statements for a subsequent job step than to render a catalog unusable
+(particularly a master catalog).  The MVS/XA 2.2 manual, which contains the
+necessary layouts, is MVS/XA: Data Facility Product: Diagnosis Reference (LY27-
+9530).
+UTILITY SOURCE
+READCAT  CSECT
+* THIS VERSION OF READCAT PROCESSES NON-VSAM DATA SETS ON IPO001
+* CAT DESCRIPTION ALLOWS FOR MVS 2.2 CENTURY INDICATORS
+BEGIN    SAVE  (14,12)                 SAVE REGISTERS
+         LR    R3,R15                  ESTABLISH ADDRESSABILITY
+         USING BEGIN,R3,R4
+         L     R4,ACON                 SET UP BASE REGISTERS
+         ST    R13,SAVE13              SAVE REG13
+         B     A1MAIN
+ACON     DC    A(BEGIN+4096)
+A1MAIN   ST    R1,PARMPTR              SAVE POINTER TO PASSED PARMS
+         LA    R13,REGSAVE             SET UP NEW SAVE AREA
+         BAL   R10,B1HSKP              INITIALISE
+         BAL   R10,B2PROCSS            ACTUAL CATALOG SCAN
+         BAL   R10,B3WRAPUP            CLOSE UP SHOP
+A1EXIT   L     R15,RETURNCD            TERMINATE
+         L     R13,SAVE13
+         RETURN (14,12),RC=(15)
+* B1 HOUSEKEEPING *
+B1HSKP   ST    R10,BHOLD               SAVE REG10
+         OPEN  (CATACB)                OPEN THE CATALOG
+         OPEN  (OUTFILE,(OUTPUT))      OPEN THE AMS STMT OUTPUT FILE
+         OPEN  (SYSPRT,(OUTPUT))       OPEN THE SYSOUT DATA SET
+         ZAP   RECKTR(5),=P'0'
+B1EXIT   L     R10,BHOLD               RETURN TO 'A' LEVEL ROUTINE
+         BR    R10
+* B2 MAIN ROUTINE *
+B2PROCSS ST    R10,BHOLD               SAVE REG10
+B2PRIME  LA    R13,REGSAVE             GET A CATALOG RECORD
+         GET   RPL=SEQRPL
+         LTR   R15,R15                 ALL IS WELL?
+         BNZ   B2OOPS                    N: ABEND WITH USER 200
+         CLI   CATREC+4,C'A'           IS THIS A NONVSAM DS RECORD ?
+         BNE   B2PRIME                   N:SKIP THIS RECORD
+         LA    R12,CATREC              MAP THE CATALOG RECORD AS AN
+         USING NONVREC,R12               ICF NONVSAM NAME CELL
+         LA    R5,CATREC+2             PT TO START OF NAME CELL
+         AH    R5,NVCELEN              ADD THE LENGTH OF THE NAME CELL
+         ST    R5,OWNRHOLD             STORE NEW PTR TO OWNER CELL
+         USING OWNRCELL,R5             ADDRESSABILITY TO OWNER CELL
+         AH    R5,OWNCELLN             ADD LENGTH OF OWNER CELL
+         DROP  R5                      DROP OWNER CELL ADDRESSABILITY
+         ST    R5,VOLHOLD              STORE THE PTR TO THE VOLUME CELL
+         USING VOLCELL,R5              VOLUME CELL ADDRESSABILITY
+         CLI   VOLTYPE,X'04'           VALIDATE THAT WE ARE EXAMINING A
+         BNE   B2BADREC                  VOLUME CELL
+         CLC   VOLDEVTP(4),=X'3010200E'   IF DATA SET ISN'T ON A 3380...
+         BNE   B2PRIME                       SKIP THE RECORD
+         CLC   VOLSERN(6),=C'IPO001'   CURRENT SYSRES VOL-SER GOES HERE
+         BNE   B2PRIME                   SKIP RECORD IF DS IS NOT ON RES
+         CLC   NVOLCNT(2),=X'0001'     ENSURE THAT ONLY ONE VOLUME CELL
+         BNE   B2BADVOL                  EXISTS IN THE CATALOG ENTRY
+         MVC   OUTREC(11),=C' DELETE     ' DELETE/NOSCRATCH AMS STMT
+         MVC   OUTREC+11(44),NVNAME    INSERT DATA SET NAME
+         MVI   OUTREC+60,C'-'          AMS CONTINUATION
+         BAL   R10,X1AMSPUT            WRITE THE RECORD
+         MVC   OUTREC(22),=C'      NONVSAM NOSCRATCH'
+         BAL   R10,X1AMSPUT            WRITE THE RECORD
+         MVC   OUTREC(25),=C' DEFINE NONVSAM(NAME(    -'
+         BAL   R10,X1AMSPUT            CREATE THE AMS GENERIC CATALOG
+         MVC   OUTREC+11(44),NVNAME      ENTRY.
+         MVC   OUTREC+60(3),=C') -'
+         BAL   R10,X1AMSPUT            WRITE THE RECORD
+         MVC   OUTREC+15(29),=C'DEVT(0000) VOLUMES(''******''))'
+         BAL   R10,X1AMSPUT            WRITE THE RECORD
+         LA    R13,REGSAVE
+         PUT   SYSPRT,PRTLINE          PRINT A BLANK LINE
+         AP    RECKTR(5),=P'1'         BUMP RECORD COUNTER
+         UNPK  PRTLINE+1(5),RECKTR+2(3)  FORMAT RECORD COUNTER
+         OI    PRTLINE+5,X'F0'
+         BAL   R10,C1PRTREC            PRINT CAT RECORD IN HEXADECIMAL
+         B     B2PRIME                 GO BACK TO THE TOP
+B2BADVOL WTO   'READCAT - TOO MANY VOLUME CELLS IN ICF RECORD'
+         ABEND 192,DUMP
+B2BADREC WTO   'READCAT - EXPECTED VOLUME CELL NOT FOUND'
+         ABEND 196,DUMP
+B2OOPS   LR    R9,R15                  SAVE VSAM RT CODE FOR DEBUG
+         WTO   'READCAT - ERROR ON SEQUENTIAL VSAM GET'
+         ABEND 200,DUMP
+B2EOF    WTO   'READCAT - CATALOG EOF HAS BEEN ENCOUNTERED'
+B2EXIT   L     R10,BHOLD               RETURN TO 'A' LEVEL ROUTINE
+         BR    R10
+* B3 WRAPUP PROCESSING *
+B3WRAPUP ST    R10,BHOLD
+B3INPNT  CLOSE (CATACB)                CLOSE THE CATALOG
+         CLOSE SYSPRT                  CLOSE THE PRINT FILE
+         CLOSE OUTFILE                 CLOSE THE AMS STMT DATA SET
+B3EXIT   L     R10,BHOLD               RETURN TO 'A' LEVEL ROUTINE
+         BR    R10
+** C1 PRINT THE RECORD TO THE SYSPRT FILE **
+C1PRTREC ST    R10,CHOLD               SAVE REG10
+         LA    R6,CATREC               PT TO THE CATALOG RECORD
+         LH    R7,CATREC               USE LENGTH IN R7 AS BYTE COUNTER
+C1TOP    SR    R8,R8                   REG8 COUNTS BYTES PER COLUMN
+         LA    R9,8                    REG9 COUNTS COLUMNS ON THE LINE
+         LA    R11,PRTLINE+12          REG11 IS PRINT POSITION INDEX
+         MVC   PRTLINE+90(32),0(R6)    PLACE THE CHAR FORMAT IN PRTLINE
+         TR    PRTLINE+90(32),TRANSTBL TRANSLATE IT TO ALL PRINTABLE
+         MVI   PRTLINE+89,C'*'         DELIMIT START AND FINISH OF
+         MVI   PRTLINE+122,C'*'        CHAR DATA WITH ASTERISKS
+C1LOOP   SR    R10,R10                 CLEAR REG10
+         IC    R10,0(R6)               GET CHAR TO BE PRINTED
+         SLL   R10,1                   MULTIPLY BY 2 TO GET TABLE INDEX
+         A     R10,=A(HEXTBL)          ADD ADDRESS OF TABLE BASE
+         MVC   0(2,R11),0(R10)         MOVE THE HEX REPRESENTATION
+         LA    R11,2(R11)              BUMP THE PRINT LINE POINTER
+         MVI   0(R6),X'40'             BLANK OUT CAT REC BYTE
+         LA    R6,1(R6)                BUMP THE CAT RECORD POINTER
+         BCT   R7,C1GOON               DECREMENT CAT BYTE COUNTER
+         B     C1DONE                  IF DONE, GO PRINT FINAL LINE
+C1GOON   LA    R8,1(R8)                BUMP BYTES/PER COLUMN COUNTER
+         C     R8,=A(4)                FOUR BYTES IN THIS COLUMN?
+         BNE   C1LOOP                    N: GO FINISH THE COLUMN
+         LA    R11,1(R11)              SEPARATE COLUMNS IN PRINT LINE
+         SR    R8,R8                   RESET BYTES PER COLUMN COUNTER
+         BCT   R9,C1LOOP               IF 8 COLUMNS NOT DONE, GO BACK
+         LA    R13,REGSAVE
+         PUT   SYSPRT,PRTLINE          PRINT LINE IS FULL...PRINT IT
+         MVI   PRTLINE,X'40'           CLEAR PRINT LINE TO SPACES
+         MVC   PRTLINE+1(132),PRTLINE
+         B     C1TOP                   GO DO IT ALL AGAIN
+C1DONE   LA    R13,REGSAVE             PRINT OUT THE LAST LINE
+         PUT   SYSPRT,PRTLINE
+         MVI   PRTLINE,X'40'           CLEAR PRINT LINE TO SPACES
+         MVC   PRTLINE+1(132),PRTLINE
+C1EXIT   L     R10,CHOLD               RETURN TO 'B' LEVEL ROUTINE
+         BR    R10
+*  X1 WRITE A RECORD TO THE AMS CONTROL STATEMENT O/P FILE *
+X1AMSPUT ST    R10,XHOLD                   SAVE REG10
+         LA    R13,REGSAVE
+         PUT   OUTFILE,OUTREC              WRITE OUT THE RECORD
+         MVI   OUTREC,X'40'                CLEAR OUTPUT RECORD TO SPACES
+         MVC   OUTREC+1(79),OUTREC
+         L     R10,XHOLD                   RETURN TO CALLING ROUTINE
+         BR    R10
+         LTORG
+PARMPTR  DS    F                       ADDRESS OF PASSED PARM LIST
+BHOLD    DS    F                       REG10 STORAGE FOR 'B' LEVEL
+CHOLD    DS    F                       REG10 STORAGE FOR 'C' LEVEL
+XHOLD    DS    F                       REG10 STORAGE FOR 'X' LEVEL
+OWNRHOLD DS    F                       ADDRESS OF OWNER CELL
+VOLHOLD  DS    F                       ADDRESS OF VOLUME CELL
+RETURNCD DC    F'0'                    RETURN CODE FROM PROGRAM
+SAVE13   DS    F                       STORAGE FOR REG13
+REGSAVE  DS    18F                     SAVE AREA FOR INTERNAL CALLS
+PASSWORD DC    8XL1'00'                ICF CATALOG PASSWORD
+OUTREC   DC    CL80' '                 AMS CNTRL O/P RECORD STORAGE
+PRTLINE  DC    133CL1' '               PRINT LINE STORAGE
+RECKTR   DC    PL5'0'                  ICF CATALOG RECORD COUNTER
+*** THE FOLLOWING TRANSLATE TABLE IS USED TO ENSURE THAT ALL ***
+*** CHARACTER FORMAT DATA CONSISTS OF PRINTABLE CHARACTERS   ***
+         DS    0F                      ALIGN ON FULL WORD
+TRANSTBL DC    CL16'................'           00 - 0F
+         DC    CL16'................'           10 - 1F
+         DC    CL16'................'           20 - 2F
+         DC    CL16'................'           30 - 3F
+         DC    CL16'..........¢.<(+|'           40 - 4F
+         DC    CL16'&&.........!$*);¬'          50 - 5F
+         DC    CL16'-/........ ,%_>?'           60 - 6F
+         DC    CL16'..........:#@''="'          70 - 7F
+         DC    CL16'.ABCDEFGHI......'           80 - 8F
+         DC    CL16'.JKLMNOPQR......'           90 - 9F
+         DC    CL16'. STUVWXYZ......'           A0 - AF
+         DC    CL16'................'           B0 - BF
+         DC    CL16' ABCDEFGHI......'           C0 - CF
+         DC    CL16' JKLMNOPQR......'           D0 - DF
+         DC    CL16'..STUVWXYZ......'           E0 - EF
+         DC    CL16'0123456789|.....'           F0 - FF
+*** THE FOLLOWING TABLE IS USED FOR PRESENTING A HEXADECIMAL BYTE ***
+*** IN 'HUMAN' READABLE FORM.                                     ***
+HEXTBL   DC    CL32'000102030405060708090A0B0C0D0E0F'
+         DC    CL32'101112131415161718191A1B1C1D1E1F'
+         DC    CL32'202122232425262728292A2B2C2D2E2F'
+         DC    CL32'303132333435363738393A3B3C3D3E3F'
+         DC    CL32'404142434445464748494A4B4C4D4E4F'
+         DC    CL32'505152535455565758595A5B5C5D5E5F'
+         DC    CL32'606162636465666768696A6B6C6D6E6F'
+         DC    CL32'707172737475767778797A7B7C7D7E7F'
+         DC    CL32'808182838485868788898A8B8C8D8E8F'
+         DC    CL32'909192939495969798999A9B9C9D9E9G'
+         DC    CL32'A0A1A2A3A4A5A6A7A8A9AAABACADAEAF'
+         DC    CL32'B0B1B2B3B4B5B6B7B8B9BABBBCBDBEBF'
+         DC    CL32'C0C1C2C3C4C5C6C7C8C9CACBCCCDCECF'
+         DC    CL32'D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDF'
+         DC    CL32'E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF'
+         DC    CL32'F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF'
+CATACB   ACB   AM=VSAM,CATALOG=NO,DDNAME=CATIN,EXLST=EXITLIST,         X
+               MACRF=(KEY,SEQ,IN),PASSWD=PASSWORD
+EXITLIST EXLST EODAD=B2EOF
+SEQRPL   RPL   ACB=CATACB,AREA=CATREC,AREALEN=32400,                   X
+               OPTCD=(KEY,SEQ)
+SYSPRT   DCB   MACRF=PM,DDNAME=SYSPRT,DSORG=PS,LRECL=133,BLKSIZE=1330, X
+               RECFM=FB
+OUTFILE  DCB   MACRF=PM,DDNAME=OUTFILE,DSORG=PS,LRECL=80,              X
+               RECFM=FB
+         DS    0F
+CATREC   DC    324CL100' '
+*** DSECTS FOR ICF NONVSAM CATALOG ENTRY CELLS ***
+NONVREC  DSECT
+NVLEN1   DS    CL2              NONVSAM RECORD LENGTH
+NVNC     DS    0CL52            NONVSAM NAME CELL
+NVCELEN  DS    CL2              NONVSAM NAME CELL LENGTH
+NVTYPE   DS    CL1              TYPE 'A' FOR NONVSAM
+NVRESV   DS    CL1              RESERVED
+NVOLCNT  DS    CL2              NONVSAM VOLUME CELL COUNT
+NVKEYLN  DS    CL1              NONVSAM KEY LENGTH
+NVNAME   DS    CL44             NONVSAM DATA SET NAME
+NVPAD    DS    CL1              END OF NONVSAM NAME CELL
+NVEND    EQU   *
+OWNRCELL DSECT                  DESCRIBE ICF NONVSAM OWNER CELL
+OWNERC   DS    0CL20            OWNER CELL
+OWNCELLN DS    CL2              OWNER CELL LENGTH
+OWNTYPE  DS    CL1              TYPE X'01' FOR OWNER CELL
+OWNID    DS    CL8              OWNER IDENTIFICATION
+OWNFLAG  DS    CL1              FLAG BYTE
+OWNRACF  EQU   X'80'            RACF PROTECTED
+OWNKSDS  EQU   X'40'            INDEX COMPONENT DATA SET
+OWNREUS  EQU   X'20'            REUSABLE DATA SET
+OWNERASE EQU   X'10'            ERASE SPECIFIED (CLUSTER ONLY)
+OWNCIND  EQU   X'08'            CENTURY BYTE INDICATOR
+OWNRESV  EQU   X'04'            RESERVED
+OWNSWAP  EQU   X'02'            SWAP SPACE INDICATOR
+OWNPAGE  EQU   X'01'            PAGE SPACE INDICATOR
+OWNCREDT DS    CL3              CREATION DATE
+OWNEXPDT DS    CL3              EXPIRATION DATE
+OWNCRCEN DS    CL1              CREATION DATE CENTURY BYTE
+OWNEXCEN DS    CL1              EXPIRATION DATE CENTURY BYTE
+OWNEND   EQU   *
+VOLUCELL DSECT                  DESCRIBE ICF NONVSAM VOLUME CELL
+VOLCELL  DS    0CL30            VOLUME CELL
+VOLLENN  DS    CL2              LENGTH OF VOLUME CELL
+VOLTYPE  DS    CL1              X'04'FOR VOLUME CELL
+VOLOFSET DS    CL1              NOT USED
+VOLSERN  DS    CL6              VOLUME SERIAL NUMBER
+VOLDEVTP DS    CL4              DEVICE TYPE
+VOLFLAG1 DS    CL1              FLAG BYTE
+VOLFLAG2 DS    CL1              FLAG BYTE
+VOLVVRBA DS    CL4              RBA OF VVR
+VOLDSTTR DS    CL3              NONVSAM - TTR OF DSCB
+         DS    CL1              RESERVED
+VOLFLSEQ DS    CL2              FILE SEQ NUMBER FOR TAPE
+VOLKRQL  DS    CL4              VSAM ONLY
+VOLVSAM  DS    0CL1             VSAM VARIABLE LENGTH DATA
+         END
+JOBSTREAM TO EXECUTE THIS UTILITY
+//READCAT1  EXEC PGM=READCAT
+//CATIN     DD   DSN=CATALOG.VIPO002,DISP=SHR
+//OUTFILE   DD   DSN=&&TEMP1,DISP=(NEW,PASS),UNIT=SYSDA,
+//         SPACE=(TRK,(5,1)),DCB=(BLKSIZE=4800,RECFM=FB,LRECL=80)
+//SYSPRT    DD   SYSOUT=*
+//SYSUDUMP  DD   SYSOUT=*
+//AMSSTEP1  EXEC PGM=IDCAMS
+//SYSPRINT  DD   SYSOUT=*
+//SYSIN     DD   DSN=&&TEMP1,DISP=(OLD,DELETE)
+//
+
+
+Guy Trag
+Systems Programmer
+Kay-Bee Toy and Hobby Shops (USA)  © Xephon 1989
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

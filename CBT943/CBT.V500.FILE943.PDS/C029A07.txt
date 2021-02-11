@@ -1,0 +1,396 @@
+ Controlling the flow of started tasks
+An application program that executes a large number of CICS START TASK commands
+can cause a CICS region to go short-on-storage, precipitating an outage of the
+region.  This problem has occurred in our recently-installed CICS 1.7
+environment, but was never noticed when we were running CICS 1.6.1.
+The application involved needs to post information into records in several files
+that are in a remote File Owning Region (FOR).  Ordinarily, this is done
+synchronously as demanded by application requests via vanilla MRO function
+shipping.  However, if the remote FOR goes down, the Application Owning Region
+(AOR) will place the information that needs posting into a Tstore-and-forwardU
+file in its own region until the FOR can be made functional again.  Then the FOR
+notifies (via a started task) the AOR that the FOR is functional again.  At this
+time an application program will loop through code that reads store-and-forward
+records and does an EXEC CICS START TASK with DATA (the DATA is a store-and-
+forward record).  Therefore, there is one started task for each record on the
+store-and-forward file.  The started tasks (non-terminal attached) run in the
+AOR and do vanilla function ships to post the data to files in the FOR.
+Apparently, the application programmer thought that having multiple concurrent
+tasks posting data would be faster than having the program that reads the store-
+and-forward file serially update the various remote files.
+When there are over 1000 records on the store-and-forward file, our application
+region will sometimes go short-on-storage doing the start task processing.  When
+we have had over 5000 records on the file, the short-on-storage has been
+unrecoverable and caused a region outage.
+When the above situation caused a CICS outage, both OMEGAMON and the system dump
+indicated that there were thousands of DCAs in the system.  These were on the
+active chain, were marked non-dispatchable (waiting for CMXT), and did not have
+TCAs.  The storage used for the DCAs obviously was a factor in going short-on-
+storage, but the storage fragmentation caused by thousands of DCAs may have been
+even more significant.  The fragmentation would have prevented any unconditional
+request for a large amount of storage from being satisfied.
+CICS does not seem to count the non-dispatchable tasks on the active chain when
+determining whether a TmaxtaskU condition exists or determining the CSAKCCT
+value (tasks on active and suspend chain).  The CSAMAXTC value was zero while
+the region was short-on-storage.  The CSAKCCT value never got over 43.  The CMXT
+setting for the class of the tasks being started was 40.  There are a few
+transactions in the AOR that are not assigned the same task class as the started
+tasks.
+CICS 1.7 seems to be attaching these started tasks (ie building a DCA on the
+active chain) regardless of the regionUs CMXT value.  CICS 1.6 seemed to avoid
+attaching a task until the number of attached tasks for its task class was under
+the CMXT value.  This avoidance may have burned CPU cycles, but prevented short-
+on-storage conditions.
+There are several possible resolutions to this problem:
+1    The application program can be changed so that it no longer starts tasks,
+but instead serially posts information from the store-and-forward file to the
+remote files.
+2    The application program can be changed so that it issues a one-second wait
+once for every 15 tasks started.  The region has a throughput capacity of
+approximately 20 tasks per second.
+3    A utility subroutine can be written that will address the CSAUs CMXT table
+and compare the number of tasks attached in each task class to the corresponding
+CMXT value.  If the attached value is greater than the maximum value, the
+subroutine will issue a one-second wait and write diagonistic messages to a
+destination.  As the application program loops through its code to issue the
+start task commands, it should link to this utility program.
+Option 3 has been implemented.  Its advantages include being able to change the
+frequency of waits dynamically by simply using the CEMT I TCLASS command and
+overtyping any of the TCLASS MAX values.  Of course, a permanent change could be
+implemented by changing the TCLASS value in the SIT.  Having a separate program
+also means that it can be linked to by any application program that starts
+multiple tasks.  The subroutine could also be used as a user exit that all tasks
+could flow through.  This subroutine will continue to be used until the
+application team can do some time trials to see if multiple concurrent started
+tasks can post the data to the remote files significantly faster than serial
+processing in one task.
+ The subroutine was written in command-level Assembler with code designed to be
+very easy to modify.  The program is 800 bytes long and has been used only in
+the CICS 1.7 environment .  If it is desired to have the calling program make
+dynamic requests of the subroutine, a commarea could be passed to the
+subroutine.  Some requests that could be passed from the calling program
+include:
+1    Check only a specific task class or task class range, rather than all 10
+task classes.
+2    Request a WAIT time interval greater than 1 second.
+3    Request that no diagnostic messages be written to a destination.
+If any of the above modifications are desired, the subroutine would have to be
+modified to interrogate the commarea passed to it.
+*   THIS PGM (OLCMXTWT) IS A SUBROUTINE THAT CAN BE LINKED TO BY ANY
+*   PGM FOR THE PURPOSE OF CHECKING TO SEE IF A CICS REGION IS OVER A
+*   TASK CLASS MAX FOR ANY TASK CLASS.  THIS PROGRAM IS SET UP TO SCAN
+*   ALL (CURRENTLY 10) TASK CLASS ENTRIES, COMPARING THE MAX PERMITTED
+*   TO THE CURRENT ATTACHED VALUE.  'CURRENT ATTACHED' TASKS MAY BE
+*   NON-DISPATCHABLE TASKS ON THE ACTIVE CHAIN WITH NOTHING MORE THAN
+*   A DCA FOR THE TASK.  IF ANY TASK CLASS ENTRY'S ATTACHED VALUE
+*   EXCEEDS ITS MAX VALUE, THIS PROGRAM WILL ISSUE A ONE SECOND WAIT.
+*   SINCE THIS PROGRAM USES VARIOUS FIELDS IN THE CICS CSA,
+*   THIS PROGRAM WILL HAVE TO BE RE-ASSEMBLED IF IBM'S NEXT RELEASE
+*   CHANGES DISPLACEMENT OF ANY REFERENCED FIELDS.
+*   THE MOST LIKELY CALLING PROGRAMS TO THIS PROGRAM WILL BE PROGRAMS
+*   THAT CAN START THOUSANDS OF TASKS FROM ONE TASK.
+*   THIS WILL HOPEFULLY SLOW DOWN THE SUBMISSION OF TASKS BEING STARTED
+*   BY THE CALLING PROGRAM LONG ENOUGH TO PREVENT A SHORT-ON-STORAGE,
+*   BUT SHORT ENOUGH TO NOT SIGNIFICANTLY SLOW DOWN THE PROCESSING
+*   OF STARTED TASKS.  OLCMXTWT WAS WRITTEN IN SUCH A MANNER THAT
+*   CHANGING THE NUMBER OF SECONDS TO WAIT, THE RANGE OF TCLASS ENTRIES
+*   TO CHECK, WHETHER DIAGONISTIC MESSAGES SHOULD BE WRITTEN TO THE
+*   SOUT DESTINATION, ETC., SHOULD BE QUITE EASY (EVEN IF ONLY
+*   TEMPORARILY USING INTERTEST TO CHANGE VALUES).  CEMT COULD ALSO BE
+*   UTILISED TO DYNAMICALLY CHANGE TASK CLASS MAX VALUES.  LOWERING A
+*   TASK CLASS MAX VALUE WOULD INCREASE THE FREQUENCY IN WHICH WAITS
+*   WOULD OCCUR.
+CSAPTR   EQU   R10
+OFLPTR   EQU   R4
+CMXTPTR  EQU   R5
+LINKREG  EQU   R14
+* USE CICS DEFAULT REGISTERS-
+*R3 --> PGM BASE REGISTER
+*R11--> EIB (EXEC INTERFACE BLOCK)
+*R13--> POINTER TO DYNAMIC STORAGE AREA
+DFHEISTG DSECT  DYNAMIC STORAGE
+DOUBLE   DS    0D    DOUBLEWORD AREA FOR BINARY --> PACKED CONVERSION
+         DS    PL6   DOUBLEWORD AREA FOR BINARY --> PACKED CONVERSION
+DOUBLE78 DS    PL2   DOUBLEWORD AREA FOR BINARY --> PACKED CONVERSION
+SUB080SV DS    F     SAVE AREA FOR 'RETURN' ADDRESSES USED BY PERFORM
+SUB090SV DS    F     SAVE AREA FOR 'RETURN' ADDRESSES USED BY PERFORM
+SUB100SV DS    F     SAVE AREA FOR 'RETURN' ADDRESSES USED BY PERFORM
+UT0100SV DS    F     SAVE AREA FOR 'RETURN' ADDRESSES USED BY PERFORM
+UT0200SV DS    F     SAVE AREA FOR 'RETURN' ADDRESSES USED BY PERFORM
+BEGENTRY DS    F    FIRST ENTRY TO EXAMINE TO SEE IF OVER A TCLASS MAX
+ENDENTRY DS    F    LAST  ENTRY TO EXAMINE TO SEE IF OVER A TCLASS MAX
+CURENTRY DS    F    CURRENT ENTRY TO EXAMINE TO SEE IF OVER A TCLASS
+WRITELEN DS    H    LENGTH OF ENTIRE MSG AREA, INITIALISED AT PGM START
+WAITSECS DS    PL4  INTERVAL TO WAIT OHHMMSS+     IF OVER A TCLASS MAX
+OVERCMXT DS    CL1  'Y' =YES   'N' = NO  IS REGION OVER A TCLASS MAX
+WRITEQSW DS    CL1  'Y' =YES   'N' = NO  SHOULD WRITE OF DATA BE DONE
+*                   OR SHOULD IT BE SUPPRESSED TO REDUCE OVERHEAD
+MSG      EQU   *             DYNAMIC STORAGE-LINE WRITTEN TO SOUT QUEUE
+MSGPROGD DS    CL9             PROGRAM NAME-
+MSGVARY  EQU   *
+MSGTIME  DS    0CL7           TIME OF DAY HHMMSST
+         DS    CL6
+ MSGTIMES DS    CL1            LAST DIGIT FOR TIME-MUST BE OI'ED TO READ
+         DS    CL1            SPACE
+MSGWORK  EQU   *              LITERAL MESSAGE AREA
+MSGWAIT  DS    0CL27
+MSGWRK02 DS    CL5            'BEGIN' OR 'END'
+         DS    CL1            ' '
+MSGWRK04 DS    CL14           'INTERVAL WAIT='
+MSGWRK06 DS    0CL7           LENGTH OF WAIT (0HHMMSS)
+         DS    CL6
+MSGWRK08 DS    CL1            LAST DIGIT OF WAIT - MUST MAKE READABLE
+         ORG   MSGWORK
+MSGWRK30 DS    0CL37
+MSGCMXT  DS    0CL31
+         DS    CL7    'TCLASS#'
+MSGWRK32 DS    0CL2
+         DS    CL1
+MSGWRK34 DS    CL1  LAST DIGIT OF T CLASS#       - MUST MAKE READABLE
+         DS    CL5    ' MAX='
+MSGWRK36 DS    0CL3
+         DS    CL2
+MSGWRK38 DS    CL1  LAST DIGIT OF T CLASS MAX    - MUST MAKE READABLE
+         DS    CL14   ' NOW ATTACHED='
+MSGWRK40 DS    0CL5
+         DS    CL4
+MSGWRK42 DS    CL1  LAST DIGIT OF ATTACHED TASKS - MUST MAKE READABLE
+MSGWRK50 DS    0CL34
+MSGINFO  DS    0CL27
+         DS    CL4    ' TC='
+MSGWRK52 DS    CL4      TRAN CODE    USE EIBTRNID
+         DS    CL9    ' CSAKCCT='
+MSGWRK54 DS    0CL3     CSAKCCT
+         DS    CL2
+MSGWRK56 DS    CL1  LAST DIGIT OF CSAKCCT        - MUST MAKE READABLE
+         DS    CL7    ' TASK#='
+MSGWRK58 DS    0CL7     TASK-NUM     USE EIBTASKN
+         DS    CL6
+MSGWRK59 DS    CL1  LAST DIGIT OF TASK-NUM       - MUST MAKE READABLE
+MSGEND   EQU   *
+MSGVARYL EQU   MSGEND-MSGVARY  LENGTH OF PORTION OF MESSAGE THAT VARIES
+MSGL     EQU   MSGEND-MSG      LENGTH OF ENTIRE MESSAGE
+*              END OF THIS PROGRAM'S DYNAMIC STORAGE
+         COPY  DFHCSADS           CSA DSECT
+* 010 EXEC CICS ADDRESS COMMAND TO GET CICS CSA ADDR-REFERENCE OFL ADDR
+* 020 ADDRESS CSA OPTIONAL FEATURES LIST (REFERENCE CLASS MAX TABLE)
+* 030 ADDRESS CLASS MAX TABLE
+* 040 SET WAIT NUMBER OF SECONDS  TO  1.
+* 050 SET BEGINNING ENTRY NUMBER  TO  1.
+* 060 SET ENDING    ENTRY NUMBER  TO 10.
+* 070 PERFORM OVER-CMXT-ANALYSIS.
+*     IF OVERCMXT = 'NO'
+*        NEXT SENTENCE
+*     ELSE
+*        PERFORM 'WAIT X SECONDS'
+*        PERFORM DISPLAY 'WAIT X SECONDS COMPLETE'
+*        PERFORM OVER-CMXT-ANALYSIS.
+* 080 GO BACK.
+OLCMXTWT CSECT
+* 010 EXEC CICS ADDRESS COMMAND TO GET CICS CSA ADDR-REFERENCE OFL ADDR
+         EXEC  CICS ADDRESS CSA(CSAPTR)
+         USING DFHCSADS,CSAPTR
+* 020 ADDRESS CSA OPTIONAL FEATURES LIST (REFERENCE CLASS MAX TABLE)
+         L     OFLPTR,CSAOPFLA   LOAD REGISTER TO ADDRESS OPTIONAL
+         USING CSAOPFL,OFLPTR    FEATURE LIST.
+* 030 ADDRESS CLASS MAX TABLE
+         L     CMXTPTR,CSAMXTAD  LOAD REGISTER TO ADDRESS CLASS
+         USING CSAMXTDS,CMXTPTR  MAX TASK TABLE
+ * 035 INITIALISE WRITE RECORD
+         LA    R0,MSGL     DYNAMICALLY DETERMINE LENGTH OF ENTIRE MSG,
+         STH   R0,WRITELEN    AND STORE FOR USE BY TD WRITE
+         MVC   MSGPROGD,PROGDASH MOVE PROGRAM NAME-  TO WRITE RECORD
+         MVI   MSGVARY,C' '     MOVE SPACE TO FIRST CHARACTER IN STRING
+         MVC   MSGVARY+1(MSGVARYL-1),MSGVARY  PROPAGATE SPACES
+* 040 SET WAIT NUMBER OF SECONDS  TO  1.
+         ZAP   WAITSECS,PACKONE
+* 045 SET WRITEQ SWITCH TO INDICATE THAT WE DO WANT MESSAGES WRITTEN
+         MVI   WRITEQSW,C'Y'
+* 050 SET BEGINNING ENTRY NUMBER  TO  1.
+         MVC   BEGENTRY,FHEXONE
+* 060 SET ENDING    ENTRY NUMBER  TO 10.
+         MVC   ENDENTRY,FHEXTEN
+* 070 PERFORM OVER-CMXT-ANALYSIS.
+         BAL   LINKREG,SUB08000  PERFORM OVER-CMXT-ANALYSIS
+         CLI   OVERCMXT,C'Y'  IF OVERCMXT NOT = 'Y'
+         BNE   OLCMXT95          NEXT SENTENCE
+*                             ELSE
+         BAL   LINKREG,UTO20000  PERFORM 'WAIT X SECONDS'
+         BAL   LINKREG,SUB08000  PERFORM OVER-CMXT-ANALYSIS.
+OLCMXT95 EQU   *
+         EXEC  CICS RETURN
+*     OVER-CMXT-ANALYSIS
+* 100 SET OVERCMXT SWITCH TO 'NO'.
+* 110 MOVE BEGINNING-ENTRY-NUMBER TO CURRENT-ENTRY-NUMBER
+* 120 CALCULATE ADDRESS OF FIRST CLASS ENTRY TO CHECK (TCLASS 01)
+* 130 TOP-OF-CMXT-LOOP. (EXAMINE TABLE FROM FIRST TO LAST ENTRY)
+*     IF CURRENT ATTACHED-INCREMENTED AT ATTACH TIME  >
+*     MAXIMUM-SET IN SIT OR WITH OVERRIDE
+*        PERFORM DISPLAY 'OVER CLASS MAXT MESSAGE'
+*        SET OVERCMXT SWITCH TO 'YES'
+*     ELSE
+*        NEXT SENTENCE.
+*     INCREMENT ADDRESS OF NEXT ENTRY TO CHECK BY LENGTH OF ENTRY.
+*     INCREMENT NUMBER OF CURRENT ENTRY                   BY 1.
+*     IF NUMBER OF CURRENT ENTRY > ENDING  ENTRY NUMBER
+*        NEXT SENTENCE
+*     ELSE
+*        GO TO TOP-OF-CMXT-LOOP.
+* 190 END-OF-CMXT-LOOP.
+SUB08000 EQU   *                 OVER-CMXT-ANALYSIS
+         ST    LINKREG,SUB080SV  SAVE    ADDRESS USED TO RETURN
+         USING CSAMXTDS,CMXTPTR  MAX TASK TABLE BEGINNING ADDRESS
+         MVI   OVERCMXT,C'N'     100 SET OVERCMXT SWITCH TO 'NO'.
+         MVC   CURENTRY,BEGENTRY 110 MOVE BEGINNING-ENTRY-NUMBER
+*                                    TO   CURRENT-ENTRY-NUMBER
+*                                120 CALCULATE ADDRESS OF FIRST
+*                                    CLASS ENTRY TO CHECK
+*                             USE R6-->R7 EVEN ODD PAIR (R6 IS IGNORED)
+         L     R7,BEGENTRY    LOAD R7 WITH ENTRY NUMBER TO START WITH
+         LA    R8,CSAMXTEL    LOAD R8 WITH LENGTH OF ENTRY
+         MR    R6,R8          64 BIT PRODUCT IS LEFT IN R6-->R7
+*                             ASSUME PRODUCT IS SO SMALL, USE R7 ONLY
+*                             R7 IS DISPLACEMENT INTO TABLE FOR FIRST
+*                             ENTRY WHICH WE WISH TO ACCESS.
+         AR    R7,CMXTPTR     ADD TABLE START ADDRESS TO DISPLACEMENT
+*                             R7 NOW CONTAINS ADDRESS OF FIRST ENTRY
+*                             THAT WE INTEND TO EXAMINE
+         DROP  CMXTPTR CMXTPTR (R10)STILL CONTAINS BEGINNING OF TABLE
+         USING CSAMXTOS,R7
+SUB08100 EQU   *                130 TOP-OF-CMXT-LOOP.
+         CP    CSAMXTOC,CSAMXTO      IF CURRENT ATTACHED-INCREMENTED
+         BH    SUB08200                 AT ATTACH TIME  > MAXIMUM
+         B     SUB08300
+SUB08200 EQU   *
+          BAL   LINKREG,SUB09000         PERFORM WRITE CMXT NUMBERS
+         MVI   OVERCMXT,C'Y'            SET OVERCMXT SWITCH TO 'YES'
+*                                    ELSE
+*                                       NEXT SENTENCE.
+SUB08300 EQU   *
+         LA    R7,CSAMXTEL(R7)       INCREMENT TO ADDRESS OF NEXT ENTRY
+         L     R6,CURENTRY
+         LA    R6,1(R6)              INCREMENT CURRENT ENTRY BY 1
+         ST    R6,CURENTRY
+         CLC   CURENTRY,ENDENTRY     IF NUMBER OF CURRENT ENTRY >
+*                                       ENDING  ENTRY NUMBER
+         BH    SUB08400                 NEXT SENTENCE
+*                                    ELSE
+         B     SUB08100                 GO TO TOP-OF-CMXT-LOOP.
+SUB08400 EQU   *                 END-OF-CMXT-LOOP.
+         L     LINKREG,SUB080SV  RESTORE ADDRESS USED TO RETURN
+         BR    LINKREG
+SUB09000 EQU   *                      CMXT-DISPLAY
+         ST    LINKREG,SUB090SV  SAVE    ADDRESS USED TO RETURN
+         MVC   MSGCMXT(L'CMXTMSG),CMXTMSG MOVE CMXT LITERALS TO MSG
+         L     R0,CURENTRY       TCLASS ENTRY CURRENTLY BEING PROCESSED
+         CVD   R0,DOUBLE         CONVERT FROM BINARY TO DECIMAL(PACKED)
+         UNPK  MSGWRK32,DOUBLE78 UNPACK LAST TWO BYTES FROM DOUBLEWORD
+         OI    MSGWRK34,X'F0'    MAKE LAST DIGIT READABLE
+         UNPK  MSGWRK36,CSAMXTO  UNPACK MAX FOR THIS T CLASS
+         OI    MSGWRK38,X'F0'    MAKE LAST DIGIT READABLE
+         UNPK  MSGWRK40,CSAMXTOC UNPACK CURRENT ATTACHED FOR T CLASS
+         OI    MSGWRK42,X'F0'    MAKE LAST DIGIT READABLE
+         BAL   LINKREG,UT010000  PERFORM WRITE TO QUEUE
+         L     LINKREG,SUB090SV  RESTORE ADDRESS USED TO RETURN
+         BR    LINKREG
+UT010000 EQU   *                 WRITE MESSAGE TO QUEUE
+         ST    LINKREG,UT0100SV  SAVE    ADDRESS USED TO RETURN
+         CLI   WRITEQSW,C'N'     IF NO DISPLAY IS DESIRED,
+         BE    UT019999             SKIP WRITE
+*                                ELSE
+*                                   MOVE DATA TO MESSAGE LINE
+         UNPK  MSGTIME,CSATODP      MOVE TIME OF DAY
+         OI    MSGTIMES,X'F0'       MAKE LAST DIGIT READABLE
+         MVC   MSGINFO(L'INFO),INFO  MOVE GENERAL INFO TO MSG
+         MVC   MSGWRK52,EIBTRNID
+         UNPK  MSGWRK54,CSAKCCT
+         OI    MSGWRK56,X'F0'    MAKE LAST DIGIT READABLE
+         UNPK  MSGWRK58,EIBTASKN
+         OI    MSGWRK59,X'F0'    MAKE LAST DIGIT READABLE
+         EXEC  CICS WRITEQ TD QUEUE('SOUT') FROM (MSG)                C
+              LENGTH (WRITELEN)
+         MVI   MSGVARY,C' '    MOVE SPACE TO FIRST CHARACTER IN STRING
+         MVC   MSGVARY+1(MSGVARYL-1),MSGVARY  PROPAGATE SPACES
+UT019999 EQU   *
+         L     LINKREG,UT0100SV  RESTORE ADDRESS USED TO RETURN
+         BR    LINKREG
+UT020000 EQU   *                 MAKE TRANSACTION WAIT
+         ST    LINKREG,UT0200SV  SAVE    ADDRESS USED TO RETURN
+         MVC   MSGWRK02(L'WAITBEG),WAITBEG  MOVE WAIT LITERALS TO MSG
+         MVC   MSGWRK04(L'WAITINT),WAITINT
+         UNPK  MSGWRK06,WAITSECS SHOW WAIT INTERVAL
+         OI    MSGWRK08,X'F0'    MAKE DIGIT READABLE
+         BAL   LINKREG,UT010000  WRITE A TIME STAMPED RECORD
+         EXEC  CICS DELAY INTERVAL(WAITSECS)
+         MVC   MSGWRK02(L'WAITEND),WAITEND  MOVE WAIT LITERALS TO MSG
+         MVC   MSGWRK04(L'WAITINT),WAITINT
+         UNPK  MSGWRK06,WAITSECS SHOW WAIT INTERVAL
+         OI    MSGWRK08,X'F0'    MAKE DIGIT READABLE
+         BAL   LINKREG,UT010000  WRITE A TIME STAMPED RECORD
+         L     LINKREG,UT0200SV  RESTORE ADDRESS USED TO RETURN
+          BR    LINKREG
+PROGDASH DS    0CL9
+PROGNAME DC    CL08'OLCMXTWT'
+DASH     DC    CL1'-'
+PACKONE  DC    PL1'1'
+FHEXONE  DC    F'1'
+FHEXTEN  DC    F'10'
+WAITBEG  DC    C'BEGIN'
+WAITINT  DC    CL14'INTERVAL WAIT='
+WAITEND  DC    C'END'
+CMXTMSG  DC    C'TCLASS#   MAX=    NOW ATTACHED='
+INFO     DC    C' TC=     CSAKCCT=     TASK#='
+         LTORG
+         END
+
+Chuck Utermohlen
+Systems Programmer/Analyst
+First Wisconsin National Bank (USA)     ) Xephon 1988
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

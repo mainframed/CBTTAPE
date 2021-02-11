@@ -1,0 +1,1874 @@
+         TITLE '*** BUILD ASSEMBLER SOURCE FROM A LOAD MODULE ***'
+RESOURCE CSECT
+RESOURCE AMODE 31
+RESOURCE RMODE 24
+*********************************************************************
+* BUILDS AN ASSEMBLER LANGUAGE SOURCE PROGRAM FROM A LOAD MODULE IN *
+* A PDS OR A PDSE. LOAD MODULE DATA IS OBTAINED USING THE READLMOD  *
+* SUBROUTINE, WHICH USES THE IEWBUFF AND IEWBIND MACROS. INITIAL    *
+* PROCESSING IS PERFORMED HERE INCLUDING OPENING FILES, GETTING     *
+* STORAGE FOR TABLES AND WORK AREAS, PROCESSING THE PARM FIELD ON   *
+* THE EXEC STATEMENT, PROCESSING CONTROL STATEMENTS, AND LOADING THE*
+* TEXT FOR THE CSECT TO BE DISASSEMBLED INTO MEMORY. WHEN INITIAL   *
+* PROCESSING IS COMPLETE, THE REBUILD PROGRAM IS CALLED WITH THE    *
+* STAGE SET TO 1 FOR LABEL HANDLING, AND THEN A SECOND TIME WITH    *
+* STAGE SET TO 2 FOR FINAL DISASSEMBLY.                             *
+*                                                                   *
+* JCL DD STATEMENTS ARE REQUIRED AS FOLLOWS:                        *
+*   SYSIN:    INPUT  RECFM=FB  LRECL=80   CONTROL STATEMENTS.       *
+*   SYSPRINT: OUTPUT RECFM=FBA LRECL=133  PRINT LISTING.            *
+*   SYSLIB:   INPUT  PDS OR PDSE RECFM=U  LOAD MODULE TO DISASSEMBLE*
+*   SYSOUT:   OUTPUT RECFM=FB  LRECL=80   ASSEMBLER SOURCE PROGRAM  *
+*                                                                   *
+* CONTROL STATEMENTS ARE ENTERED FOR THE FOLLOWING PURPOSES:        *
+*   1) COMMENTS: AN ASTERISK IN COLUMN 1 IDENTIFIES COMMENTS        *
+*   2) MEMBER AND CSECT NAME RECORD: THIS CONTROL STATEMENT MUST BE *
+*      THE FIRST NON-COMMENT RECORD IN THE CONTROL FILE. IT MUST    *
+*      CONTAIN MEMBER NAME IN COL 1-8 AND CSECT NAME IN COL 10-17.  *
+*   3) DATA ONLY RECORD (OPTIONAL): IDENTIFIES AREAS WITHIN THE TEXT*
+*      THAT CONTAIN NO INSTRUCTIONS, ONLY DATA. MULTIPLE DATA-ONLY  *
+*      RECORDS CAN BE ENTERED, IN ANY ORDER. FORMAT IS:             *
+*         COL 1-5 = 'DATA '                                         *
+*         COL 6-11 = OFFSET TO START OF DATA-ONLY AREA              *
+*         COL 12   = BLANK                                          *
+*         COL 13-18 = OFFSET TO END OF DATA-ONLY AREA               *
+*   4) USING RECORD (OPTIONAL): PROVIDES INFORMATION NEEDED TO      *
+*      TO CREATE USING AND DROP STATEMENTS. FORMAT IS:              *
+*         COL  1-6  = 'USING '                                      *
+*         COL  7-12 = HEX OFFSET TO WHERE THE USING STATEMENT WILL  *
+*                     BE PLACED (IT WILL OCCUR BEFORE THIS OFFSET). *
+*         COL  13   = BLANK                                         *
+*         COL 14-19 = HEX OFFSET TO WHERE THE DROP STATEMENT WILL   *
+*                     BE PLACED (IT WILL OCCUR BEFORE THIS OFFSET). *
+*                     IF BLANK, NO DROP WILL BE CREATED.            *
+*         COL  20   = BLANK                                         *
+*         COL  21   = REGISTER USED WITH THIS USING, 0-9 OR A-F     *
+*         COL  22   = BLANK                                         *
+*         COL 23-28 = INITIAL OFFSET VALUE IN THE USING REGISTER.   *
+*                                                                   *
+*   5) USER LABEL RECORD (OPTIONAL): DEFINE USER LABELS TO BE PLACED*
+*      ON STATEMENTS WITHIN THE PROGRAM. IF PROGRAM BASE REGISTERS  *
+*      ARE SET UP WITH USING CARDS, THESE WILL ALSO BE GENERATED AS *
+*      SYMBOLIC OPERANDS ON INSTRUCTIONS. FORMAT IS:                *
+*         COL  1-5   = LITERAL 'ULABL'                              *
+*         COL   6    = BLANK                                        *
+*         COL  7-14  = LABEL NAME                                   *
+*         COL  15    : BLANK                                        *
+*         COL 16-21  : OFFSET TO LEFT END OF FIELD, IN HEX.         *
+*         COL  22    : BLANK                                        *
+*         COL 23-25  : LENGTH OF FIELD IN DECIMAL. 256 IS MAX.      *
+*                                                                   *
+* NOTE: THE BAS R9,TESTPRNT AT THE EOJ LABEL IS FOR TESTING ONLY    *
+*       AND CAN BE COMMENTED OUT FOR NORMAL USE. IT PROVIDES A      *
+*       PRINTOUT OF THE LABEL TABLE THAT CAN BE HELPFUL WHEN TESTING*
+*       CHANGES.                                                    *
+*                                                                   *
+* AUTHOR R THORNTON FEB 2002                                        *
+*********************************************************************
+*
+*********************************************************************
+*        SAVE REGISTERS, SET UP BASE REGS, CHAIN SAVE AREAS         *
+*********************************************************************
+         USING RESOURCE,R3,R4,R5,R6
+         STM   R14,R12,12(R13)         SAVE CALLER'S REGS
+         LR    R3,R15                  SET UP BASE FIRST BASE REG
+         LA    R4,4095(R3)             SET UP SECOND
+         LA    R4,1(R4)                    BASE REGISTER
+         LA    R5,4095(R4)             SET UP THIRD
+         LA    R5,1(R5)                    BASE REGISTER
+         LA    R6,4095(R5)             SET UP THIRD
+         LA    R6,1(R6)                    BASE REGISTER
+         LA    R15,MYSAVE              POINT TO MY REGISTER SAVE AREA
+         ST    R15,8(R13)              SET LSA IN CALLER'S SAVE
+         ST    R13,4(R15)              SET HSA IN MY SAVE AREA
+         LR    R13,R15                 SET UP SAVE AREA POINTER
+         B     PARMS                   BRANCH AROUND CONSTANTS
+         DC    CL8'RESOURCE'           PROGRAM NAME IDENTIFIER
+         DC    CL8'&SYSDATE'           ASSEMBLY DATE
+         DC    CL8'&SYSTIME'           ASSEMBLY TIME
+MYSAVE   DS    18F                     MY REGISTER SAVE AREA
+*********************************************************************
+* PROCESS THE PARM STATEMENT: DEFAULT IS TO IGNORE ALL FLOATING     *
+* POINT AND PRIVILEGED INSTRUCTIONS. IF PARM CONTAINS 'FLTPT' THEN  *
+* FLOATING POINT INSTRUCTIONS WILL BE INCLUDED AND/OR IF PARM       *
+* CONTAINS 'SUPVR' THEN PRIVILEGED INSTRUCTIONS WILL BE INCLUDED.   *
+*********************************************************************
+PARMS    L     R2,0(R1)                GET PARM FIELD ADDR
+         CLC   0(2,R2),H0              ANY PARM DATA?
+         BE    TBLMODS                 NO, CONTINUE
+         CLC   0(2,R2),H5              VALID PARM LENGTH?
+         BL    BADPARM                 NO
+         BH    PMCK11                  MAYBE, TEST MORE ...
+         CLC   2(5,R2),FLTPT           FLOATING POINT SPECIFIED?
+         BNE   PM5CK2                  NO
+         NI    UNWANTED,X'BF'          YES, TURN OFF '40' BIT
+         B     TBLMODS                 CONTINUE
+PM5CK2   CLC   2(5,R2),SUPVR           SUPVR SPECIFIED?
+         BNE   BADPARM                 NO, ERROR
+         NI    UNWANTED,X'DF'          YES, TURN OFF '20' BIT
+         B     TBLMODS                 CONTINUE
+PMCK11   CLC   0(2,R2),H11             VALID PARM LENGTH?
+         BNE   BADPARM                 NO, ERROR
+         CLC   2(5,R2),FLTPT           FLOATING POINT SPECIFIED?
+         BNE   PM11CK2                 NO
+         NI    UNWANTED,X'BF'          YES, TURN OFF '40' BIT
+         B     PM11CK3                 CONTINUE
+PM11CK2  CLC   2(5,R2),=CL5'SUPVR'     SUPVR SPECIFIED?
+         BNE   BADPARM                 NO, ERROR
+         NI    UNWANTED,X'DF'          YES, TURN OFF '20' BIT
+PM11CK3  CLC   2(5,R2),8(R2)           BOTH PARMS SAME?
+         BE    BADPARM                 YES, ERROR
+         CLI   7(R2),C','              COMMA SEPARATES?
+         BNE   BADPARM                 NO, ERROR
+         CLC   8(5,R2),FLTPT           FLOATING POINT SPECIFIED?
+         BNE   PM11CK4                 NO
+         NI    UNWANTED,X'BF'          YES, TURN OFF '40' BIT
+         B     TBLMODS                 CONTINUE
+PM11CK4  CLC   8(5,R2),SUPVR           SUPVR SPECIFIED?
+         BNE   BADPARM                 NO, ERROR
+         NI    UNWANTED,X'DF'          YES, TURN OFF '20' BIT
+         B     TBLMODS                 CONTINUE
+BADPARM  WTO   'RESOURCE: INVALID PARM ON EXEC STATEMENT',ROUTCDE=11
+         ABEND 111,DUMP
+*********************************************************************
+* THIS ROUTINE MODIFIES THE OP-CODE TABLES TO ELIMINATE ENTRIES FOR *
+* UNWANTED FLOATING POINT AND/OR PRIVILEGED INSTRUCTIONS.           *
+*********************************************************************
+TBLMODS  CLI   UNWANTED,0              FLOATING POINT/SUPVR WANTED?
+         BE    GETSTOR                 YES, BOTH. NO MOD NEEDED
+TSSTART  LA    R11,TABLTABL-4          POINT TO FIRST TABLE ADDRESS -4
+         LA    R12,OPCODTBL            POINT TO FIRST TABLE
+TSNEXT   SR    R10,R10                 CLEAR FOR INSERT
+         IC    R10,UNWANTED            PICK UP UNWANTED MASK
+TSCHKEND CLC   0(4,R12),HEXFFS         END OF TABLE?
+         BE    TSSTEP                  YES, GO TO NEXT
+         USING OPCODES,R12
+         EX    R10,TSCHKWNT            THIS INSTRUCTION WANTED?
+         BZ    TSENTSTP                YES
+         MVC   OPCENTRY,XZROS          CLEAR THE ENTRY
+TSENTSTP LA    R12,L'OPCENTRY(R12)     STEP TO NEXT TABLE ENTRY
+         B     TSCHKEND                CONTINUE
+TSSTEP   LA    R11,4(R11)              STEP TO NEXT TABLE ADDRESS
+         CLC   0(4,R11),HEXFFS         END OF ADDRESS TABLE?
+         BE    TBLCMPRS                YES, GO COMPRESS TABLES
+         L     R12,0(R11)              POINT TO NEXT TABLE
+         B     TSCHKEND                GO MODIFY NEXT TABLE
+TSCHKWNT TM    OPCFLAGS,0              EXECUTED INSTRUCTION
+         DROP  R12
+*********************************************************************
+* COMPRESS THE OP-CODE TABLES AFTER CLEARING ENTRIES FOR UNWANTED   *
+* INSTRUCTIONS. THE GENERAL INSTRUCTION TABLE, OPCODTBL, IS NOT     *
+* COMPRESSED, AS IT CONTAINS 256 ENTRIES, AND IS ACCESSED DIRECTLY  *
+* USING THE FIRST BYTE OF OP-CODE AS AN INDEX.                      *
+*********************************************************************
+TBLCMPRS LA    R10,TABLTABL            POINT TO FIRST TABLE ADDRESS
+TCNEX10  CLC   0(4,R10),HEXFFS         END OF ADDRESS TABLE?
+         BE    GETSTOR                 YES, ALL THRU HERE
+         L     R11,0(R10)              POINT TO OP-CODE TABLE
+         USING OPCODES,R11
+TCNEX11  CLC   0(4,R11),HEXFFS         END OF OP-CODE TABLE?
+         BE    TCSTEP10                YES, STEP TO NEXT TABLE
+         CLI   OPCMNEM,0               THIS A WANTED INSTRUCTION?
+         BNE   TCSTEP11                YES
+         LA    R12,L'OPCENTRY(R11)     NO, STEP TO NEXT ENTRY
+TCNEX12  CLC   0(4,R12),HEXFFS         END OF OP-CODE TABLE?
+         BNE   TCCHKWNT                NO, CHECK FOR WANTED INSTRUCTION
+         MVC   OPCENTRY(4),HEXFFS      YES, SET TABLE END
+         B     TCSTEP10                GO TO NEXT TABLE
+TCCHKWNT CLI   OPCMNEM-OPCENTRY(R12),0 THIS A WANTED INSTRUCTION?
+         BE    TCSTEP12                NO, KEEP GOING
+         MVC   0(L'OPCENTRY,R11),0(R12) MOVE WANTED ENTRY BACK
+         XC    1(L'OPCENTRY-1,R12),1(R12) CLEAR THE ENTRY MOVED
+         B     TCSTEP11                CONTINUE IN TABLE
+TCSTEP12 LA    R12,L'OPCENTRY(R12)     YES, STEP TO NEXT ENTRY
+         B     TCNEX12                 CONTINUE COMPRESSION
+TCSTEP11 LA    R11,L'OPCENTRY(R11)     STEP TO NEXT TABLE ENTRY
+         B     TCNEX11                 CONTINUE
+TCSTEP10 LA    R10,4(R10)              STEP TO NEXT TABLE ADDRESS
+         B     TCNEX10                 GO COMPRESS NEXT TABLE
+         DROP  R11
+*********************************************************************
+* GET STORAGE FOR TABLES AND OPEN FILES FOR PROCESSING              *
+*********************************************************************
+GETSTOR  STORAGE OBTAIN,LENGTH=LBLTBEND,LOC=ANY GET LABEL STORAGE
+         ST    R1,LBLTBADR             SAVE THE GOTTEN ADDRESS
+         A     R1,LBLTBEND             SAVE THE
+         ST    R1,LBLTBEND                  TABLE END ADDRESS
+         OPEN  (SYSPRINT,OUTPUT,SYSOUT,OUTPUT,SYSIN) OPEN FILES
+*********************************************************************
+* READ CONTROL CARD FILE AND PROCESS THE STATEMENTS                 *
+*********************************************************************
+IIREAD   BAS   R9,READCNTL             READ NEXT CONTROL RECORD
+         CLI   MORECNTL,C'Y'           GOT A CONTROL RECORD?
+         BE    IIGOT1                  YES
+         CLI   GOTMCREC,C'Y'           NO, GOT A MEMBER/CSECT CARD?
+         BE    EXEC                    YES, EXIT
+         MVC   PRT(36),=CL36'*** NO CONTROL RECORDS IN SYSIN FILE'
+         BAS   R9,PRINT                PRINT ERROR MESSAGE
+         WTO   '*** NO CONTROL RECORDS IN SYSIN FILE',ROUTCDE=11
+         MVC   RETCODE+2(2),H8         SET RETURN CODE = 8
+         ABEND 111,DUMP                TERMINATE IN ERROR
+IIGOT1   CLI   GOTMCREC,C'Y'           ALREADY HAD MEMBER/CSECT?
+         BE    IIGOT2                  YES
+         BAS   R9,MEMBCSEC             NO, GO PROCESS MEMBER/CSECT
+         B     IIREAD                  GO READ NEXT CONTROL RECORD
+IIGOT2   CLC   CNTLCARD(5),=CL5'DATA ' THIS A DATA-ONLY RECORD?
+         BNE   IIGOT3                  NO
+         BAS   R9,DATAONLY             YES, GO PROCESS IT
+         B     IIREAD                  CONTINUE
+IIGOT3   CLC   CNTLCARD(6),=CL6'ULABL ' THIS A USER LABEL CARD?
+         BNE   IIGOT4                  NO
+         BAS   R9,ULABEL               YES, GO PROCESS ULABL
+         B     IIREAD                  CONTINUE
+IIGOT4   CLC   CNTLCARD(6),=CL6'USING ' THIS A USING RECORD?
+         BNE   IIBADCRD                NO
+         BAS   R9,USINGCRD             YES, GO PROCESS USING
+         B     IIREAD                  CONTINUE
+IIBADCRD MVC   PRT(39),=CL39'INVALID CONTROL RECORD ABOVE IS DROPPED'
+         BAS   R9,PRINT                PRINT MESSAGE
+         MVC   RETCODE+2(2),H8         SET RETURN CODE = 8
+         WTO   'DROPPED AN INVALID CONTROL RECORD',ROUTCDE=11
+         B     IIREAD                  CONTINUE
+*********************************************************************
+* INITIALIZATION FINISHED. LOAD THE DISASSEMBLY ROUTINE. CALL ONCE  *
+* FOR LABEL TABLE BUILD, THEN A SECOND TIME FOR THE FINAL OUTPUT    *
+*********************************************************************
+EXEC     LOAD  EP=REBUILD              GET THE DISASSEMBLY MODULE
+         ST    R0,REBLDEP              SAVE ENTRY POINT ADDRESS
+         LA    R1,REBLDPRM             POINT TO PARAMETERS
+         L     R15,REBLDEP             POINT TO DISASSEMBLY MODULE
+         BASR  R14,R15                 PERFORM LABEL TABLE BUILD
+         MVI   STAGE,2                 SET STAGE 2 INDICATOR
+         LA    R1,REBLDPRM             POINT TO PARAMETERS
+         L     R15,REBLDEP             POINT TO DISASSEMBLY MODULE
+         BASR  R14,R15                 PERFORM DISASSEMBLY
+*********************************************************************
+*        TERMINATE PROCESSING                                       *
+*********************************************************************
+EOJ      EQU   *
+         BAS   R9,TESTPRNT             ????TESTING DISPLAYS?????
+         CLOSE (SYSPRINT,,SYSIN,,SYSOUT) CLOSE FILES
+         L     R13,4(R13)              POINT TO CALLER'S SAVE AREA
+         L     R14,12(R13)             RESTORE RETURN REG: R14
+         L     R15,RETCODE             SET RETURN CODE
+         LM    R0,R12,20(R13)          RESTORE CALLER'S REGS 0-12
+         BR    R14                     RETURN
+*********************************************************************
+*        READ NEXT CONTROL RECORD                                   *
+*********************************************************************
+READCNTL ST    R9,RC9                  SAVE RETURN ADDRESS
+RCGET    GET   SYSIN,CNTLCARD          READ CONTROL CARD
+         MVC   PRT(21),=CL21'CONTROL RECORD READ: '
+         MVC   PRT+21(59),CNTLCARD     MOVE CONTROL RECORD
+         BAS   R9,PRINT                PRINT IT
+         CLI   CNTLCARD,C'*'           COMMENT?
+         BE    RCGET                   YES
+RCXIT    L     R9,RC9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+RCEOF    MVI   MORECNTL,C'N'           SET EOF INDICATOR
+         B     RCXIT                   AND EXIT
+RC9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+*        PROCESS MEMBER/CSECT CONTROL RECORD                        *
+*********************************************************************
+MEMBCSEC ST    R9,MC9                  SAVE RETURN ADDRESS
+         XC    CURRINFO(CURREND-CURRINFO),CURRINFO CLEAR CURRENT INFO
+         XC    TEXTENDA,TEXTENDA       SAVE TEXT LENGTH
+         MVC   PRMEMBER,CCMEMBER       MOVE REQUESTED MEMBER NAME
+         MVC   CURRMEMB,CCMEMBER       SAVE REQUESTED MEMBER NAME
+         MVC   PRMCSECT,CCCSECT        MOVE REQUESTED CSECT NAME
+         MVC   CURRCSCT,CCCSECT        SAVE REQUESTED CSECT NAME
+         MVC   PRT(29),=CL29'CONTROL CARD READ HAS MEMBER='
+         MVC   PRT+29(8),CCMEMBER      MOVE MEMBER NAME
+         MVC   PRT+39(6),=CL6'CSECT='
+         MVC   PRT+46(8),CCCSECT       MOVE CSECT NAME
+         BAS   R9,PRINT                PRINT CONTROL CARD INFO
+         L     R1,LBLTBADR             POINT TO 1ST LABEL TABLE ENTRY
+         ST    R1,CURRLABL             SET CURRENT LABEL ADDRESS
+         MVI   0(R1),X'FF'             SET TABLE END ADDRESS
+         BAS   R9,GETESD               PROCESS ESD'S FOR THE CSECT
+         BAS   R9,GETRLD               PROCESS RLD'S FOR THE CSECT
+         BAS   R9,GETTEXT              GET TEXT FOR THE CSECT
+         MVI   GOTMCREC,C'Y'           INDICATE MEMBER/CSECT REC DONE
+MCXIT    L     R9,MC9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+MC9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+* PROCESS DATA-ONLY CONTROL RECORDS: VALIDATE THE START AND END     *
+* OFFSETS, THEN BUILD LABEL TABLE ENTRIES FOR THE START OF THE      *
+* AREA AND FOR THE END OF THE AREA.                                 *
+*********************************************************************
+DATAONLY ST    R9,DO9                  SAVE RETURN ADDRESS
+         TRT   CNTLCARD+5(6),CHECKHEX  IS START OFFSET VALID HEX?
+         BNZ   DOBADCRD                NO, ERROR
+         TRT   CNTLCARD+12(6),CHECKHEX IS END OFFSET VALID HEX?
+         BNZ   DOBADCRD                NO, ERROR
+         L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         USING LBLDSECT,R1
+         TR    CNTLCARD+5(6),TRHEX     MAKE C1=FA, C2=FB, ... ETC
+         PACK  LBLOFSET(5),CNTLCARD+5(7) PACK TO MAKE HEX
+         MVI   LBLOFSET+4,C' '         CLEAR TRASH
+         MVC   HOLDSTRT,LBLOFSET       SAVE START OFFSET
+         MVI   LBLTYPE,X'18'           TYPE IS DATA-ONLY START
+         XC    LBLUREG(11),LBLUREG     REST IS N/A
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+         L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         TR    CNTLCARD+12(6),TRHEX    MAKE C1=FA, C2=FB, ... ETC
+         PACK  LBLOFSET(5),CNTLCARD+12(7) PACK TO MAKE HEX
+         MVI   LBLOFSET+4,C' '         CLEAR TRASH
+         CLC   HOLDSTRT,LBLOFSET       IS START LESS THAN END?
+         BNL   DOBADCRD                NO, ERROR
+         MVI   LBLTYPE,X'1C'           TYPE IS DATA-ONLY END
+         XC    LBLUREG(11),LBLUREG     REST IS N/A
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+         B     DOXIT                   AND EXIT
+         DROP  R1
+DOBADCRD MVC   PRT(41),=CL41'INVALID DATA-ONLY RECORD ABOVE IS DROPPED'
+         BAS   R9,PRINT                PRINT MESSAGE
+         MVC   RETCODE+2(2),H8         SET RETURN CODE = 8
+         WTO   'DROPPED AN INVALID DATA-ONLY CONTROL RECORD',ROUTCDE=11
+DOXIT    L     R9,DO9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+DO9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+* PROCESS USING CONTROL RECORDS: FIRST VALIDATE THE HEX OFFSET AND  *
+* FIELDS. FORMAT A LABEL ENTRY FOR THE USING AND ADD IT TO THE LABEL*
+* TABLE. IF A DROP LOCATION IS PROVIDED, BUILD A DROP ENTRY AND ADD *
+* IT TO THE LABEL TABLE.                                            *
+*********************************************************************
+USINGCRD ST    R9,UC9                  SAVE RETURN ADDRESS
+         TRT   CNTLCARD+6(6),CHECKHEX  IS USING OFFSET VALID HEX?
+         BNZ   UCBADCRD                NO, ERROR
+         TRT   CNTLCARD+20(1),CHECKHEX IS REGISTER VALID HEX?
+         BNZ   UCBADCRD                NO, ERROR
+         TRT   CNTLCARD+22(6),CHECKHEX  IS USING INITIAL VALUE HEX?
+         BNZ   UCBADCRD                NO, ERROR
+         CLC   CNTLCARD+13(6),BLANKS   ANY DROP OFFSET ENTERED?
+         BE    UCFORMAT                NO
+         TRT   CNTLCARD+13(6),CHECKHEX  IS USING INITIAL VALUE HEX?
+         BNZ   UCBADCRD                NO, ERROR
+UCFORMAT L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         USING LBLDSECT,R1
+         TR    CNTLCARD+6(6),TRHEX     MAKE C1=FA, C2=FB, ... ETC
+         PACK  LBLOFSET(5),CNTLCARD+6(7) PACK TO MAKE HEX
+         MVI   LBLOFSET+4,C' '         CLEAR TRASH
+         MVC   HOLDSTRT,LBLOFSET       SAVE START OFFSET
+         MVI   LBLTYPE,X'10'           TYPE IS USING
+         TR    CNTLCARD+20(1),TRHEX    MAKE C1=FA, C2=FB,... ETC
+         MVC   LBLUREG,CNTLCARD+20     MOVE REGISTER
+         NI    LBLUREG,X'0F'           CLEAR ZONE NYBBLE
+         MVC   HOLDREG,LBLUREG         SAVE REGISTER VALUE
+         XC    LBLRLDLN(10),LBLRLDLN   ZERO OUT REMAINDER
+         TR    CNTLCARD+22(6),TRHEX    MAKE C1=FA, C2=FB, ... ETC
+         MVI   HOLDINIU,0              CLEAR HIGH ORDER BYTE
+         PACK  HOLDINIU+1(4),CNTLCARD+22(7) PACK TO MAKE HEX
+         MVC   LBLINITU,HOLDINIU       MOVE INITIAL USING REG VALUE
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+         L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         CLC   HOLDINIU,XZROS          USING AT LOCATION ZERO?
+         BE    UCCKDROP                YES, NO LABEL ENTRY NEEDED
+         MVC   LBLOFSET,HOLDINIU       COPY INITIAL VALUE TO LOCATION
+         MVI   LBLOFSET,0              CLEAR 1ST BYTE OF OFFSET
+         MVI   LBLTYPE,X'30'           INDICATE SIMPLE LABEL ENTRY
+         MVI   LBLUREG,0               CLEAR USING REGISTER NBR
+         MVC   LBLRLDLN,XZROS          CLEAR RLD LENGTH
+         XC    LBLLABEL,LBLLABEL       CLEAR LABEL NAME
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+UCCKDROP CLC   CNTLCARD+13(6),BLANKS   ANY DROP OFFSET ENTERED?
+         BE    UCXIT                   NO
+         L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         TR    CNTLCARD+13(6),TRHEX    MAKE C1=FA, C2=FB, ... ETC
+         PACK  LBLOFSET(5),CNTLCARD+13(7) PACK TO MAKE HEX
+         MVI   LBLOFSET+4,C' '         CLEAR TRASH
+         CLC   HOLDSTRT,LBLOFSET       IS DROP AFTER USING?
+         BNL   UCBADCRD                NO, ERROR
+         MVI   LBLTYPE,X'0C'           TYPE IS DROP
+         MVC   LBLUREG,HOLDREG         MOVE IN REGISTER NBR
+         XC    LBLRLDLN(10),LBLRLDLN   ZERO OUT REST
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+         B     UCXIT                   AND EXIT
+         DROP  R1
+UCBADCRD MVC   PRT(37),=CL37'INVALID USING RECORD ABOVE IS DROPPED'
+         BAS   R9,PRINT                PRINT MESSAGE
+         MVC   RETCODE+2(2),H8         SET RETURN CODE = 8
+         WTO   'DROPPED AN INVALID USING CONTROL RECORD',ROUTCDE=11
+UCXIT    L     R9,UC9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+UC9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+* PROCESS USER LABEL RECORDS: FIRST VALIDATE THE HEX OFFSET, DECIMAL*
+* LENGTH, AND CHARACTER LABEL FIELDS. FORMAT A LABEL ENTRY FOR THE  *
+* LABEL AND ADD IT TO THE LABEL TABLE.                              *
+*********************************************************************
+ULABEL   ST    R9,UL9                  SAVE RETURN ADDRESS
+         TRT   CNTLCARD+15(6),CHECKHEX IS LABEL OFFSET VALID HEX?
+         BNZ   ULBADCRD                NO, ERROR
+         TRT   CNTLCARD+22(3),CHECKZON IS LENGTH VALID DECIMAL?
+         BNZ   ULBADCRD                NO, ERROR
+         CLI   CNTLCARD+6,C' '         ANY LABEL ENTERED?
+         BE    ULBADCRD                NO
+         CLI   CNTLCARD+6,C'Z'         FIRST CHARACTER VALID?
+         BH    ULBADCRD                NO
+         TRT   CNTLCARD+6(8),CHECKLBL  IS USER LABEL VALID CHARS?
+         BNZ   ULBADCRD                NO, ERROR
+ULFORMAT L     R1,CURRLABL             POINT TO CURRENT LABEL AREA
+         USING LBLDSECT,R1
+         TR    CNTLCARD+15(6),TRHEX     MAKE C1=FA, C2=FB, ... ETC
+         PACK  LBLOFSET(5),CNTLCARD+15(7) PACK TO MAKE HEX
+         MVI   LBLOFSET+4,C' '         CLEAR TRASH
+         MVI   LBLTYPE,X'30'           TYPE IS USING
+         MVI   LBLUREG,0               REGISTER NOT USED
+         PACK  DBLWD,CNTLCARD+22(3)    PACK LENGTH VALUE
+         CVB   R15,DBLWD               CONVERT TO PACKED
+         STCM  R15,3,LBLRLDLN          SAVE LENGTH
+         MVC   LBLLABEL,CNTLCARD+6     MOVE IN LABEL NAME
+         BAS   R9,ADDLABEL             GO PUT IT IN THE TABLE
+         B     ULXIT                   AND THEN EXIT
+         DROP  R1
+ULBADCRD MVC   PRT(37),=CL37'INVALID ULABL RECORD ABOVE IS DROPPED'
+         BAS   R9,PRINT                PRINT MESSAGE
+         MVC   RETCODE+2(2),H8         SET RETURN CODE = 8
+         WTO   'DROPPED AN INVALID ULABL CONTROL RECORD',ROUTCDE=11
+ULXIT    L     R9,UL9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+UL9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+* PROCESS THE ESD RECORDS FOR THIS CSECT: LOOP THROUGH ALL THE ESD  *
+* ENTRIES RETURNED BY THE READLMOD SUBROUTINE. THE FIRST THREE ARE  *
+* NORMALLY FOR THE CSECT ITSELF (AN SD, AN ED, AND AN LD). THESE    *
+* WILL BE FOLLOWED BY OTHER ESD ELEMENTS OF WHICH ONLY THE LD TYPES *
+* ARE USED. THE FIRST SD ELEMENT CONTAINS THE AMODE AND RMODE VALUES*
+* THE ED CONTAINS THE CSECT LENGTH, AND THE LD FOR THE CSECT        *
+* PROVIDES LABEL INFORMATION FOR THE CSECT ITSELF. ANY REMAINING    *
+* LD ENTRIES REPRESENT LABELS IDENTIFIED WITH ENTRY STATEMENTS.     *
+*********************************************************************
+GETESD   ST    R9,GE9                  SAVE RETURN ADDRESS
+         XC    PRMCURSR,PRMCURSR       CLEAR CURSOR FOR FIRST CALL
+GEGETIT  MVC   PRMREQST,=CL8'ESD'      SHOW REQUEST IS FOR ESD DATA
+         BAS   R9,READLMOD             GO READ THE ESD DATA
+         CLC   PRMCOUNT,ZERO           ANY DATA RETURNED?
+         BE    GEXIT                   NO
+         L     R10,PRMCOUNT            GET NUMBER ELEMENTS FOUND
+         L     R11,PRMBUFAD            POINT TO BUFFER HEADER
+         USING ESDHEADR,R11
+         LA    R12,ESDHEND             POINT TO FIRST ELEMENT
+         USING ESDENTRY,R12
+GENEXT   STM   R10,R12,WORKSAVE        SAVE WORK REGISTERS
+         MVC   ESDSYMB,BLANKS          CLEAR SYMBOL NAME
+         LH    R1,ESDNAMEC             GET LENGTH OF SYMBOL
+         LTR   R1,R1                   ANY LENGTH?
+         BZ    GEMVOWBK                NO
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         CH    R1,H8                   EXCESSIVE LENGTH?
+         BL    GEMVNAM2                NO
+         LA    R1,7                    YES, SET MAX LENGTH
+GEMVNAM2 L     R2,ESDNAMEP             POINT TO THE SYMBOL
+         EX    R1,GEMVSYMX             MOVE SYMBOL NAME
+GEMVOWBK MVC   ESDOWNER,BLANKS         PRE-CLEAR OWNER NAME
+         LH    R1,ESDRESCL             GET OWNER NAME LENGTH
+         LTR   R1,R1                   ANY LENGTH?
+         BZ    GECKTYPE                NO
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         CH    R1,H8                   EXCESSIVE LENGTH?
+         BL    GEMVOWN2                NO
+         LA    R1,7                    YES, SET MAX LENGTH
+GEMVOWN2 L     R2,ESDRESCP             POINT TO OWNING NAME
+         EX    R1,GEMVOWNX             MOVE IN OWNING NAME
+GECKTYPE CLC   ESDTYPE,=CL2'SD'        IS THIS AN SD (CSECT)?
+         BNE   GECKTYP2                NO
+         CLC   CURRCSCT,ESDSYMB        SYMBOL SAME AS REQUESTED CSECT?
+         BNE   GECKTYP2                NO
+         CLC   CURRCSCT,ESDOWNER       OWNER SAME AS REQUESTED CSECT?
+         BNE   GECKTYP2                NO
+         TM    ESDSYMAT,X'80'          STRONG REFERENCE/DEFINITION?
+         BO    GECKTYP2                YES
+         MVC   CURRAMOD,ESDAMODE       NO, SAVE AMODE
+         MVC   CURRRMOD,ESDRMODE          AND RMODE
+         B     GESTEP                  CONTINUE WITH NEXT ESD ENTRY
+GECKTYP2 CLC   ESDTYPE,=CL2'ED'        THIS AN ED?
+         BNE   GECKTYP3                NO
+         CLC   ESDSYMB,=CL8'B_TEXT'    SYMBOL NAME IS B_TEXT?
+         BNE   GECKTYP3                NO
+         CLC   CURRCSCT,ESDOWNER       OWNER SAME AS REQUESTED CSECT?
+         BNE   GECKTYP3                NO
+         TM    ESDSYMAT,X'80'          STRONG REFERENCE/DEFINITION?
+         BO    GECKTYP2                YES
+         MVC   TEXTENDA,ESDLENG        NO, SAVE TEXT LENGTH
+         MVC   TEXTLENG,ESDLENG           TWICE
+         B     GESTEP                  CONTINUE WITH NEXT ESD ENTRY
+GECKTYP3 CLC   ESDTYPE,=CL2'LD'        THIS AN LD?
+         BNE   GESTEP                  NO
+         CLC   CURRCSCT,ESDOWNER       OWNER SAME AS REQUESTED CSECT?
+         BNE   GESTEP                  NO
+         TM    ESDSYMAT,X'80'          STRONG REFERENCE/DEFINITION?
+         BZ    GESTEP                  NO
+         L     R1,CURRLABL             POINT TO CURRENT LABEL ENTRY
+         USING LBLDSECT,R1
+         MVC   LBLOFSET,ESDELOFF       OFFSET TO LABEL
+         MVI   LBLTYPE,X'30'           TYPE = LABEL
+         MVI   LBLUREG,0               NO USING REGISTER
+         XC    LBLRLDLN,LBLRLDLN       CLEAR LENGTH FOR RLD CONSTANT
+         MVC   LBLLABEL,ESDSYMB        MOVE SYMBOL NAME TO ENTRY
+         DROP  R1
+         BAS   R9,ADDLABEL             GO ADD LABEL ENTRY TO TABLE
+GESTEP   LM    R10,R12,WORKSAVE        GET WORK REGISTERS
+         A     R12,ESDHENTL            POINT TO NEXT ELEMENT
+         BCT   R10,GENEXT              LOOP THRU ESD ENTRIES
+         CLC   PRMRETCD,ZERO           ANY MORE ESD ENTRIES?
+         BE    GEGETIT                 YES, GO READ NEXT ESD BUFFER
+GEXIT    L     R9,GE9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+GE9      DC    A(0)                    RETURN ADDRESS
+GEMVSYMX MVC   ESDSYMB(1),0(R2)        EXECUTED MOVE
+GEMVOWNX MVC   ESDOWNER(1),0(R2)       EXECUTED MOVE
+         DROP  R11
+         DROP  R12
+*********************************************************************
+*        PROCESS THE RLD RECORDS FOR THIS CSECT                     *
+*********************************************************************
+GETRLD   ST    R9,GR9                  SAVE RETURN ADDRESS
+         MVC   PRMREQST,=CL8'RLD'      SHOW REQUEST IS FOR RLD DATA
+GRGET2   BAS   R9,READLMOD             GO READ THE RLD DATA
+         L     R10,PRMCOUNT            GET NUMBER ELEMENTS FOUND
+         LTR   R10,R10                 ANY RLD ELEMENTS READ?
+         BZ    GRXIT                   NO
+         L     R11,PRMBUFAD            POINT TO BUFFER HEADER
+         USING RLDHEADR,R11
+         LA    R12,RLDHEND             POINT TO FIRST ELEMENT
+         USING RLDENTRY,R12
+GRNEXT   STM   R10,R12,WORKSAVE        SAVE WORK REGISTERS
+         MVC   RESIDENT,BLANKS         PRE-CLEAR TO BLANKS
+         LH    R1,RLDRESNL             GET LENGTH OF RES CSECT NAME
+         LTR   R1,R1                   ANY LENGTH?
+         BZ    GRDMVAC                 NO
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         CH    R1,H8                   EXCESSIVE LENGTH?
+         BL    GRDMVRES                NO
+         LA    R1,7                    YES, SET MAX LENGTH
+GRDMVRES L     R2,RLDRESNP             POINT TO THE SYMBOL
+         EX    R1,GRDMVREX             MOVE SYMBOL NAME
+GRDMVAC  MVC   SYMBPTS2,BLANKS         PRE-CLEAR TO BLANKS
+         LH    R1,RLDTGTNL             GET LENGTH OF SYMBOL POINTED TO
+         LTR   R1,R1                   ANY LENGTH?
+         BZ    GRDCKIT                 NO
+         BCTR  R1,0                    COMPUTE LENGTH CODE
+         CH    R1,H8                   EXCESSIVE LENGTH?
+         BL    GRDMVTGT                NO
+         LA    R1,7                    YES, SET MAX LENGTH
+GRDMVTGT L     R2,RLDTGTNP             POINT TO THE SYMBOL
+         EX    R1,GRDTGTNX             MOVE SYMBOL NAME
+GRDCKIT  CLC   RESIDENT,CURRCSCT       ENTRY RESIDES IN CURRENT CSECT?
+         BNE   GRSTEP                  NO
+         L     R1,CURRLABL             POINT TO LABEL TABLE
+         USING LBLDSECT,R1
+GRLBLOK  MVC   LBLOFSET,RLDRESOF       OFFSET TO LABEL
+         MVI   LBLTYPE,X'40'           ASSUME ADCON
+         CLI   RLDSTAT,X'02'           IS IT AN ADCON?
+         BE    GRCLRU                  YES
+         MVI   LBLTYPE,X'50'           NO, ASSUME VCON
+         CLI   RLDSTAT,X'01'           IS IT A VCON?
+         BNE   GRSTEP                  NO, DROP IT
+GRCLRU   MVI   LBLUREG,0               CLEAR USING REG NBR
+         MVC   LBLRLDLN,RLDADCNL       LENGTH OF ADCON
+         MVC   LBLLABEL,BLANKS         CLEAR SYMBOL NAME FIELD
+         CLC   SYMBPTS2,CURRCSCT       SYMBOL = CURRENT CSECT?
+         BE    GRLBADD                 YES
+         MVC   LBLLABEL,SYMBPTS2       MOVE SYMBOL NAME TO ENTRY
+GRLBADD  BAS   R9,ADDLABEL             GO ADD LABEL TO TABLE.
+         DROP  R1
+GRSTEP   LM    R10,R12,WORKSAVE        GET WORK REGISTERS
+         A     R12,RLDHENTL            POINT TO NEXT ELEMENT
+         BCT   R10,GRNEXT              LOOP THRU ESD ENTRIES
+         CLC   PRMRETCD,ZERO           ANY MORE RLD ENTRIES?
+         BE    GRGET2                  YES
+GRXIT    L     R9,GR9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+GRDMVREX MVC   RESIDENT(1),0(R2)       EXECUTED MOVE
+GRDTGTNX MVC   SYMBPTS2(1),0(R2)       EXECUTED MOVE
+GR9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+*        OBTAIN THE TEXT FOR THIS CSECT: ISSUE A STORAGE OBTAIN     *
+*        FOR A STORAGE AREA ABOVE THE 16M LINE LARGE ENOUGH TO      *
+*        CONTAIN THE TEXT, THEN LOAD ALL THE TEXT INTO IT.          *
+*********************************************************************
+GETTEXT  ST    R9,GT9                  SAVE RETURN ADDRESS
+         MVC   PRMCURSR,ZERO           SET CURSOR=0 TO START
+         L     R0,TEXTENDA             GET TEXT LENGTH SET BY ESD
+         LTR   R0,R0                   HAS TEXT LENGTH BEEN SET?
+         BZ    GTNOTXAD                NO, ERROR
+         AH    R0,H32                  INSURE SUFFICIENT STORAGE
+         B     GTSTOBTN                YES
+GTNOTXAD MVC   PRT(39),=CL39'NO STORAGE SIZE WAS FOUND FOR THE CSECT'
+         BAS   R9,PRINT                PRINT THE ERROR MESSAGE
+         WTO   'MISSING TEXT STORAGE SIZE, ABENDING',ROUTCDE=11
+         ABEND 555,DUMP                TERMINATE IN ERROR
+GTSTOBTN STORAGE OBTAIN,LENGTH=(0),LOC=ANY GET TEXT STORAGE
+         ST    R1,TEXTADDR             SAVE THE GOTTEN ADDRESS
+         ST    R1,CURRTEXT             SET CURRENT TEXT ADDRESS
+         A     R1,TEXTENDA             SAVE THE ADDRESS OF THE
+         ST    R1,TEXTENDA                 END OF THE TEXT AREA
+         MVC   PRMREQST,=CL8'TEXT'     SHOW REQUEST IS FOR ESD DATA
+GTNEXT   BAS   R9,READLMOD             GO READ THE TEXT DATA
+         CLC   PRMCOUNT,ZERO           ANY DATA RETURNED?
+         BE    GTXIT                   NO
+         L     R11,PRMCOUNT            GET NUMBER BYTES IN BUFFER
+         L     R10,PRMBUFAD            POINT TO BUFFER HEADER
+         USING TXTHEADR,R10
+         LA    R10,TXTHEND             POINT TO FIRST TEXT BYTE
+         DROP  R10
+         L     R0,PRMCURSR             GET STARTING
+         S     R0,PRMCOUNT                 TEXT
+         A     R0,TEXTADDR                    ADDRESS
+         LR    R1,R11                  COPY TEXT LENGTH
+         MVCL  R0,R10                  MOVE TEXT
+         CLC   PRMRETCD,ZERO           ANY MORE TEXT?
+         BE    GTNEXT                  YES
+GTXIT    L     R9,GT9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+GT9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+*        CALL READLMOD TO OBTAIN DATA FROM THE LOAD MODULE          *
+*********************************************************************
+READLMOD ST    R9,RL9                  SAVE RETURN ADDRESS
+RLCALL   CALL  READLMOD,PARMAREA       CALL READLMOD FOR REQUESTED DATA
+         CLI   PRMERROR,C' '           WAS THERE AN ERROR?
+         BE    RLXIT                   NO
+         MVC   PRTREQST,PRMREQST       MOVE REQUESTED DATA TYPE
+         MVC   PRTERROR,PRMERROR       AND THE ERROR CODE
+RLCURS   UNPK  PRTCURSR(9),PRMCURSR(5) CURSOR TO PRINT
+         TR    PRTCURSR,TRCHAR         MAKE IT PRINTABLE
+         MVI   PRTCURSR+8,C' '         CLEAR TRASH
+         UNPK  PRTRETCD(9),PRMRETCD(5) RETURN CODE TO PRINT
+         TR    PRTRETCD,TRCHAR         MAKE IT PRINTABLE
+         MVI   PRTRETCD+8,C' '         CLEAR TRASH
+         UNPK  PRTRSNCD(9),PRMRSNCD(5) REASON CODE TO PRINT
+         TR    PRTRSNCD,TRCHAR         MAKE IT PRINTABLE
+         MVI   PRTRSNCD+8,C' '         CLEAR TRASH
+         UNPK  PRTCOUNT(9),PRMCOUNT(5) COUNT TO PRINT
+         TR    PRTCOUNT,TRCHAR         MAKE IT PRINTABLE
+         MVI   PRTCOUNT+8,C' '         CLEAR TRASH
+         MVC   PRT(80),PRTRETRN        DATA LINE
+         BAS   R9,PRINT                PRINT THE LINE
+         WTO   'RESOURCE FOUND ERROR RETURNED BY READLMOD CALL',       X
+               ROUTCDE=11
+         ABEND 111,DUMP                TERMINATE IN ERROR
+RLXIT    L     R9,RL9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+RL9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+*             PRINT SUBROUTINE                                      *
+*********************************************************************
+PRINT    PUT   SYSPRINT,PRTLINE        WRITE PRINT LINE
+         MVC   PRTLINE,BLANKS          CLEAR PRINT LINE
+         BR    R9                      RETURN
+*********************************************************************
+* ADD AN ENTRY TO THE LABEL TABLE. THE NEW ENTRY HAS BEEN PLACED    *
+* IN THE NEXT AVAILABLE TABLE SLOT THAT IS POINTED TO BY CURRLABL.  *
+* THE NEW ENTRY IS INSERTED INTO THE TABLE IN ADDRESS-TYPE ORDER.   *
+*********************************************************************
+ADDLABEL ST    R9,AL9                  SAVE RETURN ADDRESS
+         L     R1,LBLTBADR             POINT TO FIRST TABLE ENTRY
+         USING LBLDSECT,R1
+         L     R2,CURRLABL             POINT TO NEW ENTRY
+ALCHKEND CR    R1,R2                   PRESENTLY AT NEW ENTRY?
+         BNL   ALADVANC                YES
+         CLC   0(5,R2),LBLENTRY        AT INSERTION POINT?
+         BL    ALINSRT                 YES
+         LA    R1,L'LBLENTRY(R1)       NO, ADVANCE TO NEXT ENTRY
+         B     ALCHKEND                LOOP TO FIND INSERTION POINT
+ALINSRT  MVC   HOLDLABL,LBLENTRY       HOLD PRESENT ENTRY
+         MVC   LBLENTRY,0(R2)          MOVE IN NEW ENTRY
+         MVC   0(L'LBLENTRY,R2),HOLDLABL PREVIOUS ENTRY TO END
+         LA    R1,L'LBLENTRY(R1)       STEP TO NEXT ENTRY
+         CR    R1,R2                   PRESENTLY AT LAST ENTRY?
+         BL    ALINSRT                 NO, CONTINUE INSERTION LOOP
+ALADVANC LA    R2,L'LBLENTRY(R2)       STEP TO NEXT AVAILABLE SLOT
+         ST    R2,CURRLABL             SAVE UPDATED TABLE ADDRESS
+         C     R2,LBLTBEND             PAST END OF TABLE?
+         BL    ALXIT                   NO
+         MVC   PRT(37),=CL37'LABEL TABLE OF 32,768 ENTRIES IS FULL'
+         BAS   R9,PRINT                PRINT ERROR MESSAGE
+         WTO   'LABEL TABLE OVERFLOW, ABENDING',ROUTCDE=11
+         ABEND 666,DUMP                TERMINATE IN ERROR
+ALXIT    L     R9,AL9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+         DROP  R1
+AL9      DC    A(0)                    RETURN ADDRESS
+*********************************************************************
+*        TESTPRNT PRINTS THE LABEL TABLE AND TEXT AREAS AT END OF   *
+*        JOB FOR TESTING.                                           *
+*********************************************************************
+TESTPRNT ST    R9,TP9                  SAVE RETURN ADDRESS
+         MVC   PRT(8),=CL8'LBLOFSET'
+         MVC   PRT+9(4),=CL4'TYPE'
+         MVC   PRT+14(4),=CL4'UREG'
+         MVC   PRT+19(4),=CL4'LENG'
+         MVC   PRT+24(8),=CL8'LABEL'
+         BAS   R9,PRINT
+         L     R12,LBLTBADR            POINT TO LABEL TABLE
+         USING LBLDSECT,R12
+TPNEXTLB UNPK  PRT(9),LBLOFSET(5)
+         MVI   PRT+8,C' '
+         TR    PRT(8),TRCHAR
+         UNPK  PRT+10(3),LBLTYPE(2)
+         MVI   PRT+12,C' '
+         TR    PRT+10(2),TRCHAR
+         UNPK  PRT+15(3),LBLUREG(2)
+         MVI   PRT+17,C' '
+         TR    PRT+15(3),TRCHAR
+         UNPK  PRT+19(5),LBLRLDLN(3)
+         MVI   PRT+23,C' '
+         CLI   LBLTYPE,X'10'
+         BNE   TPLBL
+         UNPK  PRT+24(7),LBLINITU+1(4)
+         MVI   PRT+30,C' '
+         TR    PRT+24(6),TRCHAR
+         B     TPDESCR
+TPLBL    MVC   PRT+24(8),LBLLABEL
+TPDESCR  CLI   LBLTYPE,X'0C'
+         BNE   TPDESC2
+         MVC   PRT+36(4),=CL4'DROP'
+         MVI   PRT+42,C'R'
+         MVC   PRT+43(1),LBLUREG
+         OI    PRT+43,X'F0'
+         CLI   LBLUREG,X'0A'
+         BL    TPPRINT
+         MVI   PRT+43,C'1'
+         IC    R1,LBLUREG
+         LA    R1,6(R1)
+         STC   R1,PRT+44
+         OI    PRT+44,X'F0'
+         B     TPPRINT
+TPDESC2  CLI   LBLTYPE,X'10'
+         BNE   TPDESC3
+         MVC   PRT+36(5),=CL5'USING'
+         MVC   PRT+42(6),PRT+24
+         MVI   PRT+48,C','
+         MVI   PRT+49,C'R'
+         MVC   PRT+50(1),LBLUREG
+         OI    PRT+50,X'F0'
+         CLI   LBLUREG,X'0A'
+         BL    TPPRINT
+         MVI   PRT+50,C'1'
+         IC    R1,LBLUREG
+         LA    R1,6(R1)
+         STC   R1,PRT+51
+         OI    PRT+51,X'F0'
+         B     TPPRINT
+TPDESC3  CLI   LBLTYPE,X'18'
+         BNE   TPDESC4
+         MVC   PRT+36(10),=CL10'DATA START'
+         B     TPPRINT
+TPDESC4  CLI   LBLTYPE,X'1C'
+         BNE   TPDESC5
+         MVC   PRT+36(8),=CL8'DATA END'
+         B     TPPRINT
+TPDESC5  CLI   LBLTYPE,X'30'
+         BNE   TPDESC6
+         MVC   PRT+36(5),=CL5'LABEL'
+         B     TPPRINT
+TPDESC6  CLI   LBLTYPE,X'40'
+         BNE   TPDESC7
+         MVC   PRT+36(5),=CL5'ADCON'
+         B     TPPRINT
+TPDESC7  CLI   LBLTYPE,X'50'
+         BNE   TPPRINT
+         MVC   PRT+36(5),=CL5'V-CON'
+         B     TPPRINT
+TPPRINT  BAS   R9,PRINT
+         LA    R12,L'LBLENTRY(R12)
+         C     R12,CURRLABL
+         BL    TPNEXTLB
+         BAS   R9,PRINT
+         UNPK  PRT(9),TEXTLENG(5)
+         MVI   PRT+8,C' '
+         TR    PRT(8),TRCHAR
+         MVC   PRT+9(22),=CL22' BYTES OF TEXT FOLLOW:'
+         BAS   R9,PRINT
+         L     R12,TEXTADDR            POINT TO TEXT AREA START
+TPNEXTT  UNPK  PRT(9),TPOFF(5)
+         MVI   PRT+8,C' '
+         TR    PRT(8),TRCHAR
+         UNPK  PRT+9(9),0(5,R12)
+         MVI   PRT+17,C' '
+         UNPK  PRT+18(9),4(5,R12)
+         MVI   PRT+26,C' '
+         UNPK  PRT+27(9),8(5,R12)
+         MVI   PRT+35,C' '
+         UNPK  PRT+36(9),12(5,R12)
+         MVI   PRT+44,C' '
+         UNPK  PRT+46(9),16(5,R12)
+         MVI   PRT+54,C' '
+         UNPK  PRT+55(9),20(5,R12)
+         MVI   PRT+63,C' '
+         UNPK  PRT+64(9),24(5,R12)
+         MVI   PRT+72,C' '
+         UNPK  PRT+73(9),28(5,R12)
+         MVI   PRT+81,C' '
+         TR    PRT+9(74),TRCHAR
+         MVC   PRT+83(32),0(R12)
+         BAS   R9,PRINT
+         L     R1,TPOFF
+         LA    R1,32(R1)
+         ST    R1,TPOFF
+         LA    R12,32(R12)
+         C     R12,TEXTENDA
+         BL    TPNEXTT
+TPXIT    L     R9,TP9                  GET RETURN ADDRESS
+         BR    R9                      EXIT
+TP9      DC    A(0)                    RETURN ADDRESS
+TPOFF    DC    A(0)                    TEXT OFFSET
+*********************************************************************
+*        STORAGE AND FILE AREAS                                     *
+*********************************************************************
+DBLWD    DS    D                       DOUBLEWORD WORK AREA
+XZROS    DC    16X'00'                 CONSTAND HEX ZEROES
+REBLDEP  DC    A(0)                    E.P. ADDRESS FOR REBUILD
+WORKSAVE DS    3F                      SAVE AREA FOR WORK REGS 10-12
+ZERO     DC    F'0'                    CONSTANT ZEROS
+RETCODE  DC    F'0'                    RETURN CODE
+H0       DC    H'0'                    CONSTANT 0
+H5       DC    H'5'                    CONSTANT 5
+H11      DC    H'11'                   CONSTANT 11
+H8       DC    H'8'                    CONSTANT 8
+H32      DC    H'32'                   CONSTANT 32
+RESIDENT DC    CL8' '                  RLD RESIDENT CSECT NAME
+SYMBPTS2 DC    CL8' '                  RLD SYMBOL POINTED TO
+ESDSYMB  DC    CL8' '                  ESD SYMBOL NAME
+ESDOWNER DC    CL8' '                  ESD OWNING CSECT NAME
+UNWANTED DC    XL1'60'                 40=NO FLTPT, 20=NO PRIV INST
+SUPVR    DC    CL5'SUPVR'              LITERAL CONSTANT
+FLTPT    DC    CL5'FLTPT'              LITERAL CONSTANT
+BLANKS   DC    CL133' '                BLANKS
+MORECNTL DC    CL1'Y'                  N=NO MORE CONTROL RECORDS
+GOTMCREC DC    CL1'N'                  Y=MEMBER/CSECT RECORD PROCESSED
+HOLDLABL DS    CL16                    HOLD AREA FOR LABEL ENTRY SORTS
+HOLDINIU DS    XL4,XL1                 HOLD INITIAL USING REG VALUE
+HOLDSTRT DS    XL4                     WORK FIELD
+HOLDREG  DS    XL1                     WORK FIELD
+STAGE    DC    XL1'1'                  STAGE NUMBER FOR REBUILD
+HEXFFS   DC    X'FFFFFFFF'             HEX FF'S
+WORK1    DC    C' '                    WORK FIELD
+*
+REBLDPRM DS    0A                      REBUILD PARAMETER LIST
+         DC    A(STAGE)                   STAGE INDICATOR POINTER
+         DC    A(CURRCSCT)                CSECT NAME POINTER
+LBLTBADR DC    A(0)                       LABEL TABLE STARTING ADDRESS
+CURRLABL DC    A(0)                    ADDRESS OF CURRENT LABEL ENTRY
+LBLTBEND DC    A(32768*L'LBLENTRY)        SIZE OF 32,768 ENTRIES
+TEXTADDR DC    A(0)                       ADDRESS OF CSECT TEXT
+TEXTENDA DC    A(0)                       ADDRESS OF LAST BYTE OF TEXT
+TEXTLENG DC    A(0)                       TOTAL TEXT LENGTH
+TBLTBLAD DC    A(OPCODTBL)                OP-CODE TABLE POINTER
+PRNTDCBA DC    A(SYSPRINT)                SYSPRINT DCB ADDRESS
+OUTDCBA  DC    A(SYSOUT)                  SYSOUT DCB ADDRESS
+*
+TABLTABL DS    0A                      TABLE OF OP-CODE TABLE ADDRESSES
+         DC    A(OCTWO01)                  01XX OP-CODE TABLE
+         DC    A(OCTWOA7)                  A7X OP-CODE TABLE
+         DC    A(OCTWOB2)                  B2XX OP-CODE TABLE
+         DC    A(OCTWOB3)                  B3XX OP-CODE TABLE
+         DC    A(OCTWOE5)                  E5XX OP-CODE TABLE
+         DC    A(OCTWOED)                  EDXX OP-CODE TABLE
+         DC    XL4'FFFFFFFF'              END OF TABLE ENTRY
+*
+ISINST   DC    X'00'                   01=TEXT MAY BE AN INSTRUCTION
+INSTFLAG DS    XL1                     INSTRUCTION FLAGS
+INSTMNEM DS    XL5                     INSTRUCTION MNEMONIC
+INSTLENG DS    XL1                     INSTRUCTION LENGTH
+INSTFMT  DS    XL1                     INSTRUCTION LENGTH
+INSTTEXT DS    XL6                     INSTRUCTION TEXT
+*
+CURRINFO DS    0F                      CURRENT PROCESSING INFO
+CURRMEMB DC    CL8' '                     MEMBER NAME
+CURRCSCT DC    CL8' '                     CSECT NAME
+CURRTEXT DC    A(0)                    ADDRESS OF CURRENT TEXT BYTE
+CURRAMOD DS    XL1                        REQUESTED CSECT AMODE
+CURRRMOD DS    XL1                        REQUESTED CSECT RMODE
+CURREND  EQU   *
+*
+PRTLINE  DS    0CL133                  PRINT LINE
+PRTCC    DC    CL1'1'                     CARRIAGE CONTROL BYYTE
+PRT      DC    CL132' '                   PRINT DATA LINE
+*
+PRTRETRN DS    0CL80                   PRINT READLMOD RETURNED DATA
+         DC    CL5' REQ='
+PRTREQST DS    CL5                        REQUESTED DATA TYPE
+PRTRERR  DC    CL5' ERR='
+PRTERROR DS    CL1                        ERROR INDICATOR
+         DC    CL8' CURSOR='
+PRTCURSR DS    CL8                        IEWBIND CURSOR
+         DC    CL8' RETCOD='
+PRTRETCD DS    CL8                        IEWBIND RETURN CODE
+         DC    CL8' RSNCOD='
+PRTRSNCD DS    CL8                        IEWBIND REASON CODE
+         DC    CL7' COUNT='
+PRTCOUNT DS    CL8                        IEWBIND COUNT
+         DC    CL1' '
+*
+CNTLCARD DS    0CL80              CONTROL STATEMENT
+CCMEMBER DS    CL8                   MEMBER NAME
+         DS    CL1
+CCCSECT  DS    CL8                   CSECT NAME
+         DS    CL63
+*
+TRCHAR   DC    256C' '            TRANSLATE HEX TO PRINTABLE CHARS
+         ORG   TRCHAR+C'0'
+         DC    C'0123456789ABCDEF'
+         ORG
+*
+CHECKHEX DC    256X'FF'           TRT TABLE TO CHECK FOR VALID HEX
+         ORG   CHECKHEX+C'A'
+         DC    6X'00'
+         ORG   CHECKHEX+C'0'
+         DC    10X'00'
+         ORG
+*
+CHECKZON DC    256X'FF'           TRT TABLE TO CHECK FOR ZONED DECIMAL
+         ORG   CHECKZON+C'0'
+         DC    10X'00'
+         ORG
+*
+CHECKLBL DC    256X'FF'           TRT TABLE TO CHECK LABEL CHARS
+         ORG   CHECKLBL+C'@'
+         DC    X'00'
+         ORG   CHECKLBL+C'$'
+         DC    X'00'
+         ORG   CHECKLBL+C'#'
+         DC    X'00'
+         ORG   CHECKLBL+C' '
+         DC    X'00'
+         ORG   CHECKLBL+C'A'
+         DC    9X'00'
+         ORG   CHECKLBL+C'J'
+         DC    9X'00'
+         ORG   CHECKLBL+C'S'
+         DC    8X'00'
+         ORG   CHECKLBL+C'0'
+         DC    10X'00'
+         ORG
+*
+TRHEX    DC    256C' '                 TRANSLATE TO MAKE REAL HEX
+         ORG   TRHEX+C'A'
+         DC    X'FAFBFCFDFEFF'
+         ORG   TRHEX+C'0'
+         DC    C'0123456789'
+         ORG
+***********************************************************************
+*TABLES OF INSTRUCTION OP-CODES. THE FIRST TABLE CONTAINS 256 ENTRIES,*
+*ONE FOR EACH POSSIBLE SINGLE-BYTE OP-CODE. FOLLOWING TABLES ARE FOR  *
+*THE INSTRUCTIONS HAVING MORE THAN A ONE-BYTE OP-CODE. EACH TABLE     *
+*ENTRY IS 10 BYTES LONG AAND CONTAINS:                                *
+*  BYTE  0   OP-CODE FIRST OR ONLY BYTE                               *
+*  BYTE  1   FOR 1.5 AND 2 BYTE OPCODES, THE SECOND OP-CODE BYTE      *
+*  BYTES 2-6 INSTRUCTION MNEMONIC FOR SINGLE-BYTE OP-CODES            *
+*  BYTE  2   '2' FOR 1.5 AND 2 BYTE OP-CODE INSTRUCTIONS              *
+*  BYTES 3-6 ADDRESS OF THE 1.5 OR 2 BYTE OP-CODE TABLE TO USE        *
+*  BYTE  7   INSTRUCTION FORMAT IDENTIFIER. THIS IDENTIFIES THE MEMORY*
+*            FORMAT AND CODING SYNTAX FOR THE INSTRUCTION (SEE THE EQU*
+*            INSTRUCTIONS FOR THE FORMAT NAMES)                       *
+*  BYTE  8   FLAGS: X'40'=FLOATING POINT INSTRUCTION, X'20'=PRIVILEGED*
+*  BYTE  9   IF THE INSTRUCTION SETS THE CONDITION CODE, THIS BYTE    *
+*            WILL CONTAIN THE NUMBER OF THE CONDITION CODE TABLE ENTRY*
+*            TO BE USED FOR FOLLOWING CONDITIONAL BRANCHES.           *
+*  BYTE 10   FLAG BYTE 1: X'80'=ODD TEST REQUIRED                     *
+*                         X'01'=R2 MUST BE 0,1,4,5,8,9,12, OR 13      *
+*  BYTE 11   FLAG BYTE 2: X'80'=R1 MUST BE 0,1,4,5,8,9,12, OR 13      *
+*                         X'40'=M3 MUST BE 0,1,4,5,6, OR 7            *
+*                         X'20'=INSTRUCTION BITS 16-25 MUST BE 0'S    *
+*                         X'10'=R1 MUST NOT EQUAL R2                  *
+*                         X'08'=R3 MUST BE AN EVEN NUMBERED REGISTER  *
+*                         X'04'=R2 MUST BE AN EVEN NUMBERED REGISTER  *
+*                         X'02'=R1 MUST BE AN EVEN NUMBERED REGISTER  *
+*                         X'01'=IF R2=0, OUTPUT 0, NOT R0             *
+***********************************************************************
+         DS    0F
+OPCODTBL DS    0XL12
+         DC    XL2'0000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0100',CL1'2',AL4(OCTWO01),XL5'0000000000'
+         DC    XL2'0200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0400',CL5'SPM',AL1(RR3),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'0500',CL5'BALR',AL1(RR1),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0600',CL5'BCTR',AL1(RR1),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0700',CL5'BCR',AL1(RR4),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0800',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0900',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0A00',CL5'SVC',AL1(RR2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'0B00',CL5'BSM',AL1(RR1),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0C00',CL5'BASSM',AL1(RR1),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0D00',CL5'BASR',AL1(RR1),AL1(0),AL1(0),XL2'0001'
+         DC    XL2'0E00',CL5'MVCL',AL1(RR1),AL1(0),AL1(1),XL2'0006'
+         DC    XL2'0F00',CL5'CLCL',AL1(RR1),AL1(0),AL1(2),XL2'0016'
+         DC    XL2'1000',CL5'LPR',AL1(RR1),AL1(0),AL1(6),XL2'0000'
+         DC    XL2'1100',CL5'LNR',AL1(RR1),AL1(0),AL1(7),XL2'0000'
+         DC    XL2'1200',CL5'LTR',AL1(RR1),AL1(0),AL1(8),XL2'0000'
+         DC    XL2'1300',CL5'LCR',AL1(RR1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'1400',CL5'NR',AL1(RR1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'1500',CL5'CLR',AL1(RR1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'1600',CL5'OR',AL1(RR1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'1700',CL5'XR',AL1(RR1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'1800',CL5'LR',AL1(RR1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'1900',CL5'CR',AL1(RR1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'1A00',CL5'AR',AL1(RR1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'1B00',CL5'SR',AL1(RR1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'1C00',CL5'MR',AL1(RR1),AL1(0),AL1(0),XL2'0002'
+         DC    XL2'1D00',CL5'DR',AL1(RR1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'1E00',CL5'ALR',AL1(RR1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'1F00',CL5'SLR',AL1(RR1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'2000',CL5'LPDR',AL1(RR1),AL1(FP),AL1(10),XL2'0000'
+         DC    XL2'2100',CL5'LNDR',AL1(RR1),AL1(FP),AL1(7),XL2'0000'
+         DC    XL2'2200',CL5'LTDR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'2300',CL5'LCDR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'2400',CL5'HDR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'2500',CL5'LDXR',AL1(RR1),AL1(FP),AL1(0),XL2'0100'
+         DC    XL2'2600',CL5'MXR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'2700',CL5'MXDR',AL1(RR1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'2800',CL5'LDR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'2900',CL5'CDR',AL1(RR1),AL1(FP),AL1(2),XL2'0000'
+         DC    XL2'2A00',CL5'ADR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'2B00',CL5'SDR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'2C00',CL5'MDR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'2D00',CL5'DDR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'2E00',CL5'AWR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'2F00',CL5'SWR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3000',CL5'LPER',AL1(RR1),AL1(FP),AL1(10),XL2'0000'
+         DC    XL2'3100',CL5'LNER',AL1(RR1),AL1(FP),AL1(7),XL2'0000'
+         DC    XL2'3200',CL5'LTER',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3300',CL5'LCER',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3400',CL5'HER',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'3500',CL5'LEDR',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'3600',CL5'AXR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3700',CL5'SXR',AL1(RR1),AL1(FP),AL1(8),XL2'0180'
+         DC    XL2'3800',CL5'LER',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'3900',CL5'CER',AL1(RR1),AL1(FP),AL1(2),XL2'0000'
+         DC    XL2'3A00',CL5'AER',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3B00',CL5'SER',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3C00',CL5'MDER',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'3D00',CL5'DER',AL1(RR1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'3E00',CL5'AUR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'3F00',CL5'SUR',AL1(RR1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'4000',CL5'STH',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4100',CL5'LA',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4200',CL5'STC',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4300',CL5'IC',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4400',CL5'EX',AL1(RX1),AL1(0),AL1(0),XL2'8000'
+         DC    XL2'4500',CL5'BAL',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4600',CL5'BCT',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4700',CL5'BC',AL1(RX2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4800',CL5'LH',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4900',CL5'CH',AL1(RX1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'4A00',CL5'AH',AL1(RX1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'4B00',CL5'SH',AL1(RX1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'4C00',CL5'MH',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4D00',CL5'BAS',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4E00',CL5'CVD',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'4F00',CL5'CVB',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5000',CL5'ST',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5100',CL5'LAE',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5400',CL5'N',AL1(RX1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'5500',CL5'CL',AL1(RX1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'5600',CL5'O',AL1(RX1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'5700',CL5'X',AL1(RX1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'5800',CL5'L',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5900',CL5'C',AL1(RX1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'5A00',CL5'A',AL1(RX1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'5B00',CL5'S',AL1(RX1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'5C00',CL5'M',AL1(RX1),AL1(0),AL1(0),XL2'0002'
+         DC    XL2'5D00',CL5'D',AL1(RX1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'5E00',CL5'AL',AL1(RX1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'5F00',CL5'SL',AL1(RX1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'6000',CL5'STD',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'6100',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'6700',CL5'MXD',AL1(RX1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'6800',CL5'LD',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'6900',CL5'CD',AL1(RX1),AL1(FP),AL1(2),XL2'0000'
+         DC    XL2'6A00',CL5'AD',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'6B00',CL5'SD',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'6C00',CL5'MD',AL1(RX1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'6D00',CL5'DD',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'6E00',CL5'AW',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'6F00',CL5'SW',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'7000',CL5'STE',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'7100',CL5'MS',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'7200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7700',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'7800',CL5'LE',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'7900',CL5'CE',AL1(RX1),AL1(FP),AL1(2),XL2'0000'
+         DC    XL2'7A00',CL5'AE',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'7B00',CL5'SE',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'7C00',CL5'MDE',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'7D00',CL5'DE',AL1(RX1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'7E00',CL5'AU',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'7F00',CL5'SU',AL1(RX1),AL1(FP),AL1(8),XL2'0000'
+         DC    XL2'8000',CL5'SSM',AL1(S1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'8100',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8200',CL5'LPSW',AL1(S1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'8300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8400',CL5'BRXH',AL1(RSI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8500',CL5'BRXLE',AL1(RSI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8600',CL5'BXH',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8700',CL5'BXLE',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'8800',CL5'SRL',AL1(RS2),AL1(0),AL1(0),XL2'0020'
+         DC    XL2'8900',CL5'SLL',AL1(RS2),AL1(0),AL1(0),XL2'0020'
+         DC    XL2'8A00',CL5'SRA',AL1(RS2),AL1(0),AL1(8),XL2'0020'
+         DC    XL2'8B00',CL5'SLA',AL1(RS2),AL1(0),AL1(9),XL2'0020'
+         DC    XL2'8C00',CL5'SRDL',AL1(RS2),AL1(0),AL1(0),XL2'0022'
+         DC    XL2'8D00',CL5'SLDL',AL1(RS2),AL1(0),AL1(0),XL2'0022'
+         DC    XL2'8E00',CL5'SRDA',AL1(RS2),AL1(0),AL1(8),XL2'0022'
+         DC    XL2'8F00',CL5'SLDA',AL1(RS2),AL1(0),AL1(9),XL2'0022'
+         DC    XL2'9000',CL5'STM',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9100',CL5'TM',AL1(SI1),AL1(0),AL1(11),XL2'0000'
+         DC    XL2'9200',CL5'MVI',AL1(SI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9300',CL5'TS',AL1(S1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'9400',CL5'NI',AL1(SI1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'9500',CL5'CLI',AL1(SI1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'9600',CL5'OI',AL1(SI1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'9700',CL5'XI',AL1(SI1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'9800',CL5'LM',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9900',CL5'TRACE',AL1(RS1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'9A00',CL5'LAM',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9B00',CL5'STAM',AL1(RS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9C00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9D00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9E00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'9F00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A100',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A700',CL1'2',AL4(OCTWOA7),XL5'0000000000'
+         DC    XL2'A800',CL5'MVCLE',AL1(RS1),AL1(0),AL1(1),XL2'800A'
+         DC    XL2'A900',CL5'CLCLE',AL1(RS1),AL1(0),AL1(13),XL2'800A'
+         DC    XL2'AA00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'AB00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'AC00',CL5'STNSM',AL1(SI1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'AD00',CL5'STOSM',AL1(SI1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'AE00',CL5'SIGP',AL1(RS1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'AF00',CL5'MC',AL1(SI1),AL1(0),AL1(0),XL2'8000'
+         DC    XL2'B000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B100',CL5'LRA',AL1(RX1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B200',CL1'2',AL4(OCTWOB2),XL5'0000000000'
+         DC    XL2'B300',CL1'2',AL4(OCTWOB3),XL5'0000000000'
+         DC    XL2'B400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B600',CL5'STCTL',AL1(RS1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B700',CL5'LCTL',AL1(RS1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B800',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B900',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'BA00',CL5'CS',AL1(RS1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'BB00',CL5'CDS',AL1(RS1),AL1(0),AL1(1),XL2'000A'
+         DC    XL2'BC00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'BD00',CL5'CLM',AL1(RS2),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'BE00',CL5'STCM',AL1(RS3),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'BF00',CL5'ICM',AL1(RS3),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'C000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C100',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C700',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C800',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'C900',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CA00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CB00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CC00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CD00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CE00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'CF00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D100',CL5'MVN',AL1(SS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D200',CL5'MVC',AL1(SS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D300',CL5'MVZ',AL1(SS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D400',CL5'NC',AL1(SS1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'D500',CL5'CLC',AL1(SS1),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'D600',CL5'OC',AL1(SS1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'D700',CL5'XC',AL1(SS1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'D800',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'D900',CL5'MVCK',AL1(SS4),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'DA00',CL5'MVCP',AL1(SS4),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'DB00',CL5'MVCS',AL1(SS4),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'DC00',CL5'TR',AL1(SS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'DD00',CL5'TRT',AL1(SS1),AL1(0),AL1(3),XL2'0000'
+         DC    XL2'DE00',CL5'ED',AL1(SS1),AL1(0),AL1(8),XL2'0000'
+         DC    XL2'DF00',CL5'EDMK',AL1(SS1),AL1(0),AL1(8),XL2'0000'
+         DC    XL2'E000',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E100',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E200',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E300',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E500',CL1'2',AL4(OCTWOE5),XL5'0000000000'
+         DC    XL2'E600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E700',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E800',CL5'MVCIN',AL1(SS1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'E900',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'EA00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'EB00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'EC00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'ED00',CL1'2',AL4(OCTWOED),XL5'0000000000'
+         DC    XL2'EE00',CL5'PLO',AL1(SS3),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'EF00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F000',CL5'SRP',AL1(SS5),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'F100',CL5'MVO',AL1(SS2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F200',CL5'PACK',AL1(SS2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F300',CL5'UNPK',AL1(SS2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F400',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F500',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F600',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F700',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'F800',CL5'ZAP',AL1(SS2),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'F900',CL5'CP',AL1(SS2),AL1(0),AL1(2),XL2'0000'
+         DC    XL2'FA00',CL5'AP',AL1(SS2),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'FB00',CL5'SP',AL1(SS2),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'FC00',CL5'MP',AL1(SS2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'FD00',CL5'DP',AL1(SS2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'FE00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'FF00',XL5'00',AL1(0),AL1(0),AL1(0),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF TWO-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS 01               *
+***********************************************************************
+         DS    0F
+OCTWO01  DS    0XL12
+         DC    XL2'0101',CL5'PR',AL1(E1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'0102',CL5'UPT',AL1(E1),AL1(0),AL1(4),XL2'0000'
+         DC    XL2'0107',CL5'SCKPF',AL1(E1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'01FF',CL5'TRAP2',AL1(E1),AL1(0),AL1(0),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF 1.5-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS A7               *
+***********************************************************************
+         DS    0F
+OCTWOA7  DS    0XL12
+         DC    XL2'A700',CL5'TMH',AL1(RI1),AL1(0),AL1(12),XL2'0000'
+         DC    XL2'A710',CL5'TML',AL1(RI1),AL1(0),AL1(12),XL2'0000'
+         DC    XL2'A740',CL5'BRC',AL1(RI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A750',CL5'BRAS',AL1(RI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A760',CL5'BRCT',AL1(RI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A780',CL5'LHI',AL1(RI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A7A0',CL5'AHI',AL1(RI1),AL1(0),AL1(9),XL2'0000'
+         DC    XL2'A7C0',CL5'MHI',AL1(RI1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'A7E0',CL5'CHI',AL1(RI1),AL1(0),AL1(2),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF TWO-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS B2               *
+***********************************************************************
+         DS    0F
+OCTWOB2  DS    0XL12
+         DC    XL2'B202',CL5'STIDP',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B204',CL5'SCK',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B205',CL5'STCK',AL1(S3),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B206',CL5'SCKC',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B207',CL5'STCKC',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B208',CL5'SPT',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B209',CL5'STPT',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B20A',CL5'SPKA',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B20B',CL5'IPK',AL1(S2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B20D',CL5'PTLB',AL1(S2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B210',CL5'SPX',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B211',CL5'STPX',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B212',CL5'STAP',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B218',CL5'PC',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B219',CL5'SAC',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B21A',CL5'CFC',AL1(S3),AL1(0),AL1(4),XL2'8000'
+         DC    XL2'B221',CL5'IPTE',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B222',CL5'IPM',AL1(RRE2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B223',CL5'IVSK',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B224',CL5'IAC',AL1(RRE2),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B225',CL5'SSAR',AL1(RRE2),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B226',CL5'EPAR',AL1(RRE2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B227',CL5'ESAR',AL1(RRE2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B228',CL5'PT',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B229',CL5'ISKE',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B22A',CL5'RRBE',AL1(RRE1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B22B',CL5'SSKE',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B22C',CL5'TB',AL1(RRE1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B22D',CL5'DXR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B230',CL5'CSCH',AL1(S2),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B231',CL5'HSCH',AL1(S2),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B232',CL5'MSCH',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B233',CL5'SSCH',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B234',CL5'STSCH',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B235',CL5'TSCH',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B236',CL5'TPI',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B237',CL5'SAL',AL1(S2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B238',CL5'RSCH',AL1(S2),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B239',CL5'STCRW',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B23A',CL5'STCPS',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B23B',CL5'RCHP',AL1(S2),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B23C',CL5'SCHM',AL1(S2),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B240',CL5'BAKR',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B241',CL5'CKSM',AL1(RRE1),AL1(0),AL1(1),XL2'8014'
+         DC    XL2'B244',CL5'SQDR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B245',CL5'SQER',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B246',CL5'STURA',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B247',CL5'MSTA',AL1(RRE2),AL1(0),AL1(0),XL2'0002'
+         DC    XL2'B248',CL5'PALB',AL1(RRE3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B249',CL5'EREG',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B24A',CL5'ESTA',AL1(RRE1),AL1(0),AL1(1),XL2'0002'
+         DC    XL2'B24B',CL5'LURA',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B24C',CL5'TAR',AL1(RRE1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B24D',CL5'CPYA',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B24E',CL5'SAR',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B24F',CL5'EAR',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B252',CL5'MSR',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B254',CL5'MVPG',AL1(RRE1),AL1(0),AL1(1),XL2'0010'
+         DC    XL2'B255',CL5'MVST',AL1(RRE1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B257',CL5'CUSE',AL1(RRE1),AL1(0),AL1(4),XL2'0006'
+         DC    XL2'B258',CL5'BSG',AL1(RRE1),AL1(0),AL1(0),XL2'0000'
+         DC    XL2'B25A',CL5'BSA',AL1(RRE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B25D',CL5'CLST',AL1(RRE1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B25E',CL5'SRST',AL1(RRE1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B277',CL5'RP',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B278',CL5'STCKE',AL1(S3),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B279',CL5'SACF',AL1(S3),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'B27D',CL5'STSI',AL1(S3),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'B299',CL5'SRNM',AL1(S3),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B29C',CL5'STFPC',AL1(S3),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B29D',CL5'LFPC',AL1(S3),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B2A5',CL5'TRE',AL1(RRE1),AL1(0),AL1(1),XL2'8012'
+         DC    XL2'B2A6',CL5'CUUTF',AL1(RRE1),AL1(0),AL1(1),XL2'0016'
+         DC    XL2'B2A7',CL5'CUTFU',AL1(RRE1),AL1(0),AL1(1),XL2'0000'
+         DC    XL2'B2FF',CL5'TRAP4',AL1(S3),AL1(0),AL1(0),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF TWO-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS B3               *
+***********************************************************************
+         DS    0F
+OCTWOB3  DS    0XL12
+         DC    XL2'B300',CL5'LPEBR',AL1(RRE1),AL1(FP),AL1(10),XL2'0000'
+         DC    XL2'B301',CL5'LNEBR',AL1(RRE1),AL1(FP),AL1(7),XL2'0000'
+         DC    XL2'B302',CL5'LTEBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B303',CL5'LCEBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B304',CL5'LDEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B305',CL5'LXDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B306',CL5'LXEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B307',CL5'MXDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B308',CL5'KEBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'B309',CL5'CEBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'B30A',CL5'AEBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B30B',CL5'SEBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B30C',CL5'MDEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B30D',CL5'DEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B30E',CL5'MAEBR',AL1(RRF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B30F',CL5'MSEBR',AL1(RRF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B310',CL5'LPDBR',AL1(RRE1),AL1(FP),AL1(10),XL2'0000'
+         DC    XL2'B311',CL5'LNDBR',AL1(RRE1),AL1(FP),AL1(7),XL2'0000'
+         DC    XL2'B312',CL5'LTDBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B313',CL5'LCDBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B314',CL5'SQEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B315',CL5'SQDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B316',CL5'SQXBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B317',CL5'MEEBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B318',CL5'KDBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'B319',CL5'CDBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'B31A',CL5'ADBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B31B',CL5'SDBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B31C',CL5'MDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B31D',CL5'DDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B31E',CL5'MADBR',AL1(RRF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B31F',CL5'MSDBR',AL1(RRF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B324',CL5'LDER',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B325',CL5'LXDR',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B326',CL5'LXER',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B336',CL5'SQXR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B337',CL5'MEER',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B340',CL5'LPXBR',AL1(RRE1),AL1(FP),AL1(10),XL2'0180'
+         DC    XL2'B341',CL5'LNXBR',AL1(RRE1),AL1(FP),AL1(7),XL2'0180'
+         DC    XL2'B342',CL5'LTXBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0180'
+         DC    XL2'B343',CL5'LCXBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0180'
+         DC    XL2'B344',CL5'LEDBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B345',CL5'LDXBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B346',CL5'LEXBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B347',CL5'FIXBR',AL1(RRF2),AL1(FP),AL1(0),XL2'01C0'
+         DC    XL2'B348',CL5'KXBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0180'
+         DC    XL2'B349',CL5'CXBR',AL1(RRE1),AL1(FP),AL1(13),XL2'0180'
+         DC    XL2'B34A',CL5'AXBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0180'
+         DC    XL2'B34B',CL5'SXBR',AL1(RRE1),AL1(FP),AL1(14),XL2'0180'
+         DC    XL2'B34C',CL5'MXBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B34D',CL5'DXBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B350',CL5'TBEDR',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B351',CL5'TBDR',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B353',CL5'DIEBR',AL1(RRF3),AL1(FP),AL1(1),XL2'8040'
+         DC    XL2'B357',CL5'FIEBR',AL1(RRF2),AL1(FP),AL1(0),XL2'0040'
+         DC    XL2'B358',CL5'THDER',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B359',CL5'THDR',AL1(RRE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'B35B',CL5'DIDBR',AL1(RRF3),AL1(FP),AL1(1),XL2'8040'
+         DC    XL2'B35F',CL5'FIDBR',AL1(RRF2),AL1(FP),AL1(0),XL2'0040'
+         DC    XL2'B360',CL5'LPXR',AL1(RRE1),AL1(FP),AL1(10),XL2'0180'
+         DC    XL2'B361',CL5'LNXR',AL1(RRE1),AL1(FP),AL1(7),XL2'0180'
+         DC    XL2'B362',CL5'LTXR',AL1(RRE1),AL1(FP),AL1(8),XL2'0180'
+         DC    XL2'B363',CL5'LCXR',AL1(RRE1),AL1(FP),AL1(8),XL2'0180'
+         DC    XL2'B365',CL5'LXR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B366',CL5'LEXR',AL1(RRE1),AL1(FP),AL1(0),XL2'0100'
+         DC    XL2'B367',CL5'FIXR',AL1(RRE1),AL1(FP),AL1(0),XL2'0180'
+         DC    XL2'B369',CL5'CXR',AL1(RRE1),AL1(FP),AL1(2),XL2'0180'
+         DC    XL2'B374',CL5'LZER',AL1(RRE2),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B375',CL5'LZDR',AL1(RRE2),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B376',CL5'LZXR',AL1(RRE2),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B377',CL5'FIER',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B37F',CL5'FIDR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B384',CL5'SFPC',AL1(RRE2),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B38C',CL5'EFPC',AL1(RRE2),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B394',CL5'CEFBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B395',CL5'CDFBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B396',CL5'CXFBR',AL1(RRE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'B398',CL5'CFEBR',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B399',CL5'CFDBR',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B39A',CL5'CFXBR',AL1(RRF2),AL1(FP),AL1(14),XL2'0100'
+         DC    XL2'B3B4',CL5'CEFR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B3B5',CL5'CDFR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B3B6',CL5'CXFR',AL1(RRE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'B3B8',CL5'CFER',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B3B9',CL5'CFDR',AL1(RRF2),AL1(FP),AL1(14),XL2'0040'
+         DC    XL2'B3BA',CL5'CFXR',AL1(RRF2),AL1(FP),AL1(14),XL2'0140'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF TWO-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS E5               *
+***********************************************************************
+         DS    0F
+OCTWOE5  DS    0XL12
+         DC    XL2'E500',CL5'LASP',AL1(SSE1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'E501',CL5'TPROT',AL1(SSE1),AL1(PR),AL1(1),XL2'0000'
+         DC    XL2'E50E',CL5'MVCSK',AL1(SSE1),AL1(PR),AL1(0),XL2'0000'
+         DC    XL2'E50F',CL5'MVCDK',AL1(SSE1),AL1(PR),AL1(0),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+***********************************************************************
+*TABLES OF TWO-BYTE INSTRUCTIONS WHOSE FIRST BYTE IS ED               *
+***********************************************************************
+         DS    0F
+OCTWOED  DS    0XL12
+         DC    XL2'ED04',CL5'LDEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED05',CL5'LXDB',AL1(RXE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'ED06',CL5'LXEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'ED07',CL5'MXDB',AL1(RXE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'ED08',CL5'KEB',AL1(RXE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'ED09',CL5'CEB',AL1(RXE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'ED0A',CL5'AEB',AL1(RXE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'ED0B',CL5'SEB',AL1(RXE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'ED0C',CL5'MDEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED0D',CL5'DEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED0E',CL5'MAEB',AL1(RXF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED0F',CL5'MSEB',AL1(RXF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED10',CL5'TCEB',AL1(RXE1),AL1(FP),AL1(1),XL2'0000'
+         DC    XL2'ED11',CL5'TCDB',AL1(RXE1),AL1(FP),AL1(1),XL2'0000'
+         DC    XL2'ED12',CL5'TCXB',AL1(RXE1),AL1(FP),AL1(1),XL2'0080'
+         DC    XL2'ED14',CL5'SQEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED15',CL5'SQDB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED17',CL5'MEEB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED18',CL5'KDB',AL1(RXE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'ED19',CL5'CDB',AL1(RXE1),AL1(FP),AL1(13),XL2'0000'
+         DC    XL2'ED1A',CL5'ADB',AL1(RXE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'ED1B',CL5'SDB',AL1(RXE1),AL1(FP),AL1(14),XL2'0000'
+         DC    XL2'ED1C',CL5'MDB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED1D',CL5'DDB',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED1E',CL5'MADB',AL1(RXF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED1F',CL5'MSDB',AL1(RXF1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED24',CL5'LDE',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED25',CL5'LXD',AL1(RXE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'ED26',CL5'LXE',AL1(RXE1),AL1(FP),AL1(0),XL2'0080'
+         DC    XL2'ED34',CL5'SQE',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED35',CL5'SQD',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    XL2'ED37',CL5'MEE',AL1(RXE1),AL1(FP),AL1(0),XL2'0000'
+         DC    12X'FF'              END OF TABLE
+*
+***********************************************************************
+*     ***** CONDITION CODE TABLE ENTRIES FOR THE CC COLUMN *****      *
+* IN THE TABLE, NON-NUMERIC ENTRIES GIVE THE INSTRUCTION MNEMONIC TO  *
+* BE USED WHEN THE MASK IN THE INSTRUCTION MATCHES THE COLUMN NUMBER. *
+* WHEN THE ENTRY IS NUMERIC, IT IS THE CONDITION TO BE USED, AND THE  *
+* MNEMONIC WILL BE BC OR BCR.                                         *
+***********************************************************************
+*            0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F           *
+***********************************************************************
+CC01 DC CL48'NOP1  2  3  4  5  6  7  8  9  10 11 12 13 14 B  '
+CC02 DC CL48'NOP1  BH 3  BL 5  6  BNEBE 9  10 BNL12 BNH14 B  '
+CC03 DC CL48'NOP1  2  3  4  5  6  BNZBZ 9  10 11 12 13 14 B  '
+CC04 DC CL48'NOP1  2  3  4  5  6  BNEBE 9  10 11 12 13 14 B  '
+CC05 DC CL48'NOP1  BH 3  BL 5  6  BNEBE 9  10 BNL12 13 14 B  '
+CC06 DC CL48'NOPBO BP 3  4  5  6  BNZBZ 9  10 11 12 13 14 B  '
+CC07 DC CL48'NOP1  2  3  BM 5  6  BNZBZ 9  10 11 12 13 14 B  '
+CC08 DC CL48'NOP1  BP 3  BM 5  6  BNZBZ 9  10 BNM12 BNP14 B  '
+CC09 DC CL48'NOPBO BP 3  BM 5  6  BNZBZ 9  10 BNM12 BNPBNOB  '
+CC0A DC CL48'NOP1  BP 3  4  5  6  BNZBZ 9  10 11 12 13 14 B  '
+CC0B DC CL48'NOPBO 2  3  BM 5  6  BNZBZ 9  10 BNM12 13 BNOB  '
+CC0C DC CL48'NOPBO 2  3  4  5  6  BNZBZ 9  10 11 12 13 BNOB  '
+CC0D DC CL48'NOP1  BH 3  BL 5  6  BNEBE 9  10 11 12 13 14 B  '
+CC0E DC CL48'NOP1  BP 3  BM 5  6  BNZBZ 9  10 11 12 13 14 B  '
+***********************************************************************
+*  ***** MACHINE AND CODING FORMATS FOR THE FMT COLUMN                *
+***********************************************************************
+* THE FORMAT TABLE BELOW SHOWS FOR EACH FMT NUMBER THE INSTRUCTION    *
+* FORMAT NAME, MACHINE INSTRUCTION FORMAT, AND CODING FORMAT. THE     *
+* MACHINE INSTRUCTION SHOWS HOW THE INSTRUCTION IS FORMATTED IN MEMORY*
+* DURING EXECUTION, WHILE THE CODING FORMAT SHOWS HOW THE INSTRUCTION *
+* IS CODED BY THE ASSEMBLER PROGRAMMER.                               *
+* MACHINE INSTRUCTION FORMATS SHOW EACH NYBBLE (HALF-BYTE) OF THE     *
+* INSTRUCTION, AND THE DATA CONTAINED IN THAT NYBBLE. DATA CONTENT    *
+* ABBREVIATIONS ARE: OC=OP-CODE, R1-R4 ARE REGISTER OPERANDS, M1-M4   *
+* ARE MASK OPERANDS, I1-I4 ARE IMMEDIATE OPERANDS, LL IS A SINGLE     *
+* INSTRUCTION LENGTH, L1 AND L2 ARE OPERAND (1 AND 2) LENGTHS.        *
+***********************************************************************
+FP       EQU  64     FLOATING POINT INSTRUCTION
+PR       EQU  32     PRIVILEGED INSTRUCTION
+E1       EQU  1      OCOCOCOC                 <==> (NONE)
+RI1      EQU  2      OCOCR1OCI2I2I2I2         <==> R1,I2
+RR1      EQU  3      OCOCR1R2                 <==> R1,R2
+RR2      EQU  4      OCOCI1I1                 <==> I1
+RR3      EQU  5      OCOCR1--                 <==> R1
+RR4      EQU  29     OCOCM1R2                 <==> M1,R2
+RRE1     EQU  6      OCOCOCOC----R1R2         <==> R1,R2
+RRE2     EQU  7      OCOCOCOC----R1--         <==> R1
+RRE3     EQU  8      OCOCOCOC--------         <==> (NONE)
+RRF1     EQU  9      OCOCOCOCR1--R3R2         <==> R1,R3,R2
+RRF2     EQU  10     OCOCOCOCM3--R1R2         <==> R1,M3,R2
+RRF3     EQU  11     OCOCOCOCR3M4R1R2         <==> R1,R3,R2,M4
+RS1      EQU  12     OCOCR1R3B2D2D2D2         <==> R1,R3,D2(B2)
+RS2      EQU  13     OCOCR1--B2D2D2D2         <==> R1,D2(B2)
+RS3      EQU  14     OCOCR1M3B2D2D2D2         <==> R1,M3,D2(B2)
+RSI1     EQU  15     OCOCR1R3I2I2I2I2         <==> R1,R3,I2
+RX1      EQU  16     OCOCR1X2B2D2D2D2         <==> R1,D2(X2,B2)
+RX2      EQU  17     OCOCM1X2B2D2D2D2         <==> M1,D2(X2,B2)
+RXE1     EQU  18     OCOCR1X2B2D2D2D2----OCOC <==> R1,D2(X2,B2)
+RXF1     EQU  19     OCOCR3X2B2D2D2D2R1--OCOC <==> R1,R3,D2(X2,B2)
+S1       EQU  20     OCOC----B2D2D2D2         <==> D2(B2)
+S2       EQU  21     OCOCOCOC--------         <==> (NONE)
+S3       EQU  30     OCOCOCOCB2D2D2D2         <==> D2(B2)
+SI1      EQU  22     OCOCI2I2B1D1D1D1         <==> D1(B1),I2
+SS1      EQU  23     OCOCLLLLB1D1D1D1B2D2D2D2 <==> D1(LL,B1),D2(B2)
+SS2      EQU  24     OCOCL1L2B1D1D1D1B2D2D2D2 <==> D1(L1,B1),D2(L2,B2)
+SS3      EQU  25     OCOCR1R3B2D2D2D2B4D4D4D4 <==> R1,D2(B2),R3,D4(B4)
+SS4      EQU  26     OCOCR1R3B1D1D1D1B2D2D2D2 <==> D1(R1,B1),D2(B2),R3
+SS5      EQU  27     OCOCL1I3B1D1D1D1B2D2D2D2 <==> D1(L1,B1),D2(B2),I3
+SSE1     EQU  28     OCOCOCOCB1D1D1D1B2D2D2D2 <==> D1(B1),D2(B2)
+***********************************************************************
+*  PARAMETER AREA PASSED TO THE READLMOD SUBROUTINE                   *
+***********************************************************************
+PARMAREA DS    0F          READLMOD PARAMETER AREA
+PRMDDNAM DC    CL8'SYSLIB'    DDNAME FOR LOADLIB CONTAINING MEMBER
+PRMEMBER DC    CL8' '         MEMBER NAME
+PRMCSECT DC    CL8' '         CSECT NAME
+PRMREQST DC    CL8' '         NAME OF DATA TO BE RETRIEVED: ESD, RLD,
+*                                TEXT, SYM, IDRU, IDRL, IDRZ, IDRB,
+*                                NAME, OR MAP
+PRMCURSR DC    F'0'        CURSOR VALUE. CALLER SETS THIS TO ZERO
+*                             BEFORE A FIRST CALL FOR A SET OF DATA,
+*                             THEN LEAVES IT AS-IS WHEN RETURNING FOR
+*                             ADDITIONAL DATA UNTIL IT HAS ALL BEEN
+*                             RETURNED. CURRENT VALUE IS RETURNED BY
+*                             THIS SUBROUTINE AFTER EACH CALL.
+PRMRETCD DC    F'0'        RETURN CODE FROM IEWBIND (S/B ZERO)
+PRMRSNCD DC    F'0'        REASON CODE FROM IEWBIND (ZERO MEANS
+*                             MORE DATA OF THIS TYPE IS AVAILABLE AND
+*                             WILL BE RETURNED IN SUBSEQUENT CALLS.
+*                             4 MEANS THE DATA IN THE BUFFER IS ALL
+*                             THAT IS AVAILABLE OF THE REQUESTED TYPE
+PRMCOUNT DC    F'0'        NUMBER ELEMENTS AVAILABLE IN THE BUFFER
+PRMBUFAD DC    A(0)        ADDRESS OF THE DATA BUFFER HEADER. THE
+*                             HEADER IS 32 BYTES LONG, FOLLOWED BY
+*                             THE DATA ELEMENTS.
+PRMERROR DS    CL1         ERROR INDICATOR ON RETURN:
+PRMOK    EQU   C' '           SUCCESSFUL READLMOD CALL
+PRMPRMER EQU   C'P'           PARAMETER ERROR
+PRMACERR EQU   C'E'           IEWBIND MACRO ERROR OCCURRED
+*********************************************************************
+*             DCB'S                                                 *
+*********************************************************************
+SYSPRINT DCB   DSORG=PS,MACRF=PM,DDNAME=SYSPRINT,                      X
+               RECFM=FBA,LRECL=133
+SYSOUT   DCB   DSORG=PS,MACRF=PM,DDNAME=SYSOUT,                        X
+               RECFM=FB,LRECL=80
+SYSIN    DCB   DSORG=PS,MACRF=GM,DDNAME=SYSIN,EODAD=RCEOF,             X
+               RECFM=FB,LRECL=80
+         LTORG
+RESOURCE CSECT
+*********************************************************************
+*             REGISTER EQUATES                                      *
+*********************************************************************
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+***********************************************************************
+* THE TWO FOLLOWING DSECTS DESCRIBE THE CONTENT OF AN IEWBUFF         *
+* EXTERNAL SYMBOL DICTIONARY (ESD) BUFFER:                            *
+*    ESDHEADR DESCRIBES THE BUFFER HEADER.                            *
+*    ESDENTRY DESCRIBES EACH ESD ENTRY THAT FOLLOWS THE HEADER.       *
+***********************************************************************
+ESDHEADR DSECT ,    DESCRIBE THE IEWBUFF ESD BUFFER HEADER              01-IEWBU
+ESDHBUFI DS    CL8  BUFFER EYECATCHER.                                  02-00073
+ESDHBUFL DS    F    TOTAL BUFFER LENGTH INCLUDING THIS                  02-00074
+ESDHVERS DS    AL1  VERSION OF BUFFER.                                  02-00077
+         DS    AL3  RESERVED. MUST BE ZERO.                             02-00078
+ESDHENTL DS    F    LENGTH OF EACH BUFFER ENTRY.                        02-00079
+ESDHENTC DS    F    NUMBER ESDENTRY ELEMENTS CONTAINED IN THIS BUFFER   02-00080
+ESDHNAMO DS    F    OFFSET OF NAME IN NAMES LIST AREA.                  02-00081
+ESDHSTRP DS    F    ADDRESS OF BINDER NAMES LIST AREA.                  02-00082
+ESDHEND  DS    0F   BEGINNING OF 1ST BUFFER ENTRY.                      02-00083
+*
+ESDENTRY DSECT ,    DESCRIBE ESDENTRY. OCCURS ESDHENTC TIMES            01-IEWBU
+ESDTYPE  DS    CL2  TYPE OF ESD ENTRY.                                  01-IEWBU
+ESDTYPEQ DS    CL2  ESD RECORD TYPE QUALIFIER                           01-IEWBU
+ESDNAMES DS    CL1  NAME SPACE OF SYMBOL                                01-IEWBU
+ESDSCOPE DS    CL1  SCOPE OF THE SYMBOL                                 01-IEWBU
+ESDNAME  DS    0CL6 SYMBOL REPRESENTED BY ESD RECORD                    01-IEWBU
+ESDNAMEC DS    H      LENGTH OF THE NAME.                               01-IEWBU
+ESDNAMEP DS    A      POINTS TO THE NAME OF THE SYMBOL (BLANK = $PRIV)  01-IEWBU
+ESDSYMAT DS    BL1  SYMBOL ATTRIBUTE FLAGS                              01-IEWBU
+ESDSTRNG EQU   X'80'  ON=STRONG REFERENCE OR DEFINITION                 01-IEWBU
+ESDRNMBL EQU   X'40'  ON=THIS SYMBOL IS MAPPED,NOT RENAMED              01-IEWBU
+ESDDESCL EQU   X'20'  ON=SYMBOL DEFINES OR REFERENCES A LINKAGE BLOCK   01-IEWBU
+ESDMNGLD EQU   X'10'  ON=NAME MAY BE MANGLED                            01-IEWBU
+ESDXPLNK EQU   X'08'  ON=USES XPLINK LINKAGE CONVENTIONS                01-IEWBU
+         DS    CL1                                                      01-IEWBU
+ESDRESCS DS    0CL6 NAME OF OWNING OR CONTAINING SECTION                01-IEWBU
+ESDRESCL DS    H       LENGTH OF THE RESIDENT SECTION NAME              01-IEWBU
+ESDRESCP DS    A       POINTER TO NAME OF SECTION WHERE THIS SPEC. OF   01-IEWBU
+*                        THE SYMBOL RESIDES. FOR LD, PR.
+ESDLENG  DS    F    LENGTH OF DEFINED ELEMENT                           01-IEWBU
+ESDALIGN DS    XL1  ALIGNMENT SPECIFICATION FOR SD, PR                  01-IEWBU
+ESDUSBLT DS    XL1  REUSABILITY OF SD                                   01-IEWBU
+ESDAMODE DS    XL1  ADDRESSING MODE OF SD                               01-IEWBU
+ESDRMODE DS    XL1  RMODE OF SD                                         01-IEWBU
+ESDRECFM DS    H    RECORD FORMAT FOR CLASS                             01-IEWBU
+ESDLOADF DS    BL1  LOAD ATTRIBUTES                                     01-IEWBU
+ESDRO    EQU   X'80'   READ-ONLY                                        01-IEWBU
+ESDNL    EQU   X'40'   DO NOT LOAD WITH MODULE                          01-IEWBU
+ESDMOVE  EQU   X'20'   MOVEABLE                                         01-IEWBU
+ESDSHR   EQU   X'10'   SHAREABLE                                        01-IEWBU
+ESDDEFER EQU   X'08'   DEFERRED LOAD                                    01-IEWBU
+ESDBINDF DS    BL1  BIND ATTRIBUTES                                     01-IEWBU
+ESDGEND  EQU   X'80'   BINDER-GENERATED                                 01-IEWBU
+ESDNOCLS EQU   X'40'   NO CLASS DATA AVAILABLE                          01-IEWBU
+ESDVL    EQU   X'20'   VARIABLE LENGTH RECORDS                          01-IEWBU
+ESDDESCD EQU   X'10'   DESCRIPTIVE DATA                                 01-IEWBU
+ESDINIT  EQU   X'08'   HAS PART INITIALIZERS                            01-IEWBU
+ESDFILLX EQU   X'04'   ILL HAS BEEN SET                                 01-IEWBU
+ESDPADST EQU   X'02'   CLASS HAS PADDING AT START                       01-IEWBU
+ESDBINDC DS    BL1  TYPE OF PROGRAM CODE DESCRIBED BY SYMBOL            01-IEWBU
+ESDMETH  EQU   X'30'   BINDING METHOD                                   01-IEWBU
+*                        '00'B = CATENATE
+*                        '01'B = MERGE
+*                        '1-'B = RESERVED
+ESDTXTTY EQU   X'0F'   TEXT TYPE                                        01-IEWBU
+*                        '0000'B = UNSPECIFIED
+*                        '0001'B = INSTRUCTIONS
+*                        '0010'B = DATA
+*                        '0011'B = TRANSLATOR DEFN
+         DS    XL1                                                      01-IEWBU
+ESDXATCL DS    H    LENGTH OF XATTR CLASS NAME                          01-IEWBU
+ESDXATCP DS    A    PTR TO EXTENDED ATTRIBUTES CLASS NAME               01-IEWBU
+ESDXATOF DS    F    EXTENDED ATTRIBUTES OFFSET                          01-IEWBU
+ESDSEGMN DS    H    OVERLAY SEGMENT NUMBER OF SECTION                   01-IEWBU
+ESDREGN  DS    H    OVERLAY REGION NUMBER OF SECTION                    01-IEWBU
+ESDSIGN  DS    CL8  INTERFACE SIGNATURE                                 01-IEWBU
+ESDAUTOC DS    BL1  AUTOCALL SPEC. APPLIES TO REFERENCES                01-IEWBU
+ESDNVRCL EQU   X'80'      NEVERCALL WAS SPECIFIED                       01-IEWBU
+ESDMINOR EQU   X'40'      AUTOCALLED FROM LPA                           01-IEWBU
+ESDSTAT  DS    BL1  STATUS                                              01-IEWBU
+ESDRESLV EQU   X'80'      SYMBOL IS RESOLVED                            01-IEWBU
+ESDACPRC EQU   X'40'      PROCESSED BY AUTOCALL                         01-IEWBU
+ESDINCLD EQU   X'20'      INCLUDE ATTEMPTED                             01-IEWBU
+ESDNOTFD EQU   X'10'      MEMBER NOT FOUND                              01-IEWBU
+ESDEXTRN EQU   X'08'      RESOLVED OUTSIDE MODULE                       01-IEWBU
+ESDNOCAL EQU   X'04'      NOCALL/NEVERCALL                              01-IEWBU
+ESDNOREF EQU   X'02'      NO STRONG REFERENCES                          01-IEWBU
+ESDLIBRY EQU   X'01'      SPECIAL CALL LIBRARY REQUESTED                01-IEWBU
+ESDTGTL  DS    H    LENGTH OF THE TARGET.                               01-IEWBU
+ESDTGTP  DS    A    POINTS TO NAME OF SECTION WHERE SYMBOL RESIDES. FOR 01-IEWBU
+*                      EXTERNAL REFERENCES.
+         DS    H                                                        01-IEWBU
+ESDCNTCL DS    H    LENGTH OF THE CLASS                                 01-IEWBU
+ESDCNTCP DS    A    POINTS TO NAME OF CONTAINING CLASS                  01-IEWBU
+ESDELOFF DS    F    OFFSET WITHIN THE CLASS ELEMENT                     01-IEWBU
+ESDCLOFF DS    F    OFFSET WITHIN THE CLASS SEGMENT                     01-IEWBU
+         DS    H                                                        01-IEWBU
+ESDADAL  DS    H    ASSOCIATED DATA LENG                                01-IEWBU
+ESDADAP  DS    A    POINTS TO ASSOCIATED DATA                           01-IEWBU
+         DS    F                                                        01-IEWBU
+ESDPRTY  DS    F    BINDING SEQUENCE                                    01-IEWBU
+ESDNTEND DS    0F                                                       01-IEWBU
+***********************************************************************
+* THE TWO FOLLOWING DSECTS DESCRIBE THE CONTENT OF AN IEWBUFF NAME    *
+* BUFFER:                                                             *
+*    BNLHEADR DESCRIBES THE BUFFER HEADER.                            *
+*    BNLENTRY DESCRIBES EACH ENTRY THAT FOLLOWS THE HEADER.           *
+***********************************************************************
+BNLHEADR DSECT ,    DESCRIBES THE HEADER FOR THE IEWBUFF NAME BUFFER    01-IEWBU
+BNLHBUFI DS    CL8  BUFFER EYECATCHER.                                  02-00073
+BNLHBUFL DS    F    TOTAL BUFFER LENGTH, INCLUDING THIS                 02-00074
+BNLHVER  DS    AL1  VERSION OF BUFFER.                                  02-00077
+         DS    AL3                                                      02-00078
+BNLHENTL DS    F    LENGTH OF EACH BUFFER ENTRY.                        02-00079
+BNLHENTC DS    F    NUMBER BNLENTRY ELEMENTS CONTAINED IN THIS BUFFER   02-00080
+HNAMO DS    F    OFFSET OF NAME IN NAMES LIST AREA.                     02-00081
+BNLHSTRP DS    F    ADDRESS OF BINDER NAMES LIST AREA.                  02-00082
+BNLHEND  DS    0F   BEGINNING OF 1ST BUFFER ENTRY.                      02-00083
+*                                                                       02-00121
+BNLENTRY DSECT ,    DESCRIBES NAME BUFFER ENTRY. OCCURS BNLHENTC TIMES  01-IEWBU
+BNLCLSL  DS    F    CLASS LENGTH (FOR CLASS NAMES)                      01-IEWBU
+BNLBINDF DS    XL1  FLAG BITS                                           01-IEWBU
+BNLBFGEN EQU   X'80'  GENERATED BY BINDER                               01-IEWBU
+BNLBFEMP EQU   X'40'  NO DATA PRESENT                                   01-IEWBU
+BNLBFVL  EQU   X'20'  VARYING LENGTH RECORDS                            01-IEWBU
+BNLBFDES EQU   X'10'  DESCRIPTIVE DATA (NON-TEXT)                       01-IEWBU
+BNLBFINI EQU   X'08'  CLASS HAS INITIAL DATA                            01-IEWBU
+BNLBFFIL EQU   X'04'  FILL CHARACTER SPECIFIED                          01-IEWBU
+BNLBFERR EQU   X'01'  CLASS VALIDATION ERROR                            01-IEWBU
+BNLPAD1  DS    XL1  1 BYTE PAD FOR BOUNDARY ALIGNMENT                   01-IEWBU
+BNLNAMEL DS    H    NBR SIGNIFICANT CHARS IN CLASS/SECTION NAME         01-IEWBU
+BNLNAMEP DS    AL4  POINTER TO CLASS OR SECTION NAME                    01-IEWBU
+BNLELEMC DS    F    NUMBER ELEMENTS IN CLASS OR SECT                    01-IEWBU
+BNLEND   DS    0F                                                       01-IEWBU
+***********************************************************************
+* THE TWO FOLLOWING DSECTS DESCRIBE THE CONTENT OF AN IEWBUFF         *
+* RELOCATION DICTIONARY (RLD) BUFFER:                                 *
+*    RLDHEADR DESCRIBES THE BUFFER HEADER.                            *
+*    RLDENTRY DESCRIBES EACH RLD ENTRY THAT FOLLOWS THE HEADER.       *
+***********************************************************************
+RLDHEADR DSECT ,    DESCRIBE IEWBUFF RLD BUFFER HEADER                  01-IEWBU
+RLDHBUFI DS    CL8  BUFFER EYECATCHER.                                  02-00073
+RLDHBUFL DS    F    TOTAL BUFFER LENGTH, INCLUDING THIS                 02-00074
+RLDHVER  DS    AL1  VERSION OF BUFFER.                                  02-00077
+         DS    XL3                                                      02-00078
+RLDHENTL DS    F    LENGTH OF EACH BUFFER ENTRY.                        02-00079
+RLDHENTC DS    F    NUMBER RLDENTRY ELEMENTS CONTAINED IN THIS BUFFER   02-00080
+RLDHNAMP DS    F    OFFSET OF NAME IN NAMES LIST AREA.                  02-00081
+RLDHSTRP DS    F    ADDRESS OF BINDER NAMES LIST AREA.                  02-00082
+RLDHEND  DS    0F   BEGINNING OF 1ST BUFFER ENTRY.                      02-00083
+*
+RLDENTRY DSECT ,    DESCRIBE RLD BUFFER ENTRY. OCCURS RLDHENTC TIMES    01-IEWBU
+RLDTYPE  DS    XL1  ADCON TYPE.                                         01-IEWBU
+RLDSTAT  DS    XL1  ADCON RELOCATION STATUS.                            01-IEWBU
+RLDRESNL DS    H    LENGTH OF THE RESIDENT.                             01-IEWBU
+RLDRESNP DS    A    POINTS TO NAME OF SECTION WHERE ADCON RESIDES       01-IEWBU
+RLDADCNL DS    H    LENGTH OF THE ADCON.                                01-IEWBU
+RLDRESCL DS    H    LENGTH OF THE RESIDENT CLASS NAME                   01-IEWBU
+RLDRESCP DS    A    POINTS TO NAME OF CLASS WHERE ADCON RESIDES         01-IEWBU
+RLDRESOF DS    F    OFFSET OF ADDRESS CONSTANT IN ELEMENT OR PART:      01-IEWBU
+*                      RLDRESPL=0: ELEMENT; RLDRESPL>0: PART
+RLDCLOF  DS    F    OFFSET OF THE ADDRESS WITHIN CLASS SEGMENT          01-IEWBU
+RLDADCNB DS    XL1  ADCON BOUNDARY SPECIFICATION.                       01-IEWBU
+RLDBNDAT DS    BL1  ADCON BOUNDARY STATUS                               01-IEWBU
+RLDDIR   EQU   X'80'   RELOCATION SIGN: '0' = POS; '1' = NEG            01-IEWBU
+RLDHOBST EQU   X'40'   SET HIGH ORDER BIT FROM AMODE OF TARGET          01-IEWBU
+RLDINTXT EQU   X'20'   INTERNAL/EXTERNAL: '0' = INT; '1' = EXT          01-IEWBU
+RLDHOBCH EQU   X'10'   HIGH ORDER BIT CHANGED BY BINDER                 01-IEWBU
+RLDPARTR EQU   X'08'   ADCON LOCATED IN PART                            01-IEWBU
+RLDXATCL DS    H    LENGTH OF EXTENDED ATTR CLASS NAME                  01-IEWBU
+RLDXATCP DS    A    POINTER TO EXTENDED ATTRIBUTES CLASS NAME           01-IEWBU
+RLDXATOF DS    F    OFFSET OF EXTENDED ATTRIBUTES IN THE ELEMENT        01-IEWBU
+RLDNAMSP DS    XL1  NAME SPACE OF REFERENCE                             01-IEWBU
+         DS    XL1                                                      01-IEWBU
+RLDTGTNL DS    H    LENGTH OF THE TARGET NAME                           01-IEWBU
+RLDTGTNP DS    A    POINTER TO NAME OF SYMBOL TO WHICH ADCON POINTS     01-IEWBU
+         DS    XL2                                                      01-IEWBU
+RLDRESPL DS    H    RESIDENT PART LENGTH                                01-IEWBU
+RLDRESPP DS    A    RESIDENT PART POINTER                               01-IEWBU
+RLDEND   DS    0F                                                       01-IEWBU
+***********************************************************************
+* THE TWO FOLLOWING DSECT DESCRIBES THE CONTENT OF AN IEWBUFF         *
+* TEXT BUFFER                                                         *
+***********************************************************************
+TXTHEADR DSECT ,    DESCRIBE THE IEWBUFF TEXT BUFFER HEADER             01-IEWBU
+TXTHBUFI DS    CL8  BUFFER EYECATCHER.                                  02-00073
+TXTHBUFL DS    F    TOTAL BUFFER LENGTH, INCLUDING THIS                 02-00074
+TXTHVER  DS    AL1  VERSION OF BUFFER.                                  02-00077
+         DS    AL3                                                      02-00078
+TXTHENTL DS    F    LENGTH OF EACH BUFFER ENTRY.                        02-00079
+TXTHENTC DS    F    NUMBER TEXT BYTES CONTAINED IN THIS BUFFER          02-00080
+TXTHNAMO DS    F    OFFSET OF NAME IN NAMES LIST AREA.                  02-00081
+TXTHSTRP DS    F    ADDRESS OF BINDER NAMES LIST AREA.                  02-00082
+TXTHEND  DS    0F   BEGINNING OF TEXT AREA                              02-00083
+*
+TXTENTRY DSECT ,    DESCRIBES TEXT AREA
+TXTBYTE  DS    0C   TEXT BYTE. OCCURS TXTHENTC TIMES                    02-00083
+***********************************************************************
+* THE TWO FOLLOWING DSECTS DESCRIBE THE CONTENT OF AN IEWBUFF IDRL    *
+* BUFFER:                                                             *
+*    IDLHEADR DESCRIBES THE BUFFER HEADER.                            *
+*    IDLENTRY DESCRIBES EACH ENTRY THAT FOLLOWS THE HEADER.           *
+***********************************************************************
+IDLHEADR DSECT ,    DESCRIBE THE IEWBUFF IDRL BUFFER HEADER             01-IEWBU
+IDLHBUFI DS    CL8  BUFFER EYECATCHER.                                  02-00073
+IDLHBUFL DS    F    TOTAL BUFFER LENGTH, INCLUDING THIS                 02-00074
+IDLHVER  DS    AL1  VERSION OF BUFFER.                                  02-00077
+         DS    AL3                                                      02-00078
+IDLHENTL DS    F    LENGTH OF EACH BUFFER ENTRY.                        02-00079
+IDLHENTC DS    F    NUMBER IDLENTRY ELEMENTS CONTAINED IN THIS BUFFER   02-00080
+IDLHNAMO DS    F    OFFSET OF NAME IN NAMES LIST AREA.                  02-00081
+IDLHSTRP DS    F    ADDRESS OF BINDER NAMES LIST AREA.                  02-00082
+IDLHEND  DS    0F   BEGINNING OF 1ST BUFFER ENTRY.                      02-00083
+*                                                                       02-00121
+IDLENTRY DSECT ,    DESCRIBE IDRLENTRY. OCCURS IDLHENTC TIMES           01-IEWBU
+IDLPIDID DS    CL10 PROCESSOR IDENTIFICATION (PID ORDER NUMBER)         01-IEWBU
+IDLVER   DS    CL2  PROCESSOR VERSION  NUMBER.                          01-IEWBU
+IDLMODLV DS    CL2  PROCESSOR MODIFICATION LEVEL.                       01-IEWBU
+IDLDATPR DS    CL7  DATE OF COMPILATION OR ASSEMBLY (YYYYDDD)           01-IEWBU
+         DS    XL1                                                      01-IEWBU
+IDLRESNL DS    H    LENGTH OF THE RESIDENT.                             01-IEWBU
+IDLRESNP DS    AL4  POINTS TO NAME OF SECTION TO WHICH THIS APPLIES     01-IEWBU
+IDLEND   DS    0F                                                       01-IEWBU
+***********************************************************************
+* THIS DSECT DESCRIBES AN ENTRY IN THE LABEL TABLE                    *
+* THE TABLE ADDRESSES ARE LOCATED AT LBLTBADR, LBLTBEND, AND CURRLABL *
+* IF THE LENGTH OF LBLENTRY CHANGES, CHANGE HOLDLABL, AS WELL.        *
+***********************************************************************
+LBLDSECT DSECT ,                       DESCRIBES A LABEL TABLE ENTRY
+LBLENTRY DS    0CL16                   LABEL TABLE ENTRY
+LBLOFSET DS    F                           CSECT OFFSET TO THE LABEL
+LBLTYPE  DS    X                           ENTRY TYPE: 0C=DROP,10=USING
+*                                            18=DATA START, 1C=DATA END
+*                                            30=LABEL,40=ADCON,50=VCON
+LBLUREG  DS    X                           USING REGISTER
+LBLRLDLN DS    H                           LENGTH IF RLD ENTRY ELSE 0
+LBLLABEL DS    0CL8                        LABEL
+LBLINITU DS    XL4                         INITIAL REG VALUE FOR USING
+         DS    XL4
+***********************************************************************
+* DESCRIBES AN ENTRY IN AN OP-CODE TABLE                              *
+***********************************************************************
+OPCODES  DSECT ,                       DESCRIBES AN OP-CODE TABLE ENTRY
+OPCENTRY DS    0XL12                   OP-CODE TABLE ENTRY
+OPCODE1  DS    XL1                        OP-CODE BYTE 1
+OPCODE2  DS    XL1                        OP-CODE BYTE 2 OR ZERO
+OPCMNEM  DS    0CL5                       MNEMONIC -OR-
+OPCTWO2  DS    CL1                          '2' FOR 2-BYTE OP-CODES
+*                                           X'00' IF NOT AN OP-CODE
+OPCSRCH2 DS    AL4                          SRCH ADDRESS FOR 2-BYTE O-C
+OPCFORMT DS    XL1                        INSTRUCTION FORMAT CODE
+OPCFLAGS DS    XL1                        FLAGS: 40=FLOATING POINT INST
+*                                                20=PRIVILEGED
+OPCNDCOD DS    XL1                        CONDITION CODE TABLE LINE
+OPCFLAG1 DS    XL1                        FLAG BYTE
+OPCFLAG2 DS    XL1                        FLAG BYTE
+RESOURCE CSECT
+         END

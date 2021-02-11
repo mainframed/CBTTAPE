@@ -1,0 +1,427 @@
+/* REXX    CMRSTTBL   this is the anti-process of CMFLTTBL.  This
+                      rebuilds an ISPF table from the data produced
+                      by CMFLTTBL.
+
+           Written by Frank Clarke, Richmond, 19990806
+
+     Impact Analysis
+.    SYSPROC   TRAPOUT
+
+     Modification History
+     20010618 fxc upgrade from v.19990709 to v.20010524; WIDEHELP;
+                  ....
+
+*/ arg argline
+address TSO                            /* REXXSKEL ver.20010524      */
+arg parms "((" opts
+
+signal on syntax
+signal on novalue
+
+call TOOLKIT_INIT                      /* conventional start-up     -*/
+rc     = trace(tv)
+info   = parms                         /* to enable parsing          */
+
+call A_INIT                            /*                           -*/
+
+"NEWSTACK"                             /* isolate queue data         */
+                                    if \sw.0error_found then,
+call B_READ_FLATFILE                   /*                           -*/
+                                    if \sw.0error_found then,
+call C_POPULATE_TABLE                  /*                           -*/
+"DELSTACK"                             /* expose queue data          */
+
+if helpmsg <> "" then call HELP
+if \sw.nested then call DUMP_QUEUE     /*                           -*/
+exit                                   /*@ CMRSTTBL                  */
+/*
+.  ----------------------------------------------------------------- */
+A_INIT:                                /*@                           */
+   if branch then call BRANCH
+   address TSO
+
+   call AA_KEYWDS                      /*                           -*/
+   openmode.0  = "WRITE"               /* based on NOUPDT            */
+   openmode.1  = "NOWRITE"             /*                            */
+
+return                                 /*@ A_INIT                    */
+/*
+.  ----------------------------------------------------------------- */
+AA_KEYWDS:                             /*@                           */
+   if branch then call BRANCH
+   address TSO
+
+   prm_flatdsn  = KEYWD("FROM")
+   prm_libdsn   = KEYWD("LIBRARY")
+   parse var info  prm_tblnm  info
+
+   if prm_tblnm prm_flatdsn = "" then do
+      helpmsg = "Either NAME or FROM must be specified.  You may",
+                "specify both."
+      call HELP                        /* ...and don't come back     */
+      end
+   parse value prm_flatdsn   "FLATTBLS."prm_tblnm     with,
+               flatdsn   .
+
+return                                 /*@ AA_KEYWDS                 */
+/*
+.  ----------------------------------------------------------------- */
+B_READ_FLATFILE:                       /*@                           */
+   if branch then call BRANCH
+   address TSO
+
+   "ALLOC FI($IN) DA("flatdsn")  SHR REU"
+   if rc > 4 then do
+      say       "Dataset" flatdsn "failed to ALLOCate."
+      sw.0error_found = "1" ; return
+      end
+   "EXECIO * DISKR $IN (FINIS"         /* load the data queue        */
+   "FREE  FI($IN)"                     /* finished with file         */
+
+   if queued() < 2 then do
+      say       "Dataset" flatdsn "has no data."
+      sw.0error_found = "1" ; return
+      end
+   parse pull "Contents of" dta_tblnm libdata "rows)" ,
+              "KEYS(" keylst ")",
+              "NAMES(" nmlist ")"
+   parse var libdata    libdata   "(" rowcount .
+   parse var libdata  "in" dta_libdsn  .
+   if dta_libdsn <> "" then dta_libdsn = "'"dta_libdsn"'"
+
+   parse value prm_tblnm   dta_tblnm    with,
+               $tn$    .
+   parse value prm_libdsn  dta_libdsn   with,
+               libdsn  .
+
+   if libdsn = "" then do              /* no specification           */
+      helpmsg = "LIBRARY was not specified and no library name was",
+                  "found in the header of" flatdsn".  Processing",
+                  "halted.  Specify LIBRARY when reinvoking."
+      sw.0error_found = "1" ; return
+      end                              /* no LIBDSN                  */
+
+   if Sysdsn(libdsn) <> "OK" then do   /* needs to be built          */
+      "ALLOC FI($TMP) DA("libdsn") NEW CATALOG REU UNIT(SYSDA)",
+            "DSNTYPE(LIBRARY)",        /* PDSE                       */
+            "RECFM(F B) LRECL(80) BLKSIZE(0) SPACE(5 5) TRACKS"
+      "FREE  FI($TMP)"
+      end
+
+return                                 /*@ B_READ_FLATFILE           */
+/*
+.  ----------------------------------------------------------------- */
+C_POPULATE_TABLE:                      /*@                           */
+   if branch then call BRANCH
+   address ISPEXEC
+
+   "CONTROL ERRORS RETURN"             /* I'll handle my own         */
+   call CA_OPEN_TABLE                  /*                           -*/
+                                    if \sw.0error_found then,
+   call CL_LOAD_TABLE                  /*                           -*/
+                                    if \sw.0error_found then,
+   call CZ_WRAP_UP                     /*                           -*/
+
+return                                 /*@ C_POPULATE_TABLE          */
+/*
+.  ----------------------------------------------------------------- */
+CA_OPEN_TABLE:                         /*@                           */
+   if branch then call BRANCH
+   address ISPEXEC
+
+   "TBCREATE" $tn$ "KEYS("keylst") NAMES("nmlist") WRITE REPLACE"
+
+return                                 /*@ CA_OPEN_TABLE             */
+/*
+.  The first line in the stack contained the root data about the
+.  table: the table name, the dataset from which it was extracted,
+.  the key fields, and the name fields.  Each additional line in the
+.  stack represents a single table-row.  This row-data is in KEYPHRS
+.  format: a keyword (which names a table column) followed by a
+.  two-character separator followed by the data for that column
+.  followed by a second two-character separator.  After the
+.  keyfields and namefields, KEYPHRS 'XVARS' names any extension
+.  variables for that row.  Extension variable data follows in
+.  KEYPHRS format.
+.
+.  To recap: the row is formed as:
+.    <keyfld data> <namefld data>  <xvar names>  <xvar data>
+.  Each block above identifies one or more KEYPHRS blocks in which
+.  the data appears as:
+.     <literal .. one or more words ..>
+.  with the '..' being any non-blank character pair, usually 'EFEF'x.
+.
+.  <xvars> may, of course, be empty in which case there is no xvar
+.  data to follow.
+.  ----------------------------------------------------------------- */
+CL_LOAD_TABLE:                         /*@                           */
+   cl_tv = trace()                     /* what setting at entry ?    */
+   if branch then call BRANCH
+   address ISPEXEC
+
+   defined = Space(keylst nmlist,1)
+   do queued()                         /* every line in the stack    */
+      "TBVCLEAR" $tn$                  /* zap all columns            */
+      parse pull info                  /* prepare for parsing        */
+      call CLP_PARSE_FIELDS            /*                           -*/
+                                     rc = Trace("O"); rc = trace(cl_tv)
+      "TBMOD"  $tn$ "SAVE("xvarlst")"
+
+   end                                 /* queued()                   */
+
+return                                 /*@ CL_LOAD_TABLE             */
+/*
+.  ----------------------------------------------------------------- */
+CLP_PARSE_FIELDS:                      /*@                           */
+   if branch then call BRANCH
+   address TSO
+
+   do clx = 1 to Words(defined)
+      fldn    = Word(defined,clx)      /* isolate field name         */
+       clp_tv = trace()
+           rc = Trace("O")
+      fldval  = KEYPHRS(fldn)          /* acquire text from 'info'   */
+           rc = Trace(clp_tv)
+      $z$     = Value(fldn,fldval)     /* load fldval to fldn        */
+      $z$     = fldval
+   end                                 /* defined                    */
+
+   xvarlst = KEYPHRS("XVARS")          /* any extension variables ?  */
+   do clx = 1 to Words(xvarlst)
+      fldn    = Word(xvarlst,clx)      /* isolate field name         */
+       clp_tv = trace()
+           rc = Trace("O")
+      fldval  = KEYPHRS(fldn)          /* acquire text from 'info'   */
+           rc = Trace(clp_tv)
+      $z$     = Value(fldn,fldval)     /* load fldval to fldn        */
+      $z$     = fldval
+   end                                 /* xvars                      */
+
+return                                 /*@ CLP_PARSE_FIELDS          */
+/*
+.  ----------------------------------------------------------------- */
+CZ_WRAP_UP:                            /*@                           */
+   if branch then call BRANCH
+   address ISPEXEC
+
+   "LIBDEF  ISPTABL  DATASET  ID("libdsn")  STACK"
+   "TBCLOSE" $tn$
+   "LIBDEF  ISPTABL"
+
+return                                 /*@ CZ_WRAP_UP                */
+/*
+.  ----------------------------------------------------------------- */
+LOCAL_PREINIT:                         /*@ customize opts            */
+   address TSO
+
+
+return                                 /*@ LOCAL_PREINIT             */
+/*   subroutines below LOCAL_PREINIT are not selected by SHOWFLOW    */
+/*
+.  ----------------------------------------------------------------- */
+HELP:                                  /*@                           */
+address TSO;"CLEAR"                    /* NMR uses CLEAR             */
+if helpmsg <> "" then do ; say helpmsg; say ""; end
+ex_nam = Left(exec_name,8)             /* predictable size           */
+
+say "  "ex_nam"      Rebuilds an ISPF table from unload data produced by       "
+say "                CMFLTTBL or a similar process.                            "
+say "                                                                          "
+say "  Syntax:   "ex_nam"  <tblname>                                           "
+say "                      <FROM flat-dsn>                                     "
+say "                      <LIBRARY output>                                    "
+say "                 At least one of <tblname> and <flat-dsn> must be         "
+say "                 specified in order to determine the primary input file.  "
+say "                                                                          "
+say "            <tblname>     identifies the name which is to be assigned to  "
+say "                      the newly re-created table.  If not specified, it   "
+say "                      will be determined from the header information of   "
+say "                      the primary input file.                             "
+say "                                                                          "
+say "            <flat-dsn>   identifies the dataset which is to be used as the"
+say "                      primary input.  If not specified, the tblname       "
+say "                      determines the default as FLATTBLS.tblname.         "
+say "                                                                          "
+say "            <output>   identifies the ISPF table library which is to      "
+say "                      receive the re-created table.  If this library does "
+say "                      not exist it will be built.                         "
+"NEWSTACK" ; pull ; "CLEAR" ; "DELSTACK"
+say "   Debugging tools provided include:                                      "
+say "                                                                          "
+say "        MONITOR:  displays key information throughout processing.         "
+say "                  Displays most paragraph names upon entry.               "
+say "                                                                          "
+say "        NOUPDT:   by-pass all update logic.                               "
+say "                                                                          "
+say "        BRANCH:   show all paragraph entries.                             "
+say "                                                                          "
+say "        TRACE tv: will use value following TRACE to place                 "
+say "                  the execution in REXX TRACE Mode.                       "
+say "                                                                          "
+say "                                                                          "
+say "   Debugging tools can be accessed in the following manner:               "
+say "                                                                          "
+say "        TSO" ex_nam   "  parameters  ((  debug-options                    "
+say "                                                                          "
+say "   For example:                                                           "
+say "                                                                          "
+say "        TSO" ex_nam " (( MONITOR TRACE ?R                                 "
+
+address ISPEXEC "CONTROL DISPLAY REFRESH"
+exit                                   /*@ HELP                      */
+/*
+.  ----------------------------------------------------------------- */
+BRANCH: Procedure expose,              /*@                           */
+        sigl exec_name
+   rc = trace("O")                     /* we do not want to see this */
+   arg brparm .
+
+   origin = sigl                       /* where was I called from ?  */
+   do currln = origin to 1 by -1       /* inch backward to label     */
+      if Right(Word(Sourceline(currln),1),1) = ":" then do
+         parse value sourceline(currln) with pgfname ":" .  /* Label */
+         leave ; end                   /*                name        */
+   end                                 /* currln                     */
+
+   select
+      when brparm = "NAME" then return(pgfname) /* Return full name  */
+      when brparm = "ID"      then do           /* wants the prefix  */
+         parse var pgfname pgfpref "_" .        /* get the prefix    */
+         return(pgfpref)
+         end                           /* brparm = "ID"              */
+      otherwise
+         say left(sigl,6) left(pgfname,40) exec_name "Time:" time("L")
+   end                                 /* select                     */
+
+return                                 /*@ BRANCH                    */
+/*
+.  ----------------------------------------------------------------- */
+DUMP_QUEUE:                            /*@ Take whatever is in stack */
+   rc = trace("O")                     /*  and write to the screen   */
+   address TSO
+
+   "QSTACK"                            /* how many stacks?           */
+   stk2dump    = rc - tk_init_stacks   /* remaining stacks           */
+   if stk2dump = 0 & queued() = 0 then return
+   say "Total Stacks" rc ,             /* rc = #of stacks            */
+       "Begin Stacks" tk_init_stacks , /* Stacks present at start    */
+       "Stacks to DUMP" stk2dump
+
+   do dd = rc to tk_init_stacks by -1  /* empty each one.            */
+      say "Processing Stack #" dd "Total Lines:" queued()
+      do queued();pull line;say line;end /* pump to the screen       */
+      "DELSTACK"                       /* remove stack               */
+   end                                 /* dd = 1 to rc               */
+
+return                                 /*@ DUMP_QUEUE                */
+/*
+.  ----------------------------------------------------------------- */
+KEYWD: Procedure expose info           /*@ hide all vars, except info*/
+   arg kw
+   kw_pos = wordpos(kw,info)           /* find where it is, maybe    */
+   if kw_pos = 0 then return ""        /* send back a null, not found*/
+   kw_val = word(info,kw_pos+1)        /* get the next word          */
+   info   = Delword(info,kw_pos,2)     /* remove both                */
+return kw_val                          /*@ KEYWD                     */
+/*
+.  ----------------------------------------------------------------- */
+KEYPHRS: Procedure expose,             /*@                           */
+         info helpmsg exec_name        /*  except these three        */
+   arg kp
+   wp    = wordpos(kp,info)            /* where is it?               */
+   if wp = 0 then return ""            /* not found                  */
+   front = subword(info,1,wp-1)        /* everything before kp       */
+   back  = subword(info,wp+1)          /* everything after kp        */
+   parse var back dlm back             /* 1st token must be 2 bytes  */
+   if length(dlm) <> 2 then            /* Must be two bytes          */
+      helpmsg = helpmsg "Invalid length for delimiter("dlm") with KEYPHRS("kp")"
+   if wordpos(dlm,back) = 0 then       /* search for ending delimiter*/
+      helpmsg = helpmsg "No matching second delimiter("dlm") with KEYPHRS("kp")"
+   if helpmsg <> "" then call HELP     /* Something is wrong         */
+   parse var back kpval (dlm) back     /* get everything b/w delim   */
+   info =  front back                  /* restore remainder          */
+return Strip(kpval)                    /*@ KEYPHRS                   */
+/*
+.  ----------------------------------------------------------------- */
+NOVALUE:                               /*@                           */
+   say exec_name "raised NOVALUE at line" sigl
+   say " "
+   say "The referenced variable is" condition("D")
+   say " "
+   zsigl = sigl
+   signal SHOW_SOURCE                  /*@ NOVALUE                   */
+/*
+.  ----------------------------------------------------------------- */
+SHOW_SOURCE:                           /*@                           */
+   call DUMP_QUEUE                     /* Spill contents of stacks  -*/
+   if sourceline() <> "0" then         /* to screen                  */
+      say sourceline(zsigl)
+   rc =  trace("?R")
+   nop
+   exit                                /*@ SHOW_SOURCE               */
+/*
+.  ----------------------------------------------------------------- */
+SS: Procedure                          /*@ Show Source               */
+   arg  ssbeg  ssend  .
+   if ssend = "" then ssend = 10
+   if \datatype(ssbeg,"W") | \datatype(ssend,"W") then return
+   ssend = ssbeg + ssend
+   do ssii = ssbeg to ssend ; say sourceline(ssii) ; end
+return                                 /*@ SS                        */
+/*
+.  ----------------------------------------------------------------- */
+SWITCH: Procedure expose info          /*@                           */
+   arg kw
+   sw_val = Wordpos(kw,info) > 0       /* exists = 1; not found = 0  */
+   if sw_val then                      /* exists                     */
+      info = Delword(info,Wordpos(kw,info),1) /* remove it           */
+return sw_val                          /*@ SWITCH                    */
+/*
+.  ----------------------------------------------------------------- */
+SYNTAX:                                /*@                           */
+   errormsg = exec_name "encountered REXX error" rc "in line" sigl":",
+                        errortext(rc)
+   say errormsg
+   zsigl = sigl
+   signal SHOW_SOURCE                  /*@ SYNTAX                    */
+/*
+   Can call TRAPOUT.
+.  ----------------------------------------------------------------- */
+TOOLKIT_INIT:                          /*@                           */
+   address TSO
+   info = Strip(opts,"T",")")          /* clip trailing paren        */
+
+   parse source  sys_id  how_invokt  exec_name  DD_nm  DS_nm,
+                     as_invokt  cmd_env  addr_spc  usr_tokn
+
+   parse value "" with  tv  helpmsg  .
+   parse value 0   "ISR00000  YES"     "Error-Press PF1"    with,
+               sw.  zerrhm    zerralrm  zerrsm
+
+   if SWITCH("TRAPOUT") then do
+      "TRAPOUT" exec_name parms "(( TRACE R" info
+      exit
+      end                              /* trapout                    */
+
+   if Word(parms,1) = "?" then call HELP /* I won't be back          */
+
+   "QSTACK" ; tk_init_stacks = rc      /* How many stacks?           */
+
+   parse value SWITCH("BRANCH") SWITCH("MONITOR") SWITCH("NOUPDT") with,
+               branch           monitor           noupdt    .
+
+   parse value mvsvar("SYSNAME") sysvar("SYSNODE") with,
+               #tk_cpu           node          .
+
+   sw.nested    = sysvar("SYSNEST") = "YES"
+   sw.batch     = sysvar("SYSENV")  = "BACK"
+   sw.inispf    = sysvar("SYSISPF") = "ACTIVE"
+
+   parse value KEYWD("TRACE")  "O"    with   tv  .
+   tk_globalvars = "exec_name  tv  helpmsg  sw.  zerrhm  zerralrm ",
+                   "zerrsm  zerrlm  tk_init_stacks  branch  monitor ",
+                   "noupdt"
+
+   call LOCAL_PREINIT                  /* for more opts             -*/
+
+return                                 /*@ TOOLKIT_INIT              */

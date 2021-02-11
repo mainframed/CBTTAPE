@@ -1,0 +1,434 @@
+   TITLE 'UNFOLDEM -- UNFOLD FB-80 DATA INTO A LONG BUFFER'
+UNFOLDEM CSECT
+*                           -------------------------------------
+*                           It is probably not necessary to run
+*                           this program in 24-bit mode.  But
+*                           it works when it is run that way.
+*                           -------------------------------------
+*                           We do want old MVS systems to be able
+*                           to run this routine.
+*                           -------------------------------------
+*
+*     Copyright  2004 - 2005  by  Sam Golob.  All right reserved,
+*                subject to express permissions from the author
+*                to use this software.  This software is part
+*                of VTTS (Virtual Tape Transportation System).
+*
+*  ---------------------------------------------------------------  *
+*                                                                   *
+*  SUBROUTINE:    UNFOLDEM                                          *
+*                                                                   *
+*  DESCRIPTION:                                                     *
+*                                                                   *
+*      This program is the heart of the process of creating a       *
+*      real tape from an AWS-format tape file, which has been       *
+*      folded over into an FB-80 dataset.  The AWS header           *
+*      contains the number of bytes in the next chunk (complete     *
+*      or partial block) of tape data.  Once this quantity is       *
+*      known, and the beginning position of the data has been       *
+*      established (it starts just after the header ends), then     *
+*      the data itself has to be moved into a buffer, in            *
+*      preparation for that data block being written out to a       *
+*      tape.  This program unfolds the correct amount of data,      *
+*      beginning at a known position in the FB-80 file, into        *
+*      the buffer.  The position in the FB-80 file which marks      *
+*      the beginning of the data to be moved, is called the         *
+*      OFFSET into the 80-byte card, and it starts with position    *
+*      +0.                                                          *
+*                                                                   *
+*  INPUTS and OUTPUTS:   Described below.                           *
+*                                                                   *
+*  FILES NEEDED:                                                    *
+*                                                                   *
+*      This program assumes that the caller has opened DCBs for     *
+*      an FB-80 file called AWSIN, which contains its input         *
+*      "virtual tape" data, and for SYSPRINT.  This program         *
+*      needs to do GETs from AWSIN, and if necessary, it needs      *
+*      to write messages to SYSPRINT.  The caller has to provide    *
+*      ENTRY AWSIN and ENTRY SYSPRINT statements in front of        *
+*      the AWSIN and SYSPRINT DCBs, respectively.                   *
+*                                                                   *
+*  METHOD OF OPERATION:                                             *
+*                                                                   *
+*      This program operates using a control block, called the      *
+*      UNFAREA, which is passed from the caller and back to the     *
+*      caller.  Both the caller and this program update the         *
+*      UNFAREA.  Upon entry to this program, R1 is expected to      *
+*      point to the UNFAREA.                                        *
+*                                                                   *
+*      The caller does one GET of the FB-80 file, to read an        *
+*      AWS header (that has tape data following it).  Once the      *
+*      AWS header has been read, there should be enough data to     *
+*      supply to the UNFAREA control block, and then this           *
+*      program is called, to complete the move of that tape data    *
+*      to a buffer, and position the FB-80 input just past the      *
+*      data moved, so it should point to the next AWS header.       *
+*                                                                   *
+*      This program does more GETs from the FB-80 input file,       *
+*      until the request for the number of bytes to be moved,       *
+*      is satisfied.                                                *
+*                                                                   *
+*      The following is the layout of the UNFAREA.  Fields          *
+*      marked with an arrow must be supplied upon input to this     *
+*      program.                                                     *
+*                                                                   *
+*      UNFAREA  DS    0F          UNFOLD AREA CONTROL BLOCK         *
+*      *                          ------ ---- ------- -----         *
+*  --> UNFSCARD DC    F'0'        Start address of 80-byte card     *
+*  --> UNFECARD DC    F'0'        End address of 80-byte card       *
+*  --> UNFOFFST DC    F'0'        OFFSET of data to be moved        *
+*  --> UNFBYTES DC    F'0'        Number of bytes to be unfolded    *
+*      UNFBYMVD DC    F'0'        Number of bytes that were moved   *
+*  --> UNFBUFFR DC    F'0'        Current start address in buffer   *
+*  --> UNFBSTRT DC    F'0'        Original start address of buffer  *
+*      UNFINRCD DC    PL7'0'      Number of GETs for AWSIN records  *
+*      UNFLENTH EQU   *-UNFAREA                                     *
+*      *                                                            *
+*                                                                   *
+*      The rest of the fields are calculated by this program        *
+*      and returned to the caller.                                  *
+*                                                                   *
+*      UNFBUFFR and UNFOFFST are updated by this program, and       *
+*      upon return to the caller, they point to the output data     *
+*      and input data positions, respectively, that are just        *
+*      after the moved data, so as to wait for the next call,       *
+*      to be able to move more data.  UNFBSTRT preserves the        *
+*      very beginning address of the output buffer, whereas         *
+*      UNFBUFFR is a place somewhere within the buffer, which       *
+*      is the start of where the new data is expected to be         *
+*      moved.                                                       *
+*                                                                   *
+*      Since both the caller and this program do GET operations     *
+*      from the input FB-80 file, the count of the number of GETs   *
+*      done, UNFINRCD, is updated by BOTH the caller and by this    *
+*      program.                                                     *
+*                                                                   *
+*  ---------------------------------------------------------------  *
+         MACRO
+*  ---------------------------------------------------------------  *
+*    This macro is used to display hex values in a printed report.
+*  ---------------------------------------------------------------  *
+&NAME    HEX   &TO,&LEN,&FROM
+&NAME    DS    0H
+         ST    R4,SAVER04
+         STM   15,1,HEXSAVE
+         LA    1,&FROM
+         LA    0,&LEN
+         LA    15,&TO
+         BAL   4,HEX
+         L     R4,SAVER04
+         LM    15,1,HEXSAVE
+         MEND
+         SPACE
+         YREGS
+UNFOLDEM AMODE 24
+UNFOLDEM RMODE 24
+         USING *,R15
+         B     EYECATCH
+         DC    C'--- '            MAKE EYECATCHER VISIBLE
+         DC    C'UNFOLDEM '
+         DC    C' - '
+SYSDAT   DC    C'&SYSDATE'
+         DC    C'  ',C'&SYSTIME '
+SAVEAREA DC    18F'0'
+EYECATCH DS    0D                    ENSURE ALIGNMENT
+         STM   R14,R12,12(R13)
+         LR    R5,R1                 SAVE PARM POINTER
+         LA    R1,SAVEAREA           NEW SAVE-AREA ADDR
+         ST    R1,8(,R13)            FORWARD SAVE-AREA CHAIN PTR
+         ST    R13,4(,R1)            BACKWARD SAVE-AREA CHAIN PTR
+         LR    R13,R1                NEW SAVE AREA ADDRESS
+         DROP  R15
+* -----                              SET UP BASE REGISTERS
+         USING UNFOLDEM,R12,R11
+         LR    R12,R15
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+         LR    R1,R5                 RESTORE PARM POINTER
+         ST    R1,SAVEPARM
+         L     R0,SYSPRINV           SYSPRINT DCB address in caller
+         ST    R0,SYSPRDCB             store for the program's use
+         L     R0,AWSINV             AWSIN    DCB address in caller
+         ST    R0,AWSINDCB             store for the program's use
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*                                                                   *
+*   Routine to unfold FB-80 data starting at an OFFSET from the     *
+*   beginning of a card, for a certain number of bytes, to a data   *
+*   buffer area whose beginning address is supplied.  More 80-byte  *
+*   records can be read with the GET macro from the FB-80 file, to  *
+*   fulfill the move request.                                       *
+*                                                                   *
+*   Input:   UNFAREA fields are all supplied by the calling         *
+*            program, except for UNFBYMVD which is calculated       *
+*            by this program and returned to the caller.  The       *
+*            UNFAREA is pointed to by Register 1.                   *
+*                                                                   *
+*            The initial card image which is supplied by the        *
+*            calling program, already is primed with data to be     *
+*            moved (one card's worth of it).  This card contains    *
+*            the starting point for the data to be moved, at an     *
+*            OFFSET (displacement) from the beginning of the card.  *
+*                                                                   *
+*            The input data also contains the address of an         *
+*            output buffer area, which is the target for the        *
+*            (segmented) data moves.  Data will be strung out       *
+*            into this area, one card (or a partial card) at a      *
+*            time.  The current card which is in the input file,    *
+*            which contains the beginning of the data to be         *
+*            moved, has already been loaded into a card image       *
+*            work area pointed to by the calling program.  The      *
+*            OFFSET into this card is where the data to be moved    *
+*            will start.                                            *
+*                                                                   *
+*            It is the responsibility of the calling program to     *
+*            ensure that this routine has access to all of the      *
+*            buffer storage where the data is supposed to be        *
+*            moved to.                                              *
+*                                                                   *
+*   Output:  Data is moved, for the required number of bytes, to    *
+*            the output buffer area.  When more that one card       *
+*            image's worth of data has to be moved, more cards      *
+*            are obtained with the GET macro, from the input file.  *
+*                                                                   *
+*            Ending OFFSET in the FB-80 input file, pointing to     *
+*            just after the data which was moved, in the final      *
+*            card image gotten, is returned to the UNFOFFST field   *
+*            and reported to the caller, in anticipation of the     *
+*            next call to this routine.                             *
+*                                                                   *
+*            Ending address of data in buffer - one byte after      *
+*            the end of the moved data - is returned in the         *
+*            UNFBUFFR field.  The UNFBSTRT field preserves the      *
+*            address of the beginning of the data buffer.           *
+*                                                                   *
+*            A count of bytes actually moved from the FB-80 file    *
+*            to the output buffer area is reported in the UNFBYMVD  *
+*            field.  This must match the byte count of bytes which  *
+*            needed to be moved initially.  That count had been     *
+*            initially supplied by the calling program in the       *
+*            UNFBYTES field.                                        *
+*                                                                   *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+UNFOLD   DS    0H
+         ST    R1,PARMPTR
+         L     R2,=A(UNFBLOCK)
+         USING UNFBLOCK,R2
+         MVC   UNFAREA(UNFLENTH),0(R1)      Move input block to pgm
+         LA    R2,UNFAREA                   And address it.
+         MVC   SAVEBEGC,UNFSCARD    Save "start of card" address
+         MVC   SAVEENDC,UNFECARD    Save "end of card" address
+         L     R1,UNFSCARD          Address of card
+         MVC   WORKPREV(80),ZEROCARD   Zero prev work area
+         MVC   WORKCURR(80),0(R1)   Move card image to curr work area
+         MVC   UNFBYMVD,=F'0'       Initialize count of bytes moved
+         L     R7,UNFSCARD          Point to beginning of card
+         A     R7,UNFOFFST          Add OFFSET to start of input
+         ST    R7,SAVEBEGI          Save where input starts
+         L     R8,SAVEBEGI          Copy beg of input address
+         A     R8,UNFBYTES          Make hypothetical end address,
+*                                   by adding the bytes to be moved.
+* - - - - - - - - - - - - - - >>    This may be way past the address
+*             of the end of the FB-80 card.  We will decrease this
+*             address as we move bytes from successive cards to the
+*             data buffer, by 80 bytes at a time, as we GET new cards,
+*             until R8 actually falls within the end-of-card address.
+*             We will then use this address to calculate the new
+*             OFFSET for the next piece of data in the FB-80 file.
+*             The new OFFSET is returned to the caller by modifying
+*             the UNFOFFST field in the control block.
+*
+* <--------- SET UP LOOP TO START MOVING THE DATA ------->
+LOOPSET  DS    0H                   Start moving data
+         L     R3,UNFBUFFR          Point to beginning of buffer
+         ST    R3,SAVEBEGD          Save location in the program.
+         LR    R4,R3                Point R4 to end of data by adding
+         A     R4,UNFBYTES          the number of bytes to the start.
+         ST    R4,SAVEENDD          Save potential end of data location
+         ST    R8,SAVER8TR          Save R8 for trace.
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+*  Cases:  1.  Current move is within the current card.           *
+*              Covered by LOOPSHRT routine.                       *
+*                                                                 *
+*          2.  Current move is past the current card.             *
+*              Covered by LOOPMORE routine.                       *
+*                                                                 *
+*        R6 always contains the number of bytes to be moved       *
+*        for this segment.                                        *
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+LOOPINIT DS    0H
+         C     R8,SAVEENDC          Is R8 still past end-of-card?
+         BH    LOOPMORE             Yes. Copy till end and GET.
+LOOPSHRT DS    0H                   The move is short, not past end.
+         LR    R6,R8                No. Get byte count to move NOW.
+         SR    R6,R7                Bytes to move
+         C     R6,=F'80'            More than 80?
+         BH    LOOPERR1             Yes. Has to be error, so flag it.
+         BCTR  R6,0                 No. One less for EXECUTE.
+         EX    R6,MOVEBUFF          Move the data to the buffer.
+         LA    R6,1(,R6)            Restore count of bytes moved
+         L     R1,UNFBYMVD          Increment
+         AR    R1,R6                  total
+         ST    R1,UNFBYMVD          Store it away for later.
+         LA    R3,0(R6,R3)          Bop past beginning buffer address.
+*        MVC   LINE+1(8),=C'LSHRT1: '
+*        BAL   R9,UNFIMAGE
+         CR    R3,R4                Not equal to predicted end?
+         BNE   LOOPERR2             Error, so flag it.
+         ST    R3,UNFBUFFR          Return modified new buffer address.
+         LR    R6,R8                Calculate new OFFSET - save R8
+         S     R6,UNFSCARD          Subtract beginning of card address
+         ST    R6,UNFOFFST          Store the result as new OFFSET
+*        MVC   LINE+1(8),=C'LSHRT2: '
+*        BAL   R9,UNFIMAGE
+         B     RETURN
+*
+LOOPMORE DS    0H                   Data move if more than one card
+*
+         L     R6,SAVEENDC          We're going past end-of-card
+         SR    R6,R7                Subtract beg address of data
+         C     R6,=F'80'            Still bigger than 80?
+         BH    LOOPERR1             Yes. Has to be error.
+         BCTR  R6,0                 Subtract one for EXECUTE
+         EX    R6,MOVEBUFF          Move data into buffer
+         LA    R6,1(,R6)            Restore byte count
+         L     R1,UNFBYMVD          Increment
+         AR    R1,R6                  total
+         ST    R1,UNFBYMVD              bytes moved
+         LA    R3,0(R6,R3)          Bop past data moved in buffer
+*        MVC   LINE+1(8),=C'LMORE1: '
+*        BAL   R9,UNFIMAGE
+         CR    R3,R4                Test if past end
+         BH    LOOPERR3             Yes. Has to be an error.
+         ST    R3,UNFBUFFR          Re-point current buffer address.
+         S     R8,=F'80'            -80 bytes because new card gotten
+         MVC   WORKPREV,WORKCURR    Save card image to previous
+         ST    R10,SAVER10          Save register for safety
+         L     R10,AWSINDCB         Point to AWSIN DCB in caller
+         GET   (10),WORKCURR        Get a new card image
+         L     R10,SAVER10          Restore R10
+         AP    UNFINRCD,=P'1'       Increment count of AWSIN rcrds read
+         L     R7,SAVEBEGC          Point to beginning addr of workarea
+         MVC   0(80,R7),WORKCURR    Overlay caller's card image
+*        MVC   LINE+1(8),=C'LMORE2: '
+*        BAL   R9,UNFIMAGE
+         C     R8,SAVEENDC          Is R8 within the card image end?
+         BH    LOOPMORE             No. Do the LOOPMORE routine.
+         B     LOOPSHRT             Yes. Do the LOOPSHRT routine.
+         SPACE 3
+* ----------------------------------------------------------------- *
+MOVEBUFF MVC   0(*-*,R3),0(R7)      << EXECUTED >>
+* --------------------------------------------------------- *
+LOOPERR1 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR1 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR2 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR2 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+LOOPERR3 DS    0H                   Error entry location
+         MVC   LINE,LINE-1
+         MVC   LINE+1(9),=C'LOOPERR3 '
+         BAL   R9,UNFIMAGE
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+* --------------------------------------------------------- *
+RETURN   DS    0H                   RETURN TO THE OPERATING SYSTEM
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SAVEPARM         Address of UNFAREA in caller
+         MVC   0(UNFLENTH,R10),UNFAREA    Copy changed UNFAREA back
+         L     R10,SAVER10          Restore R10
+         L     R13,4(,R13)
+         MVC   16(4,R13),=F'0'      Load Maximum Return Code
+         MVC   24(4,R13),=A(UNFBLOCK)  Return address of UNFAREA in R1.
+         LM    R14,R12,12(R13)
+         BR    R14
+         EJECT
+* --------------------------------------------------------- *
+* --------------------------------------------------------- *
+* ---      S U B R O U T I N E S                        --- *
+* --------------------------------------------------------- *
+UNFIMAGE DS    0H          Diagnostic Data - State of UNFAREA currently
+*
+         HEX   LINE+10,4,UNFSCARD
+         HEX   LINE+20,4,UNFECARD
+         HEX   LINE+30,4,UNFOFFST
+         HEX   LINE+40,4,UNFBYTES
+         HEX   LINE+50,4,UNFBYMVD
+         HEX   LINE+60,4,UNFBUFFR
+         HEX   LINE+70,4,UNFBSTRT
+         HEX   LINE+80,4,SAVER8TR
+         HEX   LINE+90,7,UNFINRCD
+         ST    R10,SAVER10          Save register for safety
+         L     R10,SYSPRDCB         Point to SYSPRINT DCB in caller
+         PUT   (10),LINE            PUT the print line
+         MVC   LINE,LINE-1
+         L     R10,SAVER10          Restore R10
+         BR    R9
+* - - - - - - - -  D A T A   A R E A S  - - - - - - - - *
+UNFBLOCK CSECT
+UNFAREA  DS    0F                   UNFOLD AREA CONTROL BLOCK
+*                                   ------ ---- ------- -----
+UNFSCARD DC    F'0'                 Start address of 80-byte card
+UNFECARD DC    F'0'                 End address of 80-byte card
+UNFOFFST DC    F'0'                 OFFSET of data to be moved
+UNFBYTES DC    F'0'                 Number of bytes to be unfolded
+UNFBYMVD DC    F'0'                 Number of bytes that were moved
+UNFBUFFR DC    F'0'                 Current start address in buffer
+UNFBSTRT DC    F'0'                 Original start address of buffer
+UNFINRCD DC    PL7'0'               Number of GETs for AWSIN records
+UNFLENTH EQU   *-UNFAREA
+*
+UNFOLDEM CSECT
+WORKPREV DS    CL80                 Contiguous previous card image
+WORKCURR DS    CL80                 Card image work area
+         DC    C' '
+LINE     DC    CL133' '
+         DC    C' '
+LINE2    DC    CL133' '
+*
+FF       EQU   X'FF'
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEX      DS    0H
+         MVC   1(1,R15),0(R1)        Move byte
+         UNPK  0(3,R15),1(2,R15)     Unpack
+         TR    0(2,R15),HEXTAB-240
+         LA    R15,2(,R15)           Increment output pointer
+         LA    R1,1(,R1)             Increment input pointer
+         BCT   R0,HEX                Decrement length, then loop
+         MVI   0(R15),C' '           Blank the trailing byte
+         BR    R4                    Return to caller
+HEXTAB   DC    C'0123456789ABCDEF'   Translate table
+         SPACE
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+HEXSAVE  DS    3F                    Register save for HEX macro
+SAVER04  DS    H                     Register save for HEX macro
+* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *
+ZEROCARD DC    80X'00'
+SAVEBEGD DC    F'0'                 Save beg of buffer data address
+SAVEENDD DC    F'0'                 Save end of buffer data address
+SAVEBEGI DC    F'0'                 Save beg address of card input
+SAVEBEGC DC    F'0'                 Save beg address of card
+SAVEENDC DC    F'0'                 Save end address of card
+SAVER8TR DC    F'0'                 Save floating Reg 8 which decreases
+SAVEPARM DC    F'0'                 Save CALLER'S UNFAREA ADDRESS
+PARMPTR  DC    F'0'
+SYSPRINV DC    V(SYSPRINT)
+AWSINV   DC    V(AWSIN)
+SYSPRDCB DC    F'0'
+AWSINDCB DC    F'0'
+SAVER10  DC    F'0'
+         END

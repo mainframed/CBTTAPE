@@ -1,0 +1,3601 @@
+LWATMGR  TITLE '- LWATMGR - LWA Table Manager'
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Support Email Address: zOS.JES2@Gmail.com                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*                 |                                                   *
+* L W A T M G R   |                                                   *
+*                 |          Logon WorkArea Table Manager             *
+*------------------                                                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+*                                                                     *
+*    FUNCTION:     Dynamically Manage the TSO user's copy of the      *
+*                  authorization tables.                              *
+*                                                                     *
+*                  These tables are typically created from the        *
+*                  IKJTSOxx parmlib member but can be loaded from     *
+*                  an authorized STEPLIB or from LPA when the user    *
+*                  logs on to TSO.                                    *
+*                                                                     *
+*                  This program can replace the tables entirely,      *
+*                  just selected table(s) or it can add or remove     *
+*                  entries from the existing table.                   *
+*                                                                     *
+*                  The updates to this table affect the current TSO   *
+*                  user only.  The other TSO users are unchanged.     *
+*                  This makes this command ideal for testing a new    *
+*                  IKJTSOxx member.                                   *
+*                                                                     *
+*                  Note: If the initial table was loaded from either  *
+*                        STEPLIB or it resides in LPA, this program   *
+*                        will replace the table with one simulating   *
+*                        the PARMLIB version of the table.            *
+*                        Once the table is in this format additions   *
+*                        and deletions can easily be performed.       *
+*                        When this "LOAD MODULE" verion of the table  *
+*                        is replaced, it's storage is not released    *
+*                        as the actual size is unknown.               *
+*                        As this is only done one time it should not  *
+*                        cause a storage shortage problem.            *
+*                                                                     *
+*                                                                     *
+*       PARMS:  See comment block above "PCL".                        *
+*                                                                     *
+*                                                                     *
+* REGISTER USAGE:   R0 - PSA                                          *
+*                   R1 - Work Register                                *
+*                   R2 - Work Register                                *
+*                   R3 - Work Register                                *
+*                   R4 - Work Register                                *
+*                   R5 - Work Register                                *
+*                   R6 - Work Register                                *
+*                   R7 - Work Register                                *
+*                   R8 - CPPL                                         *
+*                   R9 - Work Register                                *
+*                  R10 - PCL                                          *
+*                  R11 - Base Register #2                             *
+*                  R12 - Base Register #1                             *
+*                  R13 - Work Area Base Register (24-Bit Storage)     *
+*                  R14 - Return Address                               *
+*                  R15 - Return Code                                  *
+*                                                                     *
+*                                                                     *
+* EXTERNALS:                                                          *
+*            DYNALLOC - Under the guise of the "ALLOC" and "FREE"     *
+*                       macro, to perform dynamic allocation.         *
+*            IEFPRMLB - Read the specified PARMLIB member into        *
+*                       storage as one large string.                  *
+*            IKJPARS  - Parse the main command & also parse the       *
+*                       IKJTSOxx statements.                          *
+*            ISPLINK  - Invoke ISPF Services.                         *
+*            PUTLINE  - Write messages to the user.                   *
+*                                                                     *
+*                                                                     *
+* Attributes:  Authorized, Key 8, Problem State, Reentrant, Amode 31. *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*     HISTORY: #V01R001 - NOV 07,2008 -  In The Beginning...          *
+*              #V01R002 - MAR 02,2012 -  Add EAV Support.      #DD12062
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         ACONTROL OPTABLE(ZS3)     Assembly OPTCDE Table
+         SPLEVEL  SET=6            Specify OS/390 R2 macro format
+         SYSSTATE ARCHLVL=2        Assembly requires z/Architecture
+         SYSSTATE OSREL=ZOSV1R13   Assembly requires z/OS 1.13 & higher
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Instream Macros                                              *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         MACRO ,
+&NAME    #SAVE ,
+SUBRTNS  LOCTR ,
+&NAME    ST    R15,STACK15         Save Work Register
+         L     R15,STACKNX@        A(Next Save Area)
+         C     R15,STACKEND        Check If Stack Has Overflowed
+         JL    #&SYSNDX            B. If Not
+         ABEND 1                   User Abend
+#&SYSNDX STM   R0,R14,0(R15)       Save Registers 0 Through 14
+         MVC   15*4(4,R15),STACK15 Save R15 As Well
+         AHI   R15,16*4            A(Next Save Area)
+         ST    R15,STACKNX@        Save Next Save Area Address
+         BALR  R11,0               Initialize Subroutine Base
+         USING *,R11
+         MEND  ,
+
+         MACRO ,
+&NAME    #RESTORE &R15=
+&NAME    DS    0H
+         AIF   ('&R15' EQ '').REST030
+         AIF   ('&R15'(1,1) EQ '(').REST010
+         LA    R15,&R15            Set Return Code
+         AGO   .REST020
+.REST010 ANOP  ,
+         AIF   ('&R15' EQ '(R15)').REST020
+         LR    R15,&R15(1)         Set Return Code
+.REST020 ANOP  ,
+         ST    R15,WRKR15          Save Return Code Value
+.REST030 ANOP  ,
+         L     R15,STACKNX@        A(Next Save Area)
+         SHI   R15,16*4            A(Current Save Area)
+         ST    R15,STACKNX@        Restore Next Save Area Address
+         LM    R0,R15,0(R15)       Restore All Registers
+         J     #&SYSNDX
+         #EXEC ,                   Executed Statements
+         LTORG ,                   Literal Pool
+#&SYSNDX DS    0H
+         AIF   ('&R15' EQ '').REST040
+         L     R15,WRKR15          Restore Return Code Value
+.REST040 ANOP  ,
+         MEND  ,
+
+         MACRO ,
+&NAME    #CALL &RTN
+&NAME    L     R15,=A(&RTN)        A(Processing Routine)
+         BALR  R14,R15             Call Subroutine
+         MEND  ,
+
+
+LWATMGR  #START ,                  Start Mainline                      *
+               BASE=(R12,R11),     Define Base Register(s)             *
+               COPY=YES,                                               *
+               WKDSECT=WRKLWATM,   Define Work Area Name               *
+               LOC=BELOW,          Acquire Work Area Below The Line    *
+               REG1=R8,            Command Parameter List              *
+               AMODE=31,RMODE=ANY, Execute In AMODE 31, RMODE Any      *
+               USING=(PSA,0,CPPL,R8),                                  *
+               LEVEL=#V01R002      Version Identifier          #DD12062
+
+*-------
+*        Initialize Save Area Stack Pointers
+*-------
+         LA    R1,STACK            A(Start Of Save Area Stack)
+         ST    R1,STACKNX@         Save "Next" Address
+         AH    R1,=AL2(STACKLEN)   A(End Of Save Area Stack)
+         ST    R1,STACKEND         Save "End" Address
+
+         MVI   BLANKS,C' '         Initialize BLANKS Area
+         MVC   BLANKS+1(L'BLANKS-1),BLANKS
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Locate and Validate The LWA                                  *
+*                                                                     *
+*---------------------------------------------------------------------*
+         L     R14,PSAAOLD         A(ASCB)
+         USING ASCB,R14
+         L     R14,ASCBASXB        A(ASXB)
+         USING ASXB,R14
+         L     R14,ASXBLWA         A(LWA)
+         ST    R14,WRKLWA@         Save LWA Address
+         USING LWA,R14
+
+         C     R14,LWAPPTR         Check If LWA Points To Itself
+         BNE   LWA00400            B. If Not
+         CLC   LWALWA,=C'   LWA  ' Check LWA Identifier
+         BNE   LWA00400            B. If Valid
+
+         MVC   WRKPRMLB,LWAPRMLB   Save Original LWA Flag Value
+
+*-------
+*        Save The Authorization Table Pointer Addresses
+*-------
+         LA    R0,LWATAP           A(IKJEFTAP Pointer)
+         ST    R0,WRKTAPP@
+         LA    R0,LWATAPLN         A(IKJEFTAP Length)
+         ST    R0,WRKTAPL@
+         MVC   WRKTAPL,LWATAPLN    Save IKJEFTAP Length
+         TM    LWAPRMLB,LWATAPST   Did IKJEFTAP Come From //STEPLIB
+         BZ    LWA00100            B. If Not
+         OI    WRKTAPF,WRK$STEP
+LWA00100 DS    0H
+         LA    R0,LWATE2           A(IKJEFTE2 Pointer)
+         ST    R0,WRKTE2P@
+         LA    R0,LWATE2LN         A(IKJEFTE2 Length)
+         ST    R0,WRKTE2L@
+         MVC   WRKTE2L,LWATE2LN    Save IKJEFTE2 Length
+         TM    LWAPRMLB,LWATE2ST   Did IKJEFTE2 Come From //STEPLIB
+         BZ    LWA00200            B. If Not
+         OI    WRKTE2F,WRK$STEP
+LWA00200 DS    0H
+         LA    R0,LWATE8           A(IKJEFTE8 Pointer)
+         ST    R0,WRKTE8P@
+         LA    R0,LWATE8LN         A(IKJEFTE8 Length)
+         ST    R0,WRKTE8L@
+         MVC   WRKTE8L,LWATE8LN    Save IKJEFTE8 Length
+         TM    LWAPRMLB,LWATE8ST   Did IKJEFTE8 Come From //STEPLIB
+         BZ    LWA00300            B. If Not
+         OI    WRKTE8F,WRK$STEP
+LWA00300 DS    0H
+         LA    R0,LWATNS           A(IKJEFTNS Pointer)
+         ST    R0,WRKTNSP@
+         LA    R0,LWATNSLN         A(IKJEFTNS Length)
+         ST    R0,WRKTNSL@
+         MVC   WRKTNSL,LWATNSLN    Save IKJEFTNS Length
+         TM    LWAPRMLB,LWATNSST   Did IKJEFTNS Come From //STEPLIB
+         BZ    LWA00500            B. If Not
+         OI    WRKTNSF,WRK$STEP
+         B     LWA00500
+         DROP  R14
+
+LWA00400 DS    0H
+         MVC   WRKDATA(#MSG001L),#MSG001
+         TPUT  WRKDATA,#MSG001L    Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Check Current Authorization Level                            *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA00500 DS    0H
+         TESTAUTH STATE=YES,       Check If Already In                 *
+               RBLEVEL=1           Supervisor State
+         LTR   R15,R15
+         BNZ   LWA00600            B. If Not (Modeset Required)
+
+         OI    WRKFLAG,$SUPER      Remember "Supervisor State"
+
+LWA00600 DS    0H
+         TESTAUTH FCTN=1           Check If APF Authorized
+         LTR   R15,R15
+         BNZ   LWA00700            B. If Not
+
+         OI    WRKFLAG,$APF        Remember "APF Authorized"
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Parse The Input Command Buffer                               *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA00700 DS    0H
+         L     R0,CPPLUPT          A(UPT)
+         ST    R0,WRKUPT@
+         L     R0,CPPLECT          A(ECT)
+         ST    R0,WRKECT@
+
+         LA    R1,WRKPPL           A(Parse Parameter List)
+         USING PPL,R1
+         MVC   PPLUPT,WRKUPT@      Set UPT  Address
+         MVC   PPLECT,WRKECT@      Set ECT  Address
+         LA    R0,WRKECB
+         ST    R0,PPLECB           Save ECB Address
+         XC    WRKECB,WRKECB
+         L     R0,=A(PCL)          A(Parse Command List)
+         ST    R0,PPLPCL           Save PCL Address
+         MVC   PPLCBUF,CPPLCBUF    Copy Command Buffer Address
+         LA    R0,WRKPDL1
+         ST    R0,PPLANS           Save PDL Address
+         DROP  R1
+
+         CALLTSSR EP=IKJPARS,      Invoke Parse Routine                *
+               MF=(E,WRKPPL)
+         LTR   R15,R15             Check Parse Return Code
+         BNZ   LWAEXIT             B. If Command Syntax Error
+
+         L     R10,WRKPDL1         A(PDL)
+         USING MAINPCL,R10
+         LA    R1,PARMLIB
+
+         L     R2,=A(X'FFFF')      L(IEFPRMLB Message Buffer)
+         GETMAIN RU,LV=(R2),LOC=ANY
+         ST    R1,WRKMSGB@         Save IEFPRMLB Message Buffer Address
+         ST    R2,WRKMSGBL         Save IEFPRMLB Message Buffer Length
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Add A New Command/Program To The Specified Table             *
+*        - A new entry will be added to the end of a table.           *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR ADD                                                  *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }          *
+*                NAME(command/program)                                *
+*                                                                     *
+*---------------------------------------------------------------------*
+         CLI   FUNCKW+1,$ADD       Check For 'ADD' Keyword
+         BNE   LWA01500            B. If Not
+
+         #CALL CHECKTAB            Check If A Table Was Specified
+         BNZ   LWAEXIT             B. If Not
+
+         MVC   WRKINS1(4),=AL2(4+4,#MSG0061)
+         MVC   WRKINS1+4(8),=C'NAME    '
+         LA    R1,NAME             A(Keyword)
+         #CALL SAVEKW              Check For "NAME" Keyword
+         BZ    LWAEXIT             B. If Not Specified
+         MVC   WRKNAMEL,WRKDATAL   Save "NAME" Value Length
+         MVC   WRKNAME,WRKDATA     Save "NAME" Value
+
+         OI    WRKFLAG,$MSG_F      Issue "Found" Message
+         #CALL FINDNAME            Find The Table Entry's Address
+         BNZ   LWAEXIT             B. If Entry Already Exists
+
+         #CALL COPYTAB             Ensure Table Is In Our Address Space
+         BZ    LWAEXIT             B. If Table Does Not Exist
+
+*-------
+*        Increase The Size Of The Current Table
+*-------
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   LWAEXIT             B. If Not Authorized
+
+         LH    R3,WRKTABL          Load Calculated Table Length
+         AH    R3,WRKTABEL         Add Length Of One Entry
+         GETMAIN RU,LV=(R3),SP=252,LOC=BELOW
+         ST    R1,WRKAUTH@         Save Authorized Table Address
+         STH   R3,WRKAUTHL         Save Authorized Table Length
+
+         L     R4,WRKTAB@          A(Current Table)
+         #MVCL (R1),(R4),LEN=(R3)  Copy Table To Authorized Storage
+
+         L     R15,WRKAUTH@        A(Authorized Storage Table)
+         AH    R15,WRKAUTHL        A(End Of Authorized Storage Table)
+         SH    R15,WRKTABEL        A(Last Entry In Authorized Table)
+
+         LH    R14,WRKTABEL        L(Table Entry)
+         #EXEC -R14,MVC,0(*-*,R15),BLANKS
+         CLC   WRKTABEL,=AL2(10)   Check For IKJEFTNS Table
+         BNE   LWA00800            B. If Not
+         MVC   0(2,R15),=X'FFFF'   Change Last Entry To A Terminator
+
+LWA00800 DS    0H
+         L     R1,WRKTAB@@         A(Table Address In LWA)
+         MVC   WRKTAB@,0(R1)       Save Old Table Address
+         MVC   0(4,R1),WRKAUTH@    Point To New Table
+         L     R1,WRKTABL@         A(Table Length In LWA)
+         MVC   WRKTABL,0(R1)       Save Old Table Length
+         MVC   0(2,R1),WRKAUTHL    Set To New Table Length
+
+         ICM   R1,15,WRKTAB@       A(Previous Table)
+         BZ    LWA00900            B. If No Previous Table
+         SLR   R0,R0
+         ICM   R0,3,WRKTABL        A(Previous Table Length)
+         BZ    LWA00900            B. If No Previous Table
+         FREEMAIN RU,A=(1),LV=(0),SP=252
+
+*-------
+*        Scan Current Table For The 1st Empty Slot & Insert New Entry
+*-------
+LWA00900 DS    0H
+         MVC   WRKTAB@,WRKAUTH@    Set New Table Address
+         MVC   WRKTABL,WRKAUTHL    Set New Table Length
+
+         L     R3,WRKTAB@          A(Start Of New Table)
+         LR    R15,R3
+         AH    R15,WRKTABL         A(End Of Table)
+         ST    R15,WRKTABE@
+         AHI   R3,16               A(1st Entry)
+
+LWA01000 DS    0H
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BNE   LWA01100            B. If Not
+         CLC   0(8,R3),BLANKS      Check For Empty Slot
+         BNE   LWA01300            B. If Not
+         MVC   0(8,R3),WRKNAME     Insert New Name
+         B     LWA01400
+
+LWA01100 DS    0H
+         CLC   0(2,R3),=X'0000'    Check For Null Slot
+         BE    LWA01200            B. If Yes
+         CLC   0(2,R3),=X'FFFF'    Check For Terminator Slot
+         BNE   LWA01300            B. If Not
+LWA01200 DS    0H
+         MVC   0(2,R3),WRKNAMEL    Insert New Name Length
+         MVC   2(8,R3),WRKNAME     Insert New Name
+         B     LWA01400
+
+LWA01300 DS    0H
+         AH    R3,WRKTABEL         A(Next Entry In Table)
+         C     R3,WRKTABE@         Check For End Of Table
+         BL    LWA01000            B. If Not
+
+         #CALL DEAUTH              Return To Original State & Key
+         B     LWAEXIT             This Branch Should Never Be Taken
+
+LWA01400 DS    0H
+         #CALL DEAUTH              Return To Original State & Key
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0021)
+         LH    R0,WRKNAMEL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         MVC   WRKINS1+4(8),WRKNAME
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0022)
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS2
+         MVC   WRKINS2+4(8),WRKCMDNM
+
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG002)      A(Added Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         #CALL PUTLINE             Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Delete An Entry From The Specified Table                     *
+*        - Remove an existing entry from within a table.              *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR DELETE                                               *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }          *
+*                NAME(command/program)                                *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA01500 DS    0H
+         CLI   FUNCKW+1,$DELETE    Check For 'DELETE' Keyword
+         BNE   LWA01700            B. If Not
+
+         #CALL CHECKTAB            Check If A Table Was Specified
+         BNZ   LWAEXIT             B. If Not
+
+         MVC   WRKINS1(4),=AL2(4+4,#MSG0061)
+         MVC   WRKINS1+4(8),=C'NAME    '
+         LA    R1,NAME             A(Keyword)
+         #CALL SAVEKW              Check For "NAME" Keyword
+         BZ    LWAEXIT             B. If Not Specified
+         MVC   WRKNAMEL,WRKDATAL   Save "NAME" Value Length
+         MVC   WRKNAME,WRKDATA     Save "NAME" Value
+
+         OI    WRKFLAG,$MSG_NF     Issue "Not_Found" Message
+         #CALL FINDNAME            Find The Table Entry's Address
+         BZ    LWAEXIT             B. If Entry Not Found
+
+         #CALL COPYTAB             Ensure Table Is In Our Address Space
+         BZ    LWAEXIT             B. If Table Does Not Exist
+
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   LWAEXIT             B. If Not Authorized
+
+         L     R5,WRKTAB@
+         A     R5,WRKNAMEO         A(Current Table Entry)
+         L     R4,WRKTAB@
+         AH    R4,WRKTABL          A(End Of Current Table)
+         ST    R4,WRKTABE@
+         LR    R3,R5
+         AH    R3,WRKTABEL         A(Next Entry In Table)
+         SR    R4,R3               Calculate Remaining Length
+         #MVCL (R5),(R3),LEN=(R4)  Shift Out Entry To Be Deleted
+
+         L     R4,WRKTABE@         A(End Of Table)
+         SH    R4,WRKTABEL         A(Last Entry In Table)
+         LH    R14,WRKTABEL
+         #EXEC -R14,MVC,0(*-*,R4),BLANKS
+         CLC   WRKTABEL,=AL2(10)   Check For IKJEFTNS Table
+         BNE   LWA01600            B. If Not
+         MVC   0(2,R4),=X'FFFF'    Change Entry To Terminator
+
+LWA01600 DS    0H
+         #CALL DEAUTH              Return To Original State & Key
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0031)
+         LH    R0,WRKNAMEL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         MVC   WRKINS1+4(8),WRKNAME
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0032)
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS2
+         MVC   WRKINS2+4(8),WRKCMDNM
+
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG003)      A(Removed Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         #CALL PUTLINE             Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Display Information About The Specified Table(s)             *
+*        - Report on the table location, attributes and contents.     *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR DISPLAY                                              *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }    *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA01700 DS    0H
+         CLI   FUNCKW+1,$DISPLAY   Check For 'DISPLAY' Keyword
+         BNE   LWA02200            B. If Not
+
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BE    LWA01800            B. If Yes
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BE    LWA01800            B. If Yes
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BE    LWA01800            B. If Yes
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BE    LWA01800            B. If Yes
+         MVI   APKW+1,$AUTHTSF
+         MVI   E2KW+1,$AUTHCMD
+         MVI   E8KW+1,$AUTHPGM     Default to "LWATMGR DISPLAY ALL"
+         MVI   NSKW+1,$NOTBKGND
+
+LWA01800 DS    0H
+         CLI   APKW+1,$AUTHTSF     Check For 'IKJEFTAP' Keyword
+         BNE   LWA01900            B. If Not
+         L     R5,WRKTAPP@
+         ICM   R5,15,0(R5)         A(IKJEFTAP Table)
+         BZ    LWA01900            B. If Not Available
+         MVC   WRKTABNM,=C'AUTHTSF '
+         ST    R5,WRKTAB@          Save Table Address
+         IVSK  R15,R5              Get Storage Key
+         STC   R15,WRKTABPK        Save Table Key
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTABL,WRKTAPL     Save Length Found in LWA
+         MVC   WRKTABF,WRKTAPF     Save Table Flag
+         #CALL DISPTAB             Display Table Information
+
+LWA01900 DS    0H
+         CLI   E2KW+1,$AUTHCMD     Check For 'IKJEFTE2' Keyword
+         BNE   LWA02000            B. If Not
+         L     R5,WRKTE2P@
+         ICM   R5,15,0(R5)         A(IKJEFTE2 Table)
+         BZ    LWA01900            B. If Not Available
+         MVC   WRKTABNM,=C'AUTHCMD '
+         ST    R5,WRKTAB@          Save Table Address
+         IVSK  R15,R5              Get Storage Key
+         STC   R15,WRKTABPK        Save Table Key
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTABL,WRKTE2L     Save Length Found in LWA
+         MVC   WRKTABF,WRKTE2F     Save Table Flag
+         #CALL DISPTAB             Display Table Information
+
+LWA02000 DS    0H
+         CLI   E8KW+1,$AUTHPGM     Check For 'IKJEFTE8' Keyword
+         BNE   LWA02100            B. If Not
+         L     R5,WRKTE8P@
+         ICM   R5,15,0(R5)         A(IKJEFTE2 Table)
+         BZ    LWA02100            B. If Not Available
+         MVC   WRKTABNM,=C'AUTHPGM '
+         ST    R5,WRKTAB@          Save Table Address
+         IVSK  R15,R5              Get Storage Key
+         STC   R15,WRKTABPK        Save Table Key
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTABL,WRKTE8L     Save Length Found in LWA
+         MVC   WRKTABF,WRKTE8F     Save Table Flag
+         #CALL DISPTAB             Display Table Information
+
+LWA02100 DS    0H
+         CLI   NSKW+1,$NOTBKGND    Check For 'IKJEFTNS' Keyword
+         BNE   LWAEXIT             B. If Not
+         L     R5,WRKTNSP@
+         ICM   R5,15,0(R5)         A(IKJEFTNS Table)
+         BZ    LWAEXIT             B. If Not Available
+         MVC   WRKTABNM,=C'NOTBKGND'
+         ST    R5,WRKTAB@          Save Table Address
+         IVSK  R15,R5              Get Storage Key
+         STC   R15,WRKTABPK        Save Table Key
+         MVC   WRKTABEL,=AL2(10)   Set Table Entry Length
+         MVC   WRKTABL,WRKTNSL     Save Length Found in LWA
+         MVC   WRKTABF,WRKTNSF     Save Table Flag
+         #CALL DISPTAB             Display Table Information
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Reload The Tables From A Load Module                         *
+*        - Load an assembled version of the IKJTABLS alias entry.     *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR RELOAD                                               *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }    *
+*                LOADLIB(dataset)                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA02200 DS    0H
+         CLI   FUNCKW+1,$RELOAD    Check For 'RELOAD' Keyword
+         BNE   LWA03200            B. If Not
+
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BE    LWA02300            B. If Yes
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BE    LWA02300            B. If Yes
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BE    LWA02300            B. If Yes
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BE    LWA02300            B. If Yes
+         MVI   APKW+1,$AUTHTSF
+         MVI   E2KW+1,$AUTHCMD
+         MVI   E8KW+1,$AUTHPGM     Default to "LWATMGR RELOAD ALL"
+         MVI   NSKW+1,$NOTBKGND
+
+*-------
+*        Allocate & Open The Specified "LOADLIB" Library
+*-------
+LWA02300 DS    0H
+         ICM   R1,15,LOADLIB       A(Fully Qualified Data Set Name)
+         BZ    LWA02800            B. If Not Available
+         LH    R2,LOADLIB+4        L(Fully Qualified Data Set Name)
+
+         LA    R0,WRKDDN           A(DDName Buffer)
+         ST    R0,WRKDDPDE
+         LHI   R0,8                L(DDName Buffer)
+         STH   R0,WRKDDPDE+4
+         MVC   WRKDDN,BLANKS       Initialize DDName
+
+         LA    R0,WRKDSN           A(Quoted Data Set Name Area)
+         ST    R0,WRKDSPDE
+         MVC   WRKDSN,BLANKS
+         MVI   WRKDSN,C''''        Insert Leading Quote
+         #EXEC -R2,MVC,WRKDSN+1(*-*),0(R1)
+         LA    R1,WRKDSN+1+1(R2)   A(End Of Data Set Name)
+         MVI   0(R1),C''''         Insert Ending Quote
+         AHI   R1,1                A(End Of Data Set Name)
+         LA    R2,WRKDSN           A(Start Of Data Set Name)
+         SR    R1,R2               Calculate Length Of Data Set Name
+         STH   R1,WRKDSPDE+4       Save Quoted Data Set Name Length
+
+         ICM   R1,15,LOADLIB+8     A(Member Name)
+         BNZ   LWA02900            B. If Member Specified (Not Allowed)
+
+         ALLOC DSN=WRKDSPDE,DISP=SHR,                                  *
+               DDNTO=WRKDDN,                                           *
+               ERROR=LWA03000
+
+*-------
+*        Acquire An Initial Buffer To Contain The Loaded Module
+*-------
+         LHI   R2,4*1024           L(Directed Load Buffer)
+         GETMAIN RU,LV=(R2),LOC=ANY
+         ST    R1,WRKLOAD@         Save Directed Load Buffer Address
+         ST    R2,WRKLOADL         Save Directed Load Buffer Length
+
+*-------
+*        Load The "AUTHTSF" Module & Anchor It Off Of The LWA
+*-------
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BNE   LWA02400            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHTSF '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTAP'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVI   WRKVFLGS,LWATAPLD   Set "Loaded" Flag
+
+         MVC   WRKTAB@@,WRKTAPP@   Set Table Pointer Address
+         L     R15,WRKTAB@@
+         MVC   WRKTAB@,0(R15)      Set Table Address
+         MVC   WRKTABL@,WRKTAPL@   Set Table Length Address
+         L     R15,WRKTABL@
+         MVC   WRKTABL,0(R15)      Set Table Length
+
+         #CALL LOADIT              Load The Table
+
+*-------
+*        Load The "AUTHCMD" Module & Anchor It Off Of The LWA
+*-------
+LWA02400 DS    0H
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BNE   LWA02500            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHCMD '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE2'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVI   WRKVFLGS,LWATE2LD   Set "Loaded" Flag
+
+         MVC   WRKTAB@@,WRKTE2P@   Set Table Pointer Address
+         L     R15,WRKTAB@@
+         MVC   WRKTAB@,0(R15)      Set Table Address
+         MVC   WRKTABL@,WRKTE2L@   Set Table Length Address
+         L     R15,WRKTABL@
+         MVC   WRKTABL,0(R15)      Set Table Length
+
+         #CALL LOADIT              Load The Table
+
+*-------
+*        Load The "AUTHPGM" Module & Anchor It Off Of The LWA
+*-------
+LWA02500 DS    0H
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BNE   LWA02600            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHPGM '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE8'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVI   WRKVFLGS,LWATE8LD   Set "Loaded" Flag
+
+         MVC   WRKTAB@@,WRKTE8P@   Set Table Pointer Address
+         L     R15,WRKTAB@@
+         MVC   WRKTAB@,0(R15)      Set Table Address
+         MVC   WRKTABL@,WRKTE8L@   Set Table Length Address
+         L     R15,WRKTABL@
+         MVC   WRKTABL,0(R15)      Set Table Length
+
+         #CALL LOADIT              Load The Table
+
+*-------
+*        Load The "NOTBKGND" Module & Anchor It Off Of The LWA
+*-------
+LWA02600 DS    0H
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BNE   LWA02700            B. If Not
+         MVC   WRKCMDNL,=AL2(8)
+         MVC   WRKCMDNM,=C'NOTBKGND'
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTNS'
+         MVC   WRKTABEL,=AL2(10)   Set Table Entry Length
+         MVI   WRKVFLGS,LWATNSLD   Set "Loaded" Flag
+
+         MVC   WRKTAB@@,WRKTNSP@   Set Table Pointer Address
+         L     R15,WRKTAB@@
+         MVC   WRKTAB@,0(R15)      Set Table Address
+         MVC   WRKTABL@,WRKTNSL@   Set Table Length Address
+         L     R15,WRKTABL@
+         MVC   WRKTABL,0(R15)      Set Table Length
+
+         #CALL LOADIT              Load The Table
+
+*-------
+*        Free The "LOADLIB" Library
+*-------
+LWA02700 DS    0H
+         FREE  DDN=WRKDDPDE        Free Any Allocated Data Set
+         B     LWAEXIT
+
+*-------
+*        Issue Error Messages
+*-------
+LWA02800 DS    0H
+         LHI   R0,1                Message Contains 1 Segment
+         L     R1,=A(#MSG015)      A(Required Keyword Missing)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LWAEXIT
+
+LWA02900 DS    0H
+         LHI   R0,1                Message Contains 1 Segments
+         L     R1,=A(#MSG016)      A(Member Not Allowed)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LWAEXIT
+
+LWA03000 DS    0H
+         S99FAIL ,                 Issue Dynamic Allocation Error
+
+         LHI   R15,8               Set Return Code
+         B     LWAEXIT
+
+LWA03100 DS    0H
+         LHI   R0,1                Message Contains 1 Segments
+         L     R1,=A(#MSG017)      A(OPEN Failed)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Replace An Entry In The Specified Table                      *
+*        - Change an entry in one of the authorization tables.        *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR REPLACE                                              *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }          *
+*                NAME(command/program)                                *
+*                NEWNAME(command/program)                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA03200 DS    0H
+         CLI   FUNCKW+1,$REPLACE   Check For 'REPLACE' Keyword
+         BNE   LWA03500            B. If Not
+
+         #CALL CHECKTAB            Check If A Table Was Specified
+         BNZ   LWAEXIT             B. If Not
+
+         MVC   WRKINS1(4),=AL2(4+4,#MSG0061)
+         MVC   WRKINS1+4(8),=C'NAME    '
+         LA    R1,NAME             A(Keyword)
+         #CALL SAVEKW              Check For "NAME" Keyword
+         BZ    LWAEXIT             B. If Not Specified
+         MVC   WRKNAMEL,WRKDATAL   Save "NAME" Value Length
+         MVC   WRKNAME,WRKDATA     Save "NAME" Value
+
+         OI    WRKFLAG,$MSG_NF     Issue "Not Found" Message
+         #CALL FINDNAME            Find The Table Entry's Address
+         BZ    LWAEXIT             B. If Entry Not Found
+
+         MVC   WRKINS1(4),=AL2(4+7,#MSG0061)
+         MVC   WRKINS1+4(8),=C'NEWNAME '
+         LA    R1,NEWNAME          A(Keyword)
+         #CALL SAVEKW              Check For "NAME" Keyword
+         BZ    LWAEXIT             B. If Not Specified
+         MVC   WRKNEWNL,WRKDATAL   Save "NAME" Value Length
+         MVC   WRKNEWN,WRKDATA     Save "NAME" Value
+
+         MVC   WRKTMPNL,WRKNAMEL   Save Name Length
+         MVC   WRKTMPN,WRKNAME     Save Name
+
+         MVI   APKW+1,0            Reset
+         MVI   E2KW+1,0             Table Keywords
+         MVI   E8KW+1,0              To Only
+         MVI   NSKW+1,0               The One
+         L     R15,WRKKW@              Where "NAME" Entry
+         MVI   1(R15),1                 Was Found
+
+         MVC   WRKNAMEL,WRKNEWNL   Change To "NEWNAME" Value Length
+         MVC   WRKNAME,WRKNEWN     Change To "NEWNAME" Value
+         OI    WRKFLAG,$MSG_F      Issue "Found" Message
+         #CALL FINDNAME            Find The Table Entry's Address
+         BNZ   LWAEXIT             B. If Entry Not Found
+
+         MVC   WRKNAMEL,WRKTMPNL   Restore Name Length
+         MVC   WRKNAME,WRKTMPN     Restore Name
+
+         #CALL COPYTAB             Ensure Table Is In Our Address Space
+         BZ    LWAEXIT             B. If Table Does Not Exist
+
+         L     R5,WRKTAB@          A(Current Table)
+         A     R5,WRKNAMEO         A(Current Table Entry)
+
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BNE   LWA03300            B. If Not
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   LWAEXIT             B. If Not Authorized
+         MVC   0(8,R5),WRKNEWN     Overlay With New Entry Name
+         #CALL DEAUTH              Return To Original State & Key
+         B     LWA03400
+
+LWA03300 DS    0H
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   LWAEXIT             B. If Not Authorized
+         MVC   0(2,R5),WRKNEWNL    Overlay With New Entry Name Length
+         MVC   2(8,R5),WRKNEWN     Overlay With New Entry Name
+         #CALL DEAUTH              Return To Original State & Key
+
+LWA03400 DS    0H
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0041)
+         LH    R0,WRKNAMEL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         MVC   WRKINS1+4(8),WRKNAME
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0042)
+         LH    R0,WRKNEWNL
+         AHI   R0,4
+         STH   R0,WRKINS2
+         MVC   WRKINS2+4(8),WRKNEWN
+         MVC   WRKINS3(4),=AL2(4+*-*,#MSG0043)
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS3
+         MVC   WRKINS3+4(8),WRKCMDNM
+
+         LHI   R0,4                Message Contains 4 Segments
+         L     R1,=A(#MSG004)      A(Replacement Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         LA    R4,WRKINS3          A(Insert #3)
+         #CALL PUTLINE             Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Replace The Tables With IKJTSOxx Input Data                  *
+*        - Validate an IKJTSOxx member and load any/all tables.       *
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR UPDATE                                               *
+*              { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }    *
+*                PARMLIB(dataset(member))                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA03500 DS    0H
+         CLI   FUNCKW+1,$UPDATE    Check For 'UPDATE' Keyword
+         BNE   LWA03900            B. If Not
+
+         #CALL CHECKTAB            Check If A Table Was Specified
+         BNZ   LWAEXIT             B. If Not
+
+         #CALL READPARM            Read The Specified Parmlib Member
+
+*-------
+*        Update 'IKJEFTAP' Table If Requested
+*-------
+         CLI   APKW+1,$AUTHTSF     Check For 'AUTHTSF' Keyword
+         BNE   LWA03600            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHTSF '
+         #CALL BUILDCMD            Build CBUF From PARMLIB Section
+         BNZ   LWA03600            B. If Section Not Found
+
+         LA    R1,WRKPPL           A(Parse Parameter List)
+         USING PPL,R1
+         XC    WRKECB,WRKECB
+         L     R0,=A(PARMPCL)      A(Parse Command List)
+         ST    R0,PPLPCL           Save PCL Address
+         MVC   PPLCBUF,WRKCBUF@    Copy Command Buffer Address
+         LA    R0,WRKPDL2
+         ST    R0,PPLANS           Save PDL Address
+         DROP  R1
+
+         CALLTSSR EP=IKJPARS,      Invoke Parse Routine                *
+               MF=(E,WRKPPL)
+         LTR   R15,R15             Check Parse Return Code
+         BNZ   LWAEXIT             B. If Command Syntax Error
+
+         MVC   WRKTABNM,=C'IKJEFTAP'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         #CALL BUILDTAB            Build Replacement Table
+         BNZ   LWAEXIT             B. If Table Construction Failed
+
+         MVC   WRKTAB@@,WRKTAPP@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTAPL@   Set Table Length Address
+         MVC   WRKTABL,WRKTAPL     Set Length Found in LWA
+         MVC   WRKTABF,WRKTAPF     Set Table Flag
+         OI    WRKPRMLB,LWATAPST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATAPLD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         IKJRLSA WRKPDL2           Release The Parse Storage
+         XC    WRKPDL2,WRKPDL2
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0141)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG014)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Update 'IKJEFTE2' Table If Requested
+*-------
+LWA03600 DS    0H
+         CLI   E2KW+1,$AUTHCMD     Check For 'AUTHCMD' Keyword
+         BNE   LWA03700            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHCMD '
+         #CALL BUILDCMD            Build CBUF From PARMLIB Section
+         BNZ   LWA03700            B. If Section Not Found
+
+         LA    R1,WRKPPL           A(Parse Parameter List)
+         USING PPL,R1
+         XC    WRKECB,WRKECB
+         L     R0,=A(PARMPCL)      A(Parse Command List)
+         ST    R0,PPLPCL           Save PCL Address
+         MVC   PPLCBUF,WRKCBUF@    Copy Command Buffer Address
+         LA    R0,WRKPDL2
+         ST    R0,PPLANS           Save PDL Address
+         DROP  R1
+
+         CALLTSSR EP=IKJPARS,      Invoke Parse Routine                *
+               MF=(E,WRKPPL)
+         LTR   R15,R15             Check Parse Return Code
+         BNZ   LWAEXIT             B. If Command Syntax Error
+
+         MVC   WRKTABNM,=C'IKJEFTE2'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         #CALL BUILDTAB            Build Replacement Table
+         BNZ   LWAEXIT             B. If Table Construction Failed
+
+         MVC   WRKTAB@@,WRKTE2P@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTE2L@   Set Table Length Address
+         MVC   WRKTABL,WRKTE2L     Set Length Found in LWA
+         MVC   WRKTABF,WRKTE2F     Set Table Flag
+         OI    WRKPRMLB,LWATE2ST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATE2LD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         IKJRLSA WRKPDL2           Release The Parse Storage
+         XC    WRKPDL2,WRKPDL2
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0141)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG014)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Update 'IKJEFTE8' Table If Requested
+*-------
+LWA03700 DS    0H
+         CLI   E8KW+1,$AUTHPGM     Check For 'AUTHPGM' Keyword
+         BNE   LWA03800            B. If Not
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHPGM '
+         #CALL BUILDCMD            Build CBUF From PARMLIB Section
+         BNZ   LWA03800            B. If Section Not Found
+
+         LA    R1,WRKPPL           A(Parse Parameter List)
+         USING PPL,R1
+         XC    WRKECB,WRKECB
+         L     R0,=A(PARMPCL)      A(Parse Command List)
+         ST    R0,PPLPCL           Save PCL Address
+         MVC   PPLCBUF,WRKCBUF@    Copy Command Buffer Address
+         LA    R0,WRKPDL2
+         ST    R0,PPLANS           Save PDL Address
+         DROP  R1
+
+         CALLTSSR EP=IKJPARS,      Invoke Parse Routine                *
+               MF=(E,WRKPPL)
+         LTR   R15,R15             Check Parse Return Code
+         BNZ   LWAEXIT             B. If Command Syntax Error
+
+         MVC   WRKTABNM,=C'IKJEFTE8'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         #CALL BUILDTAB            Build Replacement Table
+         BNZ   LWAEXIT             B. If Table Construction Failed
+
+         MVC   WRKTAB@@,WRKTE8P@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTE8L@   Set Table Length Address
+         MVC   WRKTABL,WRKTE8L     Set Length Found in LWA
+         MVC   WRKTABF,WRKTE8F     Set Table Flag
+         OI    WRKPRMLB,LWATE8ST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATE8LD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         IKJRLSA WRKPDL2           Release The Parse Storage
+         XC    WRKPDL2,WRKPDL2
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0141)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG014)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Update 'IKJEFTNS' Table If Requested
+*-------
+LWA03800 DS    0H
+         CLI   NSKW+1,$NOTBKGND    Check For 'NOTBKGND' Keyword
+         BNE   LWAEXIT             B. If Not
+         MVC   WRKCMDNL,=AL2(8)
+         MVC   WRKCMDNM,=C'NOTBKGND'
+         #CALL BUILDCMD            Build CBUF From PARMLIB Section
+         BNZ   LWAEXIT             B. If Section Not Found
+
+         LA    R1,WRKPPL           A(Parse Parameter List)
+         USING PPL,R1
+         XC    WRKECB,WRKECB
+         L     R0,=A(PARMPCL)      A(Parse Command List)
+         ST    R0,PPLPCL           Save PCL Address
+         MVC   PPLCBUF,WRKCBUF@    Copy Command Buffer Address
+         LA    R0,WRKPDL2
+         ST    R0,PPLANS           Save PDL Address
+         DROP  R1
+
+         CALLTSSR EP=IKJPARS,      Invoke Parse Routine                *
+               MF=(E,WRKPPL)
+         LTR   R15,R15             Check Parse Return Code
+         BNZ   LWAEXIT             B. If Command Syntax Error
+
+         MVC   WRKTABNM,=C'IKJEFTNS'
+         MVC   WRKTABEL,=AL2(10)   Set Table Entry Length
+         #CALL BUILDTAB            Build Replacement Table
+         BNZ   LWAEXIT             B. If Table Construction Failed
+
+         MVC   WRKTAB@@,WRKTNSP@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTNSL@   Set Table Length Address
+         MVC   WRKTABL,WRKTNSL     Set Length Found in LWA
+         MVC   WRKTABF,WRKTNSF     Set Table Flag
+         OI    WRKPRMLB,LWATNSST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATNSLD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         IKJRLSA WRKPDL2           Release The Parse Storage
+         XC    WRKPDL2,WRKPDL2
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0141)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG014)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Replace The Tables With 8 Character List Data                *
+*        - Rebuild tables With 8 Byte Name List structure.            *
+*        - Note: The List contains "--name--" to identify which table.*
+*                                                                     *
+*     Syntax:                                                         *
+*        LWATMGR BUILD                                                *
+*                LIST(datasetÝ(member)¨)                              *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWA03900 DS    0H
+         CLI   FUNCKW+1,$BUILD     Check For 'BUILD' Keyword
+         BNE   LWAEXIT             B. If Not
+
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BE    LWA04000            B. If Yes
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BE    LWA04000            B. If Yes
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BE    LWA04000            B. If Yes
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BE    LWA04000            B. If Yes
+         MVI   APKW+1,$AUTHTSF
+         MVI   E2KW+1,$AUTHCMD
+         MVI   E8KW+1,$AUTHPGM     Default to "LWATMGR BUILD ALL"
+         MVI   NSKW+1,$NOTBKGND
+
+LWA04000 DS    0H
+         ICM   R1,15,REC8          A(Fully Qualified Data Set Name)
+         BZ    LWA02800            B. If Not Available
+         LH    R2,REC8+4           L(Fully Qualified Data Set Name)
+
+*-------
+*        Allocate The Input Library
+*        - As we only use the 1st 8 bytes, the LRECL of the input file
+*          can be anything as low as 8.
+*          Anything after the 1st 8 bytes is disreguarded.
+*-------
+         LA    R0,WRKDDN           A(DDName Buffer)
+         ST    R0,WRKDDPDE
+         LHI   R0,8                L(DDName Buffer)
+         STH   R0,WRKDDPDE+4
+         MVC   WRKDDN,BLANKS       Initialize DDName
+
+         LA    R0,WRKDSN           A(Quoted Data Set Name Area)
+         ST    R0,WRKDSPDE
+         MVC   WRKDSN,BLANKS
+         MVI   WRKDSN,C''''        Insert Leading Quote
+         #EXEC -R2,MVC,WRKDSN+1(*-*),0(R1)
+         LA    R1,WRKDSN+1+1(R2)   A(End Of Data Set Name)
+         MVI   0(R1),C''''         Insert Ending Quote
+         AHI   R1,1                A(End Of Data Set Name)
+         LA    R2,WRKDSN           A(Start Of Data Set Name)
+         SR    R1,R2               Calculate Length Of Data Set Name
+         STH   R1,WRKDSPDE+4       Save Quoted Data Set Name Length
+
+         XC    WRKMNPDE(6),WRKMNPDE
+         MVC   WRKMEMNM,BLANKS
+         ICM   R1,15,REC8+8        A(Member Name)
+         BZ    LWA04100            B. If Not Available
+         LA    R0,WRKMEMNM         A(Member Name)
+         ST    R0,WRKMNPDE
+         LHI   R0,8                L(Member Name)
+         STH   R0,WRKMNPDE+4
+         LH    R2,REC8+12          L(Member Name)
+         #EXEC -R2,MVC,WRKMEMNM(*-*),0(R1)
+
+LWA04100 DS    0H
+         ALLOC DSN=WRKDSPDE,DISP=SHR,                                  *
+               MEMBER=WRKMNPDE,                                        *
+               DDNTO=WRKDDN,                                           *
+               ERROR=LWA03000
+
+         L     R14,=A(OPENSTUB)    A(24-Bit Exit Routine)
+         MVC   WDCBEXIT,0(R14)     Initialize Exit Stub
+         L     R14,=A(DCBEXIT)     A(31-Bit Exit Routine)
+         BSM   R14,0               Set Current AMode
+         STCM  R14,15,REAL@-OPENSTUB+WDCBEXIT
+         LA    R0,WDCBEXIT         A(24-Bit Exit Stub)
+         ST    R0,DCBEXIT@         Store In Exlst Plist
+         MVI   DCBEXIT@,X'85'      Open Exit Is Last In List
+
+         L     R15,=A(MODCBF)
+         MVC   WRKDCB,0(R15)       Copy DCB To Work Area
+         MVC   DCBDDNAM-IHADCB+WRKDCB,WRKDDN
+         L     R15,=A(MODCBEF)
+         MVC   WRKDCBE,0(R15)      Copy DCBE To Work Area
+         LA    R15,WRKDCBE         A(DCBE)
+         ST    R15,DCBDCBE-IHADCB+WRKDCB
+
+         L     R15,=A(MODOPEN)
+         MVC   WRKOPEN,0(R15)
+         OPEN  (WRKDCB),           Open The "LIST" Data Set            *
+               MF=(E,WRKOPEN)
+         TM    DCBOFLGS-IHADCB+WRKDCB,DCBOFOPN
+         BZ    LWA03100            B. If OPEN Failed
+
+*-------
+*        Read The "List" Into Storage.
+*-------
+         L     R4,WRKMSGB@         A(Start Of Data Buffer)
+         LR    R1,R4
+         A     R1,WRKMSGBL         A(End Of Data Buffer)
+         ST    R1,WRKMSGBE         Save End Address
+LWA04200 DS    0H
+         GET   WRKDCB              Get Next Record From LIST Data Set
+
+         C     R4,WRKMSGBE         Check For End Of Buffer
+         BNE   LWA04300            B. If Not
+
+         LR    R5,R1               Save Current Record Address
+         LR    R6,R4               A(Logical End Of Current Buffer)
+
+         L     R4,WRKMSGB@         A(Start Of Data Buffer)
+         L     R3,WRKMSGBL         L(Current Data Buffer)
+         SR    R6,R4               Calculate Used Data Buffer Length
+
+         L     R2,WRKMSGBL         L(Current Data Buffer)
+         SLL   R2,1                Double The Length
+         GETMAIN RU,LV=(R2),LOC=ANY
+         ST    R1,WRKMSGB@         Save New Buffer Address
+         ST    R2,WRKMSGBL         Save New Buffer Length
+
+         #MVCL (R1),(R4),LEN=(R6)  Copy The Previous Used Portion
+
+         FREEMAIN RU,A=(R4),LV=(R3)  Free The Old Data Buffer
+
+         L     R4,WRKMSGB@
+         LR    R1,R4
+         A     R1,WRKMSGBL         A(End Of Data Buffer)
+         ST    R1,WRKMSGBE         Save End Address
+         AR    R4,R6               A(End Of Used Portion Of Buffer)
+
+         LR    R1,R5               Restore Current Record Address
+
+LWA04300 DS    0H
+         MVC   0(8,R4),0(R1)       Copy The Current Record's Entry
+         LA    R4,8(,R4)           A(Next Slot In Data Buffer)
+         B     LWA04200            Read Until End Of File
+
+LWA04400 DS    0H
+         ST    R4,WRKMSGBE         Save Logical End Of Buffer Address
+
+         L     R15,=A(MODCLOSE)
+         MVC   WRKCLOSE,0(R15)
+         CLOSE (WRKDCB),           Close The "LIST" Data Set           *
+               MF=(E,WRKCLOSE)
+
+         FREE  DDN=WRKDDPDE        Free Any Allocated Data Set
+
+*-------
+*        Process 'IKJEFTAP' List If Requested
+*-------
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BNE   LWA04500            B. If Not
+
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHTSF '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTAP'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKNAME,=C'---AP---'
+         #CALL LISTTAB             Create Table From LIST
+         BNZ   LWA04500            B. If LIST Not Created
+
+         MVC   WRKTAB@@,WRKTAPP@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTAPL@   Set Table Length Address
+         MVC   WRKTABL,WRKTAPL     Set Length Found in LWA
+         OI    WRKPRMLB,LWATAPST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATAPLD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0211)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG021)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Process 'IKJEFE2P' List If Requested
+*-------
+LWA04500 DS    0H
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BNE   LWA04600            B. If Not
+
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHCMD '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE2'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKNAME,=C'---E2---'
+         #CALL LISTTAB             Create Table From LIST
+         BNZ   LWA04600            B. If LIST Not Created
+
+         MVC   WRKTAB@@,WRKTE2P@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTE2L@   Set Table Length Address
+         MVC   WRKTABL,WRKTE2L     Set Length Found in LWA
+         OI    WRKPRMLB,LWATE2ST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATE2LD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0211)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG021)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Process 'IKJEFE8P' List If Requested
+*-------
+LWA04600 DS    0H
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BNE   LWA04700            B. If Not
+
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHPGM '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE8'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKNAME,=C'---E8---'
+         #CALL LISTTAB             Create Table From LIST
+         BNZ   LWA04700            B. If LIST Not Created
+
+         MVC   WRKTAB@@,WRKTE8P@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTE8L@   Set Table Length Address
+         MVC   WRKTABL,WRKTE8L     Set Length Found in LWA
+         OI    WRKPRMLB,LWATE8ST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATE8LD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0211)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG021)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+
+*-------
+*        Process 'IKJEFNSP' List If Requested
+*-------
+LWA04700 DS    0H
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BNE   LWAEXIT             B. If Not
+
+         MVC   WRKCMDNL,=AL2(8)
+         MVC   WRKCMDNM,=C'NOTBKGND'
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTNS'
+         MVC   WRKTABEL,=AL2(10)   Set Table Entry Length
+         MVC   WRKNAME,=C'---NS---'
+         #CALL LISTTAB             Create Table From LIST
+         BNZ   LWAEXIT             B. If LIST Not Created
+
+         MVC   WRKTAB@@,WRKTNSP@   Set Table Pointer Address
+         MVC   WRKTABL@,WRKTNSL@   Set Table Length Address
+         MVC   WRKTABL,WRKTNSL     Set Length Found in LWA
+         OI    WRKPRMLB,LWATNSST   Set "Came From //STEPLIB" Flag
+         MVI   WRKVFLGS,LWATNSLD   Set "Loaded" Flag
+         #CALL REPTABLE            Replace The Table With A New One
+         BNZ   LWAEXIT             B. If Replace Failed
+
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0211)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG021)      A(Section Updated From Parmlib)
+         LA    R2,WRKINS1          A(Insert #1)
+         #CALL PUTLINE             Write Message
+         B     LWAEXIT
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Terminate                                                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+LWAEXIT  DS    0H
+         #CALL CLEANUP             Free All Acquired Storage
+
+         #STOP ,                   Terminate
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Constants                                                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         LTORG ,                   Literal Pool
+         #EXEC ,                   Executed Statements
+
+MODCBU   DCB   DDNAME=*,DSORG=PO,RECFM=U,MACRF=R,BUFNO=1,              *
+               DCBE=*-*
+MODCBUL  EQU   *-MODCBU            DCB Parameter List Length
+MODCBEU  DCBE  EODAD=LOAD0900,SYNAD=LOADSYN,EADSCB=OK          #DD12062
+MODCBEUL EQU   *-MODCBEU           DCBE Parameter List Length
+
+MODCBF   DCB   DDNAME=*,DSORG=PS,RECFM=FB,MACRF=GL,                    *
+               DCBE=*-*
+MODCBFL  EQU   *-MODCBF            DCB Parameter List Length
+MODCBEF  DCBE  EODAD=LWA04400,EADSCB=OK                        #DD12062
+MODCBEFL EQU   *-MODCBEF           DCBE Parameter List Length
+
+MODOPEN  OPEN  *-*,MF=L
+MODOPENL EQU   *-MODOPEN           OPEN Parameter List Length
+
+MODCLOSE CLOSE *-*,MF=L
+MODCLOSEL EQU  *-MODCLOSE          CLOSE Parameter List Length
+
+MODLOAD  LOAD  SF=L
+MODLOADL EQU   *-MODLOAD           LOAD Parameter List Length
+
+#MSG001  DC    C'LWA001I LWA control block is not valid'
+#MSG001L EQU   *-#MSG001
+
+#MSG002  #MSG  'LWA002I '''' added to '''' table'
+#MSG0021 EQU   9,8                 Insert Offset & Length
+#MSG0022 EQU   21,8                Insert Offset & Length
+
+#MSG003  #MSG  'LWA003I '''' removed from '''' table'
+#MSG0031 EQU   9,8                 Insert Offset & Length
+#MSG0032 EQU   25,8                Insert Offset & Length
+
+#MSG004  #MSG  'LWA004I '''' replaced with '''' in '''' table'
+#MSG0041 EQU   9,8                 Insert Offset & Length
+#MSG0042 EQU   26,8                Insert Offset & Length
+#MSG0043 EQU   32,8                Insert Offset & Length
+
+#MSG005  #MSG  'LWA005I Command Is Not Authorized'
+
+#MSG006  #MSG  'LWA006I '''' Keyword Is Missing'
+#MSG0061 EQU   9,8                 Insert Offset & Length
+
+#MSG007  #MSG  'LWA007I Required Table Keyword Not Specified'
+
+#MSG008  #MSG  'LWA008I  At  Key   '
+#MSG0081 EQU   8,26                Insert Offset & Length
+#MSG0082 EQU   12,8                Insert Offset & Length
+#MSG0083 EQU   17,2                Insert Offset & Length
+#MSG0084 EQU   18,17               Insert Offset & Length
+#MSG0085 EQU   19,7                Insert Offset & Length
+
+#MSG009  #MSG  'LWA009I      '
+#MSG0091 EQU   8,8                 Insert Offset & Length
+#MSG0092 EQU   9,8                 Insert Offset & Length
+#MSG0093 EQU   10,8                Insert Offset & Length
+#MSG0094 EQU   11,8                Insert Offset & Length
+#MSG0095 EQU   12,8                Insert Offset & Length
+#MSG0096 EQU   13,8                Insert Offset & Length
+
+#MSG010  #MSG  'LWA010I '''' already exists in '''' table'
+#MSG0101 EQU   9,8                 Insert Offset & Length
+#MSG0102 EQU   30,8                Insert Offset & Length
+
+#MSG011  #MSG  'LWA011I '''' Not Found'
+#MSG0111 EQU   9,8                 Insert Offset & Length
+
+#MSG012  #MSG  'LWA012I PARMLIB Must Be Specified with a member name'
+
+#MSG013  #MSG  'LWA013I PARMLIB READ failed, RC=X''''  RS=X'''' '
+#MSG0131 EQU   34,8                Insert Offset & Length
+#MSG0132 EQU   42,8                Insert Offset & Length
+
+#MSG014  #MSG  'LWA014I '''' table updated from PARMLIB'
+#MSG0141 EQU   9,8                 Insert Offset & Length
+
+#MSG015  #MSG  'LWA015I LOADLIB Keyword Is Missing'
+
+#MSG016  #MSG  'LWA016I MEMBER name can not be specified'
+
+#MSG017  #MSG  'LWA017I OPEN Failed for '''' '
+#MSG0171 EQU   25,44               Insert Offset & Length
+
+#MSG018  #MSG  'LWA018I '''' LOAD failed, RC=X''''  RS=X'''' '
+#MSG0181 EQU   9,8                 Insert Offset & Length
+#MSG0182 EQU   29,8                Insert Offset & Length
+#MSG0183 EQU   37,8                Insert Offset & Length
+
+#MSG019  #MSG  'LWA019I '''' Table loaded from '
+#MSG0191 EQU   9,8                 Insert Offset & Length
+#MSG0192 EQU   29,8                Insert Offset & Length
+
+#MSG020  #MSG  'LWA020I '''' is not a valid ALIAS in '
+#MSG0201 EQU   9,8                 Insert Offset & Length
+#MSG0202 EQU   35,8                Insert Offset & Length
+
+#MSG021  #MSG  'LWA021I '''' table updated from LIST'
+#MSG0211 EQU   9,8                 Insert Offset & Length
+
+#MSG022  #MSG  'LWA022I This Program Requires An ISPF Environment.  ISP*
+               QRY Return Code  '
+#MSG0221 EQU   71,8                Insert Offset & Length
+
+BLANKLNE #MSG  '          '
+BLANKINS EQU   2,80                Insert Offset & Length
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        DCB Open Exit Stub - Copied to Work Area (below the line).   *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+         DROP  ,
+         USING *,R15
+OPENSTUB DS    0H
+         N     R1,CLEAR1ST         CLEAR HIGH ORDER BYTE
+         ICM   R15,15,REAL@        A(31-BIT EXIT ROUTINE)
+         BSM   0,R15               B. TO 31 BIT CODE
+         DS    0F                  ALIGNMENT
+REAL@    DS    AL4                 A(31-BIT EXIT ROUTINE)
+CLEAR1ST DC    X'00FFFFFF'         CLEAR MASK
+STUBLEN  EQU   *-OPENSTUB
+         POP   USING
+
+DCBEXIT  #DCBEXIT ,                Real (Amode 31) Exit Routine
+
+FINDBLANK DC   256X'00'
+         ORG   FINDBLANK+C' '
+         DC    C' '                Find First Blank
+         ORG   ,
+
+FINDCHAR DC    AL1(*-FINDCHAR)
+         ORG   FINDCHAR+C' '
+         DC    X'00'               Skip Over Any Blanks
+         ORG   ,
+
+CONVCONT DC    256AL1(*-CONVCONT)
+         ORG   CONVCONT+C'+'
+         DC    C' '                Convert "+" To Blanks
+         ORG   CONVCONT+C'-'
+         DC    C' '                Convert "-" To Blanks
+         ORG   ,
+
+CONVDASH DC    256AL1(*-CONVDASH)
+         ORG   CONVDASH+C' '
+         DC    C'-'                Convert Blanks To Dashes
+         ORG   ,
+
+HEXTABLE DC    C'0123456789ABCDEF'
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Subroutines                                                  *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Get Into Supervisor State Key Zero                           *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+AUTH     #SAVE ,                   Save All Registers
+
+         TM    WRKFLAG,$SUPER      Check If Already In Supervisor State
+         BO    AUTH0100            B. If Yes
+         TM    WRKFLAG,$APF        Check If Module Is APF Authorized
+         BZ    AUTH0200            B. If Not (Error)
+
+         MODESET MODE=SUP          Get Into Supervisor State
+         OI    WRKFLAG,$SETSUP     Remember Superviosr State Was Set
+
+AUTH0100 DS    0H
+         IPK   ,
+         STC   R2,WRKOPSWK         Save Original Protect Key
+
+         SPKA  0                   Get Into Key Zero
+         OI    WRKFLAG,$SETKEY0    Remember KEY0 Was Set
+
+         LHI   R15,0               Set Return Code
+         B     AUTHEXIT
+
+AUTH0200 DS    0H
+         LHI   R0,1                Message Contains 1 Segment
+         L     R1,=A(#MSG005)      A(Error Message)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+
+AUTHEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Build Command Buffer From IKJTSOxx Section                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+BUILDCMD #SAVE ,                   Save All Registers
+
+         L     R5,WRKBUFF@         A(Start Of Parmlib Buffer)
+         USING PRM_READ_BUFFER,R5
+         L     R6,PRM_BUFF_SIZE_NEEDED
+         LA    R6,PRM_RECORDS(R6)  A(End Of Parmlib Buffer)
+         LA    R5,PRM_RECORDS      A(1st Parmlib Record)
+         DROP  R5
+
+*-------
+*        Find The Start Of The Requested IKJTSOxx Section
+*-------
+BUIC0100 DS    0H
+         CR    R5,R6               Check For End Of Buffer
+         BNL   BUIC0900            B. If Yes
+
+         L     R15,=A(FINDCHAR)
+         TRT   0(72,R5),0(R15)     Find The 1st Non-Blank
+         BZ    BUIC0700            B. If All Blanks
+
+         CLC   WRKCMDNM,0(R1)      Check For Current Command
+         BE    BUIC0800            B. If Match Found
+
+BUIC0200 DS    0H
+         CLC   0(72,R5),BLANKS     Check For Blank Line
+         BE    BUIC0500            B. If Yes (End Of Command)
+
+         LA    R1,71(,R5)          A(End Of Current Record)
+BUIC0300 DS    0H
+         CLI   0(R1),C' '          Check For Non-Blank
+         BNE   BUIC0400            B. If Found
+         BCT   R1,BUIC0300         Back Up And Loop To Last Non-Blank
+
+BUIC0400 DS    0H
+         CLI   0(R1),C'+'          Check for Continuation Character
+         BE    BUIC0600            B. If Yes
+         CLI   0(R1),C'-'          Check for Continuation Character
+         BE    BUIC0600            B. If Yes
+
+BUIC0500 DS    0H
+         AHI   R5,80               A(Next Record)
+         B     BUIC0100            Keep Searching For Section
+
+BUIC0600 DS    0H
+         AHI   R5,80               A(Next Record)
+         CR    R5,R6               Check For End Of Buffer
+         BL    BUIC0200            B. If Not
+         B     BUIC0100            Keep Searching For Section
+
+BUIC0700 DS    0H
+         AHI   R4,80               A(Next Record)
+         B     BUIC0100            Keep Searching For Section
+
+*-------
+*        Find The End Of The Requested IKJTSOxx Section
+*-------
+BUIC0800 DS    0H
+         ST    R1,WRKCMD@          Save Command Section Start Address
+
+BUIC0900 DS    0H
+         LR    R1,R5               A(Start Of Current Record)
+         CLC   0(72,R5),BLANKS     Check For Blank Line
+         BE    BUIC1300            B. If Yes (End Of Command)
+
+         LA    R1,71(,R5)          A(End Of Current Record)
+BUIC1000 DS    0H
+         CLI   0(R1),C' '          Check For Non-Blank
+         BNE   BUIC1100            B. If Found
+         BCT   R1,BUIC1000         Back Up And Loop To Last Non-Blank
+
+BUIC1100 DS    0H
+         CLI   0(R1),C'+'          Check for Continuation Character
+         BE    BUIC1200            B. If Yes
+         CLI   0(R1),C'-'          Check for Continuation Character
+         BE    BUIC1200            B. If Yes
+
+         LA    R1,1(,R1)           A(End Of Current Section)
+         B     BUIC1300
+
+BUIC1200 DS    0H
+         AHI   R5,80               A(Next Record)
+         CR    R5,R6               Check For End Of Buffer
+         BL    BUIC0900            B. If Not
+         LR    R1,R6               A(End Of Buffer)
+
+*-------
+*        Build A Command Buffer From This Section's Data
+*-------
+BUIC1300 DS    0H
+         ST    R1,WRKCMDE@         Save Command Section End Address
+         SL    R1,WRKCMD@          Calculate Section Length
+         AHI   R1,4                Add CBUF Header Length
+
+         LR    R3,R1
+         C     R3,WRKCBUFL         Check If Buffer Is Large Enough
+         BNH   BUIC1500            B. If Yes
+
+         ICM   R1,15,WRKCBUF@      A(Old Command Buffer)
+         BZ    BUIC1400            B. If No Previous Buffer
+         L     R0,WRKCBUFL         L(Old Command Buffer)
+         FREEMAIN RU,A=(1),LV=(0)
+
+BUIC1400 DS    0H
+         GETMAIN RU,LV=(R3),LOC=ANY
+         ST    R1,WRKCBUF@         Save New Command Buffer Address
+         ST    R3,WRKCBUFL         Save New Command Buffer Length
+
+BUIC1500 DS    0H
+         L     R5,WRKCBUF@         A(Start Of Command Buffer)
+
+         L     R1,WRKCMDE@         A(End Of Current Section)
+         SL    R1,WRKCMD@          Calculate Section Length
+         L     R14,WRKCMD@         A(Start Of Current Section)
+         STH   R1,0(,R5)           Save Command Length In Header
+         LA    R0,4(,R5)           A(Start Of Command Area)
+         #MVCL (R0),(R14),LEN=(R1) Move Section To Command Buffer
+
+         LH    R1,WRKCMDNL         L(Current Section Command)
+         LA    R1,5(R1,R5)         Point Past Command Name
+         L     R2,WRKCBUFL         L(Current Command Buffer Length)
+         SH    R2,=AL2(4)          Subtract CBUF Header Length
+         SH    R2,WRKCMDNL         Subtract Length Of Command Name
+         L     R15,=A(FINDCHAR)
+         #EXEC -R2,TRT,0(*-*,R1),0(R15)                                *
+
+         LA    R2,4(,R5)           A(Start Of Command)
+         SR    R1,R2               Calculate Offset To 1st Operand
+         STH   R1,2(,R5)           Save Offset In Header
+
+         LH    R4,0(,R5)           L(Command)
+         LA    R5,4(,R5)           A(Command)
+BUIC1600 DS    0H
+         LR    R3,R4               Copy Remaining Length
+         CHI   R3,255              Check If Length Is Too Large
+         BNH   BUIC1700            B. If Not
+         LHI   R3,255              Else. Set Length To Maximum
+
+BUIC1700 DS    0H
+         L     R15,=A(CONVCONT)
+         #EXEC -R3,TR,0(*-*,R5),0(R15)                                 *
+                                   Remove Continuation Chars from CBUF
+         AHI   R3,1
+         LA    R5,0(R3,R5)         A(Past Translated Portion)
+         SR    R4,R3               Calculate Remaining Length
+         BP    BUIC1600            B. If There Is More Command Data
+
+         LHI   R15,0               Set Return Code
+         B     BUICEXIT
+
+BUIC1800 DS    0H
+         MVC   WRKINS1(4),=AL2(*-*,#MSG0061)
+         MVC   WRKINS1+4(8),WRKCMDNM
+         LH    R1,WRKCMDNL         L(Current Section Command)
+         AHI   R1,4                Add Msg Prefix Length
+         STH   R1,WRKINS1          Save Message Length
+
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG006)      A(Error Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+
+BUICEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Build Table From Parsed Names List                           *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+BUILDTAB #SAVE ,                   Save All Registers
+
+         MVC   WRKR15,=A(8)        Set Default Return Code
+
+         L     R10,WRKPDL2         A(PDL)
+         USING TSOXXPCL,R10
+
+*-------
+*        Calculate The Number Of Specified Names
+*-------
+         LA    R5,LIST             A(Start Of 'NAMES')
+         SLR   R6,R6               Initialize Entry Counter
+BUIT0100 DS    0H
+         AHI   R6,1                Increment Entry Count
+         CLC   8(4,R5),=X'FF000000'
+         BE    BUIT0200            B. If End Of List
+         L     R5,8(,R5)           A(Next NAME In List)
+         B     BUIT0100            Else. Keep Counting
+
+*-------
+*        Add 1 To The Table Entry Count And Create a KEY8 Table
+*-------
+BUIT0200 DS    0H
+         AHI   R6,1                Add 1 To Entry Count
+         ST    R6,WRKTABCT         Save Entry Count
+
+         MH    R6,WRKTABEL         Calculate Required Table Size
+         AHI   R6,16               Add Table Header Length
+
+         GETMAIN RU,LV=(R6),LOC=ANY
+         ST    R1,WRKTEMP@         Save Table Address
+         STH   R6,WRKTEMPL         Save Table Length
+
+BUIT0300 DS    0H
+         L     R0,WRKTEMP@         A(Key8 Table Storage)
+         LH    R1,WRKTEMPL         L(Key8 Table Storage)
+         #BLANK (R0),LEN=(R1),PAD=C' '
+
+         L     R3,WRKTEMP@         A(Key8 Table Storage)
+         MVC   0(8,R3),WRKTABNM    Insert Table Name
+         MVC   8(8,R3),=C' PARMLIB'
+         AHI   R3,16               A(Start Of Table Entries)
+
+         LA    R5,LIST             A(Start Of 'NAMES')
+BUIT0400 DS    0H
+         L     R1,0(,R5)           A(Current NAME)
+         LH    R2,4(,R5)           L(Current NAME)
+
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BE    BUIT0500            B. If Yes
+         STH   R2,0(,R3)           Save NAME Length
+         AHI   R3,2                Advance Past Length
+BUIT0500 DS    0H
+         #EXEC -R2,MVC,0(*-*,R3),0(R1)
+         AHI   R3,8                Advance To Next Entry
+
+         CLC   8(4,R5),=X'FF000000'
+         BE    BUIT0600            B. If End Of List
+         L     R5,8(,R5)           A(Next NAME In List)
+         B     BUIT0400
+
+BUIT0600 DS    0H
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BE    BUIT0700            B. If Yes
+         MVC   0(2,R3),=X'FFFF'    Set End Of List
+
+BUIT0700 DS    0H
+         MVC   WRKR15,=A(0)        Set Return Code
+
+BUITEXIT DS    0H                  Restore All Registers
+         L     R15,WRKR15          Load Return Code
+         #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Ensure At Least One Table Name Was Specified                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+CHECKTAB #SAVE ,                   Save All Registers
+         SLR   R15,R15             Initialize Return Code
+
+         CLI   APKW+1,$AUTHTSF     Check For "AUTHTSF" Keyword
+         BE    CHECEXIT            B. If Yes
+         CLI   E2KW+1,$AUTHCMD     Check For "AUTHCMD" Keyword
+         BE    CHECEXIT            B. If Yes
+         CLI   E8KW+1,$AUTHPGM     Check For "AUTHPGM" Keyword
+         BE    CHECEXIT            B. If Yes
+         CLI   NSKW+1,$NOTBKGND    Check For "NOTBKGND" Keyword
+         BE    CHECEXIT            B. If Yes
+
+         LHI   R0,1                Message Contains 1 Segment
+         L     R1,=A(#MSG007)      A(No Table Message)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+
+CHECEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Perform Program Termination Cleanup                          *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+CLEANUP  #SAVE ,                   Save All Registers
+
+         IKJRLSA WRKPDL1           Release The Main Parse Storage
+         XC    WRKPDL1,WRKPDL1
+
+         IKJRLSA WRKPDL2           Release The SubCommand Parse Storage
+         XC    WRKPDL2,WRKPDL2
+
+CLEA0100 DS    0H
+         ICM   R1,15,WRKBUFF@      A(Parmlib Read Buffer)
+         BZ    CLEA0200            B. If Not Available
+         ICM   R0,15,WRKBUFFL      L(Parmlib Read Buffer)
+         BZ    CLEA0200            B. If Not Available
+         XC    WRKBUFF@,WRKBUFF@
+         FREEMAIN RU,A=(1),LV=(0)
+
+CLEA0200 DS    0H
+         ICM   R1,15,WRKMSGB@      A(Buffer)
+         BZ    CLEA0300            B. If Not Available
+         ICM   R0,15,WRKMSGBL      L(Buffer)
+         BZ    CLEA0300            B. If Not Available
+         XC    WRKMSGB@,WRKMSGB@
+         FREEMAIN RU,A=(1),LV=(0)
+
+CLEA0300 DS    0H
+         ICM   R1,15,WRKCBUF@      A(Buffer)
+         BZ    CLEA0400            B. If Not Available
+         ICM   R0,15,WRKCBUFL      L(Buffer)
+         BZ    CLEA0400            B. If Not Available
+         XC    WRKCBUF@,WRKCBUF@
+         FREEMAIN RU,A=(1),LV=(0)
+
+CLEA0400 DS    0H
+         ICM   R1,15,WRKTEMP@      A(Buffer)
+         BZ    CLEA0500            B. If Not Available
+         SLR   R0,R0
+         ICM   R0,3,WRKTEMPL       L(Buffer)
+         BZ    CLEA0500            B. If Not Available
+         XC    WRKTEMP@,WRKTEMP@
+         FREEMAIN RU,A=(1),LV=(0)
+
+CLEA0500 DS    0H
+         ICM   R1,15,WRKLOAD@      A(Buffer)
+         BZ    CLEANXIT            B. If Not Available
+         ICM   R0,15,WRKLOADL      L(Buffer)
+         BZ    CLEANXIT            B. If Not Available
+         XC    WRKLOAD@,WRKLOAD@
+         FREEMAIN RU,A=(1),LV=(0)
+
+CLEANXIT #RESTORE ,                Restore All Registers
+
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Insert The Current Loaded Module                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+COPYLOAD #SAVE ,                   Save All Registers
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   COPLEXIT            B. If Not Authorized
+
+         LH    R3,WRKMODL          Load Module Length
+         GETMAIN RU,LV=(R3),SP=252,LOC=BELOW
+         ST    R1,WRKAUTH@         Save Authorized Table Address
+         STH   R3,WRKAUTHL         Save Authorized Table Size
+
+         L     R4,WRKMOD@          A(Loaded Module)
+         #MVCL (R1),(R4),LEN=(R3)  Copy Module To Authorized Storage
+
+         L     R1,WRKTAB@@         A(Table Address In LWA)
+         MVC   WRKTAB@,0(R1)       Save Old Table Address
+         MVC   0(4,R1),WRKAUTH@    Point To New Table
+         MVC   WRKTABL,0(R1)       Save Old Table Address
+         L     R1,WRKTABL@         A(Table Length In LWA)
+         MVC   0(2,R1),WRKAUTHL    Set To New Table Length
+
+         L     R14,WRKLWA@         A(LWA)
+         USING LWA,R14
+
+         OC    LWAVFLGS,WRKVFLGS   Ensure "LOADED" Flag Is On
+
+         DROP  R14
+
+         ICM   R1,15,WRKTAB@       A(Previous Table)
+         BZ    COPYL100            B. If No Previous Table
+         SLR   R0,R0
+         ICM   R0,3,WRKTABL        A(Previous Table Length)
+         BZ    COPYL100            B. If No Previous Table
+         XC    WRKTAB@,WRKTAB@
+         XC    WRKTABL,WRKTABL
+         FREEMAIN RU,A=(1),LV=(0),SP=252
+
+COPYL100 DS    0H
+         #CALL DEAUTH              Return To Original State & Key
+         LHI   R15,0               Set Return Code
+
+COPLEXIT #RESTORE R15=(R15)        Restore All Registers
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Copy The Current Table To One With A Known Length            *
+*                                                                     *
+*        If The Table Length Is Not Known, The User May Be Using      *
+*        A Version That is Loaded From LPA (Un-Alterable).            *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+COPYTAB  #SAVE ,                   Save All Registers
+         SLR   R0,R0
+         ICM   R0,3,WRKTABL        Check If Length Is Already Known
+         BNZ   COPYEXIT            B. If Yes (No Need To Copy)
+
+         #CALL GETLEN              Determine Length Of Current Table
+         BZ    COPYEXIT            B. If No Current Table
+         STH   R15,WRKTABL         Set Current Table Length
+
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   COPYEXIT            B. If Not Authorized
+
+         LH    R3,WRKTABL          Load Calculated Table Length
+         GETMAIN RU,LV=(R3),SP=252,LOC=BELOW
+         ST    R1,WRKAUTH@         Save Authorized Table Address
+         LR    R2,R1
+         STH   R3,WRKAUTHL         Save Authorized Table Length
+
+         L     R4,WRKTAB@          A(Current Table)
+         #MVCL (R1),(R4),LEN=(R3)  Copy Table To Authorized Storage
+
+         L     R1,WRKTAB@@         A(Table Address In LWA)
+         MVC   0(4,R1),WRKAUTH@    Point To New Table
+         MVC   WRKTAB@,WRKAUTH@
+         L     R1,WRKTABL@         A(Table Length In LWA)
+         MVC   0(2,R1),WRKAUTHL    Set To New Table Length
+
+         #CALL DEAUTH              Return To Original State & Key
+
+COPYEXIT #RESTORE ,                Restore All Registers
+
+         SLR   R15,R15
+         ICM   R15,3,WRKTABL       Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Return To Original State And Key                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+DEAUTH   #SAVE ,                   Save All Registers
+
+         TM    WRKFLAG,$SETKEY0    Check If Changed To Key Zero
+         BZ    DEAU0100            B. If Not
+
+         IC    R2,WRKOPSWK         Load Original Protect Key
+         SPKA  0(R2)               Return To Original Key
+         NI    WRKFLAG,255-$SETKEY0
+
+DEAU0100 DS    0H
+         TM    WRKFLAG,$SETSUP     Check If Changed To Superviosr State
+         BZ    DEAUEXIT            B. If Not
+
+         MODESET MODE=PROB         Return To Problem State
+         NI    WRKFLAG,255-$SETSUP
+
+DEAUEXIT #RESTORE ,                Restore All Registers
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Display A Table's Information And Contents                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+DISPTAB  #SAVE ,                   Save All Registers
+
+*-------
+*     LWA008I ________(________________) AT ________ KEY __ LEN=_____
+*-------
+
+         MVC   WRKINS1(4),=AL2(4+26,#MSG0081)
+         MVC   WRKINS1+4(8),WRKTABNM
+         MVI   WRKINS1+4+8,C'('
+         MVC   WRKINS1+4+8+1(16),BLANKS
+         ICM   R5,15,WRKTAB@       A(Current Table)
+         BZ    DISP0100            B. If No Table
+         MVC   WRKINS1+4+8+1(16),0(R5)
+DISP0100 DS    0H
+         MVI   WRKINS1+4+8+1+16,C')'
+         MVC   WRKINS2(4),=AL2(4+8,#MSG0082)
+         UNPK  WRKINS2+4(9),WRKTAB@(5)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS2+4(8),0(R15)
+         MVI   WRKINS2+4+8,C' '
+         MVC   WRKINS3(4),=AL2(4+2,#MSG0083)
+         UNPK  WRKINS3+4(3),WRKTABPK(2)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS3+4(2),0(R15)
+         MVI   WRKINS3+4+2,C' '
+         MVC   WRKINS4(4),=AL2(4+9+8,#MSG0084)
+         MVC   WRKINS4+4(28),BLANKS
+         SLR   R1,R1
+         ICM   R1,3,WRKTABL
+         BZ    DISP0200
+         MVC   WRKINS4+4(4),=C'LEN='
+         CVD   R1,WRKDBL
+         OI    WRKDBL+7,X'0F'
+         UNPK  WRKINS4+8(5),WRKDBL
+         MVC   WRKINS4+8+5(8),=C' Decimal'
+
+DISP0200 DS    0H
+         MVC   WRKINS5(4),=AL2(4+L'#MSG0085,#MSG0085)
+         MVC   WRKINS5+4(28),BLANKS
+         TM    WRKTABF,WRK$STEP    Check If Table Came From //STEPLIB
+         BZ    DISP0300            B. If Not
+         MVC   WRKINS5+4(7),=C'STEPLIB'
+         B     DISP0400
+DISP0300 DS    0H
+         ICM   R0,3,WRKTABL        Check If A Length Exists In The LWA
+         BNZ   DISP0400            B. If Yes (Parmlib Or //STEPLIB)
+         MVC   WRKINS5+4(28),BLANKS
+         MVC   WRKINS5+4(3),=C'LPA'
+
+DISP0400 DS    0H
+         LHI   R0,6                Message Contains 6 Segments
+         L     R1,=A(#MSG008)      A(Informational Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         LA    R4,WRKINS3          A(Insert #3)
+         LA    R5,WRKINS4          A(Insert #4)
+         LA    R6,WRKINS5          A(Insert #5)
+         #CALL PUTLINE             Write Message
+
+*-------
+*     LWA002I ________ ________ ________ ________ ________ ________
+*-------
+         ICM   R9,15,WRKTAB@       A(Current Table)
+         BZ    DISPEXIT            B. If No Table
+         LR    R2,R9               Save Starting Address
+         XC    WRKTABE@,WRKTABE@   Reset End Of Table Address
+         AHI   R9,16               Advance Past Table Header
+
+         SLR   R1,R1
+         ICM   R1,3,WRKTABL        L(Current Table)
+         BZ    DISP0500            B. If Table Has Blank Terminator
+         AR    R2,R1               A(End Of Table)
+         ST    R2,WRKTABE@         Save End Of Table Address
+
+DISP0500 DS    0H
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0091)
+         MVC   WRKINS1+4(28),BLANKS
+         MVC   WRKINS2(4),=AL2(4+8,#MSG0092)
+         MVC   WRKINS2+4(28),BLANKS
+         MVC   WRKINS3(4),=AL2(4+8,#MSG0093)
+         MVC   WRKINS3+4(28),BLANKS
+         MVC   WRKINS4(4),=AL2(4+8,#MSG0094)
+         MVC   WRKINS4+4(28),BLANKS
+         MVC   WRKINS5(4),=AL2(4+8,#MSG0095)
+         MVC   WRKINS5+4(28),BLANKS
+         MVC   WRKINS6(4),=AL2(4+8,#MSG0096)
+         MVC   WRKINS6+4(28),BLANKS
+
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISPEXIT            B. If Terminator Slot Found
+         MVC   WRKINS1+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP0600            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP0600 DS    0H
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISP1200            B. If Terminator Slot Found
+         MVC   WRKINS2+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP0700            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP0700 DS    0H
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISP1200            B. If Terminator Slot Found
+         MVC   WRKINS3+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP0800            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP0800 DS    0H
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISP1200            B. If Terminator Slot Found
+         MVC   WRKINS4+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP0900            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP0900 DS    0H
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISP1200            B. If Terminator Slot Found
+         MVC   WRKINS5+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP1000            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP1000 DS    0H
+         #CALL GETNAME             Get Current Program/Command Name
+         BZ    DISP1200            B. If Terminator Slot Found
+         MVC   WRKINS6+4(8),WRKNAME
+         AH    R9,WRKTABEL         A(Next Slot In Table)
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP1100            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BNL   DISP1200            B. If End Encountered
+
+DISP1100 DS    0H
+         LHI   R0,7                Message Contains 7 Segments
+         L     R1,=A(#MSG009)      A(Program/Command Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         LA    R4,WRKINS3          A(Insert #3)
+         LA    R5,WRKINS4          A(Insert #4)
+         LA    R6,WRKINS5          A(Insert #5)
+         LA    R7,WRKINS6          A(Insert #6)
+         #CALL PUTLINE             Write Message
+
+         ICM   R0,3,WRKTABL        L(Current Table)
+         BZ    DISP0500            B. If Table Must Have A Terminator
+         C     R9,WRKTABE@         Check For End Of Table
+         BL    DISP0500            B. If More Entries Exist
+         B     DISPEXIT            Else. Terminate
+
+*-------
+*        Display The Last Entry
+*-------
+DISP1200 DS    0H
+         LHI   R0,7                Message Contains 7 Segments
+         L     R1,=A(#MSG009)      A(Program/Command Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         LA    R4,WRKINS3          A(Insert #3)
+         LA    R5,WRKINS4          A(Insert #4)
+         LA    R6,WRKINS5          A(Insert #5)
+         LA    R7,WRKINS6          A(Insert #6)
+         #CALL PUTLINE             Write Message
+
+DISPEXIT DS    0H
+         LHI   R0,1                Message Contains 1 Segment
+         L     R1,=A(BLANKLNE)     A(Blank Line Message)
+         #CALL PUTLINE             Write Message
+
+         #RESTORE ,                Restore All Registers
+         BR    R14                 Return To Caller
+         POP   USING
+
+*-------
+*        Save The Contents Of The Current Table Entry
+*-------
+         PUSH  USING
+GETNAME  #SAVE ,                   Save All Registers
+         MVC   WRKNAME,BLANKS      Initialize Output Area
+         LR    R1,R9               Set Start Of Entry Name
+         LHI   R2,8                Set Length For MVC
+         CLC   WRKTABEL,=AL2(10)   Check For IKJEFTNS Table
+         BNE   GETN0100            B. If Not
+         ICM   R2,3,0(R9)          Load Command Length
+         BZ    GETNEXIT            B. If Null Entry
+         CLC   0(2,R9),=X'FFFF'    Check For Terminating Entry
+         BE    GETNEXIT            B. If Yes
+         LA    R1,2(,R1)           Advance Past Length Field
+
+GETN0100 DS    0H
+         #EXEC -R2,MVC,WRKNAME(*-*),0(R1)
+
+GETNEXIT #RESTORE ,                Restore All Registers
+
+         TM    WRKNAME,X'BF'       Check If Entry Name Is Null
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Locate The Currently Specified "NAME"                        *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+FINDNAME #SAVE ,                   Save All Registers
+         SLR   R6,R6               Initialize "FOUND" Keyword Address
+
+*-------
+*        Search The AUTHTSF Table
+*-------
+         CLI   APKW+1,$AUTHTSF     Check For 'IKJEFTAP' Keyword
+         BNE   FIND0200            B. If Not
+         LA    R6,APKW             A(Current Keyword)
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHTSF '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTAP'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTAB@@,WRKTAPP@   Save Table Pointer Address
+         MVC   WRKTABL@,WRKTAPL@   Save Table Length Address
+         L     R3,WRKTAPP@
+         ICM   R3,15,0(R3)         A(IKJEFTAP Table)
+         BZ    FIND0200            B. If Not Available
+         ST    R3,WRKTAB@          Save Table Address
+         MVC   WRKTABL,WRKTAPL     Save Table Length
+         LA    R4,16(,R3)          A(1st Entry)
+         SLR   R1,R1
+         ICM   R1,3,WRKTAPL        L(Table In LWA)
+         BZ    FIND0100            B. If Length Is Zero
+         AR    R1,R3               A(End Of Table)
+         ST    R1,WRKTABE@
+FIND0100 DS    0H
+         CLI   0(R4),C' '          Check For End Of Table
+         BE    FIND0200            B. If Table Ends
+         CLC   0(8,R4),WRKNAME     Check If "NAME" Was Found
+         BE    FIND0900            B. If Yes
+         AH    R4,WRKTABEL         A(Next Table Entry)
+         ICM   R0,3,WRKTAPL        L(Table In LWA)
+         BZ    FIND0100            B. If Terminator Must Exist
+         C     R4,WRKTABE@         Check For End Of Table
+         BL    FIND0100            B. If More Entries
+
+*-------
+*        Search The AUTHCMD Table
+*-------
+FIND0200 DS    0H
+         CLI   E2KW+1,$AUTHCMD     Check For 'IKJEFTE2' Keyword
+         BNE   FIND0400            B. If Not
+         LA    R6,E2KW             A(Current Keyword)
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHCMD '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE2'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTAB@@,WRKTE2P@   Save Table Pointer Address
+         MVC   WRKTABL@,WRKTE2L@   Save Table Length Address
+         L     R3,WRKTE2P@
+         ICM   R3,15,0(R3)         A(IKJEFTE2 Table)
+         BZ    FIND0400            B. If Not Available
+         ST    R3,WRKTAB@          Save Table Address
+         MVC   WRKTABL,WRKTE2L     Save Table Length
+         LA    R4,16(,R3)          A(1st Entry)
+         SLR   R1,R1
+         ICM   R1,3,WRKTE2L        L(Table In LWA)
+         BZ    FIND0300            B. If Length Is Zero
+         AR    R1,R3               A(End Of Table)
+         ST    R1,WRKTABE@
+FIND0300 DS    0H
+         CLI   0(R4),C' '          Check For End Of Table
+         BE    FIND0400            B. If Table Ends
+         CLC   0(8,R4),WRKNAME     Check If "NAME" Was Found
+         BE    FIND0900            B. If Yes
+         AH    R4,WRKTABEL         A(Next Table Entry)
+         ICM   R0,3,WRKTAPL        L(Table In LWA)
+         BZ    FIND0300            B. If Terminator Must Exist
+         C     R4,WRKTABE@         Check For End Of Table
+         BL    FIND0300            B. If More Entries
+
+*-------
+*        Search The AUTHPGM Table
+*-------
+FIND0400 DS    0H
+         CLI   E8KW+1,$AUTHPGM     Check For 'IKJEFTE8' Keyword
+         BNE   FIND0600            B. If Not
+         LA    R6,E8KW             A(Current Keyword)
+         MVC   WRKCMDNL,=AL2(7)
+         MVC   WRKCMDNM,=C'AUTHPGM '
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTE8'
+         MVC   WRKTABEL,=AL2(8)    Set Table Entry Length
+         MVC   WRKTAB@@,WRKTE8P@   Save Table Pointer Address
+         MVC   WRKTABL@,WRKTE8L@   Save Table Length Address
+         L     R3,WRKTE8P@
+         ICM   R3,15,0(R3)         A(IKJEFTE8 Table)
+         BZ    FIND0600            B. If Not Available
+         ST    R3,WRKTAB@          Save Table Address
+         MVC   WRKTABL,WRKTE8L     Save Table Length
+         LA    R4,16(,R3)          A(1st Entry)
+         SLR   R1,R1
+         ICM   R1,3,WRKTE8L        L(Table In LWA)
+         BZ    FIND0500            B. If Length Is Zero
+         AR    R1,R3               A(End Of Table)
+         ST    R1,WRKTABE@
+FIND0500 DS    0H
+         CLI   0(R4),C' '          Check For End Of Table
+         BE    FIND0600            B. If Table Ends
+         CLC   0(8,R4),WRKNAME     Check If "NAME" Was Found
+         BE    FIND0900            B. If Yes
+         AH    R4,WRKTABEL         A(Next Table Entry)
+         ICM   R0,3,WRKTAPL        L(Table In LWA)
+         BZ    FIND0500            B. If Terminator Must Exist
+         C     R4,WRKTABE@         Check For End Of Table
+         BL    FIND0500            B. If More Entries
+
+*-------
+*        Search The NOTBKGND Table
+*-------
+FIND0600 DS    0H
+         CLI   NSKW+1,$NOTBKGND    Check For 'IKJEFTNS' Keyword
+         BNE   FIND1000            B. If Not
+         LA    R6,NSKW             A(Current Keyword)
+         MVC   WRKCMDNL,=AL2(8)
+         MVC   WRKCMDNM,=C'NOTBKGND'
+         MVC   WRKTABNL,=AL2(8)
+         MVC   WRKTABNM,=C'IKJEFTNS'
+         MVC   WRKTABEL,=AL2(10)   Set Table Entry Length
+         MVC   WRKTAB@@,WRKTNSP@   Save Table Pointer Address
+         MVC   WRKTABL@,WRKTNSL@   Save Table Length Address
+         L     R3,WRKTNSP@
+         ICM   R3,15,0(R3)         A(IKJEFTNS Table)
+         BZ    FIND1000            B. If Not Available
+         ST    R3,WRKTAB@          Save Table Address
+         MVC   WRKTABL,WRKTNSL     Save Table Length
+         LA    R4,16(,R3)          A(1st Entry)
+         SLR   R1,R1
+         ICM   R1,3,WRKTNSL        L(Table In LWA)
+         BZ    FIND0700            B. If Length Is Zero
+         AR    R1,R3               A(End Of Table)
+         ST    R1,WRKTABE@
+FIND0700 DS    0H
+         ICM   R0,3,0(R4)          Load Command Length
+         BZ    FIND1000            B. If Null Entry
+         CLC   0(2,R4),=X'FFFF'    Check For Terminating Entry
+         BE    FIND1000            B. If Yes
+         CLC   0(2,R4),WRKNAMEL    Check If Lengths Match
+         BNE   FIND0800            B. If Not
+         LH    R1,WRKNAMEL         L(NAME)
+         #EXEC -R1,CLC,2(*-*,R4),WRKNAME
+         BE    FIND0900            B. If NAME Found
+FIND0800 DS    0H
+         AH    R4,WRKTABEL         A(Next Table Entry)
+         ICM   R0,3,WRKTAPL        L(Table In LWA)
+         BZ    FIND0700            B. If No Length In LWA
+         C     R4,WRKTABE@         Check For End Of Table
+         BL    FIND0700            B. If More Entries
+         B     FIND1000            B. If Not Found
+
+*-------
+*        "NAME" Found.  Return It's Address To Caller
+*-------
+FIND0900 DS    0H
+         ST    R6,WRKKW@           Save "FOUND" Keyword Address
+
+         LR    R5,R4               A(Current Table Entry)
+
+         LR    R15,R5
+         SL    R15,WRKTAB@         Calculate Entry Offset
+         ST    R15,WRKNAMEO
+
+         TM    WRKFLAG,$MSG_F      Check If Message Requested
+         BZ    FINDEXIT            B. If Not
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0101)
+         MVC   WRKINS1+4(8),WRKNAME
+         LH    R0,WRKNAMEL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0102)
+         MVC   WRKINS2+4(8),WRKCMDNM
+         LH    R0,WRKCMDNL
+         AHI   R0,4
+         STH   R0,WRKINS2
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG010)      A(Not Found Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         B     FINDEXIT
+
+*-------
+*        "NAME" Not Found.  Issue Messaged If Requested
+*-------
+FIND1000 DS    0H
+         SLR   R5,R5               Indicate Entry Not Found
+
+         TM    WRKFLAG,$MSG_NF     Check If Message Requested
+         BZ    FINDEXIT            B. If Not
+         MVC   WRKINS1(4),=AL2(4+*-*,#MSG0111)
+         MVC   WRKINS1+4(8),WRKNAME
+         LH    R0,WRKNAMEL
+         AHI   R0,4
+         STH   R0,WRKINS1
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG011)      A(Not Found Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+FINDEXIT DS    0H
+         NI    WRKFLAG,255-($MSG_NF+$MSG_F)
+
+         #RESTORE R15=(R5)         Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Determine Length Of Table                                    *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+GETLEN   #SAVE ,                   Save All Registers
+
+         SLR   R15,R15
+         ICM   R15,3,WRKTABL       Load Table Length From LWA
+         BNZ   GETLEXIT            B. If Length Exists
+
+GETL0100 DS    0H
+         L     R15,WRKTAB@@        A(Current Table Pointer)
+         ICM   R15,15,0(R15)       A(Current Table)
+         BZ    GETLEXIT            B. If No Table Exists
+         ST    R15,WRKTAB@         Save Current Table Address
+         AHI   R15,16              A(1st Table Entry)
+
+GETL0200 DS    0H
+         CLC   WRKTABEL,=AL2(10)   Check For IKJEFTNS Table
+         BNE   GETL0300            B. If Not
+         ICM   R0,3,0(R15)         Check For Null Entry (Terminator)
+         BZ    GETL0500            B. If Yes
+         CLC   0(2,R15),=X'FFFF'   Check For Terminating Entry
+         BE    GETL0500            B. If Yes
+         B     GETL0400
+
+GETL0300 DS    0H
+         TM    0(R15),X'BF'        Check For Blank/Zero Entry
+         BZ    GETL0500            B. If Yes (Terminator)
+
+GETL0400 DS    0H
+         AH    R15,WRKTABEL        A(Next Entry In Table)
+         B     GETL0100            B. Check Next Entry
+
+GETL0500 DS    0H
+         AH    R15,WRKTABEL        A(End Of Terminating Entry)
+
+GETLEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Build A Table From The 8 Byte LIST File                      *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+LISTTAB  #SAVE ,                   Save All Registers
+
+*-------
+*        Find The Table Id And Count It's Entries
+*-------
+         L     R4,WRKMSGB@         A(Start Of Data Buffer)
+LIST0100 DS    0H
+         C     R4,WRKMSGBE         Check For End Of Buffer
+         BNL   LIST0800            B. If Id Not Found
+         CLC   WRKNAME,0(R4)       Check For Current Table Id
+         BE    LIST0200            B. If Yes
+         AHI   R4,8                A(Next LIST Entry)
+         B     LIST0100            Keep Searching
+
+LIST0200 DS    0H
+         AHI   R4,8                A(Start Of Table Names)
+         ST    R4,WRKPARM@         Save 1st Entry Address
+         SLR   R5,R5               Initialize Entry Counter
+
+LIST0300 DS    0H
+         C     R4,WRKMSGBE         Check For End Of Buffer
+         BNL   LIST0400            B. If End Reached
+         CLI   0(R4),C'-'          Check For "Id" Entry
+         BE    LIST0400            B. If Next Id Found
+         AHI   R4,8                A(Next LIST Entry)
+         AHI   R5,1                Add 1 To Entry Count
+         B     LIST0300            Keep Counting Entries
+
+LIST0400 DS    0H
+         ST    R5,WRKPARM#         Save Entry Count
+
+         LTR   R5,R5               Check Entry Count
+         BZ    LIST0800            B. If No Entries In Table
+
+*-------
+*        Add 1 To The Table Entry Count And Create a KEY8 Table
+*-------
+         AHI   R5,1                Add 1 To Entry Count
+         ST    R5,WRKTABCT         Save Entry Count
+
+         MH    R5,WRKTABEL         Calculate Required Table Size
+         AHI   R5,16               Add Table Header Length
+
+         GETMAIN RU,LV=(R5),LOC=ANY
+         ST    R1,WRKTEMP@         Save Table Address
+         STH   R5,WRKTEMPL         Save Table Length
+
+         L     R0,WRKTEMP@         A(Key8 Table Storage)
+         LH    R1,WRKTEMPL         L(Key8 Table Storage)
+         #BLANK (R0),LEN=(R1),PAD=C' '
+
+         L     R3,WRKTEMP@         A(Key8 Table Storage)
+         MVC   0(8,R3),WRKTABNM    Insert Table Name
+         MVC   8(8,R3),=C' PARMLIB'
+         AHI   R3,16               A(Start Of Table Entries)
+
+*-------
+*        Insert All The LIST Entries Into The KEY8 Table
+*-------
+         L     R5,WRKPARM@         A(1st Entry Name)
+         L     R6,WRKPARM#         Load Entry Count
+LIST0500 DS    0H
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BE    LIST0600            B. If Yes
+         LA    R1,8(,R5)           A(End Of Current Entry)
+         L     R15,=A(FINDBLANK)
+         TRT   0(8,R5),0(R15)      Find The First Blank
+         SR    R1,R5               Calculate Entry's Value Length
+         STH   R1,0(,R3)           Save NAME Length
+         AHI   R3,2                Advance Past Length
+LIST0600 DS    0H
+         MVC   0(8,R3),0(R5)       Insert LIST Entry
+         AHI   R3,8                Advance To Next Entry
+         AHI   R5,8                Advance To Next LIST Entry
+         BCT   R6,LIST0500         Process All LIST Entries
+
+         CLC   WRKTABEL,=AL2(8)    Check For Normal Table Entry
+         BE    LIST0700            B. If Yes
+         MVC   0(2,R3),=X'FFFF'    Set End Of List
+
+LIST0700 DS    0H
+         LHI   R15,0               Set Return Code
+         B     LISTEXIT
+
+LIST0800 DS    0H
+         LHI   R15,8               Set Return Code
+
+LISTEXIT #RESTORE R15=(R15)        Restore All Registers
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Load A Table From An IKJTABLS Alias Load Module              *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+LOADIT   #SAVE ,                   Save All Registers
+
+         L     R15,=A(MODCBU)
+         MVC   WRKDCB,0(R15)       Copy DCB To Work Area
+         MVC   DCBDDNAM-IHADCB+WRKDCB,WRKDDN
+         L     R15,=A(MODCBEU)
+         MVC   WRKDCBE,0(R15)      Copy DCBE To Work Area
+         LA    R15,WRKDCBE         A(DCBE)
+         ST    R15,DCBDCBE-IHADCB+WRKDCB
+
+         LA    R14,LOAD0900        A(Return From SYNAD Routine)
+         ST    R14,WRKR14          And From End-Of-Data
+         ST    R14,DCBEEODA-DCBE+WRKDCBE
+
+         L     R15,=A(MODOPEN)
+         MVC   WRKOPEN,0(R15)
+         OPEN  (WRKDCB),           Open The "LOADLIB" Data Set         *
+               MF=(E,WRKOPEN)
+         TM    DCBOFLGS-IHADCB+WRKDCB,DCBOFOPN
+         BZ    LOAD0700            B. If OPEN Failed
+
+*-------
+*        Issue BLDL To Allow Subsequent Load From Unauthorzed Library
+*-------
+         XC    WRKBLDL(WRKBLDLL),WRKBLDL
+         MVC   WRKBLDE#,=AL2(1)    Set Entry Length
+         MVC   WRKBLDEL,=AL2(L'WRKBLDLI) Set Directory Entry Length
+
+         LA    R2,WRKBLDLI         A(Directory Information)
+         USING PDS2,R2
+         MVC   PDS2NAME,WRKTABNM   Set Module Name
+
+         BLDL  WRKDCB,WRKBLDL      Search For Module Information
+         LTR   R15,R15             Check If Module Found
+         BNZ   LOAD0900            B. If Not
+
+         TM    PDS2INDC,PDS2ALIS   Check If Module Is An Alias
+         BZ    LOAD0900            B. If Not
+
+         SLR   R3,R3
+         ICM   R3,7,PDS2STOR       L(Module)
+         BZ    LOAD0900            B. If No Module
+         DROP  R2
+
+         C     R3,WRKLOADL         Check If Buffer Is Large Enough
+         BNH   LOAD0200            B. If Entire Module Will Fit
+         ICM   R1,15,WRKLOAD@      A(Buffer)
+         BZ    LOAD0100            B. If Not Available
+         ICM   R0,15,WRKLOADL      L(Buffer)
+         BZ    LOAD0100            B. If Not Available
+         FREEMAIN RU,A=(1),LV=(0)
+LOAD0100 DS    0H
+         GETMAIN RU,LV=(R3),LOC=BELOW
+         ST    R1,WRKLOAD@         Save Buffer Address
+         ST    R3,WRKLOADL         Save Buffer Length
+
+*-------
+*        Load The Requested Module Into Temporary Storage
+*-------
+LOAD0200 DS    0H
+         L     R15,=A(MODLOAD)
+         MVC   WRKLOAD,0(R15)
+         L     R2,WRKLOAD@         A(Directed Load Storage)
+
+         LOAD  EPLOC=WRKTABNM,                                         *
+               DCB=WRKDCB,LSEARCH=YES,ADRNAPF=(R2),                    *
+               ERRET=LOAD0800,SF=(E,WRKLOAD)
+
+         ST    R0,WRKMOD@          Save Module Entry Point
+         MVC   8(8,R2),=C' PARMLIB'  Simulate Data From IKJTSOxx
+
+         DELETE EPLOC=WRKTABNM     Remove The Module
+
+*-------
+*        Read The LOAD Module To Determine The CSECT Length
+*-------
+         FIND  WRKDCB,WRKTABNM,D   Point To Start Of Member
+
+LOAD0300 DS    0H
+         GETBUF WRKDCB,R6
+         ST    R6,WRKDCBBU         Save DCB Buffer Address
+
+         READ  DECB,SF,WRKDCB,(R6),'S',MF=E
+         CHECK DECB                Wait For I/O To Complete
+
+         USING CESD,R6
+         USING ESDDATA,CESDATA
+         CLI   CESDIDEN,CESDRCD    Check For CESD Record
+         BNE   LOAD0300            B. If Not
+
+         #BLKLEN DECB,R2           Get Length Of Current Block
+         AR    R2,R6               A(End Of Buffer)
+         ST    R2,WRKDCBBE         Save DCB Buffer End Address
+
+LOAD0400 DS    0H
+         C     R6,WRKDCBBE         Check For End Of Buffer
+         BNL   LOAD0300            B. If Buffer Complete
+         CLC   ESDNAME,WRKTABNM    Check For CESD For Our Module
+         BNE   LOAD0500            B. If Not
+         SLR   R3,R3
+         ICM   R3,7,ESDCLEN        Get CSECT Length
+         B     LOAD0600
+
+LOAD0500 DS    0H
+         LA    R6,16(,R6)          A(Next ESD Entry)
+         B     LOAD0400            Loop Through Buffer
+         DROP  R6
+
+LOAD0600 DS    0H
+         STH   R3,WRKMODL          Save CSECT Length
+
+         #CALL COPYLOAD            Copy And Save Address/Length In LWA
+
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0191)
+         MVC   WRKINS1+4(8),WRKTABNM
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0192)
+         MVC   WRKINS2+4(46),WRKDSN
+         LH    R1,WRKDSPDE+4       L(Quoted Data Set Name)
+         AHI   R1,4
+         STH   R1,WRKINS2
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG019)      A(Table Loaded Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,0               Set Return Code
+         B     LOAD1000
+
+LOAD0700 DS    0H
+         LHI   R0,2                Message Contains 1 Segments
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0171)
+         MVC   WRKINS1+4(8),WRKDDN
+         L     R1,=A(#MSG017)      A(OPEN Failed)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LOAD1000
+
+LOAD0800 DS    0H
+         ST    R15,WRKRCODE        Save Return Code
+         ST    R1,WRKREASN         Save Reason Code
+
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0181)
+         MVC   WRKINS1+4(8),WRKTABNM
+         MVC   WRKINS2(4),=AL2(4+8,#MSG0182)
+         UNPK  WRKINS2+4(9),WRKRCODE(5)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS2+4(8),0(R15)
+         MVI   WRKINS2+4+8,C' '
+         MVC   WRKINS3(4),=AL2(4+8,#MSG0183)
+         UNPK  WRKINS3+4(9),WRKREASN(5)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS3+4(8),0(R15)
+         MVI   WRKINS3+4+8,C' '
+         LHI   R0,4                Message Contains 4 Segments
+         L     R1,=A(#MSG018)      A(Load Failed Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         LA    R4,WRKINS3          A(Insert #3)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LOAD1000
+
+LOAD0900 DS    0H
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0201)
+         MVC   WRKINS1+4(8),WRKTABNM
+         MVC   WRKINS2(4),=AL2(4+*-*,#MSG0202)
+         MVC   WRKINS2+4(46),WRKDSN
+         LH    R1,WRKDSPDE+4       L(Quoted Data Set Name)
+         AHI   R1,4
+         STH   R1,WRKINS2
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG020)      A(Table Loaded Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         #CALL PUTLINE             Write Message
+
+         LHI   R15,8               Set Return Code
+         B     LOAD1000
+
+LOAD1000 DS    0H
+         TM    DCBOFLGS-IHADCB+WRKDCB,DCBOFOPN
+         BZ    LOADEXIT            B. If OPEN Failed
+         L     R15,=A(MODCLOSE)
+         MVC   WRKCLOSE,0(R15)
+         CLOSE (WRKDCB),           Close The "LOADLIB" Data Set        *
+               MF=(E,WRKCLOSE)
+
+LOADEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+         PUSH  USING
+LOADSYN  #SAVE ,                   Save All Registers
+         LR    R4,R13              Save Work Area Address
+         DROP  R13
+         USING WRKLWATM,R4
+
+         SYNADAF ACSMETH=BPAM,PARM1=(1)
+         MVC   WRKINS1(4),=AL2(4+82,BLANKINS)
+         MVC   WRKINS1+4(78),50(R1)
+
+         SYNADRLS ,                Release Synad Message Buffer
+
+         LR    R13,R4              Restore Dynamic Work Area
+         DROP  R4
+         USING WRKLWATM,R13
+
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(BLANKLNE)     A(Blank Line)
+         LA    R2,WRKINS1          A(Insert #1)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+         #RESTORE ,                Restore All Registers
+
+         L     R14,WRKR14          A(Synad Return Address)
+         BR    R14
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        PUTLINE Subroutine                                           *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+PUTLINE  #SAVE ,                   Save All Registers
+         TM    WRKFLAG,$ERROR      Check For Error Message
+         BO    PUTL0100            B. If Yes
+         CLI   NOMSGSKW+1,$NOMSGS  Check For 'NOMSG' Keyword
+         BE    PUTLEXIT            B. If Yes
+
+PUTL0100 DS    0H
+         STM   R0,R7,WRKOLD        Save Output Line Descriptors
+
+         L     R3,WRKUPT@          A(UPT)
+         L     R4,WRKECT@          A(ECT)
+
+         XC    WRKECB,WRKECB       Clear ECB
+         PUTLINE PARM=PUTLINEL,UPT=(R3),ECT=(R4),ECB=WRKECB,           *
+               OUTPUT=(WRKOLD,TERM,SINGLE,INFOR),                      *
+               MF=(E,WRKIOPL)      Write The Message
+
+PUTLEXIT DS    0H
+         NI    WRKFLAG,255-$ERROR
+
+         #RESTORE ,                Restore All Registers
+
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        PARMLIB Data Set Read Subroutine                             *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+READPARM #SAVE ,                   Save All Registers
+
+         XC    WRKPARM@,WRKPARM@   Clear 1st Parmlib Record Address
+         XC    WRKPARM#,WRKPARM#   Clear Parmlib Record Count
+
+         LA    R0,WRKDDN           A(DDName Buffer)
+         ST    R0,WRKDDPDE
+         LHI   R0,8                L(DDName Buffer)
+         STH   R0,WRKDDPDE+4
+         MVC   WRKDDN,BLANKS
+
+*-------
+*        Validate And Allocate The PARMLIB Data Set
+*-------
+         CLI   PARMLKW+1,$PARMLIB  Check For 'PARMLIB' Keyword
+         BNE   READ0400            B. If Not
+         ICM   R1,15,PARMLIB       A(Fully Qualified Data Set Name)
+         BZ    READ0400            B. If Not Available
+         LH    R2,PARMLIB+4        L(Fully Qualified Data Set Name)
+
+         LA    R0,WRKDSN           A(Quoted Data Set Name Area)
+         ST    R0,WRKDSPDE
+         MVC   WRKDSN,BLANKS
+         MVI   WRKDSN,C''''        Insert Leading Quote
+         #EXEC -R2,MVC,WRKDSN+1(*-*),0(R1)
+         LA    R1,WRKDSN+1+1(R2)   A(End Of Data Set Name)
+         MVI   0(R1),C''''         Insert Ending Quote
+         AHI   R1,1                A(End Of Data Set Name)
+         LA    R2,WRKDSN           A(Start Of Data Set Name)
+         SR    R1,R2               Calculate Length Of Data Set Name
+         STH   R1,WRKDSPDE+4       Save Quoted Data Set Name Length
+
+         MVC   WRKMEMNM,BLANKS
+         ICM   R1,15,PARMLIB+8     A(Member Name)
+         BZ    READ0400            B. If Not Available
+         LH    R2,PARMLIB+12       L(Member Name)
+         #EXEC -R2,MVC,WRKMEMNM(*-*),0(R1)
+
+         ALLOC DSN=WRKDSPDE,DISP=SHR,                                  *
+               DDNTO=WRKDDN,                                           *
+               ERROR=READ0500
+
+*-------
+*        Use Parmlib Services To Read The Entire IKJTSOxx Member
+*-------
+         L     R1,WRKBUFF@         A(Previous Storage Buffer)
+         ICM   R0,15,WRKBUFFL      Check If A Buffer Already Exists
+         BNZ   READ0200            B. If Yes
+         MVC   WRKBUFFL,=A(PRM_READ_BUFFER_LEN+(1024*80))
+READ0100 DS    0H
+         L     R0,WRKBUFFL
+         GETMAIN RU,LV=(R0),LOC=ANY
+READ0200 DS    0H
+         XC    0(PRM_READ_BUFFER_LEN,R1),0(R1)
+         ST    R1,WRKBUFF@
+         LR    R3,R1
+         USING PRM_READ_BUFFER,R3
+         MVC   PRM_READ_BUFF_SIZE,WRKBUFFL
+
+         L     R2,WRKMSGBL         L(IEFPRMLB Messages Buffer)
+         L     R4,WRKMSGB@         A(IEFPRMLB Messages Buffer)
+         USING PRM_Message_Buffer,R4
+         XC    PRM_MESSAGE_HEADER,PRM_MESSAGE_HEADER
+         ST    R2,PRM_MSG_BUFFER_SIZE
+         DROP  R4
+
+         IEFPRMLB REQUEST=READMEMBER,                                  *
+               DDNAME=WRKDDN,                                          *
+               MEMNAME=WRKMEMNM,                                       *
+               READBUF=(R3),                                           *
+               BLANK72=NO,                                             *
+               MSG=NO,                                                 *
+               CALLERNAME=LWAMODID,                                    *
+               RSNCODE=WRKREASN,                                       *
+               RETCODE=WRKRCODE,                                       *
+               MF=(E,WRKPRMPL,COMPLETE)
+
+         LTR   R15,R15
+         BZ    READ0300
+         CLC   WRKRCODE,=A(PRMLB_REQUEST_FAILED)
+         BNE   READ0600            B. If Not Request Failed
+         CLC   WRKREASN,=A(PRMLB_READ_BUFFER_FULL)
+         BNE   READ0600            B. If Not Buffer Full
+
+         L     R5,PRM_BUFF_SIZE_NEEDED
+         A     R5,=A(100*80)       Allow For 100 More Records
+         MVC   WRKBUFFL,PRM_BUFF_SIZE_NEEDED
+         L     R0,PRM_READ_BUFF_SIZE
+
+         FREEMAIN RU,A=(R3),LV=(0)
+         XC    WRKBUFF@,WRKBUFF@
+         B     READ0100
+
+*-------
+*        Return 1st Record Address And Number Of Records
+*-------
+READ0300 DS    0H
+         ICM   R5,15,PRM_TOTAL_RECORDS
+         BZ    READEXIT            B. If No Records In Member
+         LA    R4,PRM_RECORDS      A(1st Record)
+
+         ST    R5,WRKPARM#         #(Returned Records)
+         ST    R4,WRKPARM@         A(1st Record)
+         B     READEXIT
+
+*-------
+*        PARMLIB Not Specified Or DSN/Member Not Specified
+*-------
+READ0400 DS    0H
+         LHI   R0,1                Message Contains 1 Segment
+         L     R1,=A(#MSG012)      A(Error Message)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+         B     READEXIT
+
+*-------
+*        PARMLIB Could Not Be Allocated
+*-------
+READ0500 DS    0H
+         S99FAIL ,
+         B     READEXIT
+
+*-------
+*        PARMLIB Read Failed
+*-------
+READ0600 DS    0H
+         MVC   WRKINS1(4),=AL2(4+8,#MSG0131)
+         UNPK  WRKINS1+4(9),WRKRCODE(5)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS1+4(8),0(R15)
+         MVI   WRKINS1+4+8,C' '
+         MVC   WRKINS2(4),=AL2(4+8,#MSG0132)
+         UNPK  WRKINS2+4(9),WRKREASN(5)
+         L     R15,=A(HEXTABLE-C'0')
+         TR    WRKINS2+4(8),0(R15)
+         MVI   WRKINS2+4+8,C' '
+         LHI   R0,3                Message Contains 3 Segments
+         L     R1,=A(#MSG013)      A(Informational Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         LA    R3,WRKINS2          A(Insert #2)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+         B     READEXIT
+
+*-------
+*        TERMINATE                                                    *
+*-------
+READEXIT DS    0H
+         FREE  DDN=WRKDDPDE        Free Any Allocated Data Set
+
+         #RESTORE ,                Restore All Registers
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Replace The Entire Table                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+REPTABLE #SAVE ,                   Save All Registers
+         LHI   R15,0               Set Return Code
+
+         XC    WRKTAB@,WRKTAB@     Clear Previous Table Address
+         L     R5,WRKTAB@@         A(Current Table Address Address)
+         L     R6,WRKTABL@         A(Current Table Length Address)
+         ICM   R14,15,0(R5)        A(Current Table)
+         BZ    REPT0100            B. If No Previous Table
+         ST    R14,WRKTAB@         Save Old Table Address
+
+*-------
+*        Acquire A New Table And Anchor It In The LWA
+*-------
+REPT0100 DS    0H
+         #CALL AUTH                Get Into Supervisor State, Key Zero
+         BNZ   REPTEXIT            B. If Not Authorized
+
+         SLR   R2,R2               Clear New Table Address
+         SLR   R3,R3
+         ICM   R3,3,WRKTEMPL       L(Replacement Table)
+         BZ    REPT0200            B. If No New Table
+
+         GETMAIN RU,LV=(R3),SP=252,LOC=BELOW
+         ST    R1,WRKAUTH@         Save Authorized Table Address
+         LR    R2,R1
+         STH   R3,WRKAUTHL         Save Authorized Table Length
+
+         L     R4,WRKTEMP@         A(New Table Address)
+         #MVCL (R1),(R4),LEN=(R3)  Copy New Table To Authorized Storage
+
+         ST    R2,0(,R5)           Save New Table Address
+         STH   R3,0(,R6)           Save New Table Length
+
+         L     R14,WRKLWA@         A(LWA)
+         USING LWA,R14
+
+         MVC   LWAPRMLB,WRKPRMLB   Reset //STEPLIB Flags In LWA
+         OC    LWAVFLGS,WRKVFLGS   Ensure "LOADED" Flag Is On
+
+         DROP  R14
+
+*-------
+*        Release The Old Table's Storage If A Length Was Available
+*-------
+REPT0200 DS    0H
+         ICM   R1,15,WRKTAB@       A(Previous Table)
+         BZ    REPT0300            B. If No Previous Table
+         SLR   R0,R0
+         ICM   R0,3,WRKTABL        A(Previous Table Length)
+         BZ    REPT0300            B. If No Previous Table
+         FREEMAIN RU,A=(1),LV=(0),SP=252
+
+REPT0300 DS    0H
+         #CALL DEAUTH              Return To Original State & Key
+
+         LHI   R15,0               Set Return Code
+
+REPTEXIT #RESTORE R15=(R15)        Restore All Registers
+
+         LTR   R15,R15             Set Condition Code
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Save Current Keyword's Operand                               *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PUSH  USING
+SAVEKW   #SAVE ,                   Save All Registers
+         XC    WRKDATAL,WRKDATAL   Initialize Operand Length
+         MVC   WRKDATA,BLANKS      Initialize Operand Value
+
+         ICM   R2,15,0(R1)         A(NAME)
+         BZ    SAVE0900            B. If Not Available
+         ICM   R3,3,4(R1)          L(NAME)
+         BZ    SAVE0900            B. If Not Available
+         STH   R3,WRKDATAL         Save Operand Length
+         #EXEC -R3,MVC,WRKDATA(*-*),0(R2)
+         B     SAVEEXIT
+
+SAVE0900 DS    0H
+         LHI   R0,2                Message Contains 2 Segments
+         L     R1,=A(#MSG006)      A(Error Message)
+         LA    R2,WRKINS1          A(Insert #1)
+         OI    WRKFLAG,$ERROR      Force Message To Be Written
+         #CALL PUTLINE             Write Message
+
+SAVEEXIT #RESTORE ,                Restore All Registers
+
+         TM    WRKDATA,X'BF'       Check If A Name Exists
+         BR    R14                 Return To Caller
+         POP   USING
+
+LWATMGR  LOCTR ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Dynamic Work Area                                            *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         #STARTWA PATCH=NO
+
+         DYNSPACE ,                Dynamic Allocation Area
+         DS    XL256               In Case Of Overflow
+
+         IEFPRMLB MF=(L,WRKPRMPL)
+PUTLINEL PUTLINE MF=L              PUTLINE Parameter List
+         READ  DECB,SF,*-*,*-*,'S',MF=L
+
+WRKCALL  CALL  ,(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),VL,MF=L
+WRKLINK@ DS    A                   ISPLINK ROUTINE ADDRESS
+
+BLANKS   DS    CL80                Initialized Blanks
+
+WRKDBL   DS    D
+WRKECB   DS    F                   ECB
+WRKECT@  DS    A                   ECT Address
+WRKUPT@  DS    A                   UPT Address
+
+WRKVFLGS DS    X                   LWAVFLGS
+WRKFLAG  DS    X                   General Flag Byte
+$SUPER   EQU   X'80'               - Entered In Supervisor State
+$APF     EQU   X'40'               - Module Is APF Authorized
+$SETSUP  EQU   X'20'               - Changed To Supervisor State
+$SETKEY0 EQU   X'10'               - Changed To Key Zero
+$MSG_NF  EQU   X'08'               - Issue "Not Found" Message
+$MSG_F   EQU   X'04'               - Issue "Found" Message
+$ERROR   EQU   X'02'               - This Is An Error Message
+$EDITTAB EQU   X'01'               - Table Specified For EDIT
+
+WRKOPSWK DS    X                   Original PSW Key
+
+         CNOP  0,4
+WRKINS1  DS    AL2,AL2,CL80        PUTLINE Message Insert #1
+WRKINS2  DS    AL2,AL2,CL80        PUTLINE Message Insert #2
+WRKINS3  DS    AL2,AL2,CL80        PUTLINE Message Insert #3
+WRKINS4  DS    AL2,AL2,CL80        PUTLINE Message Insert #4
+WRKINS5  DS    AL2,AL2,CL80        PUTLINE Message Insert #5
+WRKINS6  DS    AL2,AL2,CL80        PUTLINE Message Insert #6
+
+WRKIOPL  DS    4F                  IOPL
+WRKLWA@  DS    A                   LWA Address
+WRKOLD   DS    F                   Number Of Message Segments
+         DS    A                   A(Message Text)
+         DS    A                   A(Message Insert 1)
+         DS    A                   A(Message Insert 2)
+         DS    A                   A(Message Insert 3)
+         DS    A                   A(Message Insert 4)
+         DS    A                   A(Message Insert 5)
+         DS    A                   A(Message Insert 6)
+
+WRKPPL   DS    7F                  PPL
+WRKPDL1  DS    A                   PDL
+WRKPDL2  DS    A                   PDL (IKJTSOxx Section Parse)
+
+WRKKW@   DS    A                   Keyword Matching Found Table
+
+WRKDDPDE DS    A,AL2,CL8           DD Name PDE
+WRKDDN   EQU   WRKDDPDE+6,8        DD Name
+WRKDSPDE DS    A,AL2,CL46          Data Set Name PDE
+WRKDSN   EQU   WRKDSPDE+6,46       Data Set Name
+WRKMNPDE DS    A,AL2,CL8           Member Name PDE
+WRKMEMNM EQU   WRKMNPDE+6,8        Member Name
+
+WRKZDSN  DS    CL44                ISPF Message DSName
+WRKUPDTE DS    C                   Edit Performed Update (Y/N)
+WRKSEL1  DS    C                   ISPF Selection Option
+WRKSEL2  DS    C                   ISPF Selection Option
+WRKSEL3  DS    C                   ISPF Selection Option
+WRKSEL4  DS    C                   ISPF Selection Option
+
+         CNOP  0,4
+WRKCMDNL DS    AL2                 IKJTSOxx Section Command Length
+WRKCMDNM DS    CL8                 IKJTSOxx Section Command
+
+WRKCMD@  DS    A                   IKJTSOxx Buffer Section Start
+WRKCMDE@ DS    A                   IKJTSOxx Buffer Section End
+
+WRKCBUF@ DS    A                   Command Buffer Address
+WRKCBUFL DS    F                   Command Buffer Length
+
+WRKR13   DS    F                   Register 13 Save Area
+WRKR14   DS    F                   Register 14 Save Area
+WRKR15   DS    F                   Register 15 Save Area
+
+WRKREASN DS    F                   IEFPRMLB Reason Code
+WRKRCODE DS    F                   IEFPRMLB Return Code
+WRKBUFF@ DS    A                   IEFPRMLB Return Buffer Address
+WRKBUFFL DS    F                   IEFPRMLB Return Buffer Length
+WRKMSGB@ DS    A                   IEFPRMLB Returned Message Buffer
+WRKMSGBL DS    F                   IEFPRMLB Returned Message Buffer Len
+WRKMSGBE DS    A                   End Of Buffer
+
+WRKCURB@ DS    A                   Current Buffer Address
+WRKCURBL DS    F                   Remaining Buffer Length
+
+WRKPARM@ DS    A                   First Parmlib Record Address
+WRKPARM# DS    F                   Number Of Parmlib Records Returned
+
+WRKDATAL DS    AL2                 Current Keyword's Operand Length
+WRKDATA  DS    CL80                Current Keyword's Operand
+WRKNAMEL DS    AL2                 Current Command/Program Name Length
+WRKNAME  DS    CL8                 Current Command/Program Name
+WRKNAMEO DS    A                   Current Entry's Offset In Table
+WRKNEWNL DS    AL2                 New Command/Program Name Length
+WRKNEWN  DS    CL8                 New Command/Program Name
+WRKTMPNL DS    AL2                 Save Area For NAME Length
+WRKTMPN  DS    CL8                 Save Area For NAME
+
+WRKTABNL DS    AL2                 Current Table Name Length
+WRKTABNM DS    CL8                 Current Table Name
+WRKTAB@@ DS    A                   Current Table Address Pointer
+WRKTAB@  DS    A                   Current Table Address
+WRKTABCT DS    F                   Current Command List Count
+WRKTABE@ DS    A                   Current Table End Address
+WRKTABPK DS    X                   Current Table PSW Key
+WRKTABF  DS    X                   Current Table Flags
+WRK$STEP EQU   X'80'   1... ....   Table Was Loaded From //STEPLIB
+WRKTABEL DS    AL2                 Current Table Entry Length
+WRKTABX@ DS    A                   Current Table End Address
+WRKTABL@ DS    A                   Current Table LWA Length Address
+WRKTABL  DS    AL2                 Current Table LWA Length
+
+WRKTEMP@ DS    A                   Temporary KEY8 Table Address
+WRKTEMPL DS    H                   Temporary KEY8 Table Length
+
+WRKAUTH@ DS    A                   New KEY0 Table Address
+WRKAUTHL DS    H                   New KEY0 Table Length
+
+WRKPRMLB DS    X                   Original LWAPRMLB Value
+
+         CNOP  0,4
+WRKDCB   DS    CL(MODCBUL)         DCB
+         CNOP  0,4
+WRKDCBE  DS    CL(MODCBEUL)        DCBE
+         CNOP  0,4
+WRKOPEN  DS    CL(MODOPENL)        OPEN Parameter List
+         CNOP  0,4
+WRKCLOSE DS    CL(MODCLOSEL)       CLOSE Parameter List
+         CNOP  0,4
+WRKLOAD  DS    XL(MODLOADL)        LOAD Parameter List
+
+WRKDCBBU DS    A                   DCB Buffer Address
+WRKDCBBE DS    A                   DCB Buffer End Address
+
+WRKLOAD@ DS    A                   Directed Load Buffer Address
+WRKLOADL DS    F                   Directed Load Buffer Length
+
+WRKBLDL  DS    0H
+WRKBLDE# DS    H                   Number Of Entries In List
+WRKBLDEL DS    H                   Length Of Entries In List
+WRKBLDLI DS    XL58                Returned Directory Information
+WRKBLDLL EQU   *-WRKBLDL           BLDL Parameter List Length
+
+WRKMOD@  DS    A                   Loaded Module Address
+WRKMODL  DS    H                   Loaded Module Length
+
+WRKTAPP@ DS    A                   IKJEFTAP Table Pointer Address
+WRKTAPL@ DS    A                   IKJEFTAP Table Length Address
+WRKTAPL  DS    AL2                 IKJEFTAP Table Length In LWA
+WRKTAPF  DS    C                   IKJEFTAP Flags
+         DS    X
+
+WRKTE2P@ DS    A                   IKJEFTE2 Table Pointer Address
+WRKTE2L@ DS    A                   IKJEFTE2 Table Length Address
+WRKTE2L  DS    AL2                 IKJEFTE2 Table Length In LWA
+WRKTE2F  DS    C                   IKJEFTE2 Flags
+         DS    X
+
+WRKTE8P@ DS    A                   IKJEFTE8 Table Pointer Address
+WRKTE8L@ DS    A                   IKJEFTE8 Table Length Address
+WRKTE8L  DS    AL2                 IKJEFTE8 Table Length In LWA
+WRKTE8F  DS    C                   IKJEFTE8 Flags
+         DS    X
+
+WRKTNSP@ DS    A                   IKJEFTNS Table Pointer Address
+WRKTNSL@ DS    A                   IKJEFTNS Table Length Address
+WRKTNSL  DS    AL2                 IKJEFTNS Table Length In LWA
+WRKTNSF  DS    C                   IKJEFTNS Flags
+         DS    X
+
+DCBEXIT@ DS    F                   DCB Open Exit Pointer
+WDCBEXIT DS    CL(STUBLEN)         24-Bit DCB Open Exit Stub
+
+STACK15  DS    F                   Stack Save Area
+STACKNX@ DS    A                   Next Save Area On The Stack
+STACKEND DS    A                   End Of Stack Address
+STACK    DS    (10*16)F            Register Save Area Stack
+STACKLEN EQU   *-STACK             Length Of Save Area Stack
+         #STOPWA ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        Command Parameters                                           *
+*                                                                     *
+*     Syntax:                                                         *
+*                                                                     *
+*        LWATMGR ADD                                                  *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }           *
+*               NAME(command/program)                                 *
+*                                                                     *
+*        LWATMGR BUILD                                                *
+*               LIST(dataset(member))                                 *
+*                                                                     *
+*        LWATMGR DELETE                                               *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }           *
+*               NAME(command/program)                                 *
+*                                                                     *
+*        LWATMGR DISPLAY                                              *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }     *
+*                                                                     *
+*        LWATMGR RELOAD                                               *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }     *
+*               LOADLIB(dataset)                                      *
+*                                                                     *
+*        LWATMGR REPLACE                                              *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND }           *
+*               NAME(command/program)                                 *
+*               NEWNAME(command/program)                              *
+*                                                                     *
+*        LWATMGR UPDATE                                               *
+*             { AUTHTSF  | AUTHCMD  | AUTHPGM  | NOTBKGND | ALL }     *
+*               PARMLIB(dataset(member))                              *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+         PRINT NOGEN
+
+PCL      IKJPARM DSECT=MAINPCL
+
+FUNCKW   IKJKEYWD DEFAULT='DISPLAY'
+         IKJNAME 'ADD',ALIAS='ANY'
+$ADD     EQU   1
+         IKJNAME 'BUILD'
+$BUILD   EQU   2
+         IKJNAME 'DELETE'
+$DELETE  EQU   3
+         IKJNAME 'DISPLAY'
+$DISPLAY EQU   4
+         IKJNAME 'RELOAD'
+$RELOAD  EQU   5
+         IKJNAME 'REPLACE'
+$REPLACE EQU   6
+         IKJNAME 'UPDATE'
+$UPDATE  EQU   7
+
+ALLKW    IKJKEYWD ,
+         IKJNAME 'ALL',INSERT='IKJEFTAP IKJEFTE2 IKJEFTE8 IKJEFTNS'
+APKW     IKJKEYWD ,
+         IKJNAME 'IKJEFTAP',ALIAS=('TAP','AUTHTSF')
+$AUTHTSF EQU   1
+E2KW     IKJKEYWD ,
+         IKJNAME 'IKJEFTE2',ALIAS=('TE2','AUTHCMD')
+$AUTHCMD EQU   1
+E8KW     IKJKEYWD ,
+         IKJNAME 'IKJEFTE8',ALIAS=('TE8','AUTHPGM')
+$AUTHPGM EQU   1
+NSKW     IKJKEYWD ,
+         IKJNAME 'IKJEFTNS',ALIAS=('TNS','NOTBKGND')
+$NOTBKGND EQU  1
+
+NAMEKW   IKJKEYWD ,
+         IKJNAME 'NAME',SUBFLD=NAMESUBF
+
+NEWCMDKW IKJKEYWD ,
+         IKJNAME 'NEWNAME',SUBFLD=NEWSUBF
+
+PARMLKW  IKJKEYWD ,
+         IKJNAME 'PARMLIB',                                            *
+               SUBFLD=PARMSUBF
+$PARMLIB EQU   1
+
+LOADKW   IKJKEYWD ,
+         IKJNAME 'LOADLIB',                                            *
+               SUBFLD=LOADSUBF
+
+REC8KW   IKJKEYWD ,
+         IKJNAME 'LIST',                                               *
+               SUBFLD=REC8SUBF
+
+NOMSGSKW IKJKEYWD ,
+         IKJNAME 'NOMESSAGES',ALIAS='NOMSG'
+$NOMSGS  EQU   1
+
+NAMESUBF IKJSUBF  ,
+NAME     IKJIDENT 'NAME',FIRST=ALPHA,OTHER=ALPHANUM,MAXLNTH=8,         *
+               PROMPT='Command Or Program Name'
+
+NEWSUBF  IKJSUBF  ,
+NEWNAME  IKJIDENT 'NEWNAME',FIRST=ALPHA,OTHER=ALPHANUM,MAXLNTH=8,      *
+               PROMPT='New Command Or Program Name'
+
+PARMSUBF IKJSUBF  ,
+PARMLIB  IKJPOSIT DSNAME,USID,UPPERCASE,                               *
+               PROMPT='IKJTSOXX Input Data Set'
+
+LOADSUBF IKJSUBF  ,
+LOADLIB  IKJPOSIT DSNAME,USID,UPPERCASE,                               *
+               PROMPT='IKJTABLS Load Library'
+
+REC8SUBF IKJSUBF  ,
+REC8     IKJPOSIT DSNAME,USID,UPPERCASE,                               *
+               PROMPT='Table List Data Set'
+
+         IKJENDP ,
+
+*---------------------------------------------------------------------*
+*                                                                     *
+*        IKJTSOXX Statements                                          *
+*                                                                     *
+*        Syntax:                                                      *
+*                                                                     *
+*        AUTHCMD  NAMES(...LIST...)                                   *
+*        AUTHPGM  NAMES(...LIST...)                                   *
+*        NOTBKGND NAMES(...LIST...)                                   *
+*        AUTHTSF  NAMES(...LIST...)                                   *
+*                                                                     *
+*---------------------------------------------------------------------*
+
+PARMPCL  IKJPARM DSECT=TSOXXPCL
+
+NAMESKW  IKJKEYWD ,
+         IKJNAME 'NAMES',SUBFLD=LISTSUBF
+
+LISTSUBF IKJSUBF  ,
+LIST     IKJIDENT 'NAME',LIST,                                         *
+               FIRST=ALPHA,OTHER=ALPHANUM,MAXLNTH=8,                   *
+               PROMPT='Command Or Program Name'
+
+         IKJENDP ,
+
+         PRINT GEN
+
+         IKJEFLWA ,                LOGON Work Area
+
+         IEFZPMAP ,                IEFPRMLB Parameter List
+         IEFZPRC ,                 IEFPRMLB Return Codes
+
+         IHAPDS ,                  PDS / PDSE Directory Entry
+         IHARLD ,                  Linkage Editor Records
+         IHADCBE ,                 Data Control Block Extension
+
+         #DSECTS ALLOC,ASCB,ASXB,CVT,DCB,PSA,TSO
+         END   ,

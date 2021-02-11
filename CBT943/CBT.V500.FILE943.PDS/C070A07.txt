@@ -1,0 +1,472 @@
+Compressing CICS load libraries
+
+Compressing a CICS DFHRPL library can cause abends in any
+CICS region which has built a pointer to load modules moved
+during the compress.  If the original location of the module
+gets overlaid or corrupted, there will be problems the next time
+CICS goes back to process the module, eg after program
+compression.  This would typically be an APCP-type abend.
+To avoid these abends, it is necessary either to take all regions
+down prior to doing a compress or NEWCOPY all the modules
+moved by the compress.  Since there is no automatic way to
+detect a moved module, a NEWCOPY must be issued against
+all modules in the compressed library.  This is a tedious
+process for most libraries as there is no simple command to
+NEWCOPY modules coming out of a particular library.  Also,
+issuing CEMT S PR(*) NEWCOPY is not realistic for most
+regions.
+
+Since the need to compress a library usually comes at an
+inconvenient time, I wrote a procedure to allow the regions to
+stay up while managing the possibility of abends.  The
+procedure makes use of the TTR address associated with
+modules in a load library.  By detecting changes in these
+addresses, it is possible to determine which modules have been
+manipulated in a compress.  The procedure starts out by
+executing a program called TTRSAVE.  TTRSAVE examines
+the load library's directory and saves the TTR location data.  A
+VSAM file is used to retain the information.  It must be
+defined either before the TTRSAVE step or within the step
+itself if that capability exists.  After TTRSAVE has executed,
+the library can be compressed using whatever technique is
+common to your shop.  This could be a step within the same
+job or a separate job if desired.  In either case, it is necessary
+to compress the library with a DISP of SHR since it will be in
+use by any number of CICS regions.
+
+After the compress is complete, the possibility for APCP
+abends will exist.  To correct this situation, a step which
+executes a program called TTRCHECK must be run.
+TTRCHECK will again analyse the current directory of the
+PDS and use data in the VSAM file to determine what
+programs should have a NEWCOPY issued on their behalf.
+TTRCHECK is informed via a SYSIN DD statement to which
+regions it should issue the NEWCOPY commands.  One left-
+justified SYSIN entry must be present for each region name
+containing the compressed library in its DFHRPL
+concatenation.  In turn, the NEWCOPY will be issued for a
+maximum of 10 regions.  This maximum can easily be
+increased via a minor program change.
+
+I ran into a problem when compressing libraries containing a
+large number of moved modules.  There is a limit of 256
+outstanding MODIFY commands for any single CICS region.
+Thus, if the system was flooded at normal program speed with
+these NEWCOPY commands, it would reject any that put a
+region above the 256 limit.  To compensate for this, a STIMER
+wait for half a second is included in TTRCHECK between each
+module requiring a NEWCOPY.  In my environment, this was
+adequate time to allow the system to stay within the limit.
+Depending on your overall system performance and an
+individual region's ability to respond, it's possible the
+STIMERvalue would have to be increased.  If you have
+adequate throughput, the wait can be decreased.
+
+The same procedure can also be used when one library is
+copied to another, such as from test to production.  Although it
+may not be necessary to compress the library, it is desirable to
+point CICS to the latest version of any program indicated by a
+new TTR address.  To make TTRCHECK flexible, it has the
+ability to determine that a module is new to the library.
+Although this would normally not occur in a compress
+operation, it does happen when one library is copied to
+another.  Since the new module could be located in another
+library further into the concatenation with a pointer already
+established to that version, a NEWCOPY is issued.
+
+One final option exists for TTRCHECK, allowing it to execute
+even if the TTRSAVE step is skipped or forgotten.  This can
+occur if someone performs a compress outside this procedure.
+In that case TTRCHECK can still be used to NEWCOPY every
+module in the library.  Accomplish this by entering
+NCOPYALL as one of the CICS regions via SYSIN.
+NCOPYALL indicates that the program should bypass the logic
+to check the TTR.  NCOPYALL does not impact the 10 region
+limit and can appear as any one of the SYSIN entries.
+Although more requests than necessary will be issued, it's
+better than having to recycle CICS regions in most cases.
+TTRCHECK prints a message for each module receiving a
+NEWCOPY for each region requested.  The message also
+indicates whether the module was moved or new.
+
+Both TTRSAVE and TTRCHECK report counts of members
+analysed.  In addition, TTRCHECK indicates the total number
+of NEWCOPY commands issued for all regions along with the
+number of new and moved modules.  TTRCHECK uses the
+MODESET macro so it must be authorized when linked.
+
+
+TTRSAVE SOURCE CODE
+
+TTRSAVE   CSECT
+          STM     R14,R12,12(R13)    SAVE
+          LA      R14,0(R13)              CALLERS
+          BAL     R13,84(R15)                     REGISTERS
+          USING   *,R13
+          DS      18F
+          ST      R14,4(R13)          SAVE ADDRESS OF CALLERS SAVE AREA
+          ST      R13,8(R14)          SAVE ADDRESS OF OUR SAVE AREA
+          OPEN    (VSAMACB,OUTPUT)    OPEN VSAM WORK FILE
+          LTR     R15,R15             OPEN OK?
+          BNZ     BADVSMOP            IF NO, ABEND
+          OPEN    (SYSOUT,OUTPUT,SYSLIB) OPEN SYSOUT AND PDS DD
+          ZAP     TOTCNT,=P'0'        INITIALIZE TOTAL COUNT
+READDIR   GET     SYSLIB,DIRREC       READ A DIRECTORY RECORD
+          XR      R6,R6               ZERO REG 6
+          ICM     R6,B'0011',DIRREC   SAVE DIR BLOCK LENGTH
+          LA      R3,DIRREC+2         JUMP OVER LENGTH
+CHECKEND  CLC     0(8,R3),LASTMEM     AT END?
+          BE      CKTOTCNT            IF YES, GET OUT
+          USING   PDS2,R3
+          MVC     VSAMKEY(8),PDS2NAME   SAVE MEMBER NAME
+          MVC     VSAMREC+8(3),PDS2TTRP SAVE TTR ADDRESS
+          PUT     RPL=VSAMRPL         WRITE OUT MEMBER/TTR RECORD
+          LTR     R15,R15             WRITE OK?
+          BNZ     BADVSMWR            IF NO, ABEND
+          AP      TOTCNT,=P'1'        ADD 1 TO TOTAL COUNT
+NEXTMEM   IC      R5,11(,R3)          SAVE NUMBER OF USER HALFWORDS
+          N       R5,=X'0000001F'     CLEAR UNUSED BITS
+          SLL     R5,1                MULTIPLY BY TWO
+          LA      R3,12(R5,R3)        POINT TO NEXT MEMBER
+          LA      R8,DIRREC           STARTING ADDRESS OF DIR BLOCK
+          LR      R10,R3              SAVE CURRENT LOCATION
+          SR      R10,R8              DETERMINE OFFSET
+          CR      R10,R6              ARE WE AT THE END?
+          BL      CHECKEND            IF NO, PROCESS MEMBER
+          B       READDIR             IF YES, GET NEXT DIR BLOCK
+CKTOTCNT  CLC     TOTCNT,ZERO         WERE THERE ANY RECORDS WRITTEN?
+          BNE     FINISHUP            IF YES, WE'RE OK
+          MVC     VSAMKEY(8),=C'DUMMYREC' IF NOT, WE NEED TO WRITE
+          MVC     VSAMREC+8(3),=C'DMY'       A DUMMY RECORD
+          PUT     RPL=VSAMRPL                SO TTRCHECK DOESN'T ABEND
+          LTR     R15,R15             WRITE OK?
+          BNZ     BADVSMWR            IF NO, ABEND
+FINISHUP  OI      TOTCNT+2,X'0F'      MAKE PRINTABLE FOR MESSAGE
+          UNPK    MSGTOTCT(5),TOTCNT  UNPACK COUNTS FOR MESSAGE
+          PUT     SYSOUT,MSGTOTAL     WRITE OUT THE TOTALS MESSAGE
+          CLOSE   (SYSOUT,,SYSLIB)    CLOSE SYSOUT AND PDS DD
+          CLOSE   (VSAMACB)           CLOSE THE VSAM WORK FILE
+          LTR     R15,R15             CLOSE OK?
+          BNZ     BADVSMCL            IF NO, ABEND
+          L       R13,4(R13)          RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)     RELOAD CALLERS REGISTERS
+          LA      R15,0               ZERO RETURN CODE
+          BR      R14                 GO BACK TO CALLER
+BADVSMOP  PUT     SYSOUT,OPENMSG      WRITE OUT BAD OPEN MESSAGE
+          ABEND   998                    AND ABEND
+BADVSMWR  PUT     SYSOUT,WRITMSG      WRITE OUT BAD WRITE MESSAGE
+          SHOWCB  RPL=VSAMRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          UNPK    WKFLD,FDBKCDE+2(3)  UNPACK THE FEEDBACK CODE
+          TR      WKFLD(3),TRTBL-C'0' MAKE SURE ITS PRINTABLE
+          MVC     MSGCDE,WKFLD        PUT FEEDBACK INTO MESSAGE
+          PUT     SYSOUT,MSGFDBK      WRITE OUT THE FEEDBACK CODE
+          L       R13,4(R13)          RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)     RELOAD CALLERS REGISTERS
+          LA      R15,8               END WITH RETURN CODE 8
+          BR      R14                 GO BACK TO CALLER
+BADVSMCL  PUT     SYSOUT,CLOSMSG      WRITE OUT BAD CLOSE MESSAGE
+          ABEND   999                    AND ABEND
+          LTORG
+OPENMSG   DC      CL80' * ERROR OPENING VSAM FILE *'
+WRITMSG   DC      CL80' * ERROR WRITING VSAM FILE *'
+CLOSMSG   DC      CL80' * ERROR CLOSING VSAM FILE *'
+MSGTOTAL  DC      CL80' '
+          ORG     MSGTOTAL
+          DC      CL26' TOTAL MEMBERS PROCESSED: '
+MSGTOTCT  DS      CL5
+          ORG
+RTCODE    DS      F
+FDBKCDE   DS      F
+WKFLD     DS      CL4
+MSGFDBK   DS      CL80' '
+          ORG     MSGFDBK
+          DC      CL24' VSAM FEEDBACK CODE IS: '
+MSGCDE    DS      CL3
+          ORG
+TRTBL     DC      C'0123456789ABCDE'
+DIRREC    DS      CL256
+LASTMEM   DC      8X'FF'
+TOTCNT    DS      PL3
+ZERO      DC      PL3'0'
+SYSOUT    DCB   BLKSIZE=80,LRECL=80,DDNAME=SYSOUT,DSORG=PS,MACRF=PM,   X
+               RECFM=F
+SYSLIB    DCB   DDNAME=SYSLIB,DSORG=PS,MACRF=GM,EODAD=CKTOTCNT,        X
+               RECFM=F,BLKSIZE=256,LRECL=256
+VSAMACB   ACB   MACRF=(KEY,SEQ,OUT),DDNAME=VSAMFILE
+VSAMRPL   RPL   ACB=VSAMACB,OPTCD=(SEQ),RECLEN=11,                     X
+               AREALEN=11,KEYLEN=8,ARG=VSAMKEY,AM=VSAM,AREA=VSAMREC
+VSAMREC   DS    CL11
+          ORG   VSAMREC
+VSAMKEY   DS    CL8
+          ORG
+          IHAPDS  PDSBLDL=NO
+          END
+
+
+TTRCHECK SOURCE CODE
+
+TTRCHECK  CSECT
+          STM     R14,R12,12(R13)       SAVE
+          LA      R14,0(R13)                 CALLERS
+          BAL     R13,84(R15)                        REGISTERS
+          USING   *,R13
+          DS      18F
+          ST      R14,4(R13)            SAVE ADDR OF CALLERS SAVE AREA
+          ST      R13,8(R14)            SAVE ADDR OF OUR SAVE AREA
+          ZAP     TOTCNT,=P'0'          INITIALIZE TOTAL COUNT
+          ZAP     NEWCNT,=P'0'          INITIALIZE NEW COUNT
+          ZAP     MOVEDCNT,=P'0'        INITIALIZE MOVED COUNT
+          ZAP     NCOPYCNT,=P'0'        INITIALIZE NEWCOPY COUNT
+          MVI     CICSTBL,X'FF'         INITIALIZE CICS REGIONS TABLE
+          MVC     CICSTBL+1(79),CICSTBL TO HIGH VALUES
+          LA      R7,CICSTBL            SAVE ADDRESS OF REGIONS TABLE
+          LA      R4,CICSTBL+81         SAVE ADDRESS OF END OF TABLE
+          OPEN    (SYSIN,INPUT)         OPEN SYSIN
+GETSYSIN  GET     SYSIN,CARD            GET A SYSIN RECORD
+          CLC     CARD(8),=C'NCOPYALL'  IS THIS A NEWCOPY ALL REQUEST
+          BE      NCOPYALL              IF YES, REMEMBER
+          MVC     0(8,R7),CARD          SAVE THE CICS REGION NAME
+          LA      R7,8(,R7)             POSITION TO NEXT TABLE SLOT
+          CR      R7,R4                 AT END OF TABLE?
+          BL      GETSYSIN              IF NO, GET NEXT REGION NAME
+          B       OVER10                ABEND IF OVER 10 REGION NAMES
+NCOPYALL  MVI     NCOPYFLG,C'1'         INDICATE TO NEWCOPY ALL MODULES
+          B       GETSYSIN
+EODSYSIN  CLOSE   (SYSIN)               CLOSE SYSIN
+          OPEN    (SYSOUT,OUTPUT,SYSLIB) OPEN SYSOUT AND PDS DD
+          CLI     NCOPYFLG,C'1'         DO WE NEWCOPY EVERYTHING?
+          BE      READDIR               IF YES, DON'T NEED WORK FILE
+          OPEN    (VSAMACB)             OPEN VSAM WORK FILE
+          LTR     R15,R15               OPEN OK?
+          BNZ     BADVSMOP              IF NO, ABEND
+READDIR   GET     SYSLIB,DIRREC         READ A DIRECTORY RECORD
+          XR      R6,R6                 ZERO REG 6
+          ICM     R6,B'0011',DIRREC     GET DIR BLOCK LENGTH
+          LA      R3,DIRREC+2           JUMP OVER LENGTH
+CHECKEND  CLC     0(8,R3),LASTMEM       AT END OF DIR BLOCK?
+          BE      RETURN                IF YES, WE'RE DONE
+          AP      TOTCNT,=P'1'          ADD 1 TO TOTAL COUNT
+          CLI     NCOPYFLG,C'1'         DO WE NEWCOPY EVERYTHING?
+          BE      CMDPREP               IF YES, GO DO IT
+          USING   PDS2,R3
+          MVC     VSAMKEY(8),PDS2NAME   SAVE MEMBER NAME
+          MVC     VSAMREC+8(3),PDS2TTRP SAVE TTR
+          GET     RPL=VSAMRPL           READ THE MEMBER RECORD
+          LTR     R15,R15               READ OK?
+          BNZ     CHKNTFND              IF NO, CHECK IF NOT FOUND
+          CLC     PDS2TTRP(3),VSAMREC+8 IS THE TTR THE SAME?
+          BE      NEXTMEM               IF YES, IT DIDNT MOVE
+          B       ITMOVED               GO ISSUE NEWCOPY
+CHKNTFND  SHOWCB  RPL=VSAMRPL,FIELDS=FDBK,AREA=FDBKCDE,LENGTH=4
+          CLC     FDBKCDE+3(1),=X'10'   CHECK NOT FOUND, IF SO ITS NEW
+          BE      ITSNEW                GO ISSUE NEW COPY
+          B       BADVSMGT              UNEXPECTED FEEDBACK ON READ
+ITSNEW    MVC     MSGNWMV(6),=C' NEW  ' INDICATE IT'S A NEW MODULE
+          AP      NEWCNT,=P'1'          ADD 1 TO NEW COUNT
+          B       CMDPREP               GO PREPARE THE COMMAND
+ITMOVED   MVC     MSGNWMV(6),=C'MOVED ' INDICATE IT'S A MOVED MODULE
+          AP      MOVEDCNT,=P'1'        ADD 1 TO MOVED COUNT
+CMDPREP   LA      R2,CICSTBL            SAVE ADDRESS OF REGIONS TABLE
+          MVC     MSGMODLE(8),PDS2NAME  MOVE MODULE NAME TO MSG AREA
+          STIMER  WAIT,DINTVL=WAITTIME  WAIT BEFORE GOING ON
+CHKTABLE  CLC     0(,R2),=X'FFFFFFFF'   AT END OF TABLE?
+          BE      NEXTMEM               IF YES, PROCESS NEXT MEMBER
+          MVC     CMDWORK(8),0(R2)      MOVE REGION NAME TO CMD AREA
+          MVC     MSGREGN(8),0(R2)      MOVE REGION NAME TO MSG AREA
+          LA      R7,CMDWORK+7          POINT TO POSSIBLE END OF TEXT
+          LA      R4,CMDWORK            POINT TO BEGINNING OF TEXT
+FINDTEXT  CR      R7,R4                 ALL BLANK?
+          BL      NEXTMEM               YES - IGNORE IT
+          CLI     0(R7),C' '            BLANK CHARACTER?
+          BNE     GOTTEXT               NO - FOUND END OF TEXT
+          BCT     R7,FINDTEXT           KEEP ON LOOKING
+GOTTEXT   LA      R7,1(R7)              POINT AHEAD TO FIRST BLANK
+          MVC     0(,R7),=C','          MOVE IN A COMMA
+          LA      R7,1(R7)              POSITION BEYOND COMMA
+          MVC     0(17,R7),=C'CEMT SET PROGRAM(' MOVE IN CEMT TEXT
+          LA      R7,17(R7)             POSITION BEYOND CEMT
+          MVC     0(8,R7),PDS2NAME      MOVE IN PROGRAM NAME
+          LA      R7,8(R7)              POSITION BEYOND PROGRAM NAME
+          MVC     0(13,R7),=C') NEW ENABLED' MOVE IN NEWCOPY TEXT
+          LA      R7,13(R7)             INDICATE TEXT END POSITION
+          SR      R7,R4                 COMPUTE LENGTH OF
+          LA      R7,6(R7)              TEXT AND LIST PREFIX
+          MVC     CMDTEXT(49),CMD       SAVE COMMAND FOR SVC 34
+          STH     R7,CMDLIST            SET SVC 34 LIST LENGTH
+          MODESET KEY=ZERO              INDICATE KEY=ZERO
+          L       R0,R0MASK             LOAD R0 FOR SVC34
+          LA      R1,CMDLIST            GET ADDRESS OF SVC 34 LIST
+          SVC     34                    PROCESS COMMAND
+          MODESET KEY=NZERO             GO BACK TO USER KEY
+          PUT     SYSOUT,MSGNEWCP       SHOW WE ISSUED THE COMMAND
+          AP      NCOPYCNT,=P'1'        ADD 1 TO NEWCOPY COUNT
+          LA      R2,8(,R2)             POSITION TO NEXT REGION NAME
+          B       CHKTABLE              GO ISSUE NEXT COMMAND
+NEXTMEM   IC      R5,11(,R3)            SAVE NUMBER OF USER HALFWORDS
+          N       R5,=X'0000001F'       CLEAR UNUSED BITS
+          SLL     R5,1                  MULTIPLY BY TWO
+          LA      R3,12(R5,R3)          NEXT MEMBER
+          LA      R8,DIRREC             RECORD ADDRESS
+          LR      R10,R3                CURRENT LOCATION
+          SR      R10,R8                CALC OFFSET
+          CR      R10,R6                END OF BLOCK?
+          BL      CHECKEND              IF NOT GET NEXT MEMBER
+          B       READDIR               GO GET NEXT DIR BLOCK
+RETURN    OI      TOTCNT+2,X'0F'        MAKE PRINTABLE FOR MSG
+          OI      NEWCNT+2,X'0F'
+          OI      MOVEDCNT+2,X'0F'
+          OI      NCOPYCNT+2,X'0F'
+          UNPK    MSGTOT(5),TOTCNT      UNPACK COUNTS FOR MSG
+          UNPK    MSGNEW(5),NEWCNT
+          UNPK    MSGMOVED(5),MOVEDCNT
+          UNPK    MSGNCOPY(5),NCOPYCNT
+          PUT     SYSOUT,MSGTOTAL
+          CLOSE   (SYSOUT,,SYSLIB)      CLOSE SYSOUT AND PDS DD
+          CLI     NCOPYFLG,C'1'         DID WE NEWCOPY EVERYTHING?
+          BE      RETURN1               IF YES, BYPASS VSAM FILE
+          CLOSE   (VSAMACB)             CLOSE VSAM WORK FILE
+          LTR     R15,R15               CLOSE OK?
+          BNZ     BADVSMCL              IF NO, ABEND
+RETURN1   L       R13,4(R13)            RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)       RELOAD CALLERS REGISTERS
+          LA      R15,0                 ZERO RETURN CODE
+          BR      R14                   GO BACK TO CALLER
+OVER10    PUT     SYSOUT,OVR10MSG       WRITE OVER 10 MESSAGE
+          ABEND   996                      AND ABEND
+BADVSMOP  PUT     SYSOUT,OPENMSG        WRITE BAD OPEN MESSAGE
+          ABEND   997                      AND ABEND
+BADVSMGT  PUT     SYSOUT,READMSG        WRITE BAD READ MESSAGE
+          UNPK    WKFLD,FDBKCDE+2(3)    UNPACK FEEDBACK CODE
+          TR      WKFLD(3),TRTBL-C'0'   MAKE SURE IT'S PRINTABLE
+          MVC     MSGCDE,WKFLD          PUT FEEDBACK INTO MESSAGE
+          PUT     SYSOUT,MSGFDBK        WRITE FEEDBACK MESSAGE
+          L       R13,4(R13)            RELOAD CALLERS SAVE AREA
+          LM      R14,R12,12(R13)       RELOAD CALLERS REGISTERS
+          LA      R15,8                 END WITH RETURN CODE 8
+          BR      R14                   GO BACK TO CALLER
+BADVSMCL  PUT     SYSOUT,CLOSMSG        WRITE BAD CLOSE MESSAGE
+          ABEND   999                      AND ABEND
+WAITTIME  DC      0D'0',C'00000050'     HALF SECOND WAIT
+OVR10MSG  DC      CL80' * MORE THAN 10 REGION NAMES IN SYSIN *'
+OPENMSG   DC      CL80' * ERROR OPENING VSAM FILE *'
+READMSG   DC      CL80' * ERROR READING VSAM FILE *'
+CLOSMSG   DC      CL80' * ERROR CLOSING VSAM FILE *'
+R0MASK    DC      A(0)                  SVC34 MASK
+MSGTOTAL  DC      CL80' '
+          ORG     MSGTOTAL
+          DC      C' TOTAL MEMBERS: '
+MSGTOT    DS      CL5
+          DC      C' NEW: '
+MSGNEW    DS      CL5
+          DC      C' MOVED: '
+MSGMOVED  DS      CL5
+          DC      C' NEWCOPIES ISSUED: '
+MSGNCOPY  DS      CL5
+          ORG
+MSGNEWCP  DC      CL80' '
+          ORG     MSGNEWCP
+          DC      C' NEWCOPY ISSUED FOR '
+MSGNWMV   DC      C'      '
+          DC      C'MODULE '
+MSGMODLE  DC      C'        '
+          DC      C' IN REGION '
+MSGREGN   DC      C'        '
+          ORG
+          DS      0F
+CMD       DC      C'F '                 MODIFY COMMAND KEYWORD
+CMDWORK   DC      CL47' '               TEXT FOR COMMAND
+          DS      0F
+CMDLIST   DC      AL2(*-*,0)            SVC 34 LIST
+CMDTEXT   DC      CL49' '               TEXT PASSED TO SVC34
+CARD      DC      CL80' '               CICS REGIONS INPUT
+CICSTBL   DS      CL80'FF'              TABLE OF CICS REGIONS
+LASTMEM   DC      8X'FF'                MASK FOR END OF DIR BLOCK
+DIRREC    DS      CL256                 DIRECTORY RECORD
+TOTCNT    DS      PL3                   TOTAL MEMBERS
+NEWCNT    DS      PL3                   NEW MEMBERS
+MOVEDCNT  DS      PL3                   MOVED MEMBERS
+NCOPYCNT  DS      PL3                   NEWCOPIES
+NCOPYFLG  DC      C'0'                  NEWCOPY ALL MODULES FLAG
+FDBKCDE   DS      F                     VSAM FEEDBACK CODE
+WKFLD     DS      CL4                   FEEDBACK CODE WORK
+MSGFDBK   DS      CL80' '               FEEDBACK MESSAGE
+          ORG     MSGFDBK
+          DC      CL24' VSAM FEEDBACK CODE IS: '
+MSGCDE    DS      CL3
+          ORG
+TRTBL     DC      C'0123456789ABCDE'
+VSAMREC   DS    CL11                   VSAM WORK FILE RECORD
+          ORG   VSAMREC
+VSAMKEY   DS    CL8                    VSAM WORK FILE KEY
+          ORG
+          LTORG
+SYSOUT    DCB   BLKSIZE=80,LRECL=80,DDNAME=SYSOUT,DSORG=PS,MACRF=PM,   X
+               RECFM=F
+SYSIN     DCB   DDNAME=SYSIN,DSORG=PS,LRECL=80,MACRF=(GM),RECFM=FB,    X
+               EODAD=EODSYSIN
+SYSLIB    DCB   DDNAME=SYSLIB,DSORG=PS,MACRF=GM,EODAD=RETURN,          X
+               RECFM=F,BLKSIZE=256,LRECL=256
+VSAMACB   ACB   MACRF=(KEY,DIR,IN),DDNAME=VSAMFILE
+VSAMRPL   RPL   ACB=VSAMACB,OPTCD=(DIR),RECLEN=11,                     X
+               AREALEN=11,KEYLEN=8,ARG=VSAMKEY,AM=VSAM,AREA=VSAMREC
+          IHAPDS  PDSBLDL=NO
+          END
+
+
+SAMPLE JCL
+
+//*    THIS JOB CAN BE RUN TO COMPRESS CICS LOAD LIBRARIES AND
+//*    NEWCOPY THE MODULES WHICH WERE MOVED DURING THE COMPRESSION.
+//*    IT CAN ALSO BE USED WHEN ISPF OPTION 3.3 OR IEBCOPY MOVES
+//*    ARE DONE.  IN THAT CASE RUN STEPS 1 AND 2, DO THE COPIES, AND
+//*    THEN RUN STEP 4.
+//*    IT IS ALSO POSSIBLE TO NEWCOPY ALL MODULES IN A LIBRARY BY
+//*    SPECIFYING NCOPYALL AS ONE OF THE CICS REGIONS.  IN THAT CASE
+//*    IT WOULD BE NECESSARY TO RUN STEP 4 ONLY.
+//*    THERE ARE THREE THINGS TO DO PRIOR TO RUNNING THIS JOB:
+//*
+//* 1) CHANGE SYSLIB IN STEP2, STEP3 AND STEP4 TO THE LIBRARY BEING COMPRESSED.
+//* 2) CHANGE XXXXXXX TO YOUR HIGH LEVEL QUALIFIER IN STEP1, STEP2, AND STEP4.
+//* 3) INDICATE WHAT CICS REGIONS NEED TO BE NEWCOPIED IN STEP4 VIA SYSIN.
+//*
+//STEP1    EXEC   PGM=IDCAMS
+//SYSPRINT DD     SYSOUT=*
+//SYSIN   DD *
+ DELETE XXXXXXX.WORK.FILE
+ SET MAXCC = 0
+ DEFINE CLUSTER (NAME(XXXXXXX.WORK.FILE) -
+                 VOLUME(WORK01) -
+                 CYL(1 1) -
+                 KEYS(8 0) -
+                 RECORDSIZE(11 11))
+//*
+//STEP2    EXEC PGM=TTRSAVE
+//SYSLIB   DD   DSN=YOUR.CICS.LOAD,DISP=SHR
+//SYSOUT   DD   SYSOUT=*
+//VSAMFILE DD   DSN=XXXXXXX.WORK.FILE,DISP=SHR
+//*
+//STEP3    EXEC PGM=IEBCOPY
+//SYSPRINT DD   SYSOUT=*
+//SYSOUT   DD   SYSOUT=*
+//SYSLIB   DD   DSN=YOUR.CICS.LOAD,DISP=SHR
+//SYSIN    DD   *
+   COPY INDD=SYSLIB,OUTDD=SYSLIB
+//*
+//STEP4    EXEC PGM=TTRCHECK
+//SYSLIB   DD   DSN=YOUR.CICS.LOAD,DISP=SHR
+//SYSOUT   DD   SYSOUT=*
+//*
+//*   LIST UP TO 10 REGIONS TO BE NEWCOPIED.
+//*   ONE REGION PER LINE LEFT JUSTIFIED IN COLUMNS 1 THRU 8.
+//*   USE KEYWORD NCOPYALL TO NEWCOPY ALL MODULES IN THE SELECTED REGIONS.
+//*
+//SYSIN    DD   *
+CICSC
+CICSTEST
+//VSAMFILE DD   DSN=XXXXXXX.WORK.FILE,DISP=SHR
+
+
+Ernie Ishman
+Senior Systems Programmer
+Geisinger System Services (USA)
+

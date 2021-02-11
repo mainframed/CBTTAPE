@@ -1,0 +1,1695 @@
+SMPETOOL TITLE '**** IDENTIFY SMP/E APPLY CHECK LOGJAMS **'
+***********************************************************************
+*                                                                     *
+*    NAME - SMPETOOL                                                  *
+*                                                                     *
+*    AUTHOR - TED BESTANI                                             *
+*                                                                     *
+*    PURPOSE - THIS PROGRAM READS THE SMP/E APPLY CHECK REPORT AND    *
+*              HELPS IDENTIFY LOGJAMS.  THIS POST-PROCESSOR FORWARDS  *
+*              SMP/E'S OUTPUT TO THE PRINTER BEFORE IT DOES ITS WORK. *
+*              BE CAREFUL WHEN MODIFYING THE CHAINING STRUCTURES, AS  *
+*              THEY ARE QUITE COMPLEX (ALWAYS MAKE A BACKUP OF THE    *
+*              OLD COPY FIRST).  SOME ARE LIFO AND SOME FIFO.         *
+*                                                                     *
+*    PHILOSOPHY - DATA FROM THE SMPOUT/SMPRPT LISTINGS ARE MODELED    *
+*                 INTO DATA STRUCTURES USING CHAINING TECHNIQUES.     *
+*                 LOGICAL TREE STRUCTURES ARE THEN ANALYZED FROM THE  *
+*                 RESULTING CHAINS.  I WANTED TO AVOID RECURSION SO   *
+*                 INSTEAD OF BUILDING TRUE TREE STRUCTURES I USED A   *
+*                 FORM OF NOTE/POINT LOGIC, WHERE AS A LOGICAL TREE   *
+*                 IS BEING TRAVERSED, I KEEP TRACK OF WHERE I NEED    *
+*                 TO RETURN WITH A "NOTE" CHAIN.  KEPT IN LIFO ORDER, *
+*                 THIS OBVIATES THE NEED FOR RECURSION.               *
+*                                                                     *
+*                 PLEASE NOTE THE CODE THAT STAMPS AND CHECKS A FIELD *
+*                 CALLED "MOMCYCLE".  THE PURPOSE OF THIS CODE IS TO  *
+*                 PREVENT LOOPING IN THE LOGICAL TREE, WHICH CAN      *
+*                 HAPPEN WHEN IBM MAKES A BOO-BOO ON A CBPDO RELEASE. *
+*                 PERSONALLY, I PREFER TO RUN THE UTILITY WITH THE    *
+*                 CODE DISABLED, AS IT PRODUCES A MORE INTERESTING    *
+*                 STATISTICAL REPORT.                                 *
+*                                                                     *
+*    GENDER - PLEASE PARDON THE FACT THAT I HAVE LABELED SECOND LEVEL *
+*             NODES WITH THE PREFIX "SON" INSTEAD OF "DAUGHTER".  I   *
+*             REALIZE THAT MAY OFFEND SOME PURISTS, BUT THE TRUTH WAS *
+*             I RACKED MY BRAINS BUT COULDN'T COME UP WITH A DECENT   *
+*             3-CHARACTER PREFIX FOR "DAUGHTER".  ANY COUTH IDEAS?    *
+*                                                                     *
+*    ATTRIBUTES - NON-REUSABLE                                        *
+*                                                                     *
+*    DDNAMES - SMPOUTI  - INPUT SMP/E APPLY CHECK REPORT              *
+*              SMPOUTO  - OUTPUT  "     "     "     "                 *
+*              SMPRPTI  - INPUT SMP/E APPLY CHECK REPORT              *
+*              SMPRPTO  - OUTPUT  "     "     "     "                 *
+*              PTSDD    - DYNAMICALLY ALLOCATED SMPPTS DATASET        *
+*              REPORT   - OUTPUT REPORT                               *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*  THIS PROGRAM USES A SERIES OF 32-BYTE CHAINS IN WHICH IT STORES    *
+*  VARIOUS KINDS OF DATA.                                             *
+*                                                                     *
+*  1) MAMACHN  - STORES DATA GATHERED FROM SMPOUTI INPUT REPORT       *
+*                CONSISTS PRIMARILY OF PTF ENTRIES                    *
+*  2) SONSCHN  - ENTRIES ARE CHAINED OFF MOM (1), BUILT FROM SMPOUTI, *
+*                CONSISTS OF REASONS WHY MOM WON'T APPLY              *
+*  3) LRSLTCHN - LOCAL RESULTS, USED TO PRINT CONCLUSIONS DERIVED     *
+*                FOR EACH LOGICAL TREE (EACH INDIVIDUAL MAMA)         *
+*  4) GRSLTCHN - GLOBAL RESULTS, USED TO PRINT CUMULATIVE CONCLUSIONS *
+*                THAT REPRESENT THE ENTIRE SMP/E APPLY ATTEMPT        *
+*  5) NOTECHN  - USED BY FEEDTREE ROUTINE TO RUN A LOGICAL TREE       *
+*  6) FREECHN  - FREE RESOURCES, ACQUIRED THROUGH GETFREE             *
+***********************************************************************
+         SPACE 1
+MOMDSECT DSECT
+MOMFWDP  DS    A                       PTR TO NEXT MOM IN CHAIN
+MOMSONP  DS    A                       PTR TO FIRST ENTRY IN SON CHAIN
+MOMNAME  DS    CL7                     SYSMOD ID OF THIS MOM
+MOMRSN   DS    XL1                     REASON THIS SYSMOD FAILED
+MOMFMID  DS    CL7                     FMID THIS SYSMOD IS OWNED BY
+MOMSUP   DS    CL7                     SYSMOD THAT SUP'S THIS SYSMOD
+MOMCYCLE DS    XL2                     COUNTER TO PREVENT LOOPS IN TREE
+         SPACE 1
+SONDSECT DSECT
+SONFWDP  DS    A                       PTR TO NEXT SON IN CHAIN
+SONMOMP  DS    A                       PTR BACK TO THIS BOY'S MAMA
+SONNAME  DS    CL7                     SYSMOD ID OF THIS SON
+SONRSN   DS    XL1                     REASON THIS SYSMOD FAILED
+         DS    XL8
+         SPACE 1
+GRSDSECT DSECT
+GRSFWDP  DS    A                       PTR TO NXT GLOBAL RESULT CHAINED
+GRSCOUNT DS    F                       # OF TIMES THIS GRSLT APPEARED
+GRSNAME  DS    CL7                     SYSMOD ID OF THIS GRSLT
+GRSRSN   DS    XL1                     REASON THIS SYSMOD FAILED
+         DS    XL8
+         SPACE 1
+LRSDSECT DSECT
+LRSFWDP  DS    A                       PTR TO NEXT LOCAL RESULT CHAINED
+LRSCOUNT DS    F                       # OF TIMES THIS LRSLT APPEARED
+LRSNAME  DS    CL7                     SYSMOD ID OF THIS LRSLT
+LRSRSN   DS    XL1                     REASON THIS SYSMOD FAILED
+         DS    XL8
+         EJECT
+         PRINT ON,NOGEN,NODATA
+SMPETOOL CSECT
+         STM   R14,R12,12(R13)         SAVE CALLERS REGISTERS
+         BALR  R9,0                    WHERE ARE WE?
+         USING *,R9                    TEMPORARY BASE REGISTER
+         ST    R13,SAVEAREA+4          SAVE BACKWARD SA PTR
+         LA    R8,SAVEAREA             GET SA ADDR
+         ST    R8,8(R13)               SAVE FORWARD SA PTR
+         LR    R13,R8                  COPY SA ADDR
+         LA    R12,4095(R13)           BASE2 = BASE1 + 4095 +
+         LA    R12,1(R12)                                     1
+         LA    R11,4095(R12)           BASE3 = BASE2 + 4095 +
+         LA    R11,1(R11)                                     1
+         LA    R10,4095(R11)           BASE4 = BASE3 + 4095 +
+         LA    R10,1(R10)                                     1
+         USING SAVEAREA,R13,R12,R11,R10    PERMANENT BASE REGISTERS
+         USING MOMDSECT,R2             ADDRESSABILITY FOR MAMA CHAIN
+         USING SONDSECT,R3             ADDRESSABILITY FOR SONS CHAIN
+         DROP  R9                      DROP TEMPORARY BASE REGISTER
+         SPACE 1
+         BAL   R9,DRIVER               CALL MAIN DRIVER ROUTINE
+         SPACE 1
+         L     R13,SAVEAREA+4          GET BACKWARD SA PTR
+         LM    R14,R12,12(R13)         RESTORE REGISTERS
+         LA    R15,0                   SET RC=0
+         BR    R14                     GO HOME......
+         SPACE 1
+SAVEAREA DS    18F    PROGRAM MAIN SAVE AREA
+         SPACE 1
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         EJECT
+***********************************************************************
+*     THIS IS THE HIGHEST LEVEL WORK ROUTINE IN THE PROGRAM.  IT      *
+*   DIRECTS THE FLOW OF CONTROL TO THE WORK ROUTINES.                 *
+*     THE PROGRAM IS WRITTEN USING BASIC STRUCTURED PROGRAMMING. FLOW *
+*   BETWEEN ROUTINES IS ACCOMPLISHED VIA REGISTER 9, WHICH IS ALWAYS  *
+*   SAVED UPON ENTRY AND RESTORED BEFORE EXIT.                        *
+***********************************************************************
+         SPACE 2
+DRIVER   DS    0H
+         ST    R9,SAVE10
+         B     BSAVE10
+SAVE10   DC    F'-1'
+         DC    CL8'DRIVER  '
+BSAVE10  EQU   *
+         SPACE 1
+         BAL   R9,OPTIONS              PARSE INPUT PARAMETERS
+         BAL   R9,BLDCHAIN             BUILD INITIAL FREE CHAIN
+         L     R1,FREECHN              STORE PTR TO ACQUIRED MEMORY
+         ST    R1,MAMACHN              STORE PTR TO MAMAS CHAIN
+         ST    R1,MAMALAST             STORE PTR TO MAMAS LAST
+         OPEN  (REPORT,OUTPUT)         OPEN OUTPUT REPORT
+         BAL   R9,GETDATE              GET AND FORMAT DATE AND TIME
+         MVC   HDR1DATE,DATE           MOVE THE FORMATTED DATE
+         MVC   HDR1TIME,TIME           MOVE THE FORMATTED TIME
+         MVC   HDR2DATE,DATE           MOVE THE FORMATTED DATE
+         MVC   HDR2TIME,TIME           MOVE THE FORMATTED TIME
+         BAL   R9,READSMPE             READ THE APPLY/CHECK REPORT
+         BAL   R9,READRPT              READ THE DDNAME/DSNAME REPORT
+         BAL   R9,PRTOPTS              PRINT THE OPTIONS
+         CLC   MAMACHN,=F'0'           DID WE HAVE ANY APPLY DATA?
+         BE    DRBYPALL                NO, BYPASS MAIN PROCESSING
+         BAL   R9,READPTS              READ THE PTS AND GET MORE INFO
+         BAL   R9,PRMGRSLT             FILL IN THE GLOBAL RESULT TABLE
+         BAL   R9,FEEDTREE             STEP THRU THE MAIN MAMA CHAIN
+         BAL   R9,PRTGRSLT             PRINT THE GLOBAL RESULT LIST
+DRBYPALL EQU   *
+         CLOSE (REPORT)                CLOSE PRINTED OUTPUT
+         SPACE 1
+EXIT10   EQU   *
+         L     R9,SAVE10
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE SCANS THE INPUT PARMS FOR VALID OPTIONS.           *
+***********************************************************************
+         SPACE 2
+OPTIONS  DS    0H
+         ST    R9,SAVE15
+         B     BSAVE15
+SAVE15   DC    F'-1'
+         DC    CL8'OPTIONS '
+BSAVE15  EQU   *
+         SPACE 1
+*------> INITIALIZE FOR OPTION SCAN
+         L     R1,0(R1)                ADDR OF PARM LIST
+         LH    R2,0(R1)                LENGTH OF PARM
+         CH    R2,=H'6'                IS IT THE MINIMUM LENGTH?
+         BL    EXIT15                  NO, EXIT ROUTINE
+         LA    R3,2(R1)                BUMP TO START OF PARM
+         LR    R4,R3                   COPY START ADDR
+         AR    R4,R2                   ADD LENGTH
+*------> CHECK FOR PRESENCE OF OPTIONS IN PARAMETER STRING
+CHKOPT   EQU   *
+         CR    R3,R4                   SCAN OVER?
+         BNL   EXIT15                  YES, EXIT ROUTINE
+         CLC   0(5,R3),=CL5'SXREF'     USER WANTS SHORT XREF?
+         BE    CHKSXREF                YES, GO HANDLE
+         CLC   0(6,R3),=CL6'NOXREF'    USER WANTS NO XREF AT ALL?
+         BE    CHKNXREF                YES, GO HANDLE
+         CLC   0(6,R3),=CL6'DETAIL'    USER WANTS FULL DETAIL?
+         BE    CHKDETAL                YES, GO HANDLE
+         CLC   0(6,R3),=CL6'LINES('    USER WANTS TO SPECIFY PAGE SIZE
+         BE    CHKLINES                YES, GO HANDLE
+CHKOPT2  EQU   *
+         LA    R3,1(R3)                BUMP INDEX
+         B     CHKOPT                  CHECK NEXT POSITION
+*------> PROCESS SHORT XREF OPTION
+CHKSXREF EQU   *
+         OI    OPTIONS1,OPTSXREF       TURN THE SXREF OPTION ON
+         B     CHKOPT2                 GO CHECK FOR NEXT OPTION
+*------> PROCESS NO XREF OPTION
+CHKNXREF EQU   *
+         OI    OPTIONS1,OPTSXREF       TURN THE SXREF OPTION ON
+         OI    OPTIONS1,OPTNXREF       TURN THE NO XREF OPTION ON
+         B     CHKOPT2                 GO CHECK FOR NEXT OPTION
+*------> PROCESS FULL DETAIL
+CHKDETAL EQU   *
+         OI    OPTIONS1,OPTDETAL       TURN THE DETAIL OPTION ON
+         NI    OPTIONS1,255-OPTNXREF   TURN THE NO XREF OPTION OFF
+         NI    OPTIONS1,255-OPTSXREF   TURN THE SXREF OPTION OFF
+         B     CHKOPT2                 GO CHECK FOR NEXT OPTION
+*------> PROCESS LINES(XX) OPTION
+CHKLINES EQU   *
+         TRT   6(2,R3),TRTNUM          IS IT NUMERIC?
+         BC    7,LINESBAD              NO, ISSUE ERROR MESSAGE
+         PACK  WORKDBLW,6(2,R3)        PACK THE NUMBER
+         CP    WORKDBLW,=PL2'20'       IS IT BELOW LIMITS?
+         BL    LINESBAD                YES, ISSUE ERROR MESSAGE
+         ZAP   PAGESIZE,WORKDBLW       SAVE IT FOR LATER USE
+         B     CHKOPT2                 GO CHECK FOR NEXT OPTION
+LINESBAD EQU   *
+         WTO   'SMPETOOL ERROR IN LINES PARAMETER - USING DEFAULT'
+         B     CHKOPT2
+         SPACE 1
+EXIT15   EQU   *
+         L     R9,SAVE15
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE BUILDS THE INITIAL FREE CHAIN.  THE CHAIN CONSISTS *
+*   OF 32-BYTE ENTRIES WHOSE ANCHOR NODE IS "FREECHN".                *
+***********************************************************************
+         SPACE 2
+BLDCHAIN DS    0H
+         ST    R9,SAVE20
+         STM   R2,R4,SAVE22
+         B     BSAVE20
+SAVE20   DC    F'-1'
+SAVE22   DC    3F'-1'
+         DC    CL8'BLDCHAIN'
+BSAVE20  EQU   *
+         SPACE 1
+         L     R0,=A(4096)             SET AT 1 PAGES
+         GETMAIN R,LV=(R0),BNDRY=DBLWD GO GET SOME MEMORY
+         LR    R2,R1                   GET ADDRESS OF FREE MEMORY
+         ST    R2,FREECHN              STORE ANCHOR PTR
+         L     R3,=F'127'              NUMBER OF INITIAL ENTRIES -1
+BLDLOOP  EQU   *
+         LA    R4,32(R2)               POINT TO NEXT NODE
+         ST    R4,0(R2)                STORE PTR TO NEXT NODE
+         XC    4(28,R2),4(R2)          CLEAR NODE MEMORY
+         LA    R2,32(R2)               BUMP
+         BCT   R3,BLDLOOP              ITERATE
+         XC    0(32,R2),0(R2)          LAST PTR IS NULL
+         SPACE 1
+EXIT20   EQU   *
+         LM    R2,R4,SAVE22
+         L     R9,SAVE20
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE READS THE SMP/E APPLY/CHECK REPORT AND MODELS THE  *
+*   DATA INTO A CHAIN IN MEMORY ANCHORED BY "SMPECHN"                 *
+***********************************************************************
+         SPACE 2
+READSMPE DS    0H
+         ST    R9,SAVE30
+         B     BSAVE30
+SAVE30   DC    F'-1'
+         DC    CL8'READSMPE'
+BSAVE30  EQU   *
+         SPACE 1
+         OPEN  (SMPOUTI,INPUT,SMPOUTO,OUTPUT)
+*------> FIND A MAMA NODE (MSG-GIM3022) AND BUILD A NODE
+MAMALOOP EQU   *
+         GET   SMPOUTI,WORKREC         GET THE RECORD
+         PUT   SMPOUTO,WORKREC         PUT THE RECORD
+         CLC   WORKREC+1(7),=C'GIM3022'    IS THIS A ** TERMINATED?
+         BE    MAMANEW                 YES, GO MAKE NODE
+         CLC   WORKREC+1(7),=C'GIM3190'    IS THIS A REGRESSION?
+         BNE   MAMALOOP                NO, ITERATE
+*------> SPECIAL HANDLING FOR REGRESSION REPORTS
+MAMAREGR EQU   *
+         MVC   SEARCHNM,WORKREC+19     COPY NAME OF REGRESSOR
+         BAL   R9,SEARCHN              GO SEARCH MAMA CHAIN
+         LTR   R1,R1                   IF R1=0 THEN CHILD BARREN
+         BNZ   MOMREGEX                ALREADY EXISTS, ADD ANOTHER SON
+         BAL   R9,GETFREE              GET A NODE
+         LR    R2,R1                   SAVE PTR
+         MVC   MOMNAME,WORKREC+19      MOVE SYSMOD NAME
+         MVI   MOMRSN,MAMARSND         SET FLAG BYTE
+         BAL   R9,GETFREE              GO GET A NODE
+         LR    R3,R1                   SAVE PTR
+         ST    R3,MOMSONP              STORE SONS PTR IN MAMAS NODE
+         ST    R3,SONSLAST             STORE PTR TO INITIAL LAST SON
+         BAL   R9,PUTMAMA              GO CHAIN UP MAMA
+         XC    SONFWDP,SONFWDP         CLEAR FORWARD PTR
+         ST    R2,SONMOMP              SAVE MAMAS ADDRESS
+         MVC   SONNAME,WORKREC+67      MOVE IN UMID/RMID CODE
+         MVI   SONRSN,SONSRSNG         MOVE IN REGRESSION REASON CODE
+         B     MAMALOOP                GO READ NEXT RECORD
+MOMREGEX EQU   *
+         B     MAMALOOP                GO READ NEXT RECORD
+*------> REGULAR HANDLING FOR NON-REGRESSIONS
+MAMANEW  EQU   *
+         BAL   R9,GETFREE              GET A NODE
+         LR    R2,R1                   SAVE PTR
+         MVC   MOMNAME,WORKREC+51      MOVE SYSMOD NAME
+         MVI   MOMRSN,X'00'            CLEAR FLAG BYTE
+         CLC   WORKREC+70(L'MAMAMSGA),MAMAMSGA
+         BE    MAMARSN1                GO STORE REASON CODE
+         CLC   WORKREC+70(L'MAMAMSGB),MAMAMSGB
+         BE    MAMARSN2                GO STORE REASON CODE
+         B     SONSLOOP                GO PROCESS SONS
+MAMARSN1 EQU   *
+         MVI   MOMRSN,MAMARSNA         STORE REASON CODE
+         B     SONSLOOP                GO PROCESS SONS
+MAMARSN2 EQU   *
+         MVI   MOMRSN,MAMARSNB         STORE REASON CODE
+         B     SONSLOOP                GO PROCESS SONS
+*------> FIND FIRST SONS NODE (MSG-GIM3590) AND BUILD A NODE
+SONSLOOP EQU   *
+         GET   SMPOUTI,WORKREC         GET THE RECORD
+         PUT   SMPOUTO,WORKREC         PUT THE RECORD
+         CLC   WORKREC+1(7),=C'GIM3590'    IS THIS A CAUSE ID?
+         BNE   SONSLOOP                NO, SEARCH FOR ONE
+         BAL   R9,GETFREE              GO GET A NODE
+         LR    R3,R1                   SAVE PTR
+         ST    R3,MOMSONP              STORE SONS PTR IN MAMAS NODE
+         ST    R3,SONSLAST             STORE PTR TO INITIAL LAST SON
+*------> NOW THAT WE KNOW WHERE THE FIRST SON IS, CHAIN UP MAMA
+         BAL   R9,PUTMAMA              GO CHAIN UP MAMA
+SONSMOVE EQU   *
+         XC    SONFWDP,SONFWDP         CLEAR FORWARD PTR
+         ST    R2,SONMOMP              SAVE MAMAS ADDRESS
+         CLC   WORKREC+17(08),=CL08'DOC HOLD'
+         BE    SONRSNH1                GO STORE REASON CODE
+         CLC   WORKREC+17(11),=CL11'ACTION HOLD'
+         BE    SONRSNH2                GO STORE REASON CODE
+         CLC   WORKREC+17(11),=CL11'DELETE HOLD'
+         BE    SONRSNH3                GO STORE REASON CODE
+         CLC   WORKREC+17(08),=CL08'DEP HOLD'
+         BE    SONRSNH4                GO STORE REASON CODE
+         CLC   WORKREC+17(07),=CL07'EC HOLD'
+         BE    SONRSNH5                GO STORE REASON CODE
+         CLC   WORKREC+17(09),=CL09'EXRF HOLD'
+         BE    SONRSNH6                GO STORE REASON CODE
+         CLC   WORKREC+17(12),=CL12'FULLGEN HOLD'
+         BE    SONRSNH7                GO STORE REASON CODE
+         CLC   WORKREC+17(10),=CL10'IOGEN HOLD'
+         BE    SONRSNH8                GO STORE REASON CODE
+         CLC   WORKREC+17(10),=CL10'UCLIN HOLD'
+         BE    SONRSNH9                GO STORE REASON CODE
+         MVC   SONNAME,WORKREC+17      MOVE IN CAUSE ID
+         MVI   SONRSN,X'00'            CLEAR REASON CODE
+         CLC   WORKREC+25(L'SONSMSGA),SONSMSGA
+         BE    SONSRSN1                GO STORE REASON CODE
+         CLC   WORKREC+25(L'SONSMSGB),SONSMSGB
+         BE    SONSRSN2                GO STORE REASON CODE
+         CLC   WORKREC+25(L'SONSMSGC),SONSMSGC
+         BE    SONSRSN3                GO STORE REASON CODE
+         CLC   WORKREC+25(L'SONSMSGD),SONSMSGD
+         BE    SONSRSN4                GO STORE REASON CODE
+         CLC   WORKREC+25(L'SONSMSGE),SONSMSGE
+         BE    SONSRSN5                GO STORE REASON CODE
+         CLC   WORKREC+25(L'SONSMSGF),SONSMSGF
+         BE    SONSRSN6                GO STORE REASON CODE
+         B     SONSPUT
+SONSRSN1 EQU   *
+         MVI   SONRSN,SONSRSNA         STORE REASON CODE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONSRSN2 EQU   *
+         MVI   SONRSN,SONSRSNB         STORE REASON CODE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONSRSN3 EQU   *
+         MVI   SONRSN,SONSRSNC         STORE REASON CODE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONSRSN4 EQU   *
+         MVI   SONRSN,SONSRSND         STORE REASON CODE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONSRSN5 EQU   *
+         MVI   SONRSN,SONSRSNE         STORE REASON CODE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONSRSN6 EQU   *
+         MVI   SONRSN,SONSRSNF         STORE REASON CODE
+         LA    R1,SONNAME              POINT TO HOLD ERROR NAME
+         ZAP   ADDGRSCT,=PL1'0'        INITIAL ADD
+         BAL   R9,ADDGRSLT ADD HOLD ERROR CODE TO LIST
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH1 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'DOC    '   INDICATE DOC HOLD SYSTEM
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH2 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'ACTION '   INDICATE ACTION HOLD SYSTEM
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH3 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'DELETE '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH4 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'DEP    '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH5 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'EC     '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH6 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'EXRF   '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH7 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'FULGEN '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH8 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'IOGEN  '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+SONRSNH9 EQU   *
+         MVI   SONRSN,SONSRSNH         STORE REASON CODE
+         MVC   SONNAME,=CL7'UCLIN  '   INDICATE
+         B     SONSPUT                 GO SEARCH FOR NEXT SON
+*------> CHAIN UP THE SON
+SONSPUT  EQU   *
+         BAL   R9,PUTSONS              GO CHAIN UP SONS
+SONSREAD EQU   *
+         GET   SMPOUTI,WORKREC         GET THE RECORD
+         PUT   SMPOUTO,WORKREC         PUT THE RECORD
+         CLC   WORKREC+1(7),=C'GIM3590'    IS THIS A CAUSE ID?
+         BNE   SONSSRCH                NO, KEEP SEARCHING
+         BAL   R9,GETFREE              GET A FREE NODE FOR SIBLINGS
+         ST    R1,SONFWDP              SAVE PTR
+         LR    R3,R1                   COPY NEW SONS PTR
+         B     SONSMOVE                GO DO THE MOVES
+SONSSRCH EQU   *
+         CLC   WORKREC+1(7),=C'GIM3022'    IS THIS A NEW MAMA?
+         BE    MAMANEW                 YES, GO BACK UP TOP
+         CLC   WORKREC+1(7),=C'GIM3190'    IS THIS A REGRESSION?
+         BE    MAMAREGR                YES, GO HANDLE REGRESSION
+         B     SONSREAD                GO TRY FOR ANOTHER CHILD
+EOFSMPER EQU   *
+         CLOSE (SMPOUTI,,SMPOUTO)      CLOSE DATASETS
+         SPACE 1
+EXIT30   EQU   *
+         L     R9,SAVE30
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE READS THE SMP/E DDNAME/DSNAME REPORT AND COPIES IT *
+*   TO AN OUTPUT DATASET.                                             *
+***********************************************************************
+         SPACE 2
+READRPT  DS    0H
+         ST    R9,SAVE33
+         B     BSAVE33
+SAVE33   DC    F'-1'
+         DC    CL8'READRPT '
+BSAVE33  EQU   *
+         SPACE 1
+         OPEN  (SMPRPTI,INPUT,SMPRPTO,OUTPUT)
+*------> READ THE REPORT AND COPY IT TO AN OUTPUT DATASET
+RRPTLOOP EQU   *
+         GET   SMPRPTI,WORKREC         GET THE RECORD
+         PUT   SMPRPTO,WORKREC         PUT THE RECORD
+*------> GRAB THE NAME OF THE SMPPTS AS IT SLIDES BY
+         CLC   WORKREC+1(8),=CL8'SMPPTS  '
+         BNE   RRPTLOOP
+         MVC   PTSNAME,WORKREC+34      GRAB NAME
+         MVC   PTSVOL,WORKREC+79            VOLSER
+         MVC   PTSUNIT,WORKREC+86           UNIT
+         B     RRPTLOOP
+EOFRPTR  EQU   *
+         CLOSE (SMPRPTI,,SMPRPTO)      CLOSE DATASETS
+         SPACE 1
+EXIT33   EQU   *
+         L     R9,SAVE33
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE PRINTS THE OPTIONS REPORT PAGE                     *
+***********************************************************************
+         SPACE 2
+PRTOPTS  DS    0H
+         ST    R9,SAVE34
+         B     BSAVE34
+SAVE34   DC    F'-1'
+         DC    CL8'PRTOPTS '
+BSAVE34  EQU   *
+         SPACE 1
+*------> PRINT THE OPTIONS BANNER PAGE
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         LA    R2,5                    SKIP 5 BLANK LINES
+POBLNK01 EQU   *
+         PUT   REPORT,PRTREC           PRINT BLANK LINE
+         BCT   R2,POBLNK01             ITERATE
+         L     R2,OPTLNCT              LOAD THE BANNER LINE COUNT
+         LA    R3,OPTLINE1             GET ADDRESS OF FIRST LINE
+POLINE01 EQU   *
+         MVC   PRTREC+30(OPTLNTH),0(R3) MOVE THE BANNER LINE
+         PUT   REPORT,PRTREC           PRINT THE LINE
+         LA    R3,OPTLNTH(R3)          BUMP LENGTH OF COMMENT
+         BCT   R2,POLINE01             ITERATE
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         LA    R2,3                    SKIP 3 BLANK LINES
+POBLNK02 EQU   *
+         PUT   REPORT,PRTREC           PRINT BLANK LINE
+         BCT   R2,POBLNK02             ITERATE
+*------> PRINT THE OPTIONS THAT ARE SET
+         MVC   PRTREC+40(18),=CL18'LINES(XX) - SET TO'
+         MVC   PRTREC+58(4),=XL4'40202120'
+         ED    PRTREC+58(4),PAGESIZE   DISPLAY PAGESIZE
+         PUT   REPORT,PRTREC           PRINT IT
+         MVC   PRTREC+40(12),=CL12'PTS USED  - '
+         MVC   PRTREC+52(44),PTSNAME   DISPLAY PTS NAME
+         PUT   REPORT,PRTREC           PRINT IT
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         TM    OPTIONS1,OPTSXREF       SXREF TURNED ON?
+         BNO   POBYP01                 NO, BYPASS
+         MVC   PRTREC+40(40),=CL40'SXREF     - SHORT XREF REQUESTED'
+         PUT   REPORT,PRTREC           PRINT IT
+POBYP01  EQU   *
+         TM    OPTIONS1,OPTNXREF       NXREF TURNED ON?
+         BNO   POBYP02                 NO, BYPASS
+         MVC   PRTREC+40(40),=CL40'NOXREF    - NO XREF DESIRED'
+         PUT   REPORT,PRTREC           PRINT IT
+POBYP02  EQU   *
+         TM    OPTIONS1,OPTDETAL       FULL DETAIL TURNED ON?
+         BNO   POBYP03                 NO, BYPASS
+         MVC   PRTREC+40(40),=CL40'DETAIL    - FULL DETAIL DESIRED'
+         PUT   REPORT,PRTREC           PRINT IT
+POBYP03  EQU   *
+*------> IF NOTHING ON MAMA CHAIN, REPORT THAT WE'RE GIVING UP
+         CLC   MAMACHN,=F'0'           IS MAMA CHAIN EMPTY?
+         BNE   POBYP20                 NOPE, BYPASS
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         LA    R2,3                    SKIP 3 BLANK LINES
+POBLNK03 EQU   *
+         PUT   REPORT,PRTREC           PRINT BLANK LINE
+         BCT   R2,POBLNK03             ITERATE
+         MVC   PRTREC+40(40),=CL40'NO APPLY DATA FOUND IN SMPOUT'
+         PUT   REPORT,PRTREC           PRINT IT
+         B     EXIT34
+POBYP20  EQU   *
+         SPACE 1
+EXIT34   EQU   *
+         L     R9,SAVE34
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE STEPS THROUGH THE MAIN MAMA CHAIN AND FEEDS THE    *
+*   ENTRIES ONE AT A TIME INTO THE TREE ROUTINE THAT FOLLOWS          *
+***********************************************************************
+         SPACE 2
+READPTS  DS    0H
+         ST    R9,SAVE35
+         B     BSAVE35
+SAVE35   DC    F'-1'
+         DC    CL8'READPTS '
+BSAVE35  EQU   *
+         SPACE 1
+*------> GET SOME WORKING MEMORY
+         L     R0,=A(4096)             SET AT 1 PAGES
+         GETMAIN R,LV=(R0),BNDRY=DBLWD GO GET SOME MEMORY
+         ST    R1,PTSMEM               STORE PTR TO MEMORY
+         MVC   S99DSN,PTSNAME          MOVE PTS DSNAME
+         MVC   S99VOL,PTSVOL                    VOLSER
+         MVC   S99UNIT,PTSUNIT                  UNIT
+         L     R2,MAMACHN              GET PTR TO MAMACHN
+*------> SCAN THE MAMACHN AND FOR EACH ENTRY, DYNALLOC MBR AND READ
+RPLOOP01 EQU   *
+         XC    S99C1,S99C1             CLEAR
+         XC    S99C2,S99C2             CLEAR
+         XC    S99INFO,S99INFO         CLEAR
+         MVC   S99MBR,MOMNAME          INSERT NAME OF MEMBER
+         LA    R1,S99RBPTR             GET ADDRESS OF S99 PARM LIST
+         DYNALLOC                      ISSUE DYNAMIC ALLOCATION SVC99
+         LTR   R15,R15                 DID DYNALLOC WORK OK?
+         BNZ   RPNXTMOM                NO GOOD, TRY NEXT MOM
+         OPEN  (PTSDD,INPUT)           OPEN THE INPUT DATASET
+RPLOOP02 EQU   *
+         GET   PTSDD,WORKREC           READ THE INPUT RECORD
+         CLC   WORKREC(4),=CL4'++ VER' HAVE WE REACHED THE VER CARD?
+         BNE   RPLOOP02                NOT YET, KEEP TRYING
+         L     R3,PTSMEM               GET ADDR OF TABLE
+         LA    R4,50                   TABLE CAN FIT 50 CARDS
+RPLOOP03 EQU   *
+         MVC   0(80,R3),WORKREC        MOVE THE CARD IMAGE
+         LA    R3,80(R3)               BUMP
+         LA    R5,72                   CHECK FIRST 72 CHARS FOR (.)
+         LA    R6,WORKREC              GET ADDR OF INPUT CARD
+RPLOOP04 EQU   *
+         CLI   0(R6),C'.'              IS THIS A TERMINATOR?
+         BE    EOFPTS                  YES, NO MORE READING
+         LA    R6,1(R6)                BUMP
+         BCT   R5,RPLOOP04             ITERATE
+         GET   PTSDD,WORKREC           READ THE INPUT RECORD
+         CLC   WORKREC(2),=CL2'++'     ANOTHER ++ CARD?
+         BE    EOFPTS                  YES, NO MORE READING
+         BCT   R4,RPLOOP03             ITERATE
+EOFPTS   EQU   *
+         CLOSE (PTSDD)                 CLOSE CURRENT MEMBER
+         XC    S98C1,S98C1             CLEAR
+         XC    S98C2,S98C2             CLEAR
+         XC    S98INFO,S98INFO         CLEAR
+         LA    R1,S98RBPTR             GET ADDRESS OF S99 PARM LIST
+         DYNALLOC                      ISSUE DYNAMIC ALLOCATION SVC99
+*------> SCAN FOR THE FMID OPERATOR OR THE SUP OPERATOR (R3=END)
+         LA    R3,80(R3)               ADJUST ENDING INDICATOR
+         L     R4,PTSMEM               BEGINNING OF TABLE
+         LH    R5,=H'4095'             LENGTH OF TABLE
+RPLOOP10 EQU   *
+         CR    R4,R3                   END OF TABLE?
+         BNL   RPLOOP19                YES, END SEARCH
+         CLC   0(4,R4),=CL4'FMID'      IS THIS OUR KEYWORD?
+         BE    RPLOOP11                YES, NEXT
+         LA    R4,1(R4)                BUMP
+         BCT   R5,RPLOOP10             ITERATE
+RPLOOP11 EQU   *
+         CR    R4,R3                   END OF TABLE?
+         BNL   RPLOOP19                YES, END SEARCH
+         CLI   0(R4),C'('              IS THIS OUR OPEN PAREN?
+         BE    RPLOOP12                YES, NEXT
+         LA    R4,1(R4)                BUMP
+         BCT   R5,RPLOOP11             ITERATE
+RPLOOP12 EQU   *
+         MVC   MOMFMID,1(R4)           MOVE THE FMID
+RPLOOP13 EQU   *
+         CR    R4,R3                   END OF TABLE?
+         BNL   RPLOOP19                YES, END SEARCH
+         CLC   0(3,R4),=CL3'SUP'       IS THIS OUR KEYWORD?
+         BE    RPLOOP14                YES, NEXT
+         LA    R4,1(R4)                BUMP
+         BCT   R5,RPLOOP13             ITERATE
+RPLOOP14 EQU   *
+         CR    R4,R3                   END OF TABLE?
+         BNL   RPLOOP19                YES, END SEARCH
+         CLI   0(R4),C'('              IS THIS OUR OPEN PAREN?
+         BE    RPLOOP15                YES, NEXT
+         LA    R4,1(R4)                BUMP
+         BCT   R5,RPLOOP14             ITERATE
+RPLOOP15 EQU   *
+         MVC   MOMSUP,1(R4)            MOVE THE SUP
+RPLOOP19 EQU   *
+*------> BUMP TO THE NEXT MAMA NODE AND LOOP
+RPNXTMOM EQU   *
+         L     R2,MOMFWDP              GET NEXT MAMA PTR
+         LTR   R2,R2                   IS IT NULL?
+         BNZ   RPLOOP01                GO TRY NEXT MEMBER
+         SPACE 1
+EXIT35   EQU   *
+         L     R9,SAVE35
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE STEPS THROUGH THE MAIN MAMA CHAIN AND FEEDS THE    *
+*   ENTRIES ONE AT A TIME INTO THE TREE ROUTINE THAT FOLLOWS          *
+***********************************************************************
+         SPACE 2
+FEEDTREE DS    0H
+         ST    R9,SAVE37
+         B     BSAVE37
+SAVE37   DC    F'-1'
+         DC    CL8'FEEDTREE'
+BSAVE37  EQU   *
+         SPACE 1
+         MVC   MAMANEXT,MAMACHN        COPY INITIAL ANCHOR
+FTLOOP01 EQU   *
+         MVC   MAMANOW,MAMANEXT        HANG ONTO CURRENT MAMA
+         L     R2,MAMANEXT             PICK UP PTR TO NEXT ENTRY
+         LTR   R2,R2                   NULL FORWARD PTR?
+         BZ    FTLOOP02                YES, BRANCH AROUND
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         BAL   R9,PRTLINE
+         MVC   PRT1MAMA,MOMNAME        MOVE NAME OF MAMA
+         MVC   PRT1FMID,MOMFMID        MOVE FMID
+         MVC   PRT1SUP,MOMSUP          MOVE SUP
+         MVI   PRT1RSN,C' '
+         MVC   PRT1RSN+1(L'PRT1RSN-1),PRT1RSN
+         TM    MOMRSN,MAMARSNA         IS IT THIS REASON CODE?
+         BNO   FTTSTRB                 NO, GO AROUND
+         MVC   PRT1RSN(L'MAMAMSGA),MAMAMSGA
+         B     FTUTLINE                GO WRITE THE LINE OUT
+FTTSTRB  EQU   *
+         TM    MOMRSN,MAMARSNB         IS IT THIS REASON CODE?
+         BNO   FTTSTRC                 NO, GO AROUND
+         MVC   PRT1RSN(L'MAMAMSGB),MAMAMSGB
+         B     FTUTLINE                GO WRITE THE LINE OUT
+FTTSTRC  EQU   *
+         TM    MOMRSN,MAMARSNC         IS IT THIS REASON CODE?
+         BNO   FTTSTRD                 NO, GO AROUND
+         MVC   PRT1RSN(L'MAMAMSGC),MAMAMSGC
+         B     FTUTLINE                GO WRITE THE LINE OUT
+FTTSTRD  EQU   *
+         TM    MOMRSN,MAMARSND         IS IT THIS REASON CODE?
+         BNO   FTTSTRE                 NO, GO AROUND
+         MVC   PRT1RSN(L'MAMAMSGD),MAMAMSGD
+         B     FTUTLINE                GO WRITE THE LINE OUT
+FTTSTRE  EQU   *
+         MVC   PRT1RSN(14),=CL14'REASON UNKNOWN'
+FTUTLINE EQU   *
+         MVC   PRTREC,PRTREC1          MOVE THE BUILT LINE
+         BAL   R9,PRTLINE              GO PRINT A LINE
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         BAL   R9,PRTLINE
+         L     R1,MOMFWDP              GET FORWARD PTR
+         ST    R1,MAMANEXT             STORE NEW FORWARD PTR
+         XC    NOTELAST,NOTELAST       CLEAR NOTE CHAIN FINAL PTR
+         L     R3,CYCLENUM             GET CYCLE NUMBER
+         LA    R3,1(R3)                BUMP
+         ST    R3,CYCLENUM             STORE UPDATED CYCLE NUMBER
+         BAL   R9,TREE                 GO UNRAVEL THIS CHAIN / TREE
+         B     FTLOOP01                GO DO IT AGAIN
+FTLOOP02 EQU   *
+         SPACE 1
+EXIT37   EQU   *
+         L     R9,SAVE37
+         BR    R9
+         EJECT
+***********************************************************************
+*                                                                     *
+*  THIS ROUTINE SERIALLY PROCESSES ENTRIES FROM THE MAMA CHAIN        *
+*    AT ENTRY R2 POINTS TO AN ENTRY ON THE MAMA CHAIN--->             *
+*    FOR EACH MAMA ENTRY IT PERFORMS THE FOLLOWING:                   *
+*      1) FOR EACH SON, IT SCANS THE MAMA CHAIN, IF IT DOESN'T FIND   *
+*         THE SON ON THE CHAIN, IT PRINTS THE NAME OF THE NODE        *
+*      2) IF IT FINDS THE SON ON THE CHAIN, IT REPEATS THE PROCESS    *
+*         UNTIL (1) HAPPENS                                           *
+*      3) IT MAINTAINS A "NOTE LIST" TO NAVIGATE THROUGH THE TREE     *
+*      4) ELEMENTS ON THE NOTE LIST WILL ALWAYS BE SOMEMAMA'S SON     *
+*      5) AS THE ROUTINE CRAWLS BACK UP THE NOTE LIST, SECONDARY      *
+*         MAMAS ARE REPLACED IN THE NOTE LIST BY THEIR FIRST SON.     *
+*      6) STAMPING/CHECKING MAMA NODES WITH CYCLE NUMBERS PREVENTS    *
+*         LOOPING WHILE SEARCHING THE TREE                            *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+TREE     DS    0H
+         ST    R9,SAVE40
+         B     BSAVE40
+SAVE40   DC    F'-1'
+         DC    CL8'TREE    '
+BSAVE40  EQU   *
+         SPACE 1
+*------> LOOK AT THE NODE POINTED TO BY R2 AND IF IT HAS CHILDREN,
+*        ADD EVERYTHING AFTER THE FIRST TO THE NOTE CHAIN
+CHKSIBS  EQU   *
+         L     R3,MOMSONP              GET CHILDREN PTR
+         L     R4,SONFWDP              GET SIBLINGS PTR
+         LTR   R4,R4                   ANY SIBLINGS?
+         BZ    NOSIBS                  NO SIBLINGS, IS ONLY CHILD
+*------> BEFORE ADDING A NEW NOTE, CHECK TO SEE IF IT IS ALREADY ON
+*        THE NOTE CHAIN, IF SO, DON'T BOTHER
+         L     R1,NOTECHN              GET NOTE CHAIN ANCHOR POINTER
+SIBSLP1  EQU   *
+         LTR   R1,R1                   ANYTHING ON IT?
+         BZ    SIBSLP2                 NO, GO AHEAD AND ADD
+         C     R4,4(R1)                IS IT THE SAME ONE?
+         BE    DONTADDS                YES, DON'T BOTHER ADDING
+         L     R1,0(R1)                BUMP TO NEXT NOTE
+         B     SIBSLP1                 GO TRY NEXT ELEMENT
+*------> GO AHEAD AND ADD THE NEW NOTE
+SIBSLP2  EQU   *
+         BAL   R9,ADDNOTE              ADD AN EMPTY NODE TO NOTE CHAIN
+         ST    R4,4(R1)                STORE PTR TO CHILD
+         L     R4,0(R4)                GET PTR TO NEXT CHILD
+         LTR   R4,R4                   LAST SIBLING?
+         BNZ   SIBSLP2                 NO, GO ADD NEXT CHILD TO NOTE
+*------> WE NOW WANT TO KNOW IF THIS CHILD IS ALSO A PARENT
+*        WE FIND THAT OUT BY SCANNING THE MAMA CHAIN TO SEE IF
+*        IT IS ALSO A MAMA NODE...
+NOSIBS   EQU   *
+NOTEDSIB EQU   *
+         MVC   SEARCHNM,SONNAME        COPY NAME OF CHILD
+         BAL   R9,SEARCHN              GO SEARCH MAMA CHAIN
+         LTR   R1,R1                   IF R1=0 THEN CHILD BARREN
+         BZ    BARREN                  CHILDLESS, GO PRINT NAME
+***********************************************************************
+* THE NEXT FOUR LINES, IF COMMENTED OUT, IMPROVES THE STATISTICS      *
+* QUALITY OF THE RESULTING REPORT.  LEAVING THEM AS IS GIVES YOU      *
+* IMPROVED PROTECTION AGAINST LOOPING DURING A TREE ANALYSIS.         *
+***********************************************************************
+         CLC   MOMCYCLE,CYCLENUM+2     CHECK MAMA CYCLE NUMBER
+         BE    DONTADDS                BEEN HERE BEFORE, FAKE OUT
+         MVC   MOMCYCLE,CYCLENUM+2     STAMP IT
+         LR    R2,R1                   ALSO PARENT, GO DEEPER
+         B     CHKSIBS                 GO ITERATE
+BARREN   EQU   *
+         L     R5,SONMOMP              GET PTR TO OWNING MAMA
+         TM    OPTIONS1,OPTSXREF       DO WE WANT A FULL XREF?
+         BO    PRTSXREF                YES, BYPASS THE DETAIL PRINT
+         MVC   PRT2SON,SONNAME         MOVE NAME OF BARREN CHILD
+         MVC   PRT2REL,8(R5)           MOVE NAME OF RELATED ELEMENT
+         MVC   PRTREC,PRTREC2          MOVE BUILT LINE TO REPORT LINE
+         BAL   R9,PRTLINE              GO REPORT THE BARREN CHILD
+PRTSXREF EQU   *
+         LA    R1,SONNAME              POINT TO NAME OF BARREN CHILD
+         BAL   R9,ADDLRSLT             ADD TO LOCAL RESULT TABLE
+         LA    R1,SONNAME              POINT TO NAME OF BARREN CHILD
+         ZAP   ADDGRSCT,=PL1'1'        INDICATE ADD ONE
+         BAL   R9,ADDGRSLT             ADD TO GLOBAL RESULT TABLE
+DONTADDS EQU   *
+         L     R3,NOTECHN              RESTORE PTR TO NEXT SIBLING
+         LTR   R3,R3                   WAS THAT THE LAST NOTED CHILD?
+         BZ    PRTLRSLT                YES, GO PRINT LOCAL RESULTS
+         LR    R1,R3                   COPY THE PTR TO THE NOTED CHILD
+         L     R3,4(R3)                POINT TO THE ACTUAL NODE
+         BAL   R9,POPNOTE              PERCOLATE NOTE CHAIN
+         B     NOTEDSIB                GO PROCESS NOTED SIBLING
+PRTLRSLT EQU   *
+         MVI   PRTREC,C' '
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         L     R6,LRSLTCHN             GET ANCHOR FOR LOCAL RESULTS
+LPLOOP01 EQU   *
+         CLI   8(R6),X'FF'             TERMINAL NODE?
+         BE    LPFINAL                 YES, GO PRINT LAST LINE
+         CLI   8(R6),X'11'             FIRST NODE?
+         BNE   LPMVNAME                YES, ITERATE
+         LR    R7,R6                   SAVE PTR TO PERMANENT FIRST NODE
+         L     R6,0(R6)                INDEX TO NEXT ENTRY
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         LA    R8,4                    4 ENTRIES PER PRINT LINE
+         LA    R5,PRTREC+1             START OF PRINT RECORD TO USE
+         B     LPLOOP01                GO ITERATE
+LPMVNAME EQU   *
+         MVC   9(7,R5),8(R6)           MOVE NAME OF NAME
+         MVC   18(7,R5),=XL7'4020206B202120'
+         ED    18(7,R5),5(R6)          INSERT THE COUNT
+         MVI   18(R5),C'('             INSERT A PAREN
+         MVI   25(R5),C')'             INSERT A PAREN
+         LA    R5,30(R5)               BUMP INDEX
+         MVC   0(4,R7),0(R6)           POINT TO NEXT NODE FROM 1ST
+         LR    R1,R6                   GET PTR TO CURRENT NODE
+         L     R6,0(R6)                INDEX TO NEXT ENTRY
+         BAL   R9,PUTFREE              GO ADD THE NODE BACK TO FREECHN
+         BCT   R8,LPLOOP01             ITERATE
+         TM    OPTIONS1,OPTNXREF       DO WE WANT NO XREF?
+         BO    PRTNXRF1                YES, BYPASS THE DETAIL PRINT
+         PUT   REPORT,PRTREC           PRINT REPORT
+         AP    LINECNT,=PL1'1'         BUMP THE LINE COUNTER
+PRTNXRF1 EQU   *
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         LA    R8,4                    4 ENTRIES PER PRINT LINE
+         LA    R5,PRTREC+1             START OF PRINT RECORD TO USE
+         B     LPLOOP01                ITERATE
+LPFINAL  EQU   *
+         TM    OPTIONS1,OPTNXREF       DO WE WANT NO XREF?
+         BO    PRTNXRF2                YES, BYPASS THE DETAIL PRINT
+         PUT   REPORT,PRTREC           PRINT REPORT
+         AP    LINECNT,=PL1'1'         BUMP THE LINE COUNTER
+PRTNXRF2 EQU   *
+         SPACE 1
+EXIT40   EQU   *
+         L     R9,SAVE40
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE DECHAINS A NODE FROM THE FREE CHAIN AND RETURNS    *
+*   THE ADDRESS IN REGISTER 1                                         *
+***********************************************************************
+         SPACE 2
+GETFREE  DS    0H
+         ST    R9,SAVE520
+         B     BSAVE520
+SAVE520  DC    F'-1'
+         DC    CL8'GETFREE '
+BSAVE520 EQU   *
+         SPACE 1
+         L     R1,FREECHN              GET ADDRESS OF NEXT NODE
+         LTR   R1,R1                   END OF CHAIN
+         BNZ   GFGETNXT                NO, GET THE ELEMENT
+         BAL   R9,BLDCHAIN             GO BUILD ANOTHER PAGE
+GFGETNXT EQU   *
+         L     R0,0(R1)                GET NEXT PTR
+         ST    R0,FREECHN              STORE NEW NEXT PTR
+         SPACE 1
+EXIT520  EQU   *
+         L     R9,SAVE520
+         BR    R9
+         SPACE 3
+         SPACE 2
+***********************************************************************
+*     THIS ROUTINE RECHAINS A NODE TO THE FREE CHAIN.                 *
+*     UPON ENTRY, REGISTER 1 MUST POINT TO THE NODE.                  *
+***********************************************************************
+         SPACE 2
+PUTFREE  DS    0H
+         ST    R9,SAVE530
+         B     BSAVE530
+SAVE530  DC    F'-1'
+         DC    CL8'PUTFREE'
+BSAVE530 EQU   *
+         SPACE 1
+         L     R0,FREECHN              GET ADDRESS OF NEXT NODE
+         ST    R1,FREECHN              STORE PTR TO NEW NODE
+         XC    4(28,R1),4(R1)          CLEAR MEMORY
+         ST    R0,0(R1)                STORE PTR TO NEXT NODE
+         SPACE 1
+EXIT530  EQU   *
+         L     R9,SAVE530
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE RECHAINS A NODE TO THE MAMA CHAIN.                 *
+*     UPON ENTRY, REGISTER 2 MUST POINT TO THE NODE.                  *
+***********************************************************************
+         SPACE 2
+PUTMAMA  DS    0H
+         ST    R9,SAVE540
+         B     BSAVE540
+SAVE540  DC    F'-1'
+         DC    CL8'PUTMAMA '
+BSAVE540 EQU   *
+         SPACE 1
+         L     R1,MAMALAST             GET ADDR OF OLD LAST NODE
+         ST    R2,MAMALAST             STORE ADD OF NEW LAST NODE
+         ST    R2,0(R1)                STORE FORWARD PTR
+         XC    MOMFWDP,MOMFWDP         CLEAR NEW TERMINAL PTR
+         SPACE 1
+EXIT540  EQU   *
+         L     R9,SAVE540
+         BR    R9
+         SPACE 3
+         SPACE 3
+***********************************************************************
+*     THIS ROUTINE RECHAINS A SONS NODE TO A MAMA NODE                *
+*     UPON ENTRY, REGISTER 3 MUST POINT TO THE NODE.                  *
+***********************************************************************
+         SPACE 2
+PUTSONS  DS    0H
+         ST    R9,SAVE550
+         B     BSAVE550
+SAVE550  DC    F'-1'
+         DC    CL8'PUTSONS '
+BSAVE550 EQU   *
+         SPACE 1
+         L     R1,SONSLAST             GET ADDR OF OLD LAST NODE
+         ST    R3,SONSLAST             STORE ADDR OF NEW LAST NODE
+         ST    R3,0(R1)                STORE FORWARD PTR
+         XC    0(4,R3),0(R3)           CLEAR NEW TERMINAL PTR
+         SPACE 1
+EXIT550  EQU   *
+         L     R9,SAVE550
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE SEARCHS THE CHAIN FOR A MAMA, IF NOT FOUND, R1=0   *
+*     UPON ENTRY, SEARCHNM MUST CONTAIN THE NAME TO BE FOUND          *
+*     UPON EXIT,  REGISTER 1 WILL POINT TO THE NODE, OR R1=0          *
+***********************************************************************
+         SPACE 2
+SEARCHN  DS    0H
+         ST    R9,SAVE560
+         B     BSAVE560
+SAVE560  DC    F'-1'
+         DC    CL8'SEARCHN '
+BSAVE560 EQU   *
+         SPACE 1
+         L     R1,MAMACHN              GET MAMA CHAIN ANCHOR
+SEARCHN1 EQU   *
+         LTR   R1,R1                   IS THIS THE END OF CHAIN?
+         BZ    EXIT560                 YES, NOT FOUND, EXIT W/ NULLPTR
+         CLC   8(7,R1),SEARCHNM        IS THIS OUR TARGET?
+         BE    EXIT560                 YES, EXIT BACK TO CALLER
+         L     R1,0(R1)                PICK UP NEXT PTR
+         B     SEARCHN1                TRY NEXT
+         SPACE 1
+EXIT560  EQU   *
+         L     R9,SAVE560
+         BR    R9
+         SPACE 2
+***********************************************************************
+*     THIS ROUTINE SEARCHS THE CHAIN FOR A MAMA, IF NOT FOUND, R1=0   *
+*     UPON ENTRY, SEARCHNM MUST CONTAIN THE SUP TO BE FOUND           *
+*     UPON EXIT,  REGISTER 1 WILL POINT TO THE NODE, OR R1=0          *
+***********************************************************************
+         SPACE 2
+SEARCHNS DS    0H
+         ST    R9,SAVE565
+         B     BSAVE565
+SAVE565  DC    F'-1'
+         DC    CL8'SEARCHNS'
+BSAVE565 EQU   *
+         SPACE 1
+         L     R1,MAMACHN              GET MAMA CHAIN ANCHOR
+SEARCHS1 EQU   *
+         LTR   R1,R1                   IS THIS THE END OF CHAIN?
+         BZ    SEARCHS2                YES, NOT FOUND, EXIT W/ NULLPTR
+         CLC   23(7,R1),SEARCHNM       IS THIS OUR TARGET?
+         BE    EXIT565                 YES, EXIT BACK TO CALLER
+         L     R1,0(R1)                PICK UP NEXT PTR
+         B     SEARCHS1                TRY NEXT
+SEARCHS2 EQU   *
+         SPACE 1
+EXIT565  EQU   *
+         L     R9,SAVE565
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE DECHAINS A NODE FROM THE NOTE CHAIN AND RETURNS    *
+*   IT TO THE FREE CHAIN - ALWAYS THE YOUNGEST NODE ON THE CHAIN      *
+***********************************************************************
+         SPACE 1
+POPNOTE  DS    0H
+         ST    R9,SAVE570
+         B     BSAVE570
+SAVE570  DC    F'-1'
+SAVE578  DC    F'-1'
+         DC    CL8'POPNOTE '
+BSAVE570 EQU   *
+         SPACE 1
+         ST    R8,SAVE578              STORE R8 TEMPORARILY
+         L     R8,0(R1)                GET PTR TO ELDER NODE
+         ST    R8,NOTECHN              STORE THE NEW ANCHOR
+         BAL   R9,PUTFREE              RETURN THE NODE TO THE FREECHN
+         LTR   R8,R8                   IS NOTE CHAIN NOW NULL?
+         BNZ   EXIT570                 NO, NOTELAST PTR STILL VALID
+         ST    R8,NOTELAST             NOTELAST PTR NOW NULL ALSO
+         SPACE 1
+EXIT570  EQU   *
+         L     R8,SAVE578              LOAD R8 BACK UP
+         L     R9,SAVE570
+         BR    R9
+         SPACE 2
+***********************************************************************
+*     THIS ROUTINE GET A NODE FROM THE FREE CHAIN AND ADDS IT ON TO   *
+*   THE NOTE CHAIN IN FIFO ORDER                                      *
+***********************************************************************
+         SPACE 1
+ADDNOTE  DS    0H
+         STM   R8,R9,SAVE580
+         B     BSAVE580
+SAVE580  DC    2F'-1'
+         DC    CL8'ADDNOTE '
+BSAVE580 EQU   *
+         SPACE 1
+         BAL   R9,GETFREE              GET A NODE FROM THE FREE CHAIN
+         XC    0(32,R1),0(R1)          CLEAR YOUNGSTERS MEMORY
+         L     R8,NOTELAST             LOAD PTR TO LAST NODE
+         ST    R1,NOTELAST             STORE THE NEW LAST PTR
+         LTR   R8,R8                   WAS THE CHAIN EMPTY?
+         BNZ   ADDNFRWD                NO, GO STORE THE FORWARD PTR
+         ST    R1,NOTECHN              STORE THE PTR IN THE ANCHOR
+         B     EXIT580                 ZOOM AROUND TO THE EXIT
+ADDNFRWD EQU   *
+         ST    R1,0(R8)                STORE THE NEW FORWARD PTR
+         SPACE 1
+EXIT580  EQU   *
+         LM    R8,R9,SAVE580
+         BR    R9
+         EJECT
+***********************************************************************
+*     THIS ROUTINE IS CALLED WHENEVER WE WANT TO REPORT THE NAME OF   *
+*   A BARREN CHILD                                                    *
+***********************************************************************
+         SPACE 2
+PRTLINE  DS    0H
+         ST    R9,SAVE590
+         B     BSAVE590
+SAVE590  DC    F'-1'
+         DC    CL8'PRTLINE '
+BSAVE590 EQU   *
+         SPACE 1
+         CP    PAGESIZE,LINECNT        HAVE WE HIT OVERFLOW YET?
+         BNL   BYPEJECT                DON'T EJECT YET
+         AP    PAGECNT,=PL1'1'         BUMP PAGE NUMBER
+         MVC   HDR1PAGE,=XL4'40202120' MOVE EDIT FIELD
+         ED    HDR1PAGE,PAGECNT+2 FORMAT THE PAGE NUMBER
+         PUT   REPORT,HDRREC1          WRITE THE TITLE LINE
+         ZAP   LINECNT,=PL1'3'         CLEAR THE LINE COUNTER
+         MVI   PRTREC,C'-'             TRIPLE SPACE TO FIRST DETAIL
+         PUT   REPORT,PRTREC           WRITE THE FIRST DETAIL LINE
+         B     EXIT590                 EXIT THE PRINT ROUTINE
+BYPEJECT EQU   *
+         PUT   REPORT,PRTREC           WRITE THE REPORT LINE
+         AP    LINECNT,=PL1'1'         BUMP THE LINE COUNTER
+         SPACE 1
+EXIT590  EQU   *
+         L     R9,SAVE590
+         BR    R9
+         EJECT
+***********************************************************************
+*   THIS ROUTINE OBTAINS AND FORMATS THE CURRENT DATE AND TIME.       *
+***********************************************************************
+         SPACE 1
+GETDATE  DS    0H
+         ST    R9,SAVE600
+         B     BSAVE600
+SAVE600  DC    F'-1'
+         DC    CL8'GETDATE '
+BSAVE600 EQU   *
+         SPACE 1
+         TIME  DEC                     GET THE TIME IN DECIMAL
+*--> FORMAT THE CURRENT TIME
+         STM   R0,R1,WORKDBLW          STORE THE RESULTS
+         UNPK  WORKTIME,WORKDBLW(4)    UNPACK THE TIME
+         OI    WORKTIME+7,X'F0'        CLEAR THE SIGN NIBBLE
+         MVC   TIMEHH,WORKTIME+1       MOVE THE HH
+         MVC   TIMEMM,WORKTIME+3                MM
+         MVC   TIMESS,WORKTIME+5                SS
+*--> FORMAT THE CURRENT DATE
+         MVC   DIVFIELD+0(2),=XL2'0019'    MOVE ZEROES + 19
+         MVC   DIVFIELD+2(1),WORKDBLW+5    MOVE YEAR
+         MVI   DIVFIELD+3,X'0F'            MOVE SIGN NIBBLE
+         DP    DIVFIELD,=PL2'40'       DIVIDE BY 4 X 10
+         CP    DIVFIELD+2(2),=PL1'0'   IS IT A LEAP YEAR?
+         BNE   NOTLEAP                 NO, DON'T CHANGE TABLE
+         ZAP   MONTHTBL+2(2),=PL2'29'  FEBRUARY
+NOTLEAP  EQU   *
+         LA    R4,MONTHTBL             GET ADDRESS OF MONTHTBL
+         LA    R5,12                   NUMBER OF MONTHS FOR BCT
+         ZAP   MONTH,=PL1'1'           SOMEPLACE TO START
+MONTH1   EQU   *
+         CP    WORKDBLW+6(2),0(2,R4)   NUMBER OF DAYS IN MONTH
+         BNH   MONTHEND                LESS THAN MONTH, GO FORMAT
+         SP    WORKDBLW+6(2),0(2,R4)   MORE THAN A MONTH
+         AP    MONTH,=PL1'1'           ADD 1 TO MONTH
+         LA    R4,2(R4)                BUMP MONTH POINTER
+         BCT   R5,MONTH1               GO TRY NEXT MONTH
+MONTHEND EQU   *
+         LA    R3,DATE                 ADDRESS OF DATE FIELD
+         UNPK  DATEMM,MONTH            UNPACK MONTH
+         OI    1(R3),X'F0'             CLEAR SIGN NIBBLE
+         UNPK  DATEDD,WORKDBLW+6(2)    MOVE THE DAY
+         OI    4(R3),X'F0'             CLEAR SIGN NIBBLE
+         UNPK  WORKTIME+0(3),WORKDBLW+5(2) UNPACK THE YEAR
+         OI    WORKTIME+2,X'F0'        CLEAR SIGN NIBBLE
+         MVC   DATEYY,WORKTIME         MOVE THE YEAR
+         SPACE 1
+EXIT600  EQU   *
+         L     R9,SAVE600
+         BR    R9
+         EJECT
+***********************************************************************
+*   THIS ROUTINE SEARCHES THE LOCAL RESULT TABLE.  IF IT FINDS AN     *
+*  EXISTING ENTRY OF THE SAME NAME, IT ADDS ONE TO THE ENTRIES COUNT. *
+*  IF IT DOESN'T FIND AN EXISTING ENTRY, IT INSERTS ONE IN COLLATING  *
+*  SEQUENCE AND INITIALIZES ITS COUNT TO 1.                           *
+*   AT ENTRY, R1 POINTS TO THE BARREN CHILD TO BE ADDED TO THE LIST   *
+***********************************************************************
+         SPACE 1
+ADDLRSLT DS    0H
+         STM   R6,R9,SAVE610
+         B     BSAVE610
+SAVE610  DC    4F'-1'
+         DC    CL8'ADDLRSLT'
+BSAVE610 EQU   *
+         SPACE 1
+         L     R8,LRSLTCHN             GET ADDR OF INITIAL NODE
+         LR    R7,R1                   SAVE PTR TO INPUT PARM
+LRLOOP01 EQU   *
+         CLC   0(7,R7),8(R8)           IS THIS OUR BABY?
+         BE    LRADDCNT                YES, GO ADD ONE TO COUNT
+         BL    LRADDNEW                LOW, GO ADD NEW NODE TO CHAIN
+         LR    R6,R8                   SAVE PTR TO CURRENT ENTRY
+         L     R8,0(R8)                GET PTR TO NEXT ENTRY
+         LTR   R8,R8                   IS IT NULL?
+         BNZ   LRLOOP01                NO, GO TRY NEXT
+         DC    H'0'                    SHOULD NEVER HAPPEN
+LRADDCNT EQU   *
+         AP    4(4,R8),=PL1'1'         BUMP COUNTER
+         B     EXIT610                 EXIT
+LRADDNEW EQU   *
+         BAL   R9,GETFREE              GET NEW ENTRY
+         ZAP   4(4,R1),=PL1'1'         INITIALIZE COUNT
+         MVC   8(8,R1),0(R7)           MOVE NAME
+         ST    R8,0(R1)                STORE NEW FORWARD PTR
+         ST    R1,0(R6)                STORE PTR TO NEW ELEMENT
+         SPACE 1
+EXIT610  EQU   *
+         LM    R6,R9,SAVE610
+         BR    R9
+         EJECT
+***********************************************************************
+*   THIS ROUTINE SEARCHES THE GLOBAL RESULT TABLE.  IF IT FINDS AN    *
+*  EXISTING ENTRY OF THE SAME NAME, IT ADDS ONE TO THE ENTRIES COUNT. *
+*  IF IT DOESN'T FIND AN EXISTING ENTRY, IT INSERTS ONE IN COLLATING  *
+*  SEQUENCE AND INITIALIZES ITS COUNT TO 1.                           *
+*   AT ENTRY, R1 POINTS TO THE BARREN CHILD TO BE ADDED TO THE LIST   *
+***********************************************************************
+         SPACE 1
+ADDGRSLT DS    0H
+         STM   R6,R9,SAVE630
+         B     BSAVE630
+SAVE630  DC    4F'-1'
+         DC    CL8'ADDGRSLT'
+BSAVE630 EQU   *
+         SPACE 1
+         L     R8,GRSLTCHN             GET ADDR OF INITIAL NODE
+         LR    R7,R1                   SAVE PTR TO INPUT PARM
+GRLOOP01 EQU   *
+         CLC   0(7,R7),8(R8)           IS THIS OUR BABY?
+         BE    GRADDCNT                YES, GO ADD ONE TO COUNT
+         BL    GRADDNEW                LOW, GO ADD NEW NODE TO CHAIN
+         LR    R6,R8                   SAVE PTR TO CURRENT ENTRY
+         L     R8,0(R8)                GET PTR TO NEXT ENTRY
+         LTR   R8,R8                   IS IT NULL?
+         BNZ   GRLOOP01                NO, GO TRY NEXT
+         DC    H'0'                    SHOULD NEVER HAPPEN
+GRADDCNT EQU   *
+         AP    4(4,R8),ADDGRSCT        BUMP COUNTER
+         B     EXIT630                 EXIT
+GRADDNEW EQU   *
+         BAL   R9,GETFREE              GET NEW ENTRY
+         ZAP   4(4,R1),ADDGRSCT        INITIALIZE COUNT
+         MVC   8(8,R1),0(R7)           MOVE NAME
+         ST    R8,0(R1)                STORE NEW FORWARD PTR
+         ST    R1,0(R6)                STORE PTR TO NEW ELEMENT
+         MVC   SEARCHNM,0(R7)          MOVE NAME FOR SEARCH
+         LR    R8,R1                   SAVE R1 TEMPORARILY
+         MVC   16(7,R8),=7CL1'?'       PRIME WITH ???????
+         MVC   23(8,R8),=8CL1'?'       PRIME WITH ???????
+         BAL   R9,SEARCHNS             CHECK MAMA CHAIN FOR SUP'D PTFS
+         LTR   R1,R1                   ANY MATCHES?
+         BZ    EXIT630                 NO, SPLIT
+         MVC   16(7,R8),16(R1)         MOVE FMID
+         MVC   23(8,R8),8(R1)          MOVE SUP'ING PTF
+         SPACE 1
+EXIT630  EQU   *
+         LM    R6,R9,SAVE630
+         BR    R9
+         EJECT
+***********************************************************************
+*   THIS ROUTINE FILLS IN THE GLOBAL RESULT TABLE, AND THEN GOES BACK *
+*   AND ADDS MAMA/SON NODES TO THE MAMA CHAIN FOR EVERY HOLD ERROR    *
+*   THAT HAS A NON-??????? SUPBY FIELD                                *
+***********************************************************************
+         SPACE 1
+PRMGRSLT DS    0H
+         ST    R9,SAVE635
+         B     BSAVE635
+SAVE635  DC    F'-1'
+         DC    CL8'PRMGRSLT'
+BSAVE635 EQU   *
+         SPACE 1
+*------> FIRST, FILL IN THE BLANK SPOTS IN THE TABLE
+         L     R8,GRSLTCHN             GET ADDR OF INITIAL NODE
+GMLOOP01 EQU   *
+         CLI   8(R8),X'FF'             TERMINAL NODE?
+         BE    GMFINAL1                YES, GO PRINT LAST LINE
+         CLI   8(R8),X'11'             FIRST NODE?
+         BE    GMLOOP02                YES, ITERATE
+         MVC   SEARCHNM,8(R8)          MOVE NAME FOR SEARCH
+         MVC   16(7,R8),=7CL1'?'       PRIME WITH ???????
+         MVC   23(8,R8),=8CL1'?'       PRIME WITH ???????
+         BAL   R9,SEARCHNS             CHECK MAMA CHAIN FOR SUP'D PTFS
+         LTR   R1,R1                   ANY MATCHES?
+         BZ    GMLOOP02                NO, SPLIT
+         MVC   16(7,R8),16(R1)         MOVE FMID
+         MVC   23(8,R8),8(R1)          MOVE SUP'ING PTF
+GMLOOP02 EQU   *
+         L     R8,0(R8)                INDEX TO NEXT ENTRY
+         B     GMLOOP01                ITERATE
+GMFINAL1 EQU   *
+*------> SECONDLY, FOR EVERY NON-? IN TABLE, BUILD A MAMA/SON NODE
+         L     R8,GRSLTCHN             GET ADDR OF INITIAL NODE
+GMLOOP03 EQU   *
+         CLI   8(R8),X'FF'             TERMINAL NODE?
+         BE    GMFINAL2                YES, GO PRINT LAST LINE
+         CLI   8(R8),X'11'             FIRST NODE?
+         BE    GMLOOP04                YES, ITERATE
+         CLI   16(R8),C'?'             IS IT UNKNOWN?
+         BE    GMLOOP04                YES, BYPASS
+         BAL   R9,GETFREE              GET A BLANK NODE
+         LR    R3,R1                   SAVE SONS PTR
+         BAL   R9,GETFREE              GET ANOTHER BLANK NODE
+         ST    R3,4(R1)                SAVE PTR TO SON IN MAMA
+         MVC   8(7,R1),8(R8)           MOVE NEW MAMAS NAME (ERROR ID)
+         MVI   15(R1),MAMARSNC         MOVE NEW MAMAS REASON D'ETRE
+         MVC   16(7,R1),16(R8)         MOVE NEW MAMAS FMID
+         MVC   23(7,R1),23(R8)         MOVE NEW MAMAS SUPBY
+         LR    R2,R1                   COPY REGISTER
+         BAL   R9,PUTMAMA              ADD MAMA TO MAMA CHAIN
+         XC    SONFWDP,SONFWDP         CLEAR FORWARD PTR IN SON
+         ST    R2,SONMOMP              STORE PTR TO MAMA
+         MVC   SONNAME,23(R8)          MOVE IN SUPBY NAME
+         MVC   SONRSN,30(R8)           MOVE IN SUPBY NAME
+GMLOOP04 EQU   *
+         L     R8,0(R8)                INDEX TO NEXT ENTRY
+         B     GMLOOP03                ITERATE
+GMFINAL2 EQU   *
+         SPACE 1
+EXIT635  EQU   *
+         L     R9,SAVE635
+         BR    R9
+         EJECT
+***********************************************************************
+*   THIS ROUTINE PRINTS THE GLOBAL RESULT TABLE                       *
+***********************************************************************
+         SPACE 1
+PRTGRSLT DS    0H
+         STM   R6,R9,SAVE640
+         B     BSAVE640
+SAVE640  DC    4F'-1'
+         DC    CL8'PRTGRSLT'
+BSAVE640 EQU   *
+         SPACE 1
+         L     R8,GRSLTCHN             GET ADDR OF INITIAL NODE
+         ZAP   LINECNT,=PL2'99'        FORCE FIRST PAGE EJECT
+GPLOOP01 EQU   *
+         CP    PAGESIZE,LINECNT        HAVE WE HIT OVERFLOW YET?
+         BNL   BYPEJCT2                DON'T EJECT YET
+         AP    PAGECNT,=PL1'1'         BUMP PAGE NUMBER
+         MVC   HDR2PAGE,=XL4'40202120' MOVE EDIT FIELD
+         ED    HDR2PAGE,PAGECNT+2      FORMAT THE PAGE NUMBER
+         PUT   REPORT,HDRREC2          WRITE THE TITLE LINE
+         PUT   REPORT,HDRREC3          WRITE THE SUBTITLE LINE
+         MVI   PRTREC,C' '             CLEAR FIRST BYTE
+         MVC   PRTREC+1(L'PRTREC-1),PRTREC
+         MVI   PRTREC,C'0'
+         PUT   REPORT,PRTREC
+         ZAP   LINECNT,=PL1'5'         CLEAR THE LINE COUNTER
+BYPEJCT2 EQU   *
+         CLI   8(R8),X'FF'             TERMINAL NODE?
+         BE    GPFINAL                 YES, GO PRINT LAST LINE
+         CLI   8(R8),X'11'             FIRST NODE?
+         BE    GPLOOP02                YES, ITERATE
+         TM    OPTIONS1,OPTDETAL       USER REQUEST FULL DETAIL?
+         BO    GPBYPDET                YA, BYPASS SXREF/NXREF TEST
+         CP    4(4,R8),=PL1'0'         IS THE COUNT ZERO?
+         BE    GPLOOP02                YES, DON'T PRINT
+GPBYPDET EQU   *
+         MVI   PRTREC3,C'0'            DOUBLE SPACE
+         MVC   PRT3NAME,8(R8)          MOVE NAME OF NAME
+         MVC   PRT3CNT,=XL10'40206B2020206B202120'
+         ED    PRT3CNT,4(R8)           INSERT THE COUNT
+         MVI   PRT3RSN,C' '            CLEAR THE RECORD
+         MVC   PRT3RSN+1(L'PRT3RSN-1),PRT3RSN
+         TM    15(R8),SONSRSNA         IS IT THIS REASON CODE?
+         BNO   GPTSTRB                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGA),SONSMSGA
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRB  EQU   *
+         TM    15(R8),SONSRSNB         IS IT THIS REASON CODE?
+         BNO   GPTSTRC                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGB),SONSMSGB
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRC  EQU   *
+         TM    15(R8),SONSRSNC         IS IT THIS REASON CODE?
+         BNO   GPTSTRD                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGC),SONSMSGC
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRD  EQU   *
+         TM    15(R8),SONSRSND         IS IT THIS REASON CODE?
+         BNO   GPTSTRE                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGD),SONSMSGD
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRE  EQU   *
+         TM    15(R8),SONSRSNE         IS IT THIS REASON CODE?
+         BNO   GPTSTRF                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGE),SONSMSGE
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRF  EQU   *
+         TM    15(R8),SONSRSNF         IS IT THIS REASON CODE?
+         BNO   GPTSTRG                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGF),SONSMSGF
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRG  EQU   *
+         TM    15(R8),SONSRSNG         IS IT THIS REASON CODE?
+         BNO   GPTSTRH                 NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGG),SONSMSGG
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPTSTRH  EQU   *
+         TM    15(R8),SONSRSNH         IS IT THIS REASON CODE?
+         BNO   GPUTLINE                NO, GO AROUND
+         MVC   PRT3RSN(L'SONSMSGH),SONSMSGH
+         B     GPUTLINE                GO WRITE THE LINE OUT
+GPUTLINE EQU   *
+         MVC   PRT3FMID,16(R8)         MOVE FMID
+         MVC   PRT3SUPR,23(R8)         MOVE SUP'ING PTF
+         PUT   REPORT,PRTREC3          PRINT REPORT
+         AP    LINECNT,=PL1'2'         BUMP THE LINE COUNTER
+GPLOOP02 EQU   *
+         L     R8,0(R8)                INDEX TO NEXT ENTRY
+         B     GPLOOP01                ITERATE
+GPFINAL  EQU   *
+         SPACE 1
+EXIT640  EQU   *
+         LM    R6,R9,SAVE640
+         BR    R9
+         EJECT
+***********************************************************************
+*              W O R K I N G   S T O R A G E   S E C T I O N          *
+***********************************************************************
+         SPACE 3
+SMPOUTI  DCB   DSORG=PS,               DCB FOR READING INPUT REPORT    X
+               RECFM=FBA,                                              X
+               MACRF=GM,                                               X
+               EODAD=EOFSMPER,                                         X
+               DDNAME=SMPOUTI
+SMPOUTO  DCB   DSORG=PS,               DCB FOR REPRODUCING SMPOUT      X
+               RECFM=FBA,                                              X
+               MACRF=PM,                                               X
+               LRECL=121,                                              X
+               BLKSIZE=0,                                              X
+               DDNAME=SMPOUTO
+SMPRPTI  DCB   DSORG=PS,               DCB FOR READING INPUT REPORT    X
+               RECFM=FBA,                                              X
+               MACRF=GM,                                               X
+               EODAD=EOFRPTR,                                          X
+               DDNAME=SMPRPTI
+SMPRPTO  DCB   DSORG=PS,               DCB FOR REPRODUCING SMPRPT      X
+               RECFM=FBA,                                              X
+               MACRF=PM,                                               X
+               LRECL=121,                                              X
+               BLKSIZE=0,                                              X
+               DDNAME=SMPRPTO
+REPORT   DCB   DSORG=PS,               DCB FOR PRINTING REPORT         X
+               RECFM=FBA,                                              X
+               MACRF=PM,                                               X
+               DDNAME=REPORT,                                          X
+               BLKSIZE=0,                                              X
+               LRECL=121
+PTSDD    DCB   DSORG=PS,               DCB FOR READING PTS             X
+               RECFM=FB,                                               X
+               MACRF=GM,                                               X
+               DDNAME=PTSDD,                                           X
+               BLKSIZE=0,                                              X
+               EODAD=EOFPTS,                                           X
+               LRECL=80
+         EJECT
+*------> THIS AREA IS USED FOR MISCELLANEOUS STUFF
+SEARCHNM DS    CL7                     NAME FOR SEARCHN ROUTINE
+WORKREC  DS    CL121                   INPUT AREA
+PRTREC   DS    CL121                   OUTPUT AREA
+LINECNT  DC    PL2'56'                 LINE COUNTER FOR PAGE EJECT
+PAGECNT  DC    PL4'0'                  PAGE NUMBER
+ADDGRSCT DC    PL1'0'                  0=INITIAL ADD 1=LATER ADD
+PTSMEM   DC    F'0'                    MEMORY USED BY PTS ROUTINE
+CYCLENUM DC    F'0'                    CYCLE NUMBER THROUGH FEADTREE
+         EJECT
+*------> THE FOLLOWING ITEMS ARE USED BY THE OPTIONS ROUTINE
+PAGESIZE DC    PL2'55'                 NUMBER OF LINES PER PAGE
+PTSNAME  DC    CL44' '                 NAME OF THE PTS
+PTSVOL   DC    CL6' '                  VOLSER OF THE PTS
+PTSUNIT  DC    CL8' '                  UNITNAME OF THE PTS
+OPTIONS1 DC    XL1'80'                 OPTION FLAGS
+OPTSXREF EQU   X'80'                   SHORT XREF ONLY
+OPTNXREF EQU   X'40'                   NO XREF AT ALL
+OPTDETAL EQU   X'20'                   FULL DETAIL REQUESTED
+OPTLNCT  DC    F'27'                   NUMBER OF LINES IN BANNER
+OPTLNTH  EQU   61
+OPTLINE1 EQU   *
+ DC CL61'*************************************************************'
+ DC CL61'*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*'
+ DC CL61'*++*******************************************************++*'
+ DC CL61'*++*                                                     *++*'
+ DC CL61'*++*                    SMP/E TOOL                       *++*'
+ DC CL61'*++*                                                     *++*'
+ DC CL61'*++*        ---------- DEVELOPED BY -------------        *++*'
+ DC CL61'*++*                                                     *++*'
+ DC CL61'*++*                   TED BESTANI                       *++*'
+ DC CL61'*++*        NETCOM CONSULTING AND EDUCATION, INC.        *++*'
+ DC CL61'*++*                 2644 TEAL LANE                      *++*'
+ DC CL61'*++*               UNION CITY, CA 94587                  *++*'
+ DC CL61'*++*                                                     *++*'
+ DC CL61'*++*******************************************************++*'
+ DC CL61'*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*'
+ DC CL61'*************************************************************'
+ DC CL61'* TO HELP SYSTEM PROGRAMMERS RESOLVE SMPE APPLY BACKCHAINS  *'
+ DC CL61'*************************************************************'
+ DC CL61'                                                             '
+ DC CL61'    THE FOLLOWING OPTIONS WERE SET BY PARMS:                 '
+ DC CL61'                                                             '
+         EJECT
+*------> THE FOLLOWING IS USED BY THE DATE ROUTINE
+WORKDBLW DS    D                       WORKAREA FOR CVB CONVERSIONS
+WORKTIME DS    CL8
+MONTHTBL DC    PL2'31',PL2'28',PL2'31',PL2'30',PL2'31',PL2'30'
+         DC    PL2'31',PL2'31',PL2'30',PL2'31',PL2'30',PL2'31'
+DIVFIELD DS    PL4                     MEMORY FOR DIVIDE PACKED
+MONTH    DS    PL2                     PACKED MONTH
+TIME     DS    0CL8                    CURRENT TIME
+TIMEHH   DS    CL2
+         DC    CL1':'
+TIMEMM   DS    CL2
+         DC    CL1':'
+TIMESS   DS    CL2
+DATE     DS    0CL8                    CURRENT DATE
+DATEMM   DS    CL2
+         DC    CL1'/'
+DATEDD   DS    CL2
+         DC    CL1'/'
+DATEYY   DS    CL2
+         EJECT
+*--> THE FOLLOWING ENTRIES ARE USED BY DYNALLOC (SVC 99)
+         DS    0F
+S99RBPTR DC    X'80',AL3(S99RB)        ADDR OF THE REQUEST BLOCK
+S99RB    DC    AL1(20)                 CONSTANT LENGTH
+S99TYPE  DC    AL1(01)                 DSNAME ALLOCATION
+         DC    X'0000'                 MAY USE EXISTING ALLOCATION
+S99ERROR DS    CL2                     RETURN ERROR CODE
+S99INFO  DS    CL2                     ERROR INFO CODE
+S99TXTPP DC    A(S99TUPL)              PTR TO TEXT PTR LIST
+S99C1    DC    A(0)                    RESERVED
+S99C2    DC    A(0)                    RESERVED
+S99TUPL  DC    A(S99TXT01)             PTR TO TEXT 01
+         DC    A(S99TXT02)             PTR TO TEXT 02
+         DC    A(S99TXT03)             PTR TO TEXT 02
+         DC    A(S99TXT04)             PTR TO TEXT 02
+         DC    A(S99TXT10)             PTR TO TEXT 02
+         DC    X'80',AL3(S99TXT15)     PTR TO LAST TEXT BLOCK
+S99TXT01 DC    XL06'000100010005'      ESTABLISH DDNAME
+S99DDNAM DC    CL5'PTSDD'                  THIS IS THE DDNAME
+S99TXT02 DC    XL06'00020001002C'      REQUEST BY DSNAME
+S99DSN   DC    CL44' '                     THIS IS THE DSNAME
+S99TXT03 DC    XL06'000300010007'      REQUEST BY MEMBER
+S99MBR   DC    CL7' '                      THIS IS THE MEMBER
+S99TXT04 DC    XL07'00040001000108'    DISP=SHR
+S99TXT10 DC    XL06'001000010006'      REQUEST BY VOLSER
+S99VOL   DC    CL6' '                      THIS IS THE VOLSER
+S99TXT15 DC    XL06'001500010008'      REQUEST BY UNIT
+S99UNIT  DC    CL8' '                      THIS IS THE UNIT
+         SPACE 1
+*--> THE FOLLOWING ENTRIES ARE USED BY DYNALLOC (SVC 99)
+         DS    0F
+S98RBPTR DC    X'80',AL3(S98RB)        ADDR OF THE REQUEST BLOCK
+S98RB    DC    AL1(20)                 CONSTANT LENGTH
+S98TYPE  DC    AL1(02)                 UNALLOCATE DDNAME
+         DC    X'0000'                 MAY USE EXISTING ALLOCATION
+S98ERROR DS    CL2                     RETURN ERROR CODE
+S98INFO  DS    CL2                     ERROR INFO CODE
+S98TXTPP DC    A(S98TUPL)              PTR TO TEXT PTR LIST
+S98C1    DC    A(0)                    RESERVED
+S98C2    DC    A(0)                    RESERVED
+S98TUPL  DC    A(S98TXT01)             PTR TO FIRST TEXT BLOCK
+         DC    X'80',AL3(S98TXT08)     PTR TO LAST TEXT BLOCK
+S98TXT01 DC    XL06'000100010005'      UNALLOCATE DD STATEMENT
+S98DD    DC    CL05'PTSDD'             NAME OF THE DD STATEMENT
+S98TXT08 DC    XL04'00080000'          REMOVE IN-USE ATTRIBUTE
+         EJECT
+*------> THIS AREA IS USED TO CHECK FOR NUMERICS
+TRTNUM   DC    256XL1'FF'             |TRT TABLE TO CHECK NUMERICS
+         ORG   TRTNUM+C'0'            |
+         DC    XL10'00'               |
+         ORG
+*------> THE FOLLOWING ARE PRE-DEFINED PRINT AREAS
+HDRREC1  DS    0CL121                  USED TO REPORT BARREN CHILDREN
+HDR1CC   DC    C'1'
+HDR1DATE DC    CL8' '
+         DC    CL1' '
+HDR1TIME DC    CL5' '
+         DC    CL26' '
+         DC    CL39'**** BACK-CHAINING ANALYSIS REPORT ****'
+         DC    CL33' '
+         DC    CL4'PAGE'
+HDR1PAGE DC    XL4'40202120'
+*
+PRTREC1  DS    0CL121                  USED TO REPORT BARREN CHILDREN
+PRT1CC   DC    C' '
+PRT1MAMA DC    CL7' '
+         DC    CL6' FMID('
+PRT1FMID DC    CL7' '
+         DC    CL1')'
+         DC    CL5' SUP('
+PRT1SUP  DC    CL7' '
+         DC    CL1')'
+         DC    CL2' ('
+PRT1RSN  DC    CL30' '
+         DC    CL1')'
+         DC    CL38' IS HELD UP BY THE FOLLOWING ELEMENTS:'
+         DC    CL14' '
+*
+PRTREC2  DS    0CL121                  USED TO REPORT BARREN CHILDREN
+PRT2CC   DC    C' '
+         DC    CL8' '
+PRT2SON  DC    CL7' '
+         DC    C' ('
+PRT2RSN  DC    CL25' '
+         DC    C') IS RELATED TO ELEMENT '
+PRT2REL  DC    CL7' '
+         DC    CL47' '
+*
+HDRREC2  DS    0CL121                  USED TO REPORT GLOBAL RESULTS
+HDR2CC   DC    C'1'
+HDR2DATE DC    CL8' '
+         DC    CL1' '
+HDR2TIME DC    CL5' '
+         DC    CL25' '
+         DC    CL41'**** RESEARCH RECOMMENDATIONS REPORT ****'
+         DC    CL32' '
+         DC    CL4'PAGE'
+HDR2PAGE DC    XL4'40202120'
+*
+HDRREC3  DS    0CL121                  USED TO REPORT GLOBAL RESULTS
+HDR3CC   DC    C'0'
+         DC    CL07' NAME  '
+         DC    CL14'       COUNT '
+         DC    CL26'       TYPE '
+         DC    CL06' FMID '
+         DC    CL11' '
+         DC    CL09' SUPBY '
+         DC    CL48' '
+*
+PRTREC3  DS    0CL121                  USED TO REPORT GLOBAL RESULTS
+PRT3CC   DC    C' '
+PRT3NAME DC    CL7' '
+         DC    CL4'   ('
+PRT3CNT  DC    XL10'40206B2020206B202120'
+         DC    CL3' ) '
+PRT3RSN  DC    CL15' '
+         DC    CL8'   FMID('
+PRT3FMID DC    CL7' '
+         DC    CL10')   SUPBY('
+PRT3SUPR DC    CL7' '
+         DC    CL1')'
+         DC    CL55' '
+         EJECT
+*------> MAMA NODE REASON CODES
+MAMARSNA EQU   X'80'
+MAMARSNB EQU   X'40'
+MAMARSNC EQU   X'20'
+MAMARSND EQU   X'10'
+MAMARSNE EQU   X'08'
+MAMARSNF EQU   X'04'
+MAMARSNG EQU   X'04'
+MAMARSNH EQU   X'01'
+MAMAMSGA DC    CL24'MISSING/NOGO REQUISITES:'
+MAMAMSGB DC    CL28'HOLD REASON IDS NOT RESOLVED'
+MAMAMSGC DC    CL28'HOLD ERROR CODE NOT RESOLVED'
+MAMAMSGD DC    CL24'NO PRE OR SUP - REGRESSION'
+*------> SONS NODE REASON CODES
+SONSRSNA EQU   X'80'
+SONSRSNB EQU   X'40'
+SONSRSNC EQU   X'20'
+SONSRSND EQU   X'10'
+SONSRSNE EQU   X'08'
+SONSRSNF EQU   X'04'
+SONSRSNG EQU   X'02'
+SONSRSNH EQU   X'01'
+SONSMSGA DC    CL8'PRE NOGO'
+SONSMSGB DC    CL8'PRE HELD'
+SONSMSGC DC    CL8'REQ HELD'
+SONSMSGD DC    CL10'IFREQ HELD'
+SONSMSGE DC    CL13'IFREQ MISSING'
+SONSMSGF DC    CL10'HOLD ERROR'
+SONSMSGG DC    CL13'NO PRE OR SUP'
+SONSMSGH DC    CL11'HOLD SYSTEM'
+*------>
+MAMACHN  DC    A(0)                    ANCHOR PTR FOR MAMA CHAIN
+MAMALAST DC    A(0)                    LAST MAMA IN THE CHAIN
+MAMANEXT DC    F'0'                    NEXT ROOT NODE IN MAMA CHAIN
+MAMANOW  DC    F'0'                    CURRENTLY ACTIVE MAMA
+SONSLAST DC    F'0'                    LAST SON IN THIS MAMAS CHAIN
+FREEMEM  DC    F'0'                    PTR TO GETMAINED MEMORY
+FREECHN  DC    F'0'                    ANCHOR PTR FOR FREE CHAIN
+NOTECHN  DC    F'0'                    ANCHOR PTR FOR NOTE CHAIN
+NOTELAST DC    F'0'                    LAST SON IN THE NOTE CHAIN
+         EJECT
+*------> LOCAL RESULT TABLE ALWAYS HAS A FIRST AND LAST ELEMENT
+         DS    0D
+LRSLTCHN DC    A(LRSLTBGN)
+LRSLTBGN DC    A(LRSLTEND),12XL1'11'
+LRSLTEND DC    A(0),12XL1'FF'
+*------> GLOBAL RESULT TABLE ALWAYS HAS A FIRST AND LAST ELEMENT
+         DS    0D
+GRSLTCHN DC    A(GRSLTBGN)
+GRSLTBGN DC    A(GRSLTEND),12XL1'11'
+GRSLTEND DC    A(0),12XL1'FF'
+         EJECT
+*------>
+         LTORG
+         SPACE 3
+         END   SMPETOOL

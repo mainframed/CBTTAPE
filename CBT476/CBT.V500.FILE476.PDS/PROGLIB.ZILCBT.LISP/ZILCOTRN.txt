@@ -1,0 +1,717 @@
+
+;***********************************************************************
+;*                                                                     *
+;* ZIL (c) Copyright 1989 The Charles Stark Draper Laboratory Inc.     *
+;*         All rights reserved.                                        *
+;*                                                                     *
+;***********************************************************************
+
+   ;;
+   ;; Steps in adding a new special form:
+   ;;
+   ;; (1) Add it to the list in ZEVINIT.
+   ;; (2) Add it to ZILEVAL.
+   ;; (3) Add it to FEXPAND.
+   ;; (4) Add it to ZILCOINT.
+   ;; (5) Add it to ZILCOTRN.
+   ;; (6) Figure out how to compile it.
+   ;;
+
+;;; This is the compiler transform implementer.  It takes a LISP form
+;;; and does a complete codewalk, transforming ecah form within it.
+;;;
+;;; Transforming a form consists of the following steps:
+;;;
+;;; (1) Fully macroexpand the form (using MACROEXPAND).
+;;; (2) If the result is an atom, do the appropriate processing
+;;;     on the atom (if any).
+;;;     If the result is a function call, transform each argument
+;;;     to the function call via ZILCOTRN.
+;;;     If the result is a special form, transform the arguments
+;;;     (where appropriate) via ZILCOTRN.
+;;; (3) If the CAR of the form is a LAMBDA expression,
+;;;     transform the contents of the LAMBDA expression and
+;;;     apply transformations associated with LAMBDA to the form.
+;;;     If the CAR of the form is a symbol, and it has an
+;;;     associated compiler transform function, apply that
+;;;     function to the result of (2).
+;;;    If the CAR of the form does not have an associated
+;;;    compiler transform function, we are finished.
+;;; (4) If the result of (3) is EQUAL to the result of (2),
+;;;     we are finished.  Otherwise, repeat the process
+;;;     from (1).
+;;;
+;;; A compiler transform function receives 3 arguments:
+;;;
+;;; (1) the complete form being transformed (the CAR being the
+;;;     function name)
+;;; (2) the "environment", which is currently a list of the
+;;;     locally bound variables (special or nonspecial) that
+;;;     are lexically available to the code
+;;; (3) a list of keywords describing the context in which the
+;;;     form is being evaluated.  If this list is null, the
+;;;     form is being evaluated for effect only.  Possible
+;;;     keywords that may be present include:
+;;;
+;;;       :value        will be used as a return value (or values)
+;;;       :argument     will be used as an argument to a function
+;;;       :setq         will be used to set a variable
+;;;       :predicate    will be used in a test for NIL
+;;;
+;;;     ...and others...
+;;;
+;;;     More than one of the above keywords may be present.
+;;;
+;;; Note: As a special hack for callers of ZILCOTRN that wish to
+;;;       pass a LAMBDA expression, ZILCOTRN (but not its lower-
+;;;       level functions) will transform a LAMBDA-expression
+;;;       as well as an evaluable form.
+
+;
+;***********************************************************************
+;*                                                                     *
+;* Change activity:                                                    *
+;*                                                                     *
+;* 04/05/88 - The "ENV" environment is built, as a list of variables.  *
+;* 04/27/88 - Improvements to PROGN/PROG processing, including call to *
+;*            ZXSEQOPT to do optimizations on sequential forms.        *
+;* 06/02/88 - New special forms BLOCK, TAGBODY, RETURN-FROM,           *
+;*            MULTIPLE-VALUE-BIND, MULTIPLE-VALUE-LIST, THROW.         *
+;* 06/15/88 - Contexts improved to establish more reliably the times   *
+;*            when multiple values might be returned from a form.      *
+;*            Compiler transforms should assume that multiple values   *
+;*            are possible when the context is one of the following:   *
+;*             (:VALUE), (:RETURN), (:MVLIST), (:MVBIND)               *
+;* 06/23/88 - Support for PROG and RETURN removed.                     *
+;* 11/01/88 - Bug fix - not transforming THROW calls properly.         *
+;*                                                                     *
+;***********************************************************************
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(include #.(zil-source-member zilmacs))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defargs zxseqopt 4 4 nil)
+
+(declare (special *ztran-debug*))
+
+(defun zilcotrn (x &optional (*ztran-debug* nil))
+ (let ((dumcon '(:dummy)))
+  (if (and (consp x) (eq (car x) 'lambda))
+      (ztran-lambda x nil dumcon)
+      (ztran x nil dumcon))))
+
+(defun ztran (oldform env con)
+ (prog (form xfun newform)
+       (setq form oldform)
+
+    restart
+
+;;; (1) Fully macroexpand the form (using MACROEXPAND).
+
+       (unless (ok (setq form (zilcomex form t)))
+               (return form))
+
+;;; (2) If the result is an atom, do the appropriate processing
+;;;     on the atom (if any).
+
+       (cond
+        ((atom form)
+         (setq newform (ztran-atom form env con))
+         (go test))
+
+;;;     If the result is a special form, transform the arguments
+;;;     (where appropriate) via ZILCOTRN.
+
+        ((and (symbolp (car form))
+              (get (car form) '|SPECIAL FORM|))
+         (setq form (ztran-special-form form env con)))
+
+;;;     If the result is a function call, transform each argument
+;;;     to the function call via ZILCOTRN.
+
+        ;;; Note: We know at this point that the CAR of the form
+        ;;;       cannot be a macro, since MACROEXPAND took care
+        ;;;       of that already.  Since FEXPR's don't exist as
+        ;;;       far as the compiler is concerned, this HAS to
+        ;;;       be a function call.
+
+        (t
+         (setq form (cons (car form)
+                    (ztran-args (cdr form) env '(:argument)))))
+
+      ) ; end COND
+
+;;; (3) If the CAR of the form is a LAMBDA expression,
+;;;     transform the contents of the LAMBDA expression and
+;;;     apply transformations associated with LAMBDA to the form.
+
+      (cond
+       ((consp (car form))
+        (setq form (cons (ztran-lambda (car form) env nil)
+                         (cdr form)))
+        (setq newform (lambda-transform form env con))
+       )
+
+        ;;;
+        ;;; Note:
+        ;;;
+        ;;; ZTRAN-LAMBDA takes a LAMBDA-expression (or other
+        ;;; form that can occur in functional position) and
+        ;;; fully transforms its contents.
+        ;;;
+        ;;; LAMBDA-TRANSFORM takes a form whose CAR is a
+        ;;; LAMBDA-expression (or other form that can occur
+        ;;; in functional position) and applies transformation
+        ;;; rules to it, much like a transformation function
+        ;;; associated with a symbol.
+        ;;;
+
+;;;     If the CAR of the form is a symbol, and it has an
+;;;     associated compiler transform function, apply that
+;;;     function to the result of (2).
+
+       ((and (symbolp (car form))
+             (setq xfun (get (car form) 'compiler-transform)))
+        (unless (ok (setq newform (funcall xfun form env con)))
+                (return form))
+       )
+
+;;;    If the CAR of the form does not have an associated
+;;;    compiler transform function, we are finished.
+
+       (t
+        (setq newform form)
+        (go return)))
+
+;;; (4) If the result of (3) is EQUAL to the result of (2),
+;;;     we are finished.  Otherwise, repeat the process
+;;;     from (1).
+
+   test
+
+       (cond
+        ((equal newform form)
+         (go return))
+        (t
+         (setq form newform)
+         (go restart)))
+
+   return
+
+       (when *ztran-debug*
+             (unless (equal newform oldform)
+              (cterpri)
+              (princ "With ENV=") (prin1 env)
+              (cterpri)
+              (princ " and CON=") (prin1 con)
+              (cterpri)
+              (prin1 oldform)
+              (princ " transformed into ")
+              (unless (atom newform)
+                      (princ "... ")
+                      (terpri))
+              (prin1 newform)
+              (terpri)
+              (terpri)
+        )
+       )
+
+       (return newform)
+
+))
+
+(defun ztran-atom (form env con)
+
+ ;;;
+ ;;; This function applies appropriate transformations to atoms.
+ ;;;
+
+ (cond
+
+ ;;
+ ;; If the atom is being evaluated for effect only, convert it to NIL.
+ ;; ZTRAN-PROGN, which is the main processor of "effect-only" forms,
+ ;; will excise all NILs from the form as it transforms it.
+ ;;
+
+  ((null con) nil)
+
+   ;;
+   ;; No other transformations are applicable.
+   ;;
+
+  (t form)
+ )
+)
+
+(defun ztran-special-form (form env con)
+
+ ;;;
+ ;;; This function applies appropriate transformations to
+ ;;; special forms, by transforming the forms contained therein
+ ;;; that are in evaluable positions.
+ ;;;
+ ;;; It does NOT apply transformation rules for the special forms.
+ ;;; For example, a transformational rule for special form SETQ
+ ;;; is applied to the result of this function if there is a
+ ;;; compiler transform property associated with the symbol SETQ.
+ ;;; This function merely prepares the form for the transformation.
+ ;;;
+
+ (case (car form)
+  ((quote go defload declare)
+   form)
+  ((function subr)
+   (list* (car form)
+          (ztran-lambda (cadr form) env nil)
+          (cddr form)))
+  ((throw arg setarg listify)
+   (cons (car form)
+         (ztran-args (cdr form) env '(:argument))))
+  ((and or)          (cons (car form)
+                           (ztran-and-or         (cdr form) env con)))
+  (catch             (cons (car form)
+                           (ztran-catch          (cdr form) env con)))
+  (block             (cons (car form)
+                           (ztran-block          (cdr form) env con)))
+  (return-from       (cons (car form)
+                           (ztran-return-from    (cdr form) env con)))
+  (tagbody           (cons (car form)
+                           (ztran-tagbody        (cdr form) env con)))
+  (progn             (cons (car form)
+                           (ztran-progn          (cdr form) env con)))
+  (cond              (cons (car form)
+                           (ztran-cond           (cdr form) env con)))
+  (setq              (cons (car form)
+                           (ztran-setq           (cdr form) env con)))
+  (unwind-protect    (cons (car form)
+                           (ztran-unwind-protect (cdr form) env con)))
+  (defun             (cons (car form)
+                           (ztran-defun          (cdr form) env con)))
+  (defvar            (cons (car form)
+                           (ztran-defvar         (cdr form) env con)))
+  (eval-when         (cons (car form)
+                           (ztran-eval-when      (cdr form) env con)))
+  (multiple-value-list
+                (cons (car form)
+                      (ztran-multiple-value-list (cdr form) env con)))
+  (multiple-value-bind
+                (cons (car form)
+                      (ztran-multiple-value-bind (cdr form) env con)))
+  (t (zerror "Special form unknown to ZILCOTRN" (car form)))))
+
+(defun ztran-cond (form env con) ; form = ((a1) (b1 b2) (c1 c2 c3) ...)
+ (prog (z clause)
+   loop
+       (cond
+        ((atom form)  ; Again, just in case of bad form.
+         (return (nreconc z form)))
+        ((atom (setq clause (car form)))
+         (push clause z)) ; Erroneous but let it pass...
+        ((null (cdr clause))
+         (push (ncons (ztran (car clause) env (cons ':predicate con)))
+               z))
+        (t
+         (push (cons (ztran (car clause) env '(:predicate))
+                     (ztran-progn (cdr clause) env con))
+               z))
+       )
+       (setq form (cdr form))
+       (go loop)
+ )
+)
+
+
+(defun ztran-setq (form env con) ; form = (arg1 val1 arg2 val2 ...)
+ (prog (z)
+  loop
+       (when (atom form)
+             (return (nreconc z form)))
+       (push (car form) z) ; SETQ variable
+       (setq form (cdr form))
+       (when (atom form)
+             (return (nreconc z form)))
+       (if (null (cdr form))
+           (push (ztran (car form) env (cons :setq con)) z)
+           (push (ztran (car form) env '(:setq)) z))
+       (setq form (cdr form))
+       (go loop)))
+
+(defun ztran-defun (form env con)
+                           ;  form = (foo (arglist) . body)
+                           ;      or (foo macro (arglist) . body)
+                           ;      or (foo fexpr (arglist) . body)
+
+ (if (memq (cadr form) '(expr fexpr macro))
+     (list* (car form)
+            (cadr form)
+            (ztran-arglist (caddr form) #'(lambda (new) (setq env new))
+                                        env nil)
+            ;;; Note how ENV is updated by lambda list processing.
+            (ztran-progn (cdddr form) env '(:value)))
+     (list* (car form)
+            (ztran-arglist (cadr form) #'(lambda (new) (setq env new))
+                                       env nil)
+            ;;; Note how ENV is updated by lambda list processing.
+            (ztran-progn (cddr form) env '(:value)))))
+
+(defun ztran-defvar (form env con);form = (varname value documentation)
+ (if (null (cddr form))
+     form
+     (list* (car form)
+            (cadr form)
+            (ztran (caddr form) env '(:bind))
+            (cdddr form))))
+
+(defun ztran-eval-when (form env con)
+ ; form = ((compile eval load) . body)
+ (list* (car form) (ztran-progn (cdr form) env con)))
+
+(defun ztran-block (form env con)
+ ; form = (<blockname> . body)
+ (list* (car form) (ztran-progn (cdr form) env con)))
+
+(defun ztran-return-from (form env con)
+ ; form = (<blockname> . body)
+ (cond
+  ((null form) form)
+  (t (list* (car form) (ztran-args (cdr form) env '(:return))))))
+
+(defun ztran-tagbody (form env con)
+ (ztran-some-kind-of-block form env nil t))
+
+(defun ztran-multiple-value-list (form env con)
+ (ztran-args form env '(:mvlist)))
+
+(defun ztran-multiple-value-bind (form env con)
+ ;
+ ; Even though &optional, etc. aren't permitted in the arglist of
+ ; MULTIPLE-VALUE-BIND, we still transform it as if it was, to allow
+ ; the maximum possible amount of destructuring.  It isn't even
+ ; certain that destructuring will be allowed in the arglist here.
+ ;
+ (if (consp form)
+     (let* (((arglist bindform . boddy) form)
+            (oldenv env)
+            (transformed-arglist
+             (ztran-arglist arglist #'(lambda (new) (setq env new))
+                                    env nil))
+            (transformed-bindform
+             (ztran bindform oldenv '(:mvbind)))
+            (transformed-boddy
+             (ztran-progn (cddr form) env con))
+           )
+           (list* transformed-arglist
+                  transformed-bindform
+                  transformed-boddy))
+     form))
+
+
+
+(defun ztran-args (form env con)
+
+ ;;;
+ ;;; This function applies appropriate transformations to
+ ;;; functions, by transforming all the arguments.
+ ;;;
+ ;;; It does NOT apply transformation rules for the function.
+ ;;; This function merely prepares the form for the transformation
+ ;;; associated with the function name (or for LAMBDA transforms).
+ ;;;
+
+ (prog (z)
+   loop
+       (cond
+        ((null form)
+         (return (nreverse z)))
+        ((atom form)  ; Again, just in case of bad form.
+         (return (nreconc z form)))
+        (t
+         (push (ztran (car form) env con) z))
+       )
+       (setq form (cdr form))
+       (go loop)
+ )
+)
+
+(defun ztran-lambda (form env con)
+
+ ;;;
+ ;;; This function applies appropriate transformations to
+ ;;; LAMBDA-expressions, converting the LAMBDA expression
+ ;;; (or LABEL or other non-atomic functional form)
+ ;;; so that all evaluable components are fully transformed.
+ ;;;
+ ;;; It does NOT apply transformation rules for LAMBDA.
+ ;;; This function merely prepares the form for the transformation
+ ;;; that LAMBDA-TRANSFORM does on forms that start with a
+ ;;; LAMBDA expression.
+ ;;;
+ ;;; "form" is a symbol, LAMBDA expression, LABEL expression, etc.
+ ;;; Although ZTRAN doesn't call ZTRAN-LAMBDA directly for a form
+ ;;; in the CAR of a form, this may get called from the FUNCTION
+ ;;; special form processing.
+ ;;;
+
+ (if (or (atom form) (atom (cdr form)))
+     form
+     (case (car form)
+      (lambda
+       (list* (car form)
+              (ztran-arglist (cadr form) #'(lambda (new) (setq env new))
+                                         env nil)
+              (ztran-progn (cddr form) env '(:value))))
+;;;
+;;; This ("LABEL") will have to be deleted in favor of Common LISP
+;;; LABELS/FLET/MACROLET, which are probably going to be new
+;;; special forms.
+;;;
+      (label
+       (list (car form)
+             (cadr form)
+             (ztran-lambda (caddr form) env con)))
+
+      (t
+       form))))
+
+(defun ztran-arglist (form updater env con)
+
+ ;;;
+ ;;; This function applies appropriate transformations to
+ ;;; a LAMBDA argument list, by transforming the evaluable forms
+ ;;; contained therein.
+ ;;;
+
+ (prog (mode a z new-updater pusher)
+       (setq new-updater #'(lambda (new) (setq env new)))
+       (setq pusher      #'(lambda (x) (push x env)))
+  loop
+       (or form (go end))
+       (when (atom form)
+             (push form env)
+             (funcall updater env)
+             (return (nreconc z form)))
+       (setq a (car form))
+       (when (llkeywdp a)
+             (push (setq mode a) z)
+             (go cont)
+       )
+       (case mode
+        (&optional
+         (cond
+          ((atom a)
+           (push a env)
+           (push a z))
+          ((null (cdr a))
+           (push (list (ztran-arglist (car a) new-updater env con)) z))
+          ((atom (cddr a))
+           (let ((oldenv env))
+            (push (list* (ztran-arglist (car a) new-updater env con)
+                         (ztran (cadr a) oldenv '(:bind))
+                         (cddr a))
+                  z)))
+          (t
+           (let ((oldenv env))
+            (push (list* (ztran-arglist (car a) new-updater env con)
+                         (ztran (cadr a) oldenv '(:bind))
+                         (cddr a))
+                  z)
+            (when (atom (caddr a))
+                  (push (caddr a) env))))))
+        (&aux
+         (cond
+          ((atom a)
+           (push a env)
+           (push a z))
+          ((null (cdr a))
+           (push (list (ztran-arglist (car a) new-updater env con))
+                 z))
+          (t
+           (let ((oldenv env))
+            (push (list* (ztran-arglist (car a) new-updater env con)
+                         (ztran (cadr a) oldenv '(:bind))
+                         (cddr a))
+                  z)))))
+        (&key
+         (cond
+          ((atom a)
+           (push a env)
+           (push a z))
+          ((null (cdr a))
+           (push (list (ztran-key (car a) pusher new-updater env con))
+                 z))
+          ((atom (cddr a))
+           (let ((oldenv env))
+            (push (list* (ztran-key (car a) pusher new-updater env con)
+                         (ztran (cadr a) oldenv '(:bind))
+                         (cddr a))
+                  z)))
+          (t
+           (let ((oldenv env))
+            (push (list* (ztran-key (car a) pusher new-updater env con)
+                         (ztran (cadr a) oldenv '(:bind))
+                         (cddr a))
+                  z)
+            (when (atom (caddr a))
+                  (push (caddr a) env))))))
+        (t
+         (push (ztran-arglist a new-updater env con) z)))
+  cont
+       (setq form (cdr form))
+       (go loop)
+   end
+       (funcall updater env)
+       (return (nreverse z))
+ )
+)
+
+(defun ztran-key (a pusher updater env con)
+ (cond
+  ((atom a)
+   (funcall pusher a)
+   a)
+  ((atom (cdr a))
+   (funcall pusher (car a))
+   a)
+  (t
+   (list* (car a)
+          (ztran-arglist (cadr a) updater env con)
+          (cddr a)))))
+
+(defun ztran-progn (form env con)
+ ;;;
+ ;;; This function applies appropriate transformations to
+ ;;; the CONTENTS of an implicit PROGN, by transforming the forms
+ ;;; contained therein.
+ ;;;
+ ;;; It does NOT apply transformation rules for PROGN.
+ ;;; This function merely prepares the form for the transformation
+ ;;; associated with PROGN, if any.
+ ;;;
+ ;;; "form" is a list of forms, NOT including any PROGN function form.
+ ;;;
+ ;;; Note that ZTRAN-PROGN must NEVER return a null list.  In that way
+ ;;; incorrect transformations for COND clauses are avoided.
+ ;;;
+ (or (ztran-some-kind-of-block form env con nil)
+     (list nil)))
+
+(defun ztran-and-or (form env con)
+ (prog (z)
+   loop
+       (cond
+        ((atom form)
+         (return (nreconc z form)))
+        ((null (cdr form)) ; This is the last form...
+         (push (ztran (car form) env con) z))
+        (t
+         (push (ztran (car form) env (cons ':predicate con)) z))
+       )
+       (setq form (cdr form))
+       (go loop)
+ )
+)
+
+(defun ztran-catch (form env con)
+ (cons (ztran (car form) env '(:argument))
+       (ztran-progn (cdr form) env con)))
+
+(defun ztran-unwind-protect (form env con)
+ (cons (ztran (car form) env con)
+       (ztran-progn (cdr form) env nil)))
+
+
+(defun lambda-transform (form env con)
+
+ ;;;
+ ;;; This is the transformation function for LAMBDA expressions.
+ ;;; It takes a form whose CAR is a LAMBDA expression (or LABEL
+ ;;; expression or other equivalent that can occur in functional
+ ;;; position) and applies transformation rules to the entire form.
+ ;;;
+ ;;; "form" is the entire form whose CAR is the LAMBDA expression.
+ ;;;
+ ;;; For example, if a form looks like this:
+ ;;;
+ ;;; ((LAMBDA () .  anything))
+ ;;;
+ ;;; and "anything" does not contain any declarations,
+ ;;; then it can be transformed to
+ ;;;
+ ;;; (PROGN . anything)
+ ;;;
+ ;;; (Note that transformation will proceed by applying transformation
+ ;;; rules for PROGN if any, but not until after this function returns)
+ ;;;
+
+ (let (
+       (funn (car form))
+       (args (cdr form))
+      )
+  (cond
+   ;;
+   ;; ((LAMBDA () . x)) --> (PROGN . x)  if x contains no declarations
+   ;;
+   ((and (consp funn)
+         (eq (car funn) 'lambda)
+         (null args)
+         (null (cadr funn))
+         (null (assq 'declare (cddr funn))))
+    `(progn . ,(cddr funn)))
+   (t
+   ;;
+   ;; No other transformations are applicable.
+   ;;
+    form)
+  )
+ )
+)
+
+;
+; ZTRAN-SOME-KIND-OF-BLOCK prepares a block of sequential code for
+; optimization.  It is used on explicit and implicit PROGN, PROG,
+; BLOCK and TAGBODY.
+;
+; The final result is passed to ZXSEQOPT, the "sequential optimizer",
+; for additional transformations (like SETQ collapsing), before being
+; returned to the caller.  Note that ZXSEQOPT is invoked only once at
+; this time, not repeatedly.
+;
+
+(defun ztran-some-kind-of-block (boddy env con tagp)
+ (prog (z y thiscon)
+   loop
+       (cond
+        ((atom boddy)
+         (return (zxseqopt (nreconc z boddy) env con tagp)))
+        ((and tagp (atom (car boddy))) ; GO tag?
+         (push (car boddy) z))
+        ;
+        ; "Evaluate" the form (for effect if it's not the last form).
+        ; If form transforms to an atom and is for effect only,
+        ; it is useless, so discard it.
+        ;
+        ((progn (setq thiscon (if (null (cdr boddy)) con nil))
+                (setq y (ztran (car boddy) env thiscon))
+                (and (null thiscon) (atom y)))
+         nil)
+        ;
+        ; If the form is another PROGN, get the arguments
+        ; to the PROGN into this block (i.e. "flatten out" the
+        ; nested PROGN's).
+        ;
+        ((and (consp y) (eq (car y) 'progn))
+         (setq z (nreconc (cdr y) z)))  ;  "Flatten in" PROGN's.
+        ;
+        ; Otherwise, add the form.
+        ;
+        (t
+         (push y z))
+       )
+       (setq boddy (cdr boddy))
+       (go loop)))
+

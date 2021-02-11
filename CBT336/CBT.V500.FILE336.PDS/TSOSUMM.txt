@@ -1,0 +1,810 @@
+% title TSO functional accounting summary report program;
+(**********************************************************************)
+(*                                                                    *)
+(* Program TSOSUMM - to analyze SMF type 32 records (TSO functional   *)
+(*                   accounting), and produce a summary report. The   *)
+(*                   records are assumed to be in the "DETAILS"       *)
+(*                   format, as modified by the Rice RUA11 usermods.  *)
+(*                                                                    *)
+(*                   In addition to the SMF records (read from file   *)
+(*                   SMFIN), TSOSUMM also reads the file CMDIN, which *)
+(*                   should contain the definitions of interesting    *)
+(*                   command, subcommands, and their aliases.         *)
+(*                   Commands which are not mentioned here will still *)
+(*                   be reported, but aliases and subcommands for     *)
+(*                   these will not be recognized.                    *)
+(**********************************************************************)
+% skip 3;
+program TSOSUMM(SMFIN,CMDIN,OUTPUT);   (* TSO summary MAIN program    *)
+% skip 2;
+const PAGESIZE=55;                     (* my preferred page size      *)
+      PAGESIZE_1=PAGESIZE-1;           (* one less than PAGESIZE      *)
+% skip 2;
+(**********************************************************************)
+(* The TSOSUMM command/subcommand data is organized into two data     *)
+(* bases, the input data base and the statistical data base. Each     *)
+(* data base is organized as a collection of linked lists of elements *)
+(* of type CMDENT, using variants for those fields which are common   *)
+(* to only one data base. One type is used rather than two to allow   *)
+(* the same housekeeping procedure to be used for both data bases.    *)
+(**********************************************************************)
+% skip 2;
+type CMDTYPE = (STAT,INPUT);           (* Data base type designator   *)
+     CMDPTR  = @CMDENT;                (* Command entry pointer       *)
+     CMDENT  = record                  (* command data base element   *)
+                 NEXTCMD: CMDPTR;      (* next element in list        *)
+                 NAME:    ALFA;        (* name of command/subcmd      *)
+            case CTYPE: CMDTYPE of
+                 INPUT:                (* these fields belong to      *)
+                                       (* INPUT elements              *)
+                     (TRUENAME,SUBNAME: ALFA;
+                                       (* true command and subcommand *)
+                                       (* name for input name         *)
+                      TRUECMD, SUBCMD : CMDPTR);
+                                       (* pointer to STAT element for *)
+                                       (* true command & subcommand   *)
+                 STAT:                 (* these fields belong to      *)
+                                       (* STAT elements               *)
+                     (SUBCMDHD: CMDPTR;
+                                       (* pointer to element for the  *)
+                                       (* first subcommand            *)
+                      SUBCOUNT: INTEGER;
+                                       (* number of subcommands issued*)
+                      COUNT,           (* count of commands issued    *)
+                      QCOUNT,          (* count of "quick" commands   *)
+                                       (* issued, i.e., which ended   *)
+                                       (* without reading from the    *)
+                                       (* terminal                    *)
+                      CPU,             (* CPU time accumulator        *)
+                                       (* in seconds/100              *)
+                      ELAPS,           (* elapsed time accumulator    *)
+                                       (* in seconds*4.096E-3         *)
+                      QELAPS,          (* elapsed time total for      *)
+                                       (* "quick" commands            *)
+                      XCOUNT,          (* SRM transaction count       *)
+                                       (* accumulator                 *)
+                      IOCOUNT:  INTEGER)
+                                       (* EXCP accumulator            *)
+               end;
+     HASHVAL = 0..66;                  (* INPUT HASH function result  *)
+% skip 1;
+(**********************************************************************)
+(* The INPUT data base is organized into 67 linked-lists, selected by *)
+(* a hash of the input name. The STAT data base is organized into     *)
+(* linked-lists of commands, selected by first character of the name. *)
+(* The subcommands are chained from the corresponding command.        *)
+(**********************************************************************)
+% skip 1;
+var  CMDHEAD: array(. HASHVAL .) of CMDPTR;
+                                       (* heads of the INPUT command  *)
+                                       (* lists                       *)
+     STATHEAD: array(. '$'..'Z' .) of CMDPTR;
+                                       (* heads of the INPUT command  *)
+                                       (* lists                       *)
+% skip 1;
+     SMFIN,CMDIN: TEXT;                (* SMF and command info files  *)
+% skip 1;
+     LINENO,PAGENO: INTEGER;           (* report line and page number *)
+% page;
+function SEARCH                        (* linked list serach function *)
+     (HEAD:    CMDPTR;                 (* head of the chain to search *)
+      COMMAND: ALFA;                   (* the name to search for      *)
+  var CURCMD:  CMDPTR):                (* pointer to command element  *)
+                                       (* if found, or insertion point*)
+                                       (* if not found                *)
+                        BOOLEAN;       (* TRUE if search successful   *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* function SEARCH - to search a linked list of command elements, and *)
+(*                   return the desired element address if found.     *)
+(*                   If the element is not found, the address of the  *)
+(*                   element after which the desired element ought to *)
+(*                   have been found is returned instead.             *)
+(*                                                                    *)
+(* Note: This function relies on short-circuit evaluation of BOOLEAN  *)
+(*       operators.                                                   *)
+(**********************************************************************)
+% skip 2;
+var  THISCMD:    CMDPTR;               (* working command pointer     *)
+     FOUND:      BOOLEAN;              (* search successful flag      *)
+% skip 1;
+begin
+     CURCMD:=nil;                      (* return nil if element not   *)
+                                       (* found                       *)
+     if HEAD=nil then                  (* nothing to find in an empty *)
+       SEARCH:=FALSE                   (* list                        *)
+% skip 1;
+     else
+       begin
+         THISCMD:=HEAD;                (* start search at top of list *)
+         while (THISCMD<>nil) and (THISCMD@.NAME<COMMAND) do
+                                       (* while commands earlier in   *)
+                                       (* aplhabetical order are found*)
+           begin
+             CURCMD:=THISCMD;          (* save most recent one as     *)
+                                       (* possible insert point       *)
+             THISCMD:=THISCMD@.NEXTCMD (* and then skip it            *)
+           end (* of search loop *);
+         FOUND:=(THISCMD<>nil) and (THISCMD@.NAME=COMMAND);
+                                       (* See if the element was      *)
+                                       (* actually found              *)
+         if FOUND then                 (* if so,                      *)
+           CURCMD:=THISCMD;            (* return its address          *)
+         SEARCH:=FOUND                 (* return FOUND indicator      *)
+       end (* of list not empty *)
+end (* of SEARCH function *);
+% page;
+function HASH                          (* command name hash function  *)
+     (NAME: ALFA) :                    (* the name to be hashed       *)
+                    HASHVAL;
+% skip 1
+(**********************************************************************)
+(* function HASH - to convert an eight-character name conveniently    *)
+(*                 to a number between 0 and 66 (which value has      *)
+(*                 only numerilogical significance).                  *)
+(**********************************************************************)
+% skip 1;
+var  SUM: HASHVAL;                     (* hash value accumulator      *)
+     I:   0..8;                        (* character counter           *)
+% skip 1;
+begin
+     SUM:=0;                           (* start out with nothing      *)
+     for i:=1 to 8 do                  (* a character at a time       *)
+       SUM:=(SUM*256+ORD(NAME(.I.))) mod 67;
+                                       (* compute the name mod 67     *)
+     HASH:=SUM                         (* return the result           *)
+end (* of command HASH routine *);
+% skip 3
+procedure ADDINP                       (* procedure to add a command  *)
+                                       (* to the INPUT data base      *)
+     (INPNAME: ALFA;                   (* INPUT command name          *)
+  var INPTR:   CMDPTR;                 (* return variable for command *)
+                                       (* element                     *)
+      CURCMD,                          (* corresponding STAT command  *)
+      CURSUB:  CMDPTR);                (* and subcommand elements     *)
+% skip 2
+(**********************************************************************)
+(*                                                                    *)
+(* procedure ADDINP - to add an input command name to the INPUT data  *)
+(*                    base, and initialize the created element.       *)
+(**********************************************************************)
+% skip 2
+var  I:      HASHVAL;                  (* number of chosen INPUT list *)
+     NEWCMD: CMDPTR;                   (* new INPUT entry pointer     *)
+% skip 2;
+begin
+     I:=HASH(INPNAME);                 (* hash the command name       *)
+     if not SEARCH(CMDHEAD(.I.),INPNAME,INPTR) then
+                                       (* See if name already in list *)
+       begin                           (* If not...                   *)
+         NEW(NEWCMD,INPUT);            (* allocate a new INPUT element*)
+         if INPTR<>nil then            (* if the proper insertion     *)
+                                       (* point is not the head of    *)
+           begin                       (* the list                    *)
+             NEWCMD@.NEXTCMD:=INPTR@.NEXTCMD;
+                                       (* insert it there             *)
+             INPTR@.NEXTCMD:=NEWCMD
+           end (* of insertion in middle (or at end) of list *)
+         else                          (* if need to insert at start  *)
+           begin                       (* of list                     *)
+             NEWCMD@.NEXTCMD:=CMDHEAD(.I.);
+             CMDHEAD(.I.):=NEWCMD      (* do so                       *)
+           end (* of insert at start of list *);
+         INPTR:=NEWCMD;                (* store new element addr      *)
+         with INPTR@ do                (* initialize new element      *)
+           begin
+             CTYPE:=INPUT;             (* This is an INPUT element    *)
+             TRUECMD:=CURCMD;          (* store STAT command and      *)
+             SUBCMD:=CURSUB;           (* subcommand pointers         *)
+             TRUENAME:=TRUECMD@.NAME;  (* save their names            *)
+             if SUBCMD<>nil then       (* if there is a subcommand    *)
+               SUBNAME:=SUBCMD@.NAME   (* save it                     *)
+             else
+               SUBNAME:='        ';    (* else make it blank          *)
+             NAME:=INPNAME             (* save the input name         *)
+           end (* of initialization of INPUT element *)
+       end (* of name not already in INPUT data base *)
+end (* of ADDINP procedure *);
+% skip 3;
+procedure CREATESTAT                   (* STAT element creation proc  *)
+     (COMMAND: ALFA;                   (* name of new element         *)
+  var CURCMD:  CMDPTR;                 (* pointer to the created      *)
+                                       (* element                     *)
+  var HEAD:    CMDPTR);                (* pointer to the head of list *)
+                                       (* on which to put the element *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure CREATESTAT - to add a command or subcommand name to the  *)
+(*                        STAT database, initializing the created     *)
+(*                        element, and placing it on the appropriate  *)
+(*                        list.                                       *)
+(**********************************************************************)
+% skip 2;
+var  NEWCMD: CMDPTR;                   (* new element address         *)
+%skip
+begin
+     if not SEARCH(HEAD,COMMAND,CURCMD) then
+       begin                           (* if no such element already  *)
+                                       (* in the list                 *)
+         NEW(NEWCMD,STAT);             (* allocate a STAT element     *)
+         if CURCMD<>nil then           (* if this element doesn't     *)
+           begin                       (* belong at the list head     *)
+             NEWCMD@.NEXTCMD:=CURCMD@.NEXTCMD;
+             CURCMD@.NEXTCMD:=NEWCMD   (* chain it in                 *)
+           end (* of insertion within (or at end of) list *)
+         else                          (* if need to insert at head   *)
+           begin
+             NEWCMD@.NEXTCMD:=HEAD;    (* do so                       *)
+             HEAD:=NEWCMD
+           end (* of insertion at head of list *);
+         CURCMD:=NEWCMD;               (* return element addr to      *)
+                                       (* caller                      *)
+         with CURCMD@ do               (* initialize STAT element     *)
+           begin
+             CTYPE:=STAT;              (* establish variant           *)
+             SUBCMDHD:=nil;            (* no subcommands yet          *)
+             COUNT:=0; QCOUNT:=0;      (* zero accumulators           *)
+             CPU:=0; ELAPS:=0; QELAPS:=0;
+             XCOUNT:=0; IOCOUNT:=0; SUBCOUNT:=0;
+             NAME:=COMMAND             (* establish STAT name         *)
+           end (* of STAT element initialization *)
+       end (* of element not found in list *)
+end (* of CREATESTAT procedure *);
+% page;
+procedure ADDSTAT                      (* procedure to add STAT       *)
+                     (* commands and subcommands                      *)
+     (COMMAND,SUBCMD: ALFA;            (* name of command and subcmd  *)
+                                       (* SUBCMD is blank for command *)
+                                       (* only                        *)
+  var CURCMD,CURSUB:  CMDPTR);         (* address of command and      *)
+                                       (* subcmd STAT elements        *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure ADDSTAT - add a command and/or subcommand to the STAT    *)
+(*                     data base.                                     *)
+(**********************************************************************)
+% skip 2;
+var  INITIAL: '$'..'Z';                (* first char of the command   *)
+                                       (* name                        *)
+% skip 1;
+begin
+     INITIAL:=COMMAND(.1.);            (* get command initial         *)
+     CREATESTAT(COMMAND,CURCMD,STATHEAD(.INITIAL.));
+                                       (* create command element and  *)
+                                       (* add to initial chain        *)
+     if SUBCMD<>'        ' then        (* if we also have a subcmd    *)
+       CREATESTAT(SUBCMD,CURSUB,CURCMD@.SUBCMDHD)
+                                       (* add it to the command's     *)
+                                       (* subcommand list             *)
+     else
+       CURSUB:=nil                     (* else show no subcmd         *)
+end (* of ADDSTAT procedure *);
+% page;
+procedure GETWORD                      (* get next word of input      *)
+     (var WORD: STRING);               (* to return the next word     *)
+% skip 1;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure GETWORD - to return the next word of input from TEXT     *)
+(*                     file CMDIN. Upon return, the buffer pointer    *)
+(*                     should point to a non-blank character or the   *)
+(*                     end of line.                                   *)
+(*                                                                    *)
+(* Note: This procedure uses the PASCAL/VS STRING data type.          *)
+(**********************************************************************)
+% skip 1;
+begin
+     WORD:='';                         (* start word out empty        *)
+     while CMDIN@<>' ' do              (* get non-blank characters    *)
+       begin
+         WORD:=WORD||STR(CMDIN@);      (* add accumulate them in WORD *)
+         GET(CMDIN)
+       end (* of non-blank input loop *);
+     while (CMDIN@=' ') and not EOLN(CMDIN) do
+                                       (* now skip trailing blanks    *)
+       GET(CMDIN)                      (* until end of line           *)
+end (* of GETWORD procedure *);
+% skip 3;
+procedure GETCMDS;                     (* CMDIN input routine         *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure GETCMDS - to read the CMDIN input file, building the     *)
+(*                     INPUT and STAT data bases.                     *)
+(*                                                                    *)
+(* Each record of CMDIN defines a STAT command or command-subcommand  *)
+(* pair, together with one or more input command names which          *)
+(* represent that (sub)command.  The (sub) command name comes first,  *)
+(* followed in free format by one or more input names. A subcommand   *)
+(* is represented in the input stream as "cmdname.subname".           *)
+(*                                                                    *)
+(* Note: This procedure uses the PASCAL/VS STRING data type and       *)
+(*       associated functions.                                        *)
+(**********************************************************************)
+% skip 2;
+var  COMMAND,SUBCMD: ALFA;             (* name of current cmd/subcmd  *)
+     CURCMD,CURSUB:  CMDPTR;           (* STAT elements for cmd/subcmd*)
+     ALTCMD:         CMDPTR;           (* INPUT element for cmd/subcmd*)
+     MAINNAME:       STRING(17);       (* cmd.subcmd name string      *)
+     ALTNAME:        STRING(8);        (* equivalent INPUT name       *)
+     INPNAME:        ALFA;
+     INITIAL:        '$'..'Z';         (* work var for initialization *)
+     I:              HASHVAL;          (* work var for initialization *)
+% skip 1;
+begin
+     for I:=0 to 66 do                 (* make all lists start out    *)
+       CMDHEAD(.I.):=nil;              (* empty                       *)
+     for INITIAL:='$' to 'Z' do
+       STATHEAD(.INITIAL.):=nil;
+% skip 1;
+     while not EOF(CMDIN) do           (* read until end of file      *)
+       begin
+         GETWORD(MAINNAME);            (* get a cmd.subcmd            *)
+         I:=INDEX(MAINNAME,'.');       (* Is it a pair of names?      *)
+         if I=0 then                   (* if not                      *)
+           begin
+             COMMAND:=TRIM(MAINNAME);  (* Cut it down to size         *)
+             SUBCMD:='        '        (* No subcommand name          *)
+           end (* of command name only *)
+         else                          (* if cmd.subcmd pair          *)
+           begin
+             COMMAND:=SUBSTR(MAINNAME,1,I-1);
+                                       (* separate the name at the    *)
+                                       (* period                      *)
+             SUBCMD:=SUBSTR(MAINNAME,I+1,LENGTH(MAINNAME)-I)
+           end (* of command.subcmd pair *);
+         ADDSTAT(COMMAND,SUBCMD,CURCMD,CURSUB);
+                                       (* add it to STAT data base    *)
+         repeat                        (* get equivalent INPUT names  *)
+             GETWORD(ALTNAME);
+             INPNAME:=ALTNAME;         (* pad to 8 characters         *)
+             ADDINP(INPNAME,ALTCMD,CURCMD,CURSUB)
+                                       (* and add them to the INPUT   *)
+                                       (* data base                   *)
+         until EOLN(CMDIN);            (* until end of line           *)
+         READLN(CMDIN)                 (* get the next record         *)
+       end (* of CMDIN input loop *)
+end (* of GETCMDS procedure *);
+% page;
+procedure FINDCMD                      (* procedure to locate STAT    *)
+     (INPNAME: ALFA;                   (* input command name          *)
+  var COMMAND,                         (* found STAT element for cmd  *)
+      SUBCMD:  CMDPTR);                (* and subcmd                  *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure FINDCMD - to locate (or create) the STAT elements for    *)
+(*                     the command and subcommand represented by an   *)
+(*                     input command name.                            *)
+(**********************************************************************)
+% skip 2;
+var  INPTR: CMDPTR;                    (* INPUT element pointer for   *)
+                                       (* command name                *)
+     I:     HASHVAL;                   (* INPUT list number for name  *)
+% skip 1;
+begin
+     I:=HASH(INPNAME);                 (* hash the input name         *)
+     if not SEARCH(CMDHEAD(.I.),INPNAME,INPTR) then
+                                       (* if the name is not known    *)
+       begin                           (* add to both INPUT and STAT  *)
+         ADDSTAT(INPNAME,'        ',COMMAND,SUBCMD);
+                                       (* as a command                *)
+         ADDINP(INPNAME,INPTR,COMMAND,SUBCMD)
+       end (* of previously unknown input command *)
+     else                              (* if command previously seen  *)
+       begin
+         COMMAND:=INPTR@.TRUECMD;      (* find STAT entries from INPUT*)
+                                       (* entries                     *)
+         SUBCMD:=INPTR@.SUBCMD;
+       end (* of known input command name *)
+end (* of FINDCMD procedure *);
+% page;
+function GETINT                        (* function to read an         *)
+                                       (* unformatted integer from    *)
+                                       (* SMFIN                       *)
+     (LEN: INTEGER):                   (* the number of bytes to read *)
+                    INTEGER;           (* the integer which was read  *)
+% skip 1;
+(**********************************************************************)
+(*                                                                    *)
+(* function GETINT - to read an integer (in internal form) from the   *)
+(*                   current position on file SMFIN.                  *)
+(*                                                                    *)
+(* Note: This function uses the PASCAL/VS integer shift (<<) operator.*)
+(**********************************************************************)
+% skip 1;
+var  BYTE:   CHAR;                     (* character input variable    *)
+     RESULT: INTEGER;                  (* the value to return         *)
+     I:      1..4;                     (* for loop control variable   *)
+% skip 1
+begin
+     RESULT:=0;
+     for I:=1 to LEN do                (* a byte at a time            *)
+       begin
+         READ(SMFIN,BYTE);             (* bite off a byte             *)
+         RESULT:=(RESULT<<8)+ORD(BYTE) (* append to previous bytes    *)
+       end (* of integer assembly *);
+     GETINT:=RESULT                    (* pass it back                *)
+end (* of GETINT function *);
+% skip 3;
+procedure ACCUM                        (* STAT accumulation procedure *)
+     (CURCMD,SUBCMD: CMDPTR);          (* name of command/subcmd to   *)
+                                       (* accumulate                  *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure ACCUM - to add statistics from the current SMF record    *)
+(*                    to the STAT entries for the current command     *)
+(*                    and subcommand.                                 *)
+(**********************************************************************)
+% skip 2;
+var  INCR:    INTEGER;                 (* the amount to add to a count*)
+     THISCMD: CMDPTR;                  (* the entry to add to         *)
+% skip 1;
+begin
+     if SUBCMD=nil then                (* if this is a command        *)
+       THISCMD:=CURCMD                 (* add to command entry        *)
+     else
+       THISCMD:=SUBCMD;                (* else add to subcmd entry    *)
+     INCR:=GETINT(4);                  (* get number of times issued  *)
+     THISCMD@.COUNT:=THISCMD@.COUNT+INCR;
+                                       (* add to entry                *)
+     if SUBCMD<>nil then               (* if count for subcmd         *)
+       CURCMD@.SUBCOUNT:=CURCMD@.SUBCOUNT+INCR;
+                                       (* add to subcmd count for cmd *)
+     INCR:=GETINT(4);                  (* get CPU time                *)
+     THISCMD@.CPU:=THISCMD@.CPU+INCR;  (* et cetera                   *)
+     INCR:=GETINT(4);                  (* get elapsed time            *)
+     THISCMD@.ELAPS:=THISCMD@.ELAPS+INCR;
+     INCR:=GETINT(4);                  (* get quick elapsed time      *)
+     THISCMD@.QELAPS:=THISCMD@.QELAPS+INCR;
+     INCR:=GETINT(4);                  (* get quick command count     *)
+     THISCMD@.QCOUNT:=THISCMD@.QCOUNT+INCR;
+     INCR:=GETINT(4);                  (* get SRM transaction count   *)
+     THISCMD@.XCOUNT:=THISCMD@.XCOUNT+INCR;
+     INCR:=GETINT(4);                  (* get EXCP count              *)
+     THISCMD@.IOCOUNT:=THISCMD@.IOCOUNT+INCR;
+end (* of ACCUM procedure *);
+% page;
+procedure GETSMF;                      (* SMFIN input routine         *)
+% skip 2;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure GETSMF - to read SMF type 32 records from the SMFIN      *)
+(*                    file and accumulate TSO command statistics.     *)
+(*                                                                    *)
+(* For information in addition to that given below on the type 32     *)
+(* record format, see the IBM SMF manual. Note that the RUA11 usermods*)
+(* have changed the SRB time, TPUT and TGET accumulators to elapsed   *)
+(* time, quick elapsed time and quick command count respectively.     *)
+(*                                                                    *)
+(* Note: This procedure uses PASCAL/VS notation for hexadecimal       *)
+(*       strings.                                                     *)
+(**********************************************************************)
+% skip 2;
+var  RECTYPE:        CHAR;             (* SMF record type             *)
+     PRODUCT_OFFSET: INTEGER;          (* offset to record "product   *)
+                                       (* section"                    *)
+     CMD_OFFSET:     INTEGER;          (* offset to record "command   *)
+                                       (* section"                    *)
+     CMDNO:          INTEGER;          (* number of commands in record*)
+     INPNAME:        ALFA;             (* input command name          *)
+     INITIAL:        CHAR;             (* first char of INPNAME       *)
+     CURCMD,SUBCMD:  CMDPTR;           (* cmd and subcmd STAT entry   *)
+                                       (* pointers                    *)
+     I:              INTEGER;          (* for loop index              *)
+     FILLER:         CHAR;             (* dummy input variable        *)
+% skip 1;
+begin
+     while not EOF(SMFIN) do           (* until the data runs out     *)
+       begin
+         READ(SMFIN,FILLER,            (* skip 1 character,           *)
+              RECTYPE);                (* read record type            *)
+                                       (* SMF32RTY offset = 1         *)
+         if RECTYPE='20'XC then        (* if we have a type 32        *)
+           begin
+             READ(SMFIN,FILLER:18);    (* SMF32POF offset = 20        *)
+             PRODUCT_OFFSET:=GETINT(4);(* get "product section" offset*)
+             READ(SMFIN,FILLER:12);    (* SMF32COF offset = 36        *)
+             CMD_OFFSET:=GETINT(4);    (* get "command section" offset*)
+             READ(SMFIN,FILLER:2);     (* SMF32CON offset = 42        *)
+             CMDNO:=GETINT(2);         (* get number of commands      *)
+%skip 1;
+             READ(SMFIN,FILLER:PRODUCT_OFFSET-47);
+                                       (* skip to the product section *)
+             READ(SMFIN,FILLER);       (* read the record subtype     *)
+             if FILLER='04'XC then (* if this is a session end *)
+               begin                   (* detail record, collect it   *)
+                 READ(SMFIN,FILLER:CMD_OFFSET-PRODUCT_OFFSET-2);
+                                       (* skip to the command section *)
+                                       (**** this assumes that the ****)
+                                       (**** the command section   ****)
+                                       (**** follows the product   ****)
+                                       (**** section (it better)   ****)
+                 for I:=1 to CMDNO do  (* process each entry          *)
+                   begin
+                     READ(SMFIN,INPNAME);
+                                       (* get the command name        *)
+                     INITIAL:=INPNAME(.1.);
+                                       (* extract its initial         *)
+                     if not (INITIAL in (.'$','@','#','A'..'J','K'..'R',
+                                         'S'..'Z'.)) then
+                                       (* if the command name gets    *)
+                                       (* off to a bad start          *)
+                       INPNAME:='*INVALID';
+                                       (* accumulate specially        *)
+                     FINDCMD(INPNAME,CURCMD,SUBCMD);
+                                       (* find STAT entries for this  *)
+                                       (* command                     *)
+                     ACCUM(CURCMD,SUBCMD);
+                                       (* accumulate statistics       *)
+                   end (* of command entry loop *)
+               end (* of session end detail processing *)
+           end (* of record type 32 processing *);
+         READLN(SMFIN)                 (* skip to next SMF record     *)
+       end (* of SMFIN input loop *)
+end (* of GETSMF procedure *);
+% page;
+function AVGFORM                       (* function to format average  *)
+                                       (* values                      *)
+     (TOTAL,COUNT: INTEGER):           (* total value and number of   *)
+                                       (* observations                *)
+                             STRING(6);(* the formatted result        *)
+% skip 1
+(**********************************************************************)
+(*                                                                    *)
+(* function AVGFORM - to produce a character representation of an     *)
+(*                    average of a set of integers. If the value      *)
+(*                    is greater than 10,000, it is formatted in "K"  *)
+(*                    notation. If the number of observations is      *)
+(*                    zero, it is formatted as "---".                 *)
+(*                                                                    *)
+(* Note: This procedure uses the PASCALVS STRING data type and the    *)
+(*       WRITESTR procedure.                                          *)
+(**********************************************************************)
+% skip 1;
+var  AVG:  REAL;                       (* the average value           *)
+     AVGF: STRING(6);                  (* working string varaible     *)
+% skip 1;
+begin
+     if COUNT=0 then                   (* if no data to average       *)
+       AVGFORM:='---'                  (* so indicate                 *)
+     else
+       begin
+         AVG:=FLOAT(TOTAL)/FLOAT(COUNT);
+                                       (* compute real average        *)
+         if AVG<9999.95 then           (* fewer than 5 digits rounded?*)
+           WRITESTR(AVGF,AVG:6:1)      (* if so, format normally      *)
+         else
+           begin
+             WRITESTR(AVGF,AVG/1000.0:6:0);
+                                       (* format the number of K      *)
+                                       (* as an integer               *)
+             AVGF:=SUBSTR(AVGF,1,5)||'K'
+                                       (* replace point with K        *)
+           end (* of large value to format *);
+         AVGFORM:=AVGF;                (* return result to caller     *)
+       end (* of at least one observation *)
+end (* of AVGFORM function *);
+% skip 2;
+function TIMEFORM                      (* average time formatter      *)
+     (TIME, COUNT: INTEGER;            (* total time and number of    *)
+                                       (* observations                *)
+      UNITS:       REAL):              (* time unit in seconds        *)
+                          STRING(5);   (* the formatted result        *)
+% skip 1;
+(**********************************************************************)
+(*                                                                    *)
+(* function TIMEFORM - to format an average time value as "nn.nU",    *)
+(*                     where U is "S", "M" or "H", for seconds,       *)
+(*                     minutes or hours. if there are no observations,*)
+(*                     "---" in returned instead.                     *)
+(*                                                                    *)
+(* Note: This procedure uses the PASCALVS STRING data type and the    *)
+(*       WRITESTR procedure.                                          *)
+(**********************************************************************)
+% skip 1;
+var  AVG:   REAL;                      (* average time in seconds     *)
+     TIMEF: STRING(7);                 (* the formatted time value    *)
+% skip 1;
+begin
+     if COUNT=0 then                   (* if no meaningful data       *)
+       TIMEFORM:='---'                 (* so indicate                 *)
+     else
+       begin
+         AVG:=UNITS*FLOAT(TIME)/FLOAT(COUNT);
+                                       (* compute average time in     *)
+                                       (* seconds                     *)
+         if AVG<59.95 then             (* if small enough for seconds *)
+           WRITESTR(TIMEF,AVG:4:1,'S') (* make it nn.nS               *)
+         else
+           if AVG/60.0<59.95 then      (* if small enough for minutes *)
+             WRITESTR(TIMEF,AVG/60.0:4:1,'M')
+                                       (* make it nn.nM               *)
+           else                        (* make in nn.nH               *)
+             WRITESTR(TIMEF,AVG/3600.0:4:1,'H');
+         TIMEFORM:=TIMEF               (* give result to caller       *)
+       end (* of non-zero count of times *)
+end (*of TIMEFORM function *);
+% page;
+procedure REPORTLINE                   (* report line writer proc     *)
+     (CURCMD,SUBCMD: CMDPTR;           (* command and subcmd elements *)
+                                       (* for the output line         *)
+      NEWPAGE:       BOOLEAN);         (* will this line be the first *)
+                                       (* on the page?                *)
+% skip 2
+(**********************************************************************)
+(*                                                                    *)
+(* procedure REPORTLINE - To write the statistics report line for a   *)
+(*                        single command or subcommand.               *)
+(*                                                                    *)
+(* Note: This procedure requires several PASCAL/VS string-handling    *)
+(*       function and the COLS file-handling function.                *)
+(**********************************************************************)
+% skip 2;
+var  SUBOUT: BOOLEAN;                  (* line is for subcmd flag     *)
+% skip 1;
+begin
+     SUBOUT:=SUBCMD<>nil;              (* see whether subcmd output   *)
+     if not SUBOUT and not NEWPAGE then
+       begin                           (* if command and not new page *)
+         WRITELN;                      (* double space                *)
+         LINENO:=LINENO+1              (* bump line counter           *)
+       end (* of command not at page top *);
+     if not SUBOUT then                (* if command line             *)
+       WRITE(CURCMD@.NAME)             (* label with command name     *)
+     else                              (* if a subcommand             *)
+       if NEWPAGE then                 (* if starting new page        *)
+         WRITE(TRIM(STR(CURCMD@.NAME)),'.',SUBCMD@.NAME)
+                                       (* mention command name again  *)
+       else                            (* if subcmd on old page       *)
+         WRITE(SUBSTR('........',1,LENGTH(TRIM(STR(CURCMD@.NAME)))),'.',
+               SUBCMD@.NAME);          (* replace command name with   *)
+                                       (* dots ("....subcmd")         *)
+% skip;
+     WRITE(' ':21-COLS(OUTPUT));       (* tab to col 21               *)
+     if SUBOUT then                    (* if this is a subcmd,        *)
+       CURCMD:=SUBCMD;                 (* treat it as command now     *)
+     with CURCMD@ do                   (* write out stats             *)
+       begin
+         WRITE(COUNT:6,' ':3,QCOUNT:6,' ':3);
+                                       (* write number of commands    *)
+                                       (* (both quick and dead)       *)
+         if not SUBOUT then            (* if this is a command        *)
+           WRITE(SUBCOUNT:7,' ':3)     (* write no of subcmds         *)
+         else
+           WRITE('---':7,' ':3);       (* else say not meaningful     *)
+         WRITE(TIMEFORM(CPU,COUNT,0.01):5,' ':3,
+               TIMEFORM(ELAPS,COUNT,4.096E-3):5,' ':3,
+               TIMEFORM(QELAPS,QCOUNT,4.096E-3):5,' ':3);
+                                       (* write CPU and elapsed times *)
+         WRITE(AVGFORM(XCOUNT,COUNT):6,' ':3,
+               AVGFORM(IOCOUNT,COUNT):6,' ':3);
+                                       (* write SRM transaction and   *)
+                                       (* EXCP count averages         *)
+         WRITELN;                      (* end of that line            *)
+         LINENO:=LINENO+1              (* bump the line counter       *)
+       end (* of with statement *)
+end (* of REPORTLINE procedure *);
+% page;
+procedure TITLE;                       (* report page heading proc    *)
+% skip 1;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure TITLE - To write a page heading line and two lines of    *)
+(*                   column headings for the summary report.          *)
+(*                                                                    *)
+(* Note: This procedure relies on the PASCAL/VS interpretation of     *)
+(*       negative field width in the WRITE function call (i.e., left  *)
+(*       justification), and on the DATETIME function to retrieve the *)
+(*       current time and date.                                       *)
+(**********************************************************************)
+% skip 1
+var  NOW,TODAY: ALFA;                  (* current time and date       *)
+% skip 1;
+begin
+     DATETIME(TODAY,NOW);              (* find out when it is         *)
+     PAGENO:=PAGENO+1;                 (* bump page counter           *)
+     if PAGENO<>1 then                 (* except for page 1           *)
+       PAGE(OUTPUT);                   (* throw a page                *)
+     WRITELN('TSO COMMAND SUMMARY',' ':60,TODAY,' ':7,NOW,' ':7,
+             'PAGE ',PAGENO:4);        (* write main heading          *)
+     WRITELN;                          (* skip a line after           *)
+     WRITELN('CMD.SUBCMD':-17,'EXEC':9 ,'SHORT':9,'SUBCMD':10,
+                 'CPU':8,'ELAPSED AVG':15,' ':1,'AVG SRM':9,'EXCP':9);
+     WRITELN('NAME':-17,      'COUNT':9,'COUNT':9,'COUNT':10,
+                 'AVG':8,'(ALL) (SHORT)':16,      'TRANS':9,'AVG':9);
+                                       (* write out column headings   *)
+     WRITELN;                          (* skip a line after headings  *)
+     LINENO:=5;                        (* set starting line number    *)
+end (* of title procedure *);
+% page;
+procedure CMDRPT                       (* report on command routine   *)
+     (CURCMD: CMDPTR;                  (* STAT element for command    *)
+      SUBCMD: CMDPTR);                 (* STAT element for subcommand *)
+% skip 1;
+(**********************************************************************)
+(*                                                                    *)
+(* procedure CMDRPT - to write the output for a single command or     *)
+(*                    subcommand. For a command, it calls itself      *)
+(*                    recursively to write the subcommand lines.      *)
+(**********************************************************************)
+% skip 1;
+var  NEWPAGE: BOOLEAN;                 (* new page required flag      *)
+     SUBPTR:  CMDPTR;                  (* subcommand work pointer     *)
+     NOUSE:   BOOLEAN;                 (* don't write line flag       *)
+% skip 1;
+begin
+     if SUBCMD=nil then                (* see if any use to mention   *)
+       NOUSE:=CURCMD@.COUNT=0
+     else
+       NOUSE:=SUBCMD@.COUNT=0;
+     if not NOUSE then                 (* if any use to speak of      *)
+       begin                           (* write the report line       *)
+         NEWPAGE:=FALSE;               (* assume new page not needed  *)
+         if (LINENO=PAGESIZE) or
+            ((LINENO=PAGESIZE_1) and (SUBCMD=nil)) then
+           begin                       (* if page has no room for next*)
+                                       (* line                        *)
+             TITLE;                    (* skip to next page           *)
+             NEWPAGE:=TRUE             (* note for REPORTLINE         *)
+           end (* of new page required *);
+         REPORTLINE(CURCMD,SUBCMD,NEWPAGE);
+                                       (* write line for this (sub)cmd*)
+         if (SUBCMD=nil) and (CURCMD@.SUBCOUNT>0) then
+                                       (* if this command has subcmds *)
+           begin
+             SUBPTR:=CURCMD@.SUBCMDHD; (* get first subcmd entry      *)
+             while SUBPTR<>nil do
+               begin
+                 CMDRPT(CURCMD,SUBPTR);(* write line for each subcmd  *)
+                 SUBPTR:=SUBPTR@.NEXTCMD    (* until all are done     *)
+               end (* of subcommand output loop *)
+           end (* of command with subcommands *)
+       end (* of command with non-zero use *)
+end (* of CMDRPT procedure *);
+% skip 3;
+procedure REPORT;                      (* report-writing procedure    *)
+% skip 2
+(**********************************************************************)
+(*                                                                    *)
+(* procedure REPORT - to write the accumulated statistics report to   *)
+(*                    OUTPUT.                                         *)
+(**********************************************************************)
+% skip 2;
+var  INITIAL: '$'..'Z';                (* command initial variable    *)
+     CURCMD:  CMDPTR;                  (* work command pointer        *)
+% skip 1;
+begin
+     LINENO:=PAGESIZE;                 (* force page start            *)
+     PAGENO:=0;                        (* and page number 1           *)
+     for INITIAL:='$' to 'Z' do        (* handle each chain of STAT   *)
+       begin                           (* elements                    *)
+         CURCMD:=STATHEAD(.INITIAL.);  (* start at head of chain      *)
+         while CURCMD<>nil do          (* while there are cmds left   *)
+           begin
+             CMDRPT(CURCMD,nil);       (* write stats for this command*)
+             CURCMD:=CURCMD@.NEXTCMD   (* get the next one            *)
+           end (* of command chain loop *)
+       end (* of loop over first letter *)
+end (* of REPORT procedure *);
+% page
+(**********************************************************************)
+(*                                                                    *)
+(* This is the body of TSOSUMM. (I bet you thought I'd forgotten it.) *)
+(**********************************************************************)
+% skip 1;
+begin
+     REWRITE(OUTPUT,'DDNAME=SYSPRINT,RECFM=VA,LRECL=125,BLKSIZE=129');
+                                       (* use DDname SYSPRINT for     *)
+                                       (* OUTPUT                      *)
+     RESET(CMDIN); RESET(SMFIN);       (* open input files            *)
+% skip 1;
+     GETCMDS;                          (* read the command input      *)
+     GETSMF;                           (* read the SMF input          *)
+     REPORT;                           (* write out the report        *)
+% skip 1;
+end (* of TSOSUMM program *).

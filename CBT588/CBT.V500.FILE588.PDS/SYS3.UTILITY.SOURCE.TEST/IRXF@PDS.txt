@@ -1,0 +1,648 @@
+//jobname JOB (account),userid,CLASS=S,MSGCLASS=Y,REGION=4M
+//*
+//* First modify JOB card and data set names to your environment
+//* Assemble and Link program/module
+//*
+//ASMH EXEC PGM=ASMA90,REGION=4M,
+// PARM='OBJECT,NODECK,NOXREF,BATCH,RENT'
+//SYSLIB   DD DISP=SHR,DSN=SYS1.MACLIB
+//         DD DISP=SHR,DSN=SYS1.MODGEN
+//         DD DISP=SHR,DSN=SYS3.UTILITY.MACLIB.TEST      <== hlq.MACLIB
+//SYSUT1   DD UNIT=VIO,SPACE=(CYL,2)
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD UNIT=VIO,SPACE=(TRK,1),DISP=(,PASS),DCB=BLKSIZE=3200
+//SYSIN    DD *
+*-------------------------------------------------------------------
+     TITLE 'IRXF@PDS REXX function L_PDS'
+*-------------------------------------------------------------------
+* History of Changes (last comes first):
+* 07-10-2003 SVM Added WTP if IRXSAY not available (in CA/OPS)
+* 03/17/03 SVM Added error processing
+* 03/05/03 SVM Created
+*
+* Compare to LISTPDS testing results (CEE.SCEELKED, 7904 members):
+*          VIRT   SYS    EXT    SYS      EXCP   SRVC   CPU,s
+* IRXF@PDS 248k   352k   420k   10104k   1476    75K   1.38
+* LISTPDS  228k   876k  1420k   10172k   1487   162K   2.82
+*.....................................................................
+*   Runs in both TSO (IKJEFT1B) and non-TSO environment (IRXJCS)
+*
+* FUNCTION:     Open PO dataset,
+*               Allocate member list table
+*               Read PO dataset and fill member list
+*               Adjust EVSIZE and copy members to EVDATA.
+*               If member has aliases, put them in 'ALIAS()'
+*               after the primary member name.
+*               Use blanks to separate primary members,
+*               Use comma to separate aliases.
+*
+* Sample use:   dsn='...'; memlist=L_PDS(dsn)
+*
+* PARAMETERS:   dsn,vol
+*               dsnname - required
+*               volume  - optional or blanks
+*
+* OUTPUT:       Result - string of members and aliases
+*               If Error - R15>0 ("Incorrect call to procedure")
+*               - no parm,
+*               - no $OPEN program
+*               - no dataset
+*               - too many members
+*               If warning - R15=0, result=null
+*               - not a PDS
+*               - no members
+*               Say error/warning message.
+* Attributes:
+*               reentrant, AMODE=31,RMODE=ANY
+* Externals:
+*               $OPEN - dynalloc/read interface module (A=24)
+*                            LOADed and CALLed
+*--------------------------------------------------------------------
+IRXF@PDS BEGIN A=31
+WRK      WORK  LV=WRKL,LOC=BELOW
+         B     START
+*--------------------------------------------------------------------
+*  Exit the program - clean up first:
+EXIT     DS    0H
+         L     R3,DATADDR
+         LTR   R3,R3
+         BZ    EXT2
+         L     R2,DATALEN
+         FREEMAIN RU,A=(R3),LV=(R2)
+EXT2     L     R3,$OPENADR
+         LTR   R3,R3
+         BZ    FIN
+         DELETE EP=$OPENI
+         LTR   R15,R15
+         BZ    FIN
+FIN      L     R15,RETC
+         FIN
+*--------------------
+* REGISTER EQUATES:
+* R9  -> EVALBLOCK result block
+* R10 -> IRXEFPL   parm block
+* R11 -> ENVBLOCK  environment block
+*---------------------------------------------------------------------
+*- Set REXX environment:
+START    LR    R10,R1                  IRXEFPL
+         USING EFPL,R10                - parm list
+         LR    R11,R0                  ENVBLOCK
+         USING ENVBLOCK,R11            - externals
+         L     R9,EFPLEVAL
+         L     R9,0(R9)                EVALBLOCK
+         USING EVALBLOCK,R9            - result
+*
+         SR    R2,R2                   By default:
+         ST    R2,RETC                 return rc = 0
+         ST    R2,EVALBLOCK_EVLEN      return empty value
+* get parm #1 (DSNAME)
+         LA    R2,1
+         BAL   R14,GETPARM             R3=addr,R4=length (0=not found)
+         LTR   R4,R4
+         LA    R15,#ERR1
+         BZ    ERROR                   no parm
+         BCTR  R4,0                    length - 1
+         MVC   DSNAME(44),#BLANKS
+         EX    R4,MVCDSN               copy parm to DSNAME
+* get parm #2 (VOLUME)
+         MVC   VOLUME(6),#BLANKS
+         LA    R2,2
+         BAL   R14,GETPARM             R3=addr,R4=length (0=not found)
+         LTR   R4,R4
+         BZ    NOVOL                   blank
+         BCTR  R4,0                    length - 1
+         EX    R4,MVCVOL               copy parm to VOLUME
+NOVOL    DS    0H
+*---------------------------------------------------------------------
+*  $OPEN Input Dataset to read directory:
+         MVC   MEMBER(8),#BLANKS       Clear MEMBER to read Directory
+         XC    RECLEN(NUMLEN),RECLEN   Nullify other fields
+**       WTO   'TEST: Calling $OPENI...',ROUTCDE=11
+         LA    R15,$PARM
+         ST    R15,$PADDR              Set $PADDR
+         OI    $PADDR,X'80'            Set VL bit
+         LOAD  EP=$OPENI,ERRET=LOADERR
+         ST    R0,$OPENADR
+         LR    R1,R0
+         LA    R0,$CLSOFFS(R1)
+         ST    R0,$CLOSADR
+         LA    R0,$REDOFFS(R1)
+         ST    R0,$READADR
+*---------------------------------------------------------------------
+*  Allocate space for member list, 12 bytes for each member:
+*  R8=# of members
+ALLOC    DS    0H
+         L     R8,#MAXMEM
+         LA    R5,12
+         MR    R4,R8                   R4||R5 = R5 * R8
+         ST    R5,DATALEN              store data length
+         GETMAIN RU,LV=(R5),LOC=RES
+         ST    R1,DATADDR              store data addr
+*---------------------------------------------------------------------
+*  Open PDS directory and read member entries,
+*  put aliases from bottom to top and members from top to bottom
+*  into allocated work area:
+**       WTO   'TEST: Calling $OPENI...',ROUTCDE=11
+         LA    R1,$PADDR
+**    CALL  $OPENI
+         L     R15,$OPENADR
+         BASSM R14,R15
+         LTR   R15,R15
+         LA    R15,#ERR3
+         BNZ   ERROR                   Cannot open data set
+READ2    DS    0H
+         L     R4,DCBAD
+         USING IHADCB,R4
+         TM    DCBDSORG,DCBDSGPO
+         LA    R15,#ERR4
+         BNO   ERROR                   not PO dataset - ret null
+         DROP  R4
+*
+         L     R8,DATADDR              R8 -> 1st data element
+         ST    R8,MEMBEND              Init memb list end addr
+         LA    R6,DLEN                 R6 = data elem length
+         LR    R7,R8
+         A     R7,DATALEN
+         ST    R7,DATAEND              Store end of data addr
+         ST    R7,ALIAS                Init alias list addr
+         SR    R3,R3                   R3 = member counter
+TREAD2   DS    0H
+**       WTO   'TEST: TREAD2 loop...',ROUTCDE=11
+         LA    R1,$PADDR
+**    CALL  $READ
+         L     R15,$READADR
+         BASSM R14,R15
+         LTR   R15,R15
+         BNZ   TREND2                  end of file
+*  Read dir entries:
+         L     R2,RECADDR
+         LH    R1,0(R2)                blk length
+         LA    R0,0(R1,R2)             next to last used byte
+         LA    R2,2(R2)                1st entry
+         USING ENTRY,R2
+LOOP2    SR    R1,R1
+         ICM   R1,8,COUNTER
+         SLL   R1,3                    use 5 bits
+         SRL   R1,26                   length of DATA
+         LA    R1,12(R1)               length of ENTRY
+         CLC   NAME(8),#MAX            end of directory -
+         BE    TREND2                  leave
+         LA    R3,1(R3)                advance member counter
+         C     R3,#MAXMEM
+         BNH   GOOD
+         LA    R15,#ERR6
+         B     ERROR                   too many - increase #MAXMEM
+GOOD     TM    COUNTER,#ALIAS
+         BO    PRCALS
+*  Process member ENTRY:
+         USING DENTRY,R8
+         MVC   DENTRY(DLEN),ENTRY
+         AR    R8,R6                   to next elem
+         ST    R8,MEMBEND              save addr of member list end
+         DROP  R8
+         B     PRCANY
+* Process alias  ENTRY:
+         USING DENTRY,R7
+PRCALS   SR    R7,R6                   To Next position
+         MVC   DENTRY(DLEN),ENTRY
+         OI    DENTRY+DLEN-1,#MARK     Mark as non-processed alias
+         ST    R7,ALIAS                save 1st alias address
+         DROP  R7
+*  Common processing:
+PRCANY   LA    R2,0(R1,R2)             next entry ?
+         CR    R2,R0                   compare to block end
+         BNL   TREAD2                  next block
+         B     LOOP2                   next entry
+*  R8,MEMBEND-> member list end
+*  R7,ALIAS  -> alias list start
+TREND2   DS    0H
+         ST    R3,MEMBERS              store real number of members
+         LTR   R15,R15
+         BZ    TCLOSE
+**       WTO   'EOF reached',ROUTCDE=11
+*---------------------------------------------------------------------
+*  Close Input Dataset:
+TCLOSE   DS    0H
+**       WTO   'TEST: Calling $CLOSE...',ROUTCDE=11
+         LA    R1,$PADDR
+**       CALL  $CLOSE
+         L     R15,$OPENADR
+         BASSM R14,R15
+         LTR   R15,R15
+         BZ    CHKALS
+**       WTO 'TEST: $CLOSE failed',ROUTCDE=11
+*---------------------------------------------------------------------
+*  Build a chain of mambers and aliases using TTRC field as
+*  addr of next in chain:
+*  - local register equates:
+M0       EQU   R0                      start of member list
+MN       EQU   R1                      next member addr
+MC       EQU   R2                      current member addr
+ME       EQU   R3                      end of member list
+A0       EQU   R4                      start of alias list
+AN       EQU   R5                      next alias  addr
+AC       EQU   R6                      current alias  addr
+AE       EQU   R7                      end of alias  list
+MX       EQU   R8                      current chain end
+*
+CHKALS   DS    0H
+         L     R3,MEMBERS
+         LTR   R3,R3
+         LA    R15,#ERR5               No members in PDS
+         BZ    ERROR
+**       WTO 'CHKALS...',ROUTCDE=11
+         LA    M0,DLEN
+         ST    M0,DLENF                store DLEN
+         L     M0,DATADDR              1st member
+         L     ME,MEMBEND              end of member list
+         L     A0,ALIAS                1st alias
+         L     AE,DATAEND              end of alias list
+         S     AE,DLENF                last alias
+         LR    MN,M0                   1st member
+         CR    M0,ME                   If 1st = end
+         BNE   NX1
+         SR    MN,MN                   set next mem to 0 - no members
+NX1      DS    0H
+         CR    A0,AE                   if 1st <= last
+         BNH   MLOOP
+         SR    AE,AE                   set next alias = 0 - no aliases
+*  Loop by members:
+MLOOP    DS    0H
+         LTR   MN,MN
+         BZ    MFIN                    no more members to process
+         LR    MC,MN
+         LA    MN,DLEN(MC)             addr of next member
+         CR    MN,ME                   if next >= end
+         BL    NX3
+         SR    MN,MN                   set next = 0
+NX3      LR    MX,MC                   set chain link to current mem
+         MVC   TTRX(3),TTR-ENTRY(MC)   store TTR of current member
+         LR    AN,AE                   start from AE
+*  Internal loop by aliaces (search aliaces for the member):
+ALOOP    LTR   AN,AN
+         BZ    AFIN                    no more aliases to process
+         LR    AC,AN
+         S     AN,DLENF                addr of prev alias
+         CR    AN,A0                   if prev < start
+         BNL   NX4
+         SR    AN,AN                   set next = 0
+NX4      CLI   COUNTER-ENTRY(AC),#MARK   processed?
+         BNE   ALOOP                   yes - skip it
+         CLC   TTR-ENTRY(3,AC),TTRX    If alias.ttr = ttrx
+         BNE   NX5
+         ST    AC,TTR-ENTRY(MX)        link alias to chain
+         LR    MX,AC                   advance chain link
+NX5      B     ALOOP                   consider next alias
+*
+AFIN     ST    MN,TTR-ENTRY(MX)        link next member to chain
+         B     MLOOP
+*
+MFIN     DS    0H
+**       WTO   'Getting EVALBLOCK...',ROUTCDE=11
+*---------------------------------------------------------------------
+*  Get bigger EVALBLOCK, if needed:
+         L     R2,MEMBERS              # of members
+         MHI   R2,$MLEN                length of EVDATA required
+         L     R6,EVALBLOCK_EVSIZE     save to show
+         BAL   R14,GETBIG
+*---------------------------------------------------------------------
+*  Copy members to EVDATA in format 'mem (al) (al) mem mem (al) mem...'
+**       WTO   'Copying members to EVDATA',ROUTCDE=11
+         L     R1,MEMBERS
+         L     MC,DATADDR              from
+         LA    MX,EVALBLOCK_EVDATA     to
+         L     A0,ALIAS
+CPLOOP   BAL   R14,COPYM               copy member to EVDATA
+         L     MC,DTTR-DNAME(MC)       next member in chain
+         LTR   MC,MC
+         BZ    CPLEAVE
+         BCT   R1,CPLOOP
+*
+CPLEAVE  DS    0H
+         CLI   PREV,#A
+         BNE   SETEVLEN
+         MVI   0(MX),C')'              close alias list
+         LA    MX,1(MX)                shift output pos
+SETEVLEN LA    MC,EVALBLOCK_EVDATA
+         SR    MX,MC
+         ST    MX,EVALBLOCK_EVLEN
+         SR    R15,R15
+         B     EXIT
+*---------------------------------------------------------------------*
+*- Error EXIT: R15 -> ERRBLK
+LOADERR  LA    R15,#ERR2               Load error
+ERROR    DS    0H
+         USING ERRBLK,R15
+         MVC   RETC(4),ERRCODE
+         MVC   MESSAGE(ERRMSGL),ERRMSG store for WTP
+* make parm for IRXSAY:
+         MVC   P1(8),=CL8'WRITE'       function request
+         LA    R1,ERRMSG
+         ST    R1,P2                   string addr
+         LA    R1,ERRMSGL
+         ST    R1,P3                   string length
+         ST    R11,P4                  ENVBLOCK
+         XC    P5(4),P5                clear RC
+* make addr list:
+         LA    R1,P1
+         ST    R1,A1
+         LA    R1,P2
+         ST    R1,A2
+         LA    R1,P3
+         ST    R1,A3
+         LA    R1,P4
+         ST    R1,A4
+         LA    R1,P5
+         ST    R1,A5
+         OI    A5,X'80'                set VL bit
+* call program:
+         LA    R1,A1                   parm list addr
+         L     R15,ENVBLOCK_IRXEXTE    addr IRXEXTE
+         USING IRXEXTE,R15
+         L     R15,IRXSAY              addr IRXSAY
+         DROP  R15
+         LTR   R15,R15
+         BZ    NOSAY
+         BALR  R14,R15                 Call IRXSAY
+         B     EXIT
+* WTP message instead of Saying:
+NOSAY    LA    R1,MSGLEN
+         ST    R1,A1
+         OI    A1,X'80'
+         LA    R1,ERRMSGL
+         STH   R1,MSGLEN
+         LA    R1,A1
+         CALL  WTP
+         B     EXIT
+*
+*=====================================================================*
+*        S U B R O U T I N E S                                        *
+*---------------------------------------------------------------------*
+* GET input parameter (addr,length) by number:                        *
+*    entry :  R2=parm # (not changed)                                 *
+*    use   :  R15 (return 0, when parm is found)                      *
+*    return:  to R14, R3=parm addr, R4=parm length (0, if not found)  *
+*---------------------------------------------------------------------*
+GETPARM  DS    0H
+         LR    R15,R2
+         SR    R4,R4                   make length zero
+         L     R3,EFPLARG              A(1st parm)
+         B     GETPL1                  go into loop
+GETPL    LA    R3,8(R3)                next parm
+GETPL1   CLC   0(8,R3),PARMEND
+         BER   R14                     not found
+         BCT   R15,GETPL
+* parm found:
+         L     R4,4(R3)                parm length
+         L     R3,0(R3)                parm addr
+         BR    R14
+*---------------------------------------------------------------------*
+* Copy data member name from data to EVDATA,
+*    separate with a blank, put alias into '()'
+*    Use local Regs definition and values
+*    MC(R2) - current member to copy
+*    MX(R8) - where to copy (update after copy)
+*    A0(R4) - alias list start
+*    AC(R6), AE(R7), MN(R1) = work regs
+*---------------------------------------------------------------------*
+COPYM    STM   R14,R7,S2
+         CR    MC,A0                    if alias
+         BL    CMEM                     not alias
+* alias:
+         CLI   PREV,#A
+         MVI   PREV,#A                  update PREV to "Alias"
+         BE    CAA
+*  prev was member:
+CMA      MVC   0(#LMA,MX),#MA           start alias list with #MA
+         LA    MX,#LMA(MX)              shift output pos
+         B     CNXT1
+*  prev was alias:
+CAA      MVI   0(MX),C','               separate aliaces with a comma
+         LA    MX,1(MX)                 shift output pos
+         B     CNXT1
+*  member:
+CMEM     CLI   PREV,#A
+         MVI   PREV,#M
+         BNE   CNXT1
+*  prev was alias:
+CAM      MVC   0(2,MX),=C') '           end alias (alias list)
+         LA    MX,2(MX)                 shift output pos
+*  prev was member:
+*        Member already has a trailing blank
+* copy non-blank chars of member name:
+CNXT1    LR    MN,MC                    R1 - first char
+         LA    AE,7(MC)                 R7 - last char
+         LA    AC,1                     R6 - incr
+CLOOP    CLI   0(MN),C' '
+         BE    CLOOPE                   leave on blank
+         BXLE  MN,AC,CLOOP              until AN
+* MN -> blank or next char after DNAME
+CLOOPE   SR    MN,MC                    length
+         LTR   MN,MN                    null -
+         BZ    CNXT2                    move one char anyway
+         BCTR  MN,0                     length-1 for MVC
+CNXT2    EX    MN,CMVCNAM               copy memb name chars
+         LA    MN,1(MN)                 back to length
+         AR    MX,MN                    shift output position
+         CLI   PREV,#M                  if it is a member
+         BNE   COPYEND                  no
+         MVI   0(MX),C' '               put a blank
+         LA    MX,1(MX)                 shift output pos
+COPYEND  LM    R14,R7,S2
+         BR    R14
+CMVCNAM  MVC   0(0,MX),0(MC)
+*---------------------------------------------------------------------*
+* GET bigger EVALBLOCK by calling IRXRLT:                             *
+*    (std length of EVDATA is 250 bytes, to replace EVALBLOCK,        *
+*    call IRXRLT and put new address into EFLEVAL)                    *
+*    entry :  R2=new data length (must be 16M>=l>=0                   *
+*    return:  to R9 -> new evalblock, R15=rc from IRXRLT              *
+*---------------------------------------------------------------------*
+GETBIG   STM   R14,R1,S2
+         SR    R15,R15
+         LR    R1,R2                   Check if it fits:
+         SRL   R1,3                    R2/8 (in doublewords)
+         LA    R1,2(R1)                required EVSIZE
+         C     R1,EVALBLOCK_EVSIZE
+         BNH   GETBRET                 fits
+         LA    R1,FUNC                 set parm addr list
+         ST    R1,PA#1
+         LA    R1,EVBADDR
+         ST    R1,PA#2
+         LA    R1,EVDTLEN
+         ST    R1,PA#3
+         OI    PA#3,x'80'              set VL bit
+         MVC   FUNC(8),#GETBLK         Set parm values
+         XC    EVBADDR(4),EVBADDR
+         ST    R2,EVDTLEN
+         LR    R0,R11
+         LA    R1,PA#1
+         L     R15,ENVBLOCK_IRXEXTE    addr IRXEXTE
+         USING IRXEXTE,R15
+         L     R15,IRXRLT              IRXRLT entry addr
+         DROP  R15
+         BALR  R14,R15                 Call IRXRLT
+         LTR   R15,R15
+         BNZ   GETBRET
+         L     R9,EVBADDR              Update addr of EVALBLOCK
+GETBRET  ST    R15,S2+4
+         LM    R14,R1,S2
+         BR    R14
+*=====================================================================
+*  Constants:
+*---------------------------------------------------------------------
+#MA      DC    C' ALIAS('              start of alias list
+#LMA     EQU   *-#MA                   length of #MA
+#A       EQU   C'A'                    PREV was alias
+#M       EQU   C'M'                    PREV was member
+#MAXMEM  DC    F'15000'                max # of members can process
+$MLEN    EQU   14                     Average length of entry in EVDATA
+$CLSOFFS EQU   80                      X'50' offset of $CLOSE ep
+$REDOFFS EQU   48                      X'30' offset of $READ ep
+#EVDFLT  DC    F'250'                  Standard EVDATA max len
+#ALIAS   EQU   X'80'                   flag 'alias' in COUNTER byte
+#MARK    EQU   X'FF'                   flag member has alias(es)
+PARMEND  DC    8X'FF'
+#BLANKS  DC    CL44' '
+#MAX     DC    8X'FF'
+#GETBLK  DC    C'GETBLOCK'                  func for IRXRLT
+MVCDSN   MVC   DSNAME(0),0(R3)              move parm to DSNAME
+MVCVOL   MVC   VOLUME(0),0(R3)              move parm to VOLUME
+MVCRET   MVC   EVALBLOCK_EVDATA(0),DSNAME   move DSNAME to return buf
+#ERR1    DC    F'12'                   No parm
+         DC    CL40'L_PDS: Error - no parm passed          '
+#ERR2    DC    F'12'                   No $OPEN
+         DC    CL40'L_PDS: Error - $OPEN cannot be LOADed  '
+#ERR3    DC    F'12'                   Open failed
+         DC    CL40'L_PDS: Error - Cannot open data set    '
+#ERR4    DC    F'00'                   Not PDS
+         DC    CL40'L_PDS: Warning - Dataset is not a PDS  '
+#ERR5    DC    F'00'                   No members
+         DC    CL40'L_PDS: Warning - PSD directory empty   '
+#ERR6    DC    F'12'                   No members
+         DC    CL40'L_PDS: Error - Too many members        '
+         LTORG
+*=====================================================================
+*  Mapping:
+*---------------------------------------------------------------------
+WRK      DSECT
+S        DS    18F
+S2       DS    18F
+VALUE    DS    D
+D        DS    2D
+RETC     DS    A
+*- $PARM map for $OPEN:
+$PADDR   DC    X'80'                   Std Parm addr list
+         DC    AL3($PARM)              Actually AL4
+$PARM    DS    0F
+RC       DC    F'0'                    <Return Code
+DSNAME   DC    44C' '                  >Dataset Name
+MEMBER   DC    8C' '                   >PDS Member Name/blanks
+VOLUME   DC    6C' '                   >Volume Name/blanks
+RECLEN   DC    H'0'                    <Current Record Length
+TYPE     EQU   RECLEN
+DCBAD    DC    F'0'                   ><DCB Address
+BUFADDR  DC    F'0'                   ><Buffer Address
+LENGTH   DC    F'0'                    <Data Length in Buffer (bytes)
+RECADDR  DC    F'0'                    <Current Record Addr
+NUMLEN   EQU   *-RECLEN
+*- end of $PARM map
+*- Parm for IRXRLT:
+PA#1     DS    A                     > Addr of function
+PA#2     DS    A                      <Addr of A(new EVALBLOCK)
+PA#3     DS    A                     > Requested length of EVDATA,VL
+FUNC     DS    CL8                     =C'GETBLOCK'
+EVBADDR  DS    A
+EVDTLEN  DS    F
+*- end of parm for IRXRLT
+$OPENADR DS    A                       addr of $OPENI
+$CLOSADR DS    A                       addr of $CLOSE
+$READADR DS    A                       addr of $READ
+*- data area variables:
+MEMBERS  DS    F                       # of member entries
+DATALEN  DS    F                       length of data allocated
+DATADDR  DS    A                       addr of data allocated
+DATAEND  DS    A                       addr of end of data
+MEMBEND  DS    A                       addr of last prim member
+ALIAS    DS    A                       addr of alias list in data
+MEMPTR   DS    A                       wrk
+TTRX     DS    F                       wrk
+DLENF    DS    F                       wrk
+PREV     DS    CL1
+*- Function call parameter:
+*- R0 -> env block IRXENVB
+*- R1 -> following parameter list:
+A1       DS    A
+A2       DS    A
+A3       DS    A
+A4       DS    A
+A5       DS    A
+A6       DS    A
+* parameter values:
+P1       DS    CL8                     function requested
+P2       DS    A                       addr os data
+P3       DS    F                       length of data
+P4       DS    A                   IRXENVB optional, R0 is alternative
+P5       DS    A                       RC and VL bit
+**
+MSGLEN   DS    H                       For WTP
+MESSAGE  DS    CL40                    For WTP
+WRKL     EQU   (*-WRK+7)/8*8           WORK AREA LENGTH
+*
+*---------------------------------------------------------------------*
+*        DSECTS                                                       *
+*---------------------------------------------------------------------*
+ERRBLK   DSECT
+ERRCODE  DS    F
+ERRMSG   DS    CL40
+ERRMSGL  EQU   *-ERRMSG
+         PRINT NOGEN
+         REGS
+* REXX specific DSECTs:
+         IRXEFPL DSECT=YES             REXX parameter list
+         IRXEVALB                      REXX evaluation block EVALBLOCK
+         IRXEXTE                       REXX vector of external ep
+         IRXENVB                       REXX environment block ENVBLOCK
+* DCB mapping:
+         DCBD  DSORG=PO,DEVD=DA
+* DATA element:
+DENTRY   DSECT
+DNAME    DS    CL8
+DTTR     DS    XL3
+DFLAG    DS    XL1
+DLEN     EQU   *-DENTRY
+*
+* PO directory entry map:
+ENTRY    DSECT
+NAME     DS    CL8
+TTR      DS    XL3
+COUNTER  DS    XL1
+DATA     DS    XL1
+         END
+//*
+//LKED    EXEC PGM=HEWLKED,COND=(8,LE),
+//        PARM='RENT,REUS,CAL,MAP,AC=1,RMOD=ANY,AMOD=31'
+//SYSLIB   DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST       <== hlq.LOAD
+//SYSLMOD  DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST(IRXF@PDS) <=*.LOAD
+//SYSPRINT DD SYSOUT=*
+//SYSLIN   DD DSN=*.ASMH.SYSLIN,DISP=(OLD,PASS)
+//*
+//* test changes, if any:
+//GO      EXEC PGM=IKJEFT1B,COND=(8,LE),
+//        PARM='%PW'
+//SYSEXEC  DD DISP=SHR,DSN=SYS3.UTILITY.EXEC.SHARE         <== hlq.EXEC
+//STEPLIB  DD DISP=SHR,DSN=SYS3.UTILITY.LOADLIB.TEST       <== hlq.LOAD
+//SYSTSPRT DD  SYSOUT=*
+//SYSTSIN  DD  DUMMY
+//SYSUDUMP DD SYSOUT=*
+//TEMPL    DD *
+ dsn = 'CEE.SCEELKED'  /* big PDS */
+ result = IRXF@PDS(dsn)
+ Say 'DD='dsn 'RC=' rc
+ Say 'Good Result=' result
+ dsn = 'SYS3.UTILITY.PS.TEST'
+ result = IRXF@PDS(dsn)
+ Say 'Bad  Result=' result
+ result = IRXF@PDS()
+ EXIT
+//
